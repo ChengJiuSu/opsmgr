@@ -37,12 +37,8 @@ PROVIDER_SEEDS = [
 
 # 内置渠道：code, 名称, 平台, 排序
 CHANNEL_SEEDS = [
-    ('official', '官服', 'all', 1),
-    ('appstore', 'App Store', 'ios', 2),
-    ('taptap', 'TapTap', 'android', 3),
-    ('huawei', '华为', 'android', 4),
-    ('xiaomi', '小米', 'android', 5),
-    ('yyb', '应用宝', 'android', 6),
+    ('qixia', '奇侠', 'all', 1),
+    ('bilibili', 'B站', 'all', 2),
 ]
 
 SLUG_RE = re.compile(r'^[-a-zA-Z0-9_]+$')

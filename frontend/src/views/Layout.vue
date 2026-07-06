@@ -33,8 +33,8 @@
           </template>
           <el-menu-item index="/config/project-groups">项目组</el-menu-item>
           <el-menu-item index="/config/channels">渠道</el-menu-item>
-          <el-menu-item index="/config/environments">环境</el-menu-item>
           <el-menu-item index="/config/cloud-providers">云厂商</el-menu-item>
+          <el-menu-item index="/config/environments">环境</el-menu-item>
           <el-menu-item index="/config/service-types">服务类型</el-menu-item>
           <el-menu-item index="/config/allocation">服务概要</el-menu-item>
         </el-sub-menu>
