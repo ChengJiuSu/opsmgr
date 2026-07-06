@@ -1,0 +1,29 @@
+# Web 框架
+Django==6.0.5
+djangorestframework>=3.16.0
+django-cors-headers>=4.7.0
+
+# 认证
+djangorestframework-simplejwt>=5.4.0
+
+# 环境变量管理
+python-decouple>=3.8
+
+# 异步任务（任务执行 celery 后端 / P2 成本告警模块使用）
+celery>=5.4.0
+redis>=5.2.0
+django-celery-beat>=2.7.0
+django-celery-results>=2.5.0
+
+# 任务执行（命令 / 剧本均通过 Ansible 下发）
+ansible-core>=2.16
+
+# 数据库（生产 MySQL）
+mysqlclient>=2.2.0
+
+# 代码质量
+black>=24.0.0
+isort>=5.13.0
+
+# API 文档（可选）
+drf-spectacular>=0.28.0

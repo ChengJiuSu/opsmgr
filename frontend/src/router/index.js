@@ -1,0 +1,129 @@
+import { createRouter, createWebHistory } from 'vue-router'
+
+const router = createRouter({
+  history: createWebHistory(),
+  routes: [
+    {
+      path: '/login',
+      name: 'Login',
+      component: () => import('../views/Login.vue'),
+      meta: { public: true },
+    },
+    {
+      path: '/',
+      component: () => import('../views/Layout.vue'),
+      redirect: '/dashboard',
+      children: [
+        {
+          path: 'dashboard',
+          name: 'Dashboard',
+          component: () => import('../views/Dashboard.vue'),
+          meta: { title: '概览' },
+        },
+        {
+          path: 'assets/servers',
+          name: 'Servers',
+          component: () => import('../views/assets/Servers.vue'),
+          meta: { title: '服务器管理' },
+        },
+        // 配置管理：服务概要（归属分配 + 服务规划）+ CMDB 基础数据字典
+        {
+          path: 'config/allocation',
+          name: 'ConfigAllocation',
+          component: () => import('../views/config/Allocation.vue'),
+          meta: { title: '服务概要' },
+        },
+        {
+          path: 'config/project-groups',
+          name: 'ProjectGroups',
+          component: () => import('../views/config/DictManager.vue'),
+          props: { type: 'project-groups' },
+          meta: { title: '项目组' },
+        },
+        {
+          path: 'config/channels',
+          name: 'Channels',
+          component: () => import('../views/config/DictManager.vue'),
+          props: { type: 'channels' },
+          meta: { title: '渠道' },
+        },
+        {
+          path: 'config/environments',
+          name: 'Environments',
+          component: () => import('../views/config/DictManager.vue'),
+          props: { type: 'environments' },
+          meta: { title: '环境' },
+        },
+        {
+          path: 'config/cloud-providers',
+          name: 'CloudProviders',
+          component: () => import('../views/config/DictManager.vue'),
+          props: { type: 'cloud-providers' },
+          meta: { title: '云厂商' },
+        },
+        {
+          path: 'config/service-types',
+          name: 'ServiceTypes',
+          component: () => import('../views/config/DictManager.vue'),
+          props: { type: 'service-types' },
+          meta: { title: '服务类型' },
+        },
+        {
+          path: 'task/executions',
+          name: 'TaskExecutions',
+          component: () => import('../views/task/Executions.vue'),
+          meta: { title: '任务执行' },
+        },
+        {
+          path: 'task/methods',
+          name: 'TaskMethods',
+          component: () => import('../views/task/Methods.vue'),
+          meta: { title: '方法管理', staff: true },
+        },
+        {
+          path: 'task/credentials',
+          name: 'TaskCredentials',
+          component: () => import('../views/task/Credentials.vue'),
+          meta: { title: '连接凭据', staff: true },
+        },
+        {
+          path: 'audit/logs',
+          name: 'AuditLogs',
+          component: () => import('../views/audit/Logs.vue'),
+          meta: { title: '操作审计' },
+        },
+        {
+          path: 'system/users',
+          name: 'Users',
+          component: () => import('../views/system/Users.vue'),
+          meta: { title: '用户管理', staff: true },
+        },
+        {
+          path: 'system/configs',
+          name: 'SystemConfigs',
+          component: () => import('../views/system/Configs.vue'),
+          meta: { title: '系统配置' },
+        },
+      ],
+    },
+  ],
+})
+
+// 路由守卫：未登录跳转登录页；非管理员禁止访问 staff 页面
+router.beforeEach((to) => {
+  const token = localStorage.getItem('access_token')
+  if (!to.meta.public && !token) {
+    return { name: 'Login' }
+  }
+  if (to.name === 'Login' && token) {
+    return { name: 'Dashboard' }
+  }
+  if (to.meta.staff) {
+    const user = JSON.parse(localStorage.getItem('user') || 'null')
+    if (!user?.is_staff) {
+      return { name: 'Dashboard' }
+    }
+  }
+})
+
+export default router

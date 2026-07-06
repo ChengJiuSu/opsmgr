@@ -1,0 +1,3 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'PingFang SC', 'Microsoft YaHei', sans-serif; }
+#app { height: 100vh; }

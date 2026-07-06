@@ -1,0 +1,232 @@
+<template>
+  <el-card shadow="never">
+    <div class="toolbar">
+      <div class="toolbar-left">
+        <el-input v-model="filter.keyword" placeholder="方法名称" clearable style="width:160px" @keyup.enter="fetchData" @clear="fetchData" />
+        <el-select v-model="filter.provider" placeholder="Provider" clearable style="width:150px" @change="fetchData">
+          <el-option label="Ansible 剧本" value="ansible_playbook" />
+          <el-option label="云主机管理" value="cloud_host" />
+        </el-select>
+        <el-button :icon="Search" @click="fetchData">查询</el-button>
+      </div>
+      <el-button type="primary" :icon="Plus" @click="openDialog()">新增方法</el-button>
+    </div>
+
+    <el-alert type="info" :closable="false" show-icon style="margin-bottom:12px">
+      平台方法用于集中管理可复用的执行能力。Ansible 剧本方法 = 指定剧本文件 + tags；云主机管理等 provider 为后续扩展预留。
+    </el-alert>
+
+    <el-table v-loading="loading" :data="tableData" stripe>
+      <el-table-column prop="name" label="名称" min-width="120" />
+      <el-table-column prop="code" label="标识" width="150" />
+      <el-table-column label="Provider" width="130">
+        <template #default="{ row }">
+          <el-tag size="small" :type="row.provider === 'ansible_playbook' ? 'success' : 'warning'">
+            {{ row.provider_display }}
+          </el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="剧本 / Tags" min-width="200">
+        <template #default="{ row }">
+          <span v-if="row.provider === 'ansible_playbook'">
+            <code>{{ row.config?.playbook || '-' }}</code>
+            <el-tag v-if="row.config?.tags" size="small" type="info" style="margin-left:6px">
+              tags: {{ row.config.tags }}
+            </el-tag>
+          </span>
+          <span v-else class="muted">—</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="服务类型" width="110">
+        <template #default="{ row }">
+          <el-tag v-if="row.service_type_name" size="small" type="warning">{{ row.service_type_name }}</el-tag>
+          <span v-else class="muted">—</span>
+        </template>
+      </el-table-column>
+      <el-table-column prop="description" label="说明" show-overflow-tooltip />
+      <el-table-column label="状态" width="80">
+        <template #default="{ row }">
+          <el-tag size="small" :type="row.enabled ? 'success' : 'info'">{{ row.enabled ? '启用' : '禁用' }}</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="操作" width="140" fixed="right">
+        <template #default="{ row }">
+          <el-button size="small" :icon="Edit" @click="openDialog(row)">编辑</el-button>
+          <el-button size="small" type="danger" :icon="Delete" @click="handleDelete(row)" />
+        </template>
+      </el-table-column>
+    </el-table>
+  </el-card>
+
+  <el-dialog v-model="dialogVisible" :title="editRow ? '编辑方法' : '新增方法'" width="560px">
+    <el-form ref="formRef" :model="form" :rules="rules" label-width="100px">
+      <el-form-item label="名称" prop="name">
+        <el-input v-model="form.name" />
+      </el-form-item>
+      <el-form-item label="标识" prop="code">
+        <el-input v-model="form.code" :disabled="!!editRow" placeholder="唯一英文标识，如 restart-nginx" />
+      </el-form-item>
+      <el-form-item label="Provider">
+        <el-select v-model="form.provider" style="width:100%">
+          <el-option label="Ansible 剧本" value="ansible_playbook" />
+          <el-option label="云主机管理（预留）" value="cloud_host" />
+        </el-select>
+      </el-form-item>
+
+      <!-- ansible_playbook 专属配置 -->
+      <template v-if="form.provider === 'ansible_playbook'">
+        <el-form-item label="剧本文件" prop="config_playbook">
+          <el-input v-model="form.config.playbook" placeholder="相对 Ansible 项目目录，如 site.yml" />
+        </el-form-item>
+        <el-form-item label="Tags">
+          <el-input v-model="form.config.tags" placeholder="逗号分隔，如 nginx,restart" />
+        </el-form-item>
+        <el-form-item label="Inventory">
+          <el-input v-model="form.config.inventory" placeholder="可留空用项目默认" />
+        </el-form-item>
+        <el-form-item label="默认 Limit">
+          <el-input v-model="form.config.limit" placeholder="可留空" />
+        </el-form-item>
+      </template>
+
+      <!-- 其他 provider：通用 JSON 配置 -->
+      <el-form-item v-else label="配置 (JSON)">
+        <el-input v-model="rawConfig" type="textarea" :rows="4" placeholder='{"action": "reboot"}' />
+      </el-form-item>
+
+      <el-form-item label="服务类型">
+        <el-select v-model="form.service_type" clearable style="width:100%" placeholder="部署类方法关联后，执行前校验目标主机已规划该服务">
+          <el-option v-for="o in serviceTypes" :key="o.id" :label="o.name" :value="o.id" />
+        </el-select>
+      </el-form-item>
+      <el-form-item label="说明">
+        <el-input v-model="form.description" />
+      </el-form-item>
+      <el-form-item label="启用">
+        <el-switch v-model="form.enabled" />
+      </el-form-item>
+    </el-form>
+    <template #footer>
+      <el-button @click="dialogVisible = false">取消</el-button>
+      <el-button type="primary" :loading="submitting" @click="handleSubmit">确定</el-button>
+    </template>
+  </el-dialog>
+</template>
+
+<script setup>
+import { ref, reactive, onMounted } from 'vue'
+import { Plus, Edit, Delete, Search } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { getMethods, createMethod, updateMethod, deleteMethod } from '../../api/tasks'
+import { serviceTypeApi, fetchDictOptions } from '../../api/assets'
+
+const loading = ref(false)
+const submitting = ref(false)
+const tableData = ref([])
+const filter = reactive({ keyword: '', provider: '' })
+// 服务类型下拉选项（部署前置校验关联用）
+const serviceTypes = ref([])
+
+const dialogVisible = ref(false)
+const editRow = ref(null)
+const formRef = ref()
+const rawConfig = ref('{}')
+const emptyForm = () => ({
+  name: '', code: '', provider: 'ansible_playbook', description: '', service_type: null,
+  enabled: true, config: { playbook: '', tags: '', inventory: '', limit: '' },
+})
+const form = reactive(emptyForm())
+const rules = {
+  name: [{ required: true, message: '请输入名称' }],
+  code: [{ required: true, message: '请输入标识' }],
+  config_playbook: [{
+    validator: (_r, _v, cb) =>
+      (form.provider !== 'ansible_playbook' || form.config.playbook)
+        ? cb() : cb(new Error('请填写剧本文件')),
+  }],
+}
+
+async function fetchData() {
+  loading.value = true
+  try {
+    const params = { page_size: 200 }
+    if (filter.keyword) params.keyword = filter.keyword
+    if (filter.provider) params.provider = filter.provider
+    const res = await getMethods(params)
+    tableData.value = res.data?.results || []
+  } finally {
+    loading.value = false
+  }
+}
+
+function openDialog(row = null) {
+  editRow.value = row
+  Object.assign(form, emptyForm())
+  if (row) {
+    Object.assign(form, {
+      name: row.name, code: row.code, provider: row.provider,
+      description: row.description, enabled: row.enabled, service_type: row.service_type,
+      config: { playbook: '', tags: '', inventory: '', limit: '', ...(row.config || {}) },
+    })
+    rawConfig.value = JSON.stringify(row.config || {}, null, 2)
+  } else {
+    rawConfig.value = '{}'
+  }
+  dialogVisible.value = true
+  formRef.value?.clearValidate()
+}
+
+async function handleSubmit() {
+  await formRef.value.validate()
+  let config = form.config
+  if (form.provider !== 'ansible_playbook') {
+    try {
+      config = JSON.parse(rawConfig.value || '{}')
+    } catch {
+      ElMessage.error('配置 JSON 格式不正确')
+      return
+    }
+  }
+  const payload = {
+    name: form.name, code: form.code, provider: form.provider,
+    description: form.description, enabled: form.enabled, config,
+    // clearable 置空时为 undefined/空串，统一提交 null 表示不关联
+    service_type: form.service_type || null,
+  }
+  submitting.value = true
+  try {
+    if (editRow.value) {
+      await updateMethod(editRow.value.id, payload)
+      ElMessage.success('更新成功')
+    } else {
+      await createMethod(payload)
+      ElMessage.success('新增成功')
+    }
+    dialogVisible.value = false
+    fetchData()
+  } finally {
+    submitting.value = false
+  }
+}
+
+async function handleDelete(row) {
+  await ElMessageBox.confirm(`确定删除方法「${row.name}」吗？`, '警告', { type: 'warning' })
+  await deleteMethod(row.id)
+  ElMessage.success('删除成功')
+  fetchData()
+}
+
+onMounted(() => {
+  fetchData()
+  fetchDictOptions(serviceTypeApi).then((res) => {
+    serviceTypes.value = res.data?.results || []
+  })
+})
+</script>
+
+<style scoped>
+.toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+.toolbar-left { display: flex; gap: 8px; }
+.muted { color: #c0c4cc; }
+code { background: #f5f7fa; padding: 1px 6px; border-radius: 3px; font-size: 12px; }
+</style>
