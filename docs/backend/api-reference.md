@@ -249,7 +249,7 @@ GET /api/assets/servers/stats/
 
 ### CMDB 基础数据（字典）
 
-项目组 / 渠道 / 环境 / 云厂商四个模块接口形态一致（管理员可写，普通用户只读）：
+项目组 / 渠道 / 环境 / 云厂商四个模块接口形态一致（普通用户可查、可新增，修改与删除仅管理员）：
 
 ```
 GET    /api/assets/{module}/          # 列表，支持 enabled=true|false、keyword 过滤

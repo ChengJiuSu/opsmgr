@@ -29,7 +29,7 @@ class BaseApiTest(TestCase):
         self.admin = self._client()
         self.envProd = Environment.objects.get(code='prod')
         self.group = ProjectGroup.objects.create(name='仙侠项目组', code='xianxia')
-        self.channel = Channel.objects.get(code='official')
+        self.channel = Channel.objects.get(code='qixia')
         self.s1 = Server.objects.create(name='s1', ip='10.2.0.1')
         self.s2 = Server.objects.create(name='s2', ip='10.2.0.2', region='cn-shanghai')
 

@@ -30,7 +30,7 @@ class DictSeedTests(TestCase):
         self.assertTrue(Environment.objects.get(code='prod').is_prod)
         self.assertFalse(Environment.objects.get(code='dev').is_prod)
         self.assertIn('aliyun', CloudProvider.objects.values_list('code', flat=True))
-        self.assertIn('official', Channel.objects.values_list('code', flat=True))
+        self.assertIn('qixia', Channel.objects.values_list('code', flat=True))
 
 
 class DictApiTests(BaseApiTest):
@@ -38,16 +38,24 @@ class DictApiTests(BaseApiTest):
         admin = self._client(is_staff=True)
         normal = self._client(is_staff=False)
 
-        # 管理员可创建，普通用户只读
+        # 管理员可创建；普通用户可查、可新增，不可修改/删除
         r = admin.post('/api/assets/project-groups/', {'name': '传奇项目组', 'code': 'legend', 'owner': '张三'}, format='json')
         self.assertEqual(r.status_code, 201)
         gid = r.json()['data']['id'] if 'data' in r.json() else r.json()['id']
 
-        r = normal.post('/api/assets/project-groups/', {'name': 'x', 'code': 'x1'}, format='json')
-        self.assertEqual(r.status_code, 403)
+        r = normal.post('/api/assets/project-groups/', {'name': '武侠项目组', 'code': 'wuxia'}, format='json')
+        self.assertEqual(r.status_code, 201)
+        nid = r.json()['data']['id'] if 'data' in r.json() else r.json()['id']
 
         r = normal.get('/api/assets/project-groups/')
         self.assertEqual(r.status_code, 200)
+
+        r = normal.put(f'/api/assets/project-groups/{nid}/', {'name': '武侠项目组', 'code': 'wuxia', 'owner': '王五'}, format='json')
+        self.assertEqual(r.status_code, 403)
+        r = normal.patch(f'/api/assets/project-groups/{nid}/', {'enabled': False}, format='json')
+        self.assertEqual(r.status_code, 403)
+        r = normal.delete(f'/api/assets/project-groups/{nid}/')
+        self.assertEqual(r.status_code, 403)
 
         # 编码唯一性
         r = admin.post('/api/assets/project-groups/', {'name': '重复', 'code': 'legend'}, format='json')
@@ -92,7 +100,7 @@ class ServerApiTests(BaseApiTest):
         self.envProd = Environment.objects.get(code='prod')
         self.envTest = Environment.objects.get(code='test')
         self.group = ProjectGroup.objects.create(name='仙侠项目组', code='xianxia')
-        self.channel = Channel.objects.get(code='official')
+        self.channel = Channel.objects.get(code='qixia')
         self.provider = CloudProvider.objects.get(code='aliyun')
 
     def test_create_with_fk_and_display_fields(self):
@@ -112,6 +120,17 @@ class ServerApiTests(BaseApiTest):
         # 外键全部留空也允许创建
         r = self.admin.post('/api/assets/servers/', {'name': 'tmp-01', 'ip': '10.1.0.9'}, format='json')
         self.assertEqual(r.status_code, 201)
+
+    def test_normal_user_can_create_but_not_modify(self):
+        normal = self._client(is_staff=False)
+        r = normal.post('/api/assets/servers/', {'name': 'user-01', 'ip': '10.2.0.1'}, format='json')
+        self.assertEqual(r.status_code, 201)
+        sid = r.json()['data']['id'] if 'data' in r.json() else r.json()['id']
+
+        r = normal.put(f'/api/assets/servers/{sid}/', {'name': 'user-01x', 'ip': '10.2.0.1'}, format='json')
+        self.assertEqual(r.status_code, 403)
+        r = normal.delete(f'/api/assets/servers/{sid}/')
+        self.assertEqual(r.status_code, 403)
 
     def test_filter_by_code_and_id(self):
         Server.objects.create(name='p1', ip='10.1.0.2', environment=self.envProd, project_group=self.group)

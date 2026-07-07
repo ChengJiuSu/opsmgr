@@ -57,7 +57,7 @@
           <el-tag size="small" :type="statusType(row.status)">{{ statusLabel(row.status) }}</el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="140" fixed="right">
+      <el-table-column v-if="authStore.isStaff" label="操作" width="140" fixed="right">
         <template #default="{ row }">
           <el-button size="small" :icon="Edit" @click="openDialog(row)">编辑</el-button>
           <el-button size="small" type="danger" :icon="Delete" @click="handleDelete(row)">删除</el-button>
@@ -186,6 +186,9 @@ import {
   getServers, createServer, updateServer, deleteServer,
   projectGroupApi, channelApi, environmentApi, cloudProviderApi, fetchDictOptions,
 } from '../../api/assets'
+import { useAuthStore } from '../../stores/auth'
+
+const authStore = useAuthStore()
 
 const loading = ref(false)
 const submitting = ref(false)

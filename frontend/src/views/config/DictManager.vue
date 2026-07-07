@@ -44,11 +44,13 @@
       <el-table-column prop="sort_order" label="排序" width="70" />
       <el-table-column label="启用" width="80">
         <template #default="{ row }">
-          <el-switch :model-value="row.enabled" @change="(v) => toggleEnabled(row, v)" />
+          <!-- 启停属于修改操作，普通用户仅展示状态 -->
+          <el-switch v-if="authStore.isStaff" :model-value="row.enabled" @change="(v) => toggleEnabled(row, v)" />
+          <el-tag v-else size="small" :type="row.enabled ? 'success' : 'info'">{{ row.enabled ? '启用' : '停用' }}</el-tag>
         </template>
       </el-table-column>
       <el-table-column prop="remark" label="备注" min-width="120" show-overflow-tooltip />
-      <el-table-column label="操作" width="140" fixed="right">
+      <el-table-column v-if="authStore.isStaff" label="操作" width="140" fixed="right">
         <template #default="{ row }">
           <el-button size="small" :icon="Edit" @click="openDialog(row)">编辑</el-button>
           <el-button size="small" type="danger" :icon="Delete" @click="handleDelete(row)">删除</el-button>
@@ -107,6 +109,9 @@ import { ref, reactive, computed, watch, onMounted } from 'vue'
 import { Plus, Edit, Delete } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { projectGroupApi, channelApi, environmentApi, cloudProviderApi, serviceTypeApi } from '../../api/assets'
+import { useAuthStore } from '../../stores/auth'
+
+const authStore = useAuthStore()
 
 // 路由以 props 方式传入字典类型（见 router/index.js）
 const props = defineProps({

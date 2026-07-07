@@ -88,7 +88,7 @@ region         = CharField(max_length=50, blank=True)
 
 ### BaseDictViewSet（字典通用视图）
 
-- 权限 `IsAdminOrReadOnly`：管理员可维护，普通用户只读
+- 权限 `IsAdminOrReadCreate`：普通用户可查看/新增，修改与删除仅管理员（服务器接口同权限）
 - 列表支持 `enabled=true|false`、`keyword`（名称/编码模糊）过滤
 - `destroy` 捕获 `ProtectedError`，返回友好错误：`「生产」仍被 3 台服务器引用，无法删除`
 

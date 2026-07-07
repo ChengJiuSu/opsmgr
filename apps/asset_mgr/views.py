@@ -2,7 +2,7 @@ from django.db.models import ProtectedError, Q
 from rest_framework import viewsets
 from rest_framework.decorators import action
 
-from common.permissions import IsAdminOrReadOnly
+from common.permissions import IsAdminOrReadCreate
 from common.response import fail, ok
 
 from .models import Channel, CloudProvider, Environment, ProjectGroup, Server, ServiceType
@@ -17,9 +17,12 @@ from .serializers import (
 
 
 class BaseDictViewSet(viewsets.ModelViewSet):
-    """CMDB 字典表通用 ViewSet：启用/关键字筛选 + 被引用删除保护。"""
+    """CMDB 字典表通用 ViewSet：启用/关键字筛选 + 被引用删除保护。
 
-    permission_classes = [IsAdminOrReadOnly]
+    权限：已认证用户可查看/新增，修改与删除仅管理员。
+    """
+
+    permission_classes = [IsAdminOrReadCreate]
     # 删除保护提示中的引用对象单位（如「台服务器」「条主机服务记录」）
     protected_hint = '台服务器'
 
@@ -79,7 +82,8 @@ class ServerViewSet(viewsets.ModelViewSet):
         .order_by('-created_at')
     )
     serializer_class = ServerSerializer
-    permission_classes = [IsAdminOrReadOnly]
+    # 已认证用户可查看/新增服务器，修改与删除仅管理员
+    permission_classes = [IsAdminOrReadCreate]
 
     # 查询参数 → 字典外键字段映射（值为纯数字按 id 过滤，否则按 code 过滤）
     DICT_FILTERS = (
