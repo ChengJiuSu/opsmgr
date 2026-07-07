@@ -12,6 +12,7 @@ OVERVIEW_URL = '/api/config/allocation/overview/'
 PLAN_URL = '/api/config/services/plan/'
 MARK_URL = '/api/config/services/mark/'
 UNPLAN_URL = '/api/config/services/unplan/'
+PROCESS_URL = '/api/config/services/process/'
 
 
 class BaseApiTest(TestCase):
@@ -130,12 +131,102 @@ class ServicePlanTests(BaseApiTest):
         self.assertEqual(r.json()['data']['created'], 0)
         self.assertEqual(r.json()['data']['skipped'], 4)
 
+    def test_plan_generates_process_name_and_count(self):
+        """规划时自动生成进程名（同分组维度按服务类型递增），process_count 应用到全部记录。"""
+        r = self.admin.post(PLAN_URL, {
+            'server_ids': [self.s1.id, self.s2.id],
+            'service_type_ids': [self.nginx.id],
+            'process_count': 4,
+        }, format='json')
+        self.assertEqual(r.status_code, 200)
+        # s1/s2 归属维度相同（均未分配）→ 同组编号 nginx-01 / nginx-02
+        names = set(ServerService.objects.values_list('process_name', flat=True))
+        self.assertEqual(names, {'nginx-01', 'nginx-02'})
+        self.assertEqual(
+            set(ServerService.objects.values_list('process_count', flat=True)), {4},
+        )
+
+        # 取消规划空出的序号可复用：删除 nginx-01 后新规划的主机补位 01
+        first = ServerService.objects.get(process_name='nginx-01')
+        self.admin.post(UNPLAN_URL, {
+            'server_ids': [first.server_id], 'service_type_id': self.nginx.id,
+        }, format='json')
+        s3 = Server.objects.create(name='s3', ip='10.2.0.3')
+        self._plan([s3.id], [self.nginx.id])
+        self.assertEqual(
+            ServerService.objects.get(server=s3).process_name, 'nginx-01',
+        )
+
+    def test_plan_process_name_scoped_by_dims(self):
+        """归属维度不同的主机序号互相独立。"""
+        self.s1.project_group = self.group
+        self.s1.save()
+        self._plan([self.s1.id, self.s2.id], [self.nginx.id])
+        # s1（仙侠项目组）与 s2（未分配）不同组，各自都是 nginx-01
+        self.assertEqual(
+            list(ServerService.objects.values_list('process_name', flat=True)),
+            ['nginx-01', 'nginx-01'],
+        )
+
+    def test_process_count_update_increase_only(self):
+        """进程数修改：可调大；调小整批拒绝；未规划的主机报错。"""
+        self._plan([self.s1.id], [self.nginx.id])
+
+        # 调大 1 → 3
+        r = self.admin.post(PROCESS_URL, {
+            'server_ids': [self.s1.id], 'service_type_id': self.nginx.id, 'process_count': 3,
+        }, format='json')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()['data']['updated'], 1)
+        self.assertEqual(ServerService.objects.get(server=self.s1).process_count, 3)
+
+        # 调小 3 → 2 拒绝
+        r = self.admin.post(PROCESS_URL, {
+            'server_ids': [self.s1.id], 'service_type_id': self.nginx.id, 'process_count': 2,
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('仅允许调大', r.json()['msg'])
+        self.assertEqual(ServerService.objects.get(server=self.s1).process_count, 3)
+
+        # 等值提交视为无操作
+        r = self.admin.post(PROCESS_URL, {
+            'server_ids': [self.s1.id], 'service_type_id': self.nginx.id, 'process_count': 3,
+        }, format='json')
+        self.assertEqual(r.json()['data']['updated'], 0)
+
+        # 未规划的主机报错；非法 process_count 报错
+        r = self.admin.post(PROCESS_URL, {
+            'server_ids': [self.s2.id], 'service_type_id': self.nginx.id, 'process_count': 2,
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('尚未规划', r.json()['msg'])
+        r = self.admin.post(PROCESS_URL, {
+            'server_ids': [self.s1.id], 'service_type_id': self.nginx.id, 'process_count': 0,
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+
+        # 权限：仅管理员
+        normal = self._client(is_staff=False, username='user_p')
+        r = normal.post(PROCESS_URL, {
+            'server_ids': [self.s1.id], 'service_type_id': self.nginx.id, 'process_count': 5,
+        }, format='json')
+        self.assertEqual(r.status_code, 403)
+
     def test_plan_validations(self):
         r = self._plan([], [self.game.id])
         self.assertEqual(r.status_code, 400)
         r = self._plan([self.s1.id], [])
         self.assertEqual(r.status_code, 400)
         r = self._plan([self.s1.id, 99999], [self.game.id])
+        self.assertEqual(r.status_code, 400)
+        # process_count 必须为正整数
+        r = self.admin.post(PLAN_URL, {
+            'server_ids': [self.s1.id], 'service_type_ids': [self.game.id], 'process_count': 0,
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        r = self.admin.post(PLAN_URL, {
+            'server_ids': [self.s1.id], 'service_type_ids': [self.game.id], 'process_count': 'x',
+        }, format='json')
         self.assertEqual(r.status_code, 400)
         # 停用的服务类型拒绝规划
         disabled = ServiceType.objects.create(name='停用服务', code='disabled-svc', enabled=False)

@@ -26,12 +26,12 @@ const router = createRouter({
           component: () => import('../views/assets/Servers.vue'),
           meta: { title: '服务器管理' },
         },
-        // 配置管理：服务概要（归属分配 + 服务规划）+ CMDB 基础数据字典
+        // 配置管理：服务器分配（归属分配 + 服务规划，仅显示已规划主机）+ CMDB 基础数据字典
         {
           path: 'config/allocation',
           name: 'ConfigAllocation',
           component: () => import('../views/config/Allocation.vue'),
-          meta: { title: '服务概要' },
+          meta: { title: '服务器分配' },
         },
         {
           path: 'config/project-groups',

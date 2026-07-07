@@ -108,9 +108,12 @@ class ServicePlanView(APIView):
 
     请求体::
 
-        {"server_ids": [1, 2], "service_type_ids": [3, 4]}
+        {"server_ids": [1, 2], "service_type_ids": [3, 4], "process_count": 2}
 
-    幂等：主机已存在该服务类型记录（任意状态）时跳过，不报错。
+    - process_count 可选（默认 1），应用到本次创建的所有记录
+    - 进程名自动生成：<服务类型code>-<两位序号>，序号在相同云厂商+项目组+
+      环境+渠道的主机范围内按服务类型递增（见 ServerService.next_process_name）
+    - 幂等：主机已存在该服务类型记录（任意状态）时跳过，不报错
     """
 
     permission_classes = [IsAdmin]
@@ -119,10 +122,13 @@ class ServicePlanView(APIView):
     def post(self, request):
         server_ids = request.data.get('server_ids')
         service_type_ids = request.data.get('service_type_ids')
+        process_count = request.data.get('process_count', 1)
         if not isinstance(server_ids, list) or not server_ids:
             return fail('server_ids 必须为非空数组')
         if not isinstance(service_type_ids, list) or not service_type_ids:
             return fail('service_type_ids 必须为非空数组')
+        if not isinstance(process_count, int) or isinstance(process_count, bool) or process_count < 1:
+            return fail('process_count 必须为正整数')
 
         servers = Server.objects.filter(id__in=server_ids)
         if servers.count() != len(set(server_ids)):
@@ -138,14 +144,19 @@ class ServicePlanView(APIView):
             .filter(server__in=servers, service_type__in=types)
             .values_list('server_id', 'service_type_id')
         )
-        links = [
-            ServerService(server=srv, service_type=st, status='planned')
+        pairs = [
+            (srv, st)
             for srv in servers for st in types
             if (srv.id, st.id) not in existing
         ]
         with transaction.atomic():
+            links = ServerService.build_planned_links(pairs, process_count=process_count)
             ServerService.objects.bulk_create(links)
-        return ok({'created': len(links), 'skipped': len(existing)})
+        return ok({
+            'created': len(links),
+            'skipped': len(existing),
+            'process_names': {f'{link.server_id}-{link.service_type_id}': link.process_name for link in links},
+        })
 
 
 class ServiceMarkView(APIView):
@@ -216,6 +227,43 @@ class ServiceUnplanView(APIView):
         with transaction.atomic():
             deleted, _ = links.delete()
         return ok({'deleted': deleted})
+
+
+class ServiceProcessView(APIView):
+    """修改进程数：更新已有服务记录的 process_count（规划创建后调整进程数量用）。
+
+    请求体::
+
+        {"server_ids": [1, 2], "service_type_id": 3, "process_count": 4}
+
+    - **进程数只允许调大**：目标值小于任一记录当前进程数时整批拒绝（缩容需走下线流程）
+    - 进程名不在此修改：进程名由规划时自动生成，保持稳定不随进程数变化
+    """
+
+    permission_classes = [IsAdmin]
+
+    @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
+    def post(self, request):
+        process_count = request.data.get('process_count')
+        if not isinstance(process_count, int) or isinstance(process_count, bool) or process_count < 1:
+            return fail('process_count 必须为正整数')
+        servers, service_type, error = _validate_batch_params(
+            request.data.get('server_ids'), request.data.get('service_type_id'),
+        )
+        if error:
+            return error
+
+        links = ServerService.objects.filter(server__in=servers, service_type=service_type)
+        if links.count() != servers.count():
+            return fail(f'部分主机尚未规划服务「{service_type.name}」，请先完成规划')
+        blocked = links.filter(process_count__gt=process_count).count()
+        if blocked:
+            return fail(f'{blocked} 条记录当前进程数大于 {process_count}，进程数仅允许调大，不允许调小')
+        with transaction.atomic():
+            updated = links.filter(process_count__lt=process_count).update(
+                process_count=process_count, updated_at=timezone.now(),
+            )
+        return ok({'updated': updated})
 
 
 class AllocationOverviewView(APIView):

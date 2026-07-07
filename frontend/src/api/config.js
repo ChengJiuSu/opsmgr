@@ -4,7 +4,8 @@ import request from '../utils/request'
 export const batchAssign = (data) => request.post('/api/config/allocation/assign/', data)
 export const getAllocationOverview = () => request.get('/api/config/allocation/overview/')
 
-// 服务类型规划：批量规划 / 状态流转 / 取消规划
+// 服务类型规划：批量规划 / 状态流转 / 取消规划 / 修改进程数
 export const planServices = (data) => request.post('/api/config/services/plan/', data)
 export const markServices = (data) => request.post('/api/config/services/mark/', data)
 export const unplanServices = (data) => request.post('/api/config/services/unplan/', data)
+export const updateServiceProcess = (data) => request.post('/api/config/services/process/', data)

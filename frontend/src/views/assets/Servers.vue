@@ -164,6 +164,15 @@
             <el-input-number v-model="form.ssh_port" :min="1" :max="65535" style="width:100%" />
           </el-form-item>
         </el-col>
+        <!-- 分配服务仅在新增时提供；已有主机的服务调整走「配置管理 → 服务器分配」 -->
+        <el-col v-if="!editRow" :span="24">
+          <el-form-item label="分配服务">
+            <el-select v-model="form.service_type_ids" multiple clearable placeholder="可选：规划本机承载的服务类型" style="width:100%">
+              <el-option v-for="o in dicts.serviceTypes" :key="o.id" :label="o.name" :value="o.id" />
+            </el-select>
+            <div class="form-tip">选择后自动创建「已规划」服务记录并生成进程名；未分配服务的主机不能作为任务执行目标</div>
+          </el-form-item>
+        </el-col>
         <el-col :span="24">
           <el-form-item label="备注">
             <el-input v-model="form.remark" type="textarea" :rows="2" />
@@ -184,7 +193,7 @@ import { Plus, Edit, Delete } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   getServers, createServer, updateServer, deleteServer,
-  projectGroupApi, channelApi, environmentApi, cloudProviderApi, fetchDictOptions,
+  projectGroupApi, channelApi, environmentApi, cloudProviderApi, serviceTypeApi, fetchDictOptions,
 } from '../../api/assets'
 import { useAuthStore } from '../../stores/auth'
 
@@ -202,7 +211,7 @@ const editRow = ref(null)
 const formRef = ref()
 
 // CMDB 字典下拉选项（仅启用项）
-const dicts = reactive({ environments: [], projectGroups: [], channels: [], cloudProviders: [] })
+const dicts = reactive({ environments: [], projectGroups: [], channels: [], cloudProviders: [], serviceTypes: [] })
 
 // 字典外键字段：提交前把清空的下拉值归一为 null
 const FK_FIELDS = ['environment', 'project_group', 'channel', 'cloud_provider']
@@ -219,7 +228,7 @@ const MEMORY_OPTIONS = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262
 const emptyForm = () => ({
   name: '', ip: '', os: '', cpu: null, memory: null, status: 'running',
   environment: null, project_group: null, channel: null, cloud_provider: null,
-  region: '', ssh_user: 'root', ssh_port: 22, remark: '',
+  region: '', ssh_user: 'root', ssh_port: 22, remark: '', service_type_ids: [],
 })
 const form = reactive(emptyForm())
 const rules = {
@@ -231,16 +240,18 @@ const statusType = (s) => ({ running: 'success', stopped: 'danger', maintenance:
 const statusLabel = (s) => ({ running: '运行中', stopped: '已停止', maintenance: '维护中' }[s] || s)
 
 async function loadDicts() {
-  const [envs, groups, channels, providers] = await Promise.all([
+  const [envs, groups, channels, providers, serviceTypes] = await Promise.all([
     fetchDictOptions(environmentApi),
     fetchDictOptions(projectGroupApi),
     fetchDictOptions(channelApi),
     fetchDictOptions(cloudProviderApi),
+    fetchDictOptions(serviceTypeApi),
   ])
   dicts.environments = envs.data?.results || []
   dicts.projectGroups = groups.data?.results || []
   dicts.channels = channels.data?.results || []
   dicts.cloudProviders = providers.data?.results || []
+  dicts.serviceTypes = serviceTypes.data?.results || []
 }
 
 async function fetchData() {
@@ -312,4 +323,5 @@ onMounted(() => {
 <style scoped>
 .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .toolbar-left { display: flex; gap: 8px; flex-wrap: wrap; }
+.form-tip { color: #909399; font-size: 12px; line-height: 1.5; margin-top: 4px; }
 </style>

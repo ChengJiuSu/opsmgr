@@ -121,6 +121,9 @@ class ServerViewSet(viewsets.ModelViewSet):
             qs = qs.filter(**cond).distinct()
         elif service_status:
             qs = qs.filter(services__status=service_status).distinct()
+        # 已规划筛选：assigned=service_type → 仅返回有服务记录的主机（服务器分配页专用）
+        if params.get('assigned') == 'service_type':
+            qs = qs.filter(services__isnull=False).distinct()
         # 未分配筛选：unassigned=<维度字段名> / any（任一归属维度缺失）/ service_type（未规划任何服务）
         unassigned = params.get('unassigned')
         dict_fields = [field for _, field in self.DICT_FILTERS]

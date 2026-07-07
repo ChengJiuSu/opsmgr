@@ -68,6 +68,11 @@ class DictBase(models.Model):
   `deployed→offline|planned`（回退纠错）、`offline→planned`（重新规划）
 - `planned_at` / `deployed_at` / `offline_at` 记录最近一次进入对应状态的时间
 - `service_type` 外键 `PROTECT`；`server` 外键 `CASCADE`（主机删除时记录随之删除）
+- **进程规划字段**：`process_name`（进程名，规划时自动生成）、`process_count`（进程数，默认 1）
+  - 进程名格式 `<服务类型code>-<两位序号>`（如 `nginx-01`），序号在「相同云厂商+项目组+
+    环境+渠道」的主机范围内按服务类型递增，与主机名中的序号无关；取消规划空出的序号可复用
+  - 生成逻辑见 `ServerService.next_process_name` / `build_planned_links`（批量创建时
+    组内预留防重）
 
 ### Server 关联
 
@@ -99,8 +104,15 @@ region         = CharField(max_length=50, blank=True)
 列表查询使用 `select_related` 预取四个外键、`prefetch_related` 预取服务关联避免 N+1。
 
 服务维度筛选：`service_type`（id 或 code）、`service_status`（planned/deployed/offline，
-可与 `service_type` 组合）、`unassigned=service_type`（未规划任何服务的主机）。
-`ServerSerializer` 附带 `services` 摘要（服务类型 + 状态列表）。
+可与 `service_type` 组合）、`unassigned=service_type`（未规划任何服务的主机）、
+`assigned=service_type`（仅返回有服务记录的主机，服务器分配页数据源）。
+`ServerSerializer` 附带 `services` 摘要（服务类型 + 状态 + 进程名/进程数）。
+
+### 新增主机时分配服务
+
+创建服务器可携带可选参数 `service_type_ids`（启用中的服务类型 id 数组），
+序列化器在事务内同步创建 `planned` 记录并自动生成进程名；编辑主机时该字段被忽略
+（服务调整走「配置管理 → 服务器分配」）。
 
 ### 数据迁移
 
@@ -109,6 +121,8 @@ region         = CharField(max_length=50, blank=True)
   `env` / `department` 文本值转换为字典记录回填外键（可重复执行、可回滚）
 - `0005`：删除旧的 `env` / `department` 文本列
 - `0006`：新增 `ServiceType` 字典与 `ServerService` 关联表（服务类型规划）
+- `0007`：`ServerService` 新增 `process_name` / `process_count` 字段，并按分组维度
+  为存量记录幂等回填进程名
 
 ---
 

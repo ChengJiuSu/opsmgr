@@ -102,7 +102,7 @@
               :disabled="!isServerPlanned(s)"
             />
           </el-select>
-          <div class="form-tip">仅已在「服务概要」中规划服务类型的主机可作为执行目标</div>
+          <div class="form-tip">仅已在「服务器分配」中规划服务类型的主机可作为执行目标</div>
         </el-form-item>
         <el-row :gutter="16">
           <el-col :span="12">
@@ -204,7 +204,7 @@ const serverOptions = ref([])
 const credentialOptions = ref([])
 const methodOptions = ref([])
 
-// 服务概要中有 planned/deployed 记录的主机才具备执行权限（与后端校验一致）
+// 服务器分配中有 planned/deployed 记录的主机才具备执行权限（与后端校验一致）
 function isServerPlanned(s) {
   return (s.services || []).some(x => x.status === 'planned' || x.status === 'deployed')
 }

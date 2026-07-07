@@ -145,6 +145,61 @@ class ServerApiTests(BaseApiTest):
         r = self.admin.get('/api/assets/servers/', {'project_group': 'xianxia'})
         self.assertEqual([i['name'] for i in r.json()['data']['results']], ['p1'])
 
+    def test_create_with_service_types_generates_process_name(self):
+        """新增主机时可选分配服务：直接落 planned 记录并自动生成进程名。"""
+        from .models import ServerService, ServiceType
+
+        nginx = ServiceType.objects.create(name='Nginx', code='nginx')
+        payload = {
+            'name': 'idc-cn-cd-develop-nginx-01', 'ip': '10.1.1.1',
+            'environment': self.envProd.id, 'project_group': self.group.id,
+            'channel': self.channel.id, 'cloud_provider': self.provider.id,
+            'service_type_ids': [nginx.id],
+        }
+        def _services(resp):
+            body = resp.json()
+            return (body['data'] if 'data' in body else body)['services']
+
+        r = self.admin.post('/api/assets/servers/', payload, format='json')
+        self.assertEqual(r.status_code, 201)
+        services = _services(r)
+        self.assertEqual(services[0]['status'], 'planned')
+        self.assertEqual(services[0]['process_name'], 'nginx-01')
+        self.assertEqual(services[0]['process_count'], 1)
+
+        # 相同云厂商+项目组+环境+渠道的第二台 nginx → nginx-02（与主机名序号无关）
+        r = self.admin.post('/api/assets/servers/', {
+            **payload, 'name': 'idc-cn-cd-develop-web-09', 'ip': '10.1.1.2',
+        }, format='json')
+        self.assertEqual(_services(r)[0]['process_name'], 'nginx-02')
+
+        # 分组维度不同（换云厂商）→ 序号独立，从 01 重新开始
+        other = CloudProvider.objects.get(code='tencent')
+        r = self.admin.post('/api/assets/servers/', {
+            **payload, 'name': 'tx-nginx', 'ip': '10.1.1.3', 'cloud_provider': other.id,
+        }, format='json')
+        self.assertEqual(_services(r)[0]['process_name'], 'nginx-01')
+
+        # 停用的服务类型拒绝分配
+        disabled = ServiceType.objects.create(name='停用', code='disabled-x', enabled=False)
+        r = self.admin.post('/api/assets/servers/', {
+            **payload, 'name': 'bad', 'ip': '10.1.1.4', 'service_type_ids': [disabled.id],
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(ServerService.objects.count(), 3)
+
+    def test_server_list_assigned_filter(self):
+        """assigned=service_type 仅返回有服务记录的主机（服务器分配页数据源）。"""
+        from .models import ServerService, ServiceType
+
+        nginx = ServiceType.objects.create(name='Nginx', code='nginx')
+        planned = Server.objects.create(name='planned-01', ip='10.1.2.1')
+        Server.objects.create(name='raw-01', ip='10.1.2.2')
+        ServerService.objects.create(server=planned, service_type=nginx, status='planned')
+
+        r = self.admin.get('/api/assets/servers/', {'assigned': 'service_type'})
+        self.assertEqual([i['name'] for i in r.json()['data']['results']], ['planned-01'])
+
     def test_stats_by_env_and_project(self):
         Server.objects.create(name='p1', ip='10.1.0.2', environment=self.envProd, project_group=self.group)
         Server.objects.create(name='p2', ip='10.1.0.4', environment=self.envProd)

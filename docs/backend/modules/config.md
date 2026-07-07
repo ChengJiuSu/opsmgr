@@ -11,7 +11,12 @@
 以及**服务类型规划**（规划 → 部署 → 下线的三态生命周期管理）。
 
 - 本模块**不建模型**，数据以 `asset_mgr` 为唯一数据源（与 `dashboard` 同为纯视图 app）
-- 前端「配置管理」菜单 = 五个字典维护页 + 服务概要页（原「服务器分配」，字典 CRUD 接口仍在 `/api/assets/` 下）
+- 前端「配置管理」菜单 = 五个字典维护页 + 服务器分配页（字典 CRUD 接口仍在 `/api/assets/` 下）
+- 服务器分配页**仅展示已规划服务的主机**（列表带 `assigned=service_type`）；
+  未规划的新主机通过页内「分配服务」表单（或新增主机时的分配服务下拉）纳管。
+  分配服务表单支持按项目组/渠道/环境筛选候选主机（复用服务器列表的
+  `project_group`/`channel`/`env` + `unassigned=service_type` 组合参数按需拉取），
+  切换筛选不清空已选主机，可跨项目/渠道/环境累计勾选后一次提交
 - 服务器逐台编辑仍走资产管理的服务器接口；本模块解决"圈选一批 → 统一归属/规划"的场景
 - **部署前置规划**：部署类平台方法（`method_mgr.Method.service_type`）执行前，
   task_exec 会校验目标主机已存在该服务类型的 planned/deployed 记录，未规划则拦截
@@ -91,19 +96,27 @@ GET /api/config/allocation/overview/    （登录即可）
 POST /api/config/services/plan/      批量规划：创建 planned 记录（部署前置步骤）
 POST /api/config/services/mark/      状态流转：planned→deployed→offline→planned
 POST /api/config/services/unplan/    取消规划：删除 planned 记录
+POST /api/config/services/process/   修改进程数（只允许调大）
 ```
 
 **请求体：**
 
 ```json
-// plan：幂等，主机已存在该服务类型记录（任意状态）时跳过
-{"server_ids": [1, 2], "service_type_ids": [3, 4]}
+// plan：幂等，主机已存在该服务类型记录（任意状态）时跳过；
+// process_count 可选（默认 1）；进程名自动生成（<服务类型code>-<两位序号>，
+// 序号在相同云厂商+项目组+环境+渠道的主机范围内按服务类型递增），
+// 响应附 process_names 映射（"<server_id>-<service_type_id>" -> 进程名）
+{"server_ids": [1, 2], "service_type_ids": [3, 4], "process_count": 2}
 
 // mark：所有主机必须已有该服务记录，且当前状态允许流转到目标状态
 {"server_ids": [1, 2], "service_type_id": 3, "status": "deployed"}
 
 // unplan：仅「已规划」可取消；已部署/已下线记录保留追溯，禁止删除
 {"server_ids": [1, 2], "service_type_id": 3}
+
+// process：修改进程数。只允许调大——目标值小于任一记录当前进程数时整批拒绝
+//（缩容走下线流程）；进程名保持稳定不随进程数变化
+{"server_ids": [1, 2], "service_type_id": 3, "process_count": 4}
 ```
 
 **状态流转规则（`ServerService.STATUS_TRANSITIONS`）：**
@@ -127,7 +140,8 @@ POST /api/config/services/unplan/    取消规划：删除 planned 记录
 | `any` | 任一归属维度未分配 |
 | `service_type` | 未规划任何服务 |
 
-另支持 `service_type=<id|code>`、`service_status=<planned|deployed|offline>` 组合筛选。
+另支持 `service_type=<id|code>`、`service_status=<planned|deployed|offline>` 组合筛选，
+以及 `assigned=service_type`（仅返回有服务记录的主机，服务器分配页列表数据源）。
 
 ---
 

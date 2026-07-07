@@ -6,8 +6,8 @@
       :key="card.key"
       shadow="never"
       class="overview-card"
-      :class="{ active: filter.unassigned === card.filterValue }"
-      @click="toggleUnassigned(card.filterValue)"
+      :class="{ active: card.filterValue !== null && filter.unassigned === card.filterValue }"
+      @click="handleCardClick(card)"
     >
       <div class="card-label">{{ card.label }}</div>
       <div class="card-value" :class="{ warn: card.filterValue && card.value > 0 }">{{ card.value }}</div>
@@ -18,13 +18,13 @@
     <!-- 工具栏 -->
     <div class="toolbar">
       <div class="toolbar-left">
+        <!-- 本页仅展示已规划服务的主机，「未规划服务」筛选不再适用（未规划主机走「分配服务」表单纳管） -->
         <el-select v-model="filter.unassigned" placeholder="未分配维度" clearable style="width:140px" @change="fetchData">
           <el-option label="任一维度未分配" value="any" />
           <el-option label="未分配项目组" value="project_group" />
           <el-option label="未分配环境" value="environment" />
           <el-option label="未分配渠道" value="channel" />
           <el-option label="未分配云厂商" value="cloud_provider" />
-          <el-option label="未规划服务" value="service_type" />
         </el-select>
         <el-select v-model="filter.project_group" placeholder="项目组" clearable style="width:130px" @change="fetchData">
           <el-option v-for="o in dicts.projectGroups" :key="o.id" :label="o.name" :value="o.code" />
@@ -52,6 +52,9 @@
       </div>
       <!-- 批量分配/规划均为修改操作，仅管理员可见 -->
       <div v-if="authStore.isStaff" class="toolbar-right">
+        <el-button type="success" :icon="Plus" @click="openAllocateDialog">
+          分配服务<template v-if="overview.unassigned.service_type">（{{ overview.unassigned.service_type }} 台未规划）</template>
+        </el-button>
         <el-button
           :icon="Menu"
           :disabled="!selection.length"
@@ -105,9 +108,10 @@
             {{ row.cloud_provider_name || '未分配' }}</span><template v-if="row.region"> / {{ row.region }}</template>
         </template>
       </el-table-column>
-      <el-table-column label="服务（规划/部署）" min-width="180">
+      <el-table-column label="服务进程（规划/部署）" min-width="200">
         <template #default="{ row }">
           <template v-if="row.services?.length">
+            <!-- 进程名与进程数同层级展示（如 nginx-01 ×2），方便直观确认进程数量 -->
             <el-tag
               v-for="svc in row.services"
               :key="svc.id"
@@ -115,7 +119,7 @@
               :type="SERVICE_STATUS_TAG[svc.status]"
               class="svc-tag"
             >
-              {{ svc.service_type_name }} · {{ SERVICE_STATUS_LABELS[svc.status] }}
+              {{ svc.process_name || svc.service_type_name }} ×{{ svc.process_count }} · {{ SERVICE_STATUS_LABELS[svc.status] }}
             </el-tag>
           </template>
           <span v-else class="unset">未规划</span>
@@ -182,16 +186,19 @@
     </template>
   </el-dialog>
 
-  <!-- 批量规划服务弹窗 -->
+  <!-- 批量规划服务弹窗（对表格中已选主机追加服务） -->
   <el-dialog v-model="planDialogVisible" :title="`规划服务（已选 ${selection.length} 台服务器）`" width="480px">
     <el-alert type="info" :closable="false" show-icon style="margin-bottom:16px">
-      为选中主机创建「已规划」服务记录，作为部署的前置步骤；已存在的记录自动跳过
+      为选中主机创建「已规划」服务记录并自动生成进程名（如 nginx-01）；已存在的记录自动跳过
     </el-alert>
     <el-form label-width="90px">
       <el-form-item label="服务类型">
         <el-select v-model="planForm.serviceTypeIds" multiple style="width:100%" placeholder="选择要规划的服务类型">
           <el-option v-for="o in dicts.serviceTypes" :key="o.id" :label="o.name" :value="o.id" />
         </el-select>
+      </el-form-item>
+      <el-form-item label="进程数">
+        <el-input-number v-model="planForm.processCount" :min="1" :max="99" style="width:160px" />
       </el-form-item>
     </el-form>
     <template #footer>
@@ -200,10 +207,78 @@
     </template>
   </el-dialog>
 
+  <!-- 分配服务弹窗：把未规划服务的主机纳入分配（本页表格只显示已规划主机） -->
+  <el-dialog v-model="allocateDialogVisible" title="分配服务" width="560px">
+    <el-alert type="info" :closable="false" show-icon style="margin-bottom:16px">
+      本页仅显示已规划服务的主机；在此为「未规划服务」的主机分配服务类型后，主机将出现在列表中并获得任务执行权限
+    </el-alert>
+    <el-form label-width="90px">
+      <!-- 主机筛选：按项目组/渠道/环境按需拉取候选主机；切换筛选不清空已选（支持跨项目/渠道/环境累计勾选） -->
+      <el-form-item label="主机筛选">
+        <div class="allocate-filter">
+          <el-select v-model="allocateFilter.project_group" placeholder="项目组" clearable style="flex:1" @change="loadUnplannedServers">
+            <el-option v-for="o in dicts.projectGroups" :key="o.id" :label="o.name" :value="o.code" />
+          </el-select>
+          <el-select v-model="allocateFilter.channel" placeholder="渠道" clearable style="flex:1" @change="loadUnplannedServers">
+            <el-option v-for="o in dicts.channels" :key="o.id" :label="o.name" :value="o.code" />
+          </el-select>
+          <el-select v-model="allocateFilter.env" placeholder="环境" clearable style="flex:1" @change="loadUnplannedServers">
+            <el-option v-for="o in dicts.environments" :key="o.id" :label="o.name" :value="o.code" />
+          </el-select>
+        </div>
+      </el-form-item>
+      <el-form-item label="目标主机">
+        <el-select
+          v-model="allocateForm.serverIds"
+          multiple
+          filterable
+          style="width:100%"
+          :loading="allocateLoading"
+          placeholder="选择未规划服务的主机"
+        >
+          <el-option v-for="s in allocateOptions" :key="s.id" :label="serverOptionLabel(s)" :value="s.id" />
+        </el-select>
+        <div v-if="!allocateLoading && !unplannedServers.length" class="form-tip">
+          当前筛选条件下没有未规划服务的主机{{ allocateForm.serverIds.length ? '（已选主机保留在上方）' : '' }}
+        </div>
+      </el-form-item>
+      <el-form-item label="服务类型">
+        <el-select v-model="allocateForm.serviceTypeIds" multiple style="width:100%" placeholder="选择要规划的服务类型">
+          <el-option v-for="o in dicts.serviceTypes" :key="o.id" :label="o.name" :value="o.id" />
+        </el-select>
+      </el-form-item>
+      <el-form-item label="进程数">
+        <el-input-number v-model="allocateForm.processCount" :min="1" :max="99" style="width:160px" />
+      </el-form-item>
+    </el-form>
+    <template #footer>
+      <el-button @click="allocateDialogVisible = false">取消</el-button>
+      <el-button type="primary" :loading="submitting" @click="handleAllocate">确定</el-button>
+    </template>
+  </el-dialog>
+
   <!-- 单机服务管理弹窗：状态流转 / 取消规划 / 补充规划 -->
-  <el-dialog v-model="serviceDialogVisible" :title="`服务管理 - ${serviceRow?.name || ''}`" width="560px">
+  <el-dialog v-model="serviceDialogVisible" :title="`服务管理 - ${serviceRow?.name || ''}`" width="680px">
     <el-table :data="serviceRow?.services || []" size="small">
-      <el-table-column prop="service_type_name" label="服务类型" min-width="120" />
+      <el-table-column prop="service_type_name" label="服务类型" min-width="100" />
+      <el-table-column label="进程名" min-width="110">
+        <template #default="{ row }">
+          <span :class="{ unset: !row.process_name }">{{ row.process_name || '—' }}</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="进程数" width="130">
+        <template #default="{ row }">
+          <!-- 直接改数字即保存；min 锁定当前值：进程数只允许调大（缩容走下线流程），进程名保持稳定 -->
+          <el-input-number
+            :model-value="row.process_count"
+            :min="row.process_count"
+            :max="99"
+            size="small"
+            style="width:100px"
+            @change="(v) => handleProcessCount(row, v)"
+          />
+        </template>
+      </el-table-column>
       <el-table-column label="状态" width="100">
         <template #default="{ row }">
           <el-tag size="small" :type="SERVICE_STATUS_TAG[row.status]">{{ SERVICE_STATUS_LABELS[row.status] }}</el-tag>
@@ -228,13 +303,13 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted } from 'vue'
-import { Connection, Menu } from '@element-plus/icons-vue'
+import { Connection, Menu, Plus } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   getServers, projectGroupApi, channelApi, environmentApi, cloudProviderApi, serviceTypeApi, fetchDictOptions,
 } from '../../api/assets'
 import {
-  batchAssign, getAllocationOverview, planServices, markServices, unplanServices,
+  batchAssign, getAllocationOverview, planServices, markServices, unplanServices, updateServiceProcess,
 } from '../../api/config'
 import { useAuthStore } from '../../stores/auth'
 
@@ -258,6 +333,14 @@ const pageSize = ref(20)
 const selection = ref([])
 const dialogVisible = ref(false)
 const planDialogVisible = ref(false)
+const allocateDialogVisible = ref(false)
+const allocateLoading = ref(false)
+// 分配服务弹窗的候选主机：当前筛选条件下未规划任何服务的主机
+const unplannedServers = ref([])
+// 弹窗内的主机筛选条件（项目组/渠道/环境，按 code 传参）
+const allocateFilter = reactive({ project_group: '', channel: '', env: '' })
+// 已加载过的主机缓存（id → 主机对象）：切换筛选后已选主机仍能正确显示名称
+const allocateSeen = new Map()
 const serviceDialogVisible = ref(false)
 // 服务管理弹窗当前操作的服务器行
 const serviceRow = ref(null)
@@ -291,14 +374,16 @@ const baseline = reactive({
 const extraOptions = reactive({
   project_group: [], environment: [], channel: [], cloud_provider: [],
 })
-const planForm = reactive({ serviceTypeIds: [] })
+const planForm = reactive({ serviceTypeIds: [], processCount: 1 })
+const allocateForm = reactive({ serverIds: [], serviceTypeIds: [], processCount: 1 })
 
+// filterValue 为 null 的卡片不参与未分配筛选（未规划主机不在本页列表，点击改为打开分配服务弹窗）
 const overviewCards = computed(() => [
-  { key: 'total', label: '服务器总数', value: overview.value.total, filterValue: '' },
+  { key: 'total', label: '已规划服务器', value: overview.value.total - (overview.value.unassigned.service_type ?? 0), filterValue: '' },
   { key: 'pg', label: '未分配项目组', value: overview.value.unassigned.project_group ?? 0, filterValue: 'project_group' },
   { key: 'env', label: '未分配环境', value: overview.value.unassigned.environment ?? 0, filterValue: 'environment' },
   { key: 'ch', label: '未分配渠道', value: overview.value.unassigned.channel ?? 0, filterValue: 'channel' },
-  { key: 'svc', label: '未规划服务', value: overview.value.unassigned.service_type ?? 0, filterValue: 'service_type' },
+  { key: 'svc', label: '未规划服务', value: overview.value.unassigned.service_type ?? 0, filterValue: null },
 ])
 
 const statusType = (s) => ({ running: 'success', stopped: 'danger', maintenance: 'warning' }[s] || 'info')
@@ -327,7 +412,8 @@ async function loadOverview() {
 async function fetchData() {
   loading.value = true
   try {
-    const params = { page: page.value, page_size: pageSize.value }
+    // assigned=service_type：本页只显示已规划服务的主机，未规划主机通过「分配服务」纳管
+    const params = { page: page.value, page_size: pageSize.value, assigned: 'service_type' }
     Object.entries(filter).forEach(([key, value]) => {
       if (value) params[key] = value
     })
@@ -339,9 +425,13 @@ async function fetchData() {
   }
 }
 
-// 点击概览卡片切换未分配筛选（再次点击取消）
-function toggleUnassigned(value) {
-  filter.unassigned = filter.unassigned === value ? '' : value
+// 点击概览卡片：未分配类卡片切换筛选（再次点击取消）；「未规划服务」卡片打开分配服务弹窗
+function handleCardClick(card) {
+  if (card.filterValue === null) {
+    if (authStore.isStaff) openAllocateDialog()
+    return
+  }
+  filter.unassigned = filter.unassigned === card.filterValue ? '' : card.filterValue
   page.value = 1
   fetchData()
 }
@@ -399,6 +489,7 @@ async function handleAssign() {
 // ---------- 服务规划 ----------
 function openPlanDialog() {
   planForm.serviceTypeIds = []
+  planForm.processCount = 1
   planDialogVisible.value = true
 }
 
@@ -412,10 +503,75 @@ async function handlePlan() {
     const res = await planServices({
       server_ids: selection.value.map((r) => r.id),
       service_type_ids: planForm.serviceTypeIds,
+      process_count: planForm.processCount,
     })
     ElMessage.success(`已规划 ${res.data?.created ?? 0} 条服务记录（跳过已存在 ${res.data?.skipped ?? 0} 条）`)
     planDialogVisible.value = false
     selection.value = []
+    refreshAll()
+  } finally {
+    submitting.value = false
+  }
+}
+
+// ---------- 分配服务（未规划主机纳管） ----------
+// 候选项 = 当前筛选结果 + 已选但不在当前筛选内的主机（从缓存取，保证跨筛选累计勾选时标签正常显示）
+const allocateOptions = computed(() => {
+  const current = unplannedServers.value
+  const currentIds = new Set(current.map((s) => s.id))
+  const kept = allocateForm.serverIds
+    .filter((id) => !currentIds.has(id) && allocateSeen.has(id))
+    .map((id) => allocateSeen.get(id))
+  return [...kept, ...current]
+})
+
+// 已选但被筛掉的主机在标签中标注归属，便于确认跨项目/环境勾选无误
+function serverOptionLabel(s) {
+  const dims = [s.project_group_name, s.environment_name].filter(Boolean).join('/')
+  return `${s.name} (${s.ip})${dims ? ` - ${dims}` : ''}`
+}
+
+async function loadUnplannedServers() {
+  allocateLoading.value = true
+  try {
+    const params = { unassigned: 'service_type', page_size: 200 }
+    Object.entries(allocateFilter).forEach(([key, value]) => {
+      if (value) params[key] = value
+    })
+    const res = await getServers(params)
+    unplannedServers.value = res.data?.results || []
+    unplannedServers.value.forEach((s) => allocateSeen.set(s.id, s))
+  } finally {
+    allocateLoading.value = false
+  }
+}
+
+async function openAllocateDialog() {
+  allocateForm.serverIds = []
+  allocateForm.serviceTypeIds = []
+  allocateForm.processCount = 1
+  allocateFilter.project_group = ''
+  allocateFilter.channel = ''
+  allocateFilter.env = ''
+  allocateSeen.clear()
+  allocateDialogVisible.value = true
+  loadUnplannedServers()
+}
+
+async function handleAllocate() {
+  if (!allocateForm.serverIds.length || !allocateForm.serviceTypeIds.length) {
+    ElMessage.warning('请选择目标主机和服务类型')
+    return
+  }
+  submitting.value = true
+  try {
+    const res = await planServices({
+      server_ids: allocateForm.serverIds,
+      service_type_ids: allocateForm.serviceTypeIds,
+      process_count: allocateForm.processCount,
+    })
+    ElMessage.success(`已为 ${allocateForm.serverIds.length} 台主机分配 ${res.data?.created ?? 0} 条服务`)
+    allocateDialogVisible.value = false
     refreshAll()
   } finally {
     submitting.value = false
@@ -454,6 +610,18 @@ async function handleMark(svc, status) {
   refreshAll()
 }
 
+// 修改进程数：只允许调大（min 已锁定当前值，后端同样校验）
+async function handleProcessCount(svc, value) {
+  if (!value || value === svc.process_count) return
+  const res = await updateServiceProcess({
+    server_ids: [serviceRow.value.id],
+    service_type_id: svc.service_type,
+    process_count: value,
+  })
+  ElMessage.success(`已更新 ${res.data?.updated ?? 0} 条记录的进程数`)
+  refreshAll()
+}
+
 async function handleUnplan(svc) {
   await ElMessageBox.confirm(
     `确定取消「${svc.service_type_name}」的规划吗？`,
@@ -488,4 +656,6 @@ onMounted(() => {
 .svc-tag { margin: 2px 4px 2px 0; }
 .unset { color: #c0c4cc; }
 .region-line { display: flex; gap: 8px; width: 100%; }
+.form-tip { color: #909399; font-size: 12px; line-height: 1.5; margin-top: 4px; }
+.allocate-filter { display: flex; gap: 8px; width: 100%; }
 </style>

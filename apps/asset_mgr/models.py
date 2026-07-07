@@ -1,3 +1,5 @@
+import re
+
 from django.db import models
 
 
@@ -164,6 +166,9 @@ class ServerService(models.Model):
         ServiceType, verbose_name='服务类型', on_delete=models.PROTECT, related_name='server_links',
     )
     status = models.CharField('状态', max_length=20, choices=STATUS_CHOICES, default='planned')
+    # 进程规划：进程名规划时自动生成（<服务类型code>-<两位序号>），进程数手动维护
+    process_name = models.CharField('进程名', max_length=100, blank=True)
+    process_count = models.PositiveIntegerField('进程数', default=1)
     # 各状态时间戳记录「最近一次进入该状态」的时间
     planned_at = models.DateTimeField('规划时间', auto_now_add=True)
     deployed_at = models.DateTimeField('部署时间', null=True, blank=True)
@@ -182,5 +187,49 @@ class ServerService(models.Model):
         ]
         ordering = ['server_id', 'service_type_id']
 
+    # 进程名序号的分组维度：相同云厂商+项目组+环境+渠道内，同服务类型独立编号
+    PROCESS_SCOPE_FIELDS = ('cloud_provider_id', 'project_group_id', 'environment_id', 'channel_id')
+
     def __str__(self):
         return f'{self.server_id}-{self.service_type_id} {self.get_status_display()}'
+
+    @classmethod
+    def next_process_name(cls, server, service_type, reserved=None):
+        """生成进程名：``<服务类型code>-<两位序号>``（如 nginx-01、nginx-02）。
+
+        序号在「相同云厂商+项目组+环境+渠道」的主机范围内按服务类型递增，
+        与主机名中的序号无关；取最小未占用序号（取消规划空出的序号可复用）。
+        reserved 为同批次已分配但尚未入库的进程名集合（批量创建防重）。
+        """
+        scope = {f'server__{field}': getattr(server, field) for field in cls.PROCESS_SCOPE_FIELDS}
+        names = set(
+            cls.objects.filter(service_type=service_type, **scope)
+            .values_list('process_name', flat=True)
+        )
+        if reserved:
+            names |= set(reserved)
+        pattern = re.compile(rf'^{re.escape(service_type.code)}-(\d+)$')
+        used = {int(m.group(1)) for name in names if (m := pattern.match(name or ''))}
+        seq = 1
+        while seq in used:
+            seq += 1
+        return f'{service_type.code}-{seq:02d}'
+
+    @classmethod
+    def build_planned_links(cls, server_type_pairs, process_count=1):
+        """为 (server, service_type) 组合批量构造 planned 记录，自动分配进程名。
+
+        同批次内按「进程名分组维度 + 服务类型」隔离预留序号，避免 bulk_create
+        尚未入库时同组重复取号。返回未保存的实例列表，由调用方 bulk_create。
+        """
+        reserved = {}
+        links = []
+        for server, service_type in server_type_pairs:
+            key = (service_type.id, *(getattr(server, f) for f in cls.PROCESS_SCOPE_FIELDS))
+            name = cls.next_process_name(server, service_type, reserved=reserved.get(key))
+            reserved.setdefault(key, set()).add(name)
+            links.append(cls(
+                server=server, service_type=service_type, status='planned',
+                process_name=name, process_count=process_count,
+            ))
+        return links
