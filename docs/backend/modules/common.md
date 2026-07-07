@@ -32,7 +32,7 @@ class StandardPagination(PageNumberPagination):
 | 参数 | 类型 | 说明 |
 |------|------|------|
 | `page` | integer | 页码，从 1 开始 |
-| `page_size` | integer | 每页条数，最大 200 |
+| `page_size` | integer | 每页条数，最大 200；**传 0 跳过分页一次性返回全量**（导出/同步场景），响应结构不变（`page=1`，`page_size=total`） |
 
 ---
 

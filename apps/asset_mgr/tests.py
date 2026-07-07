@@ -200,6 +200,24 @@ class ServerApiTests(BaseApiTest):
         r = self.admin.get('/api/assets/servers/', {'assigned': 'service_type'})
         self.assertEqual([i['name'] for i in r.json()['data']['results']], ['planned-01'])
 
+    def test_page_size_zero_returns_all(self):
+        """page_size=0 跳过分页一次性返回全量，响应结构与分页时一致。"""
+        for i in range(25):  # 超过默认页大小 20
+            Server.objects.create(name=f'bulk-{i:02d}', ip=f'10.9.0.{i + 1}')
+
+        r = self.admin.get('/api/assets/servers/', {'page_size': 0})
+        data = r.json()['data']
+        self.assertEqual(data['total'], 25)
+        self.assertEqual(len(data['results']), 25)
+        self.assertEqual(data['page'], 1)
+
+        # 常规分页行为不受影响
+        r = self.admin.get('/api/assets/servers/', {'page_size': 10, 'page': 2})
+        data = r.json()['data']
+        self.assertEqual(data['total'], 25)
+        self.assertEqual(len(data['results']), 10)
+        self.assertEqual(data['page'], 2)
+
     def test_stats_by_env_and_project(self):
         Server.objects.create(name='p1', ip='10.1.0.2', environment=self.envProd, project_group=self.group)
         Server.objects.create(name='p2', ip='10.1.0.4', environment=self.envProd)
