@@ -91,21 +91,22 @@
             <el-input v-model="form.ip" />
           </el-form-item>
         </el-col>
-        <el-col :span="12">
+        <!-- 操作系统名称较长（如 Windows Server 2019），独占整行；CPU/内存用标准半行，避免下拉框过窄看不见选中值 -->
+        <el-col :span="24">
           <el-form-item label="操作系统">
             <el-select v-model="form.os" filterable allow-create default-first-option clearable placeholder="选择或输入" style="width:100%">
               <el-option v-for="o in OS_OPTIONS" :key="o" :label="o" :value="o" />
             </el-select>
           </el-form-item>
         </el-col>
-        <el-col :span="6">
+        <el-col :span="12">
           <el-form-item label="CPU(核)">
             <el-select v-model="form.cpu" clearable placeholder="选择" style="width:100%">
               <el-option v-for="n in CPU_OPTIONS" :key="n" :label="`${n} 核`" :value="n" />
             </el-select>
           </el-form-item>
         </el-col>
-        <el-col :span="6">
+        <el-col :span="12">
           <el-form-item label="内存">
             <el-select v-model="form.memory" clearable placeholder="选择" style="width:100%">
               <el-option v-for="m in MEMORY_OPTIONS" :key="m" :label="`${m / 1024} GB`" :value="m" />
