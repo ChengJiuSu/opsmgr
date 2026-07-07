@@ -13,6 +13,7 @@
 | [认证模块](modules/auth.md) | 自定义用户模型、JWT 登录流程 |
 | [资产管理模块](modules/assets.md) | 服务器 CRUD 与 CMDB 字典（项目组/渠道/环境/云厂商） |
 | [配置管理模块](modules/config.md) | 服务器归属批量分配、分配概览 |
+| [任务执行模块](modules/exec.md) | 命令/剧本执行、动态 inventory、服务规划前置校验 |
 | [审计模块](modules/audit.md) | 中间件自动审计、只读 API |
 | [系统配置模块](modules/system.md) | 键值对配置管理 |
 | [公共工具](modules/common.md) | 标准分页、统一响应、异常处理 |

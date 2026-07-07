@@ -56,6 +56,35 @@ class InventoryTests(TestCase):
         self.assertIn('ansible_ssh_pass=secret', content)
         self.assertIn('ansible_become=true', content)
 
+    def test_hostname_alias_and_service_groups(self):
+        """inventory 以主机名为别名，并注入服务概要的 service_types 变量与分组。"""
+        from apps.asset_mgr.models import ServerService, ServiceType
+
+        game = ServiceType.objects.create(name='游戏服', code='game-server')
+        redis = ServiceType.objects.create(name='Redis', code='redis')
+        offline_svc = ServiceType.objects.create(name='网关', code='gateway')
+        srv = Server.objects.create(name='game-01', ip='10.0.0.8')
+        ServerService.objects.create(server=srv, service_type=game, status='planned')
+        ServerService.objects.create(server=srv, service_type=redis, status='deployed')
+        # offline 状态不进 inventory
+        link = ServerService.objects.create(server=srv, service_type=offline_svc, status='planned')
+        ServerService.objects.filter(pk=link.pk).update(status='offline')
+
+        content = _inventory_content([srv], None, '/tmp')
+        self.assertTrue(content.startswith('game-01 ansible_host=10.0.0.8'))
+        self.assertIn('service_types="game-server,redis"', content)
+        self.assertIn('[game-server]\ngame-01', content)
+        self.assertIn('[redis]\ngame-01', content)
+        self.assertNotIn('gateway', content)
+
+    def test_alias_sanitized_and_deduplicated(self):
+        """主机名含非法字符时净化为下划线；重名主机追加 IP 保证别名唯一。"""
+        s1 = Server.objects.create(name='web 01', ip='10.0.0.11')
+        s2 = Server.objects.create(name='web 01', ip='10.0.0.12')
+        content = _inventory_content([s1, s2], None, '/tmp')
+        self.assertIn('web_01 ansible_host=10.0.0.11', content)
+        self.assertIn('web_01_10.0.0.12 ansible_host=10.0.0.12', content)
+
 
 class MethodModelTests(TestCase):
     def _admin_client(self):
@@ -97,10 +126,15 @@ class MethodModelTests(TestCase):
 @override_settings(TASK_EXEC_BACKEND='sync')
 class ExecutionAPITests(TestCase):
     def setUp(self):
+        from apps.asset_mgr.models import ServerService, ServiceType
+
         self.admin = User.objects.create(username='admin1', is_staff=True, is_superuser=True)
         self.admin.set_password('Pass!2345xyz')
         self.admin.save()
         self.server = Server.objects.create(name='local', ip='127.0.0.1')
+        # 执行权限前提：主机需在服务概要中已规划服务
+        self.base_service = ServiceType.objects.create(name='基础服务', code='base')
+        ServerService.objects.create(server=self.server, service_type=self.base_service, status='planned')
 
     def _client(self):
         c = APIClient()
@@ -113,6 +147,30 @@ class ExecutionAPITests(TestCase):
             'name': 'bad', 'task_type': 'command', 'server_ids': [self.server.id],
         }, format='json')
         self.assertEqual(r.status_code, 400)
+
+    def test_command_task_rejects_unplanned_server(self):
+        """执行权限校验：未规划任何服务类型的主机不允许作为执行目标。"""
+        unplanned = Server.objects.create(name='raw-01', ip='10.0.0.99')
+        r = self._client().post('/api/exec/tasks/', {
+            'name': 'cmd', 'task_type': 'command', 'command': 'uptime',
+            'server_ids': [self.server.id, unplanned.id],
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('未规划任何服务类型', str(r.json()))
+        self.assertIn('raw-01', str(r.json()))
+
+    def test_run_command_guard_blocks_unplanned_server(self):
+        """兜底校验：创建后规划被撤销（如服务下线）时，重跑在 runner 层拦截。"""
+        from apps.asset_mgr.models import ServerService
+
+        from . import runner
+
+        task = ExecutionTask.objects.create(name='guard', task_type='command', command='uptime')
+        task.servers.add(self.server)
+        ServerService.objects.filter(server=self.server).update(status='offline')
+        code, output = runner.run(task)
+        self.assertEqual(code, 1)
+        self.assertIn('未规划任何服务类型', output)
 
     def test_method_task_requires_method(self):
         r = self._client().post('/api/exec/tasks/', {

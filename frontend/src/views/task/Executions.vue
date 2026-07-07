@@ -94,8 +94,15 @@
         </el-form-item>
         <el-form-item label="目标主机" prop="server_ids">
           <el-select v-model="form.server_ids" multiple filterable placeholder="选择目标服务器" style="width:100%">
-            <el-option v-for="s in serverOptions" :key="s.id" :label="`${s.name} (${s.ip})`" :value="s.id" />
+            <el-option
+              v-for="s in serverOptions"
+              :key="s.id"
+              :label="serverLabel(s)"
+              :value="s.id"
+              :disabled="!isServerPlanned(s)"
+            />
           </el-select>
+          <div class="form-tip">仅已在「服务概要」中规划服务类型的主机可作为执行目标</div>
         </el-form-item>
         <el-row :gutter="16">
           <el-col :span="12">
@@ -196,6 +203,20 @@ const filter = reactive({ keyword: '', task_type: '', status: '' })
 const serverOptions = ref([])
 const credentialOptions = ref([])
 const methodOptions = ref([])
+
+// 服务概要中有 planned/deployed 记录的主机才具备执行权限（与后端校验一致）
+function isServerPlanned(s) {
+  return (s.services || []).some(x => x.status === 'planned' || x.status === 'deployed')
+}
+
+function serverLabel(s) {
+  const base = `${s.name} (${s.ip})`
+  if (!isServerPlanned(s)) return `${base} - 未规划服务`
+  const codes = (s.services || [])
+    .filter(x => x.status === 'planned' || x.status === 'deployed')
+    .map(x => x.service_type_name)
+  return `${base} [${codes.join('/')}]`
+}
 
 const dialogVisible = ref(false)
 const formRef = ref()
@@ -360,6 +381,7 @@ onUnmounted(() => {
 .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .toolbar-left { display: flex; gap: 8px; flex-wrap: wrap; }
 .muted { color: #909399; }
+.form-tip { color: #909399; font-size: 12px; line-height: 1.5; margin-top: 4px; }
 code { background: #f5f7fa; padding: 1px 6px; border-radius: 3px; font-size: 12px; }
 .output-meta { display: flex; gap: 16px; align-items: center; margin-bottom: 12px; color: #606266; font-size: 13px; }
 .output-box {

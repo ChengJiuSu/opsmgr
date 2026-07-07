@@ -88,8 +88,31 @@ class ExecutionTaskSerializer(serializers.ModelSerializer):
         if task_type == 'method':
             if method is None:
                 raise serializers.ValidationError({'method': '平台方法任务必须选择一个方法'})
+        self._validate_servers_planned(servers)
+        if task_type == 'method':
             self._validate_service_planned(method, servers)
         return attrs
+
+    @staticmethod
+    def _validate_servers_planned(servers):
+        """执行权限校验：所选主机必须在服务概要中已规划至少一个服务。
+
+        未规划服务类型（无 planned/deployed 记录）的主机不允许作为执行目标。
+        """
+        from apps.task_exec.runner import _unplanned_servers
+
+        if not servers:
+            return
+        unplanned = _unplanned_servers(servers)
+        if unplanned:
+            names = '、'.join(f'{s.name}({s.ip})' for s in unplanned[:5])
+            more = f' 等 {len(unplanned)} 台' if len(unplanned) > 5 else ''
+            raise serializers.ValidationError({
+                'server_ids': (
+                    f'主机 {names}{more}未规划任何服务类型，不允许执行，'
+                    '请先在「配置管理 → 服务器分配」完成服务规划'
+                ),
+            })
 
     @staticmethod
     def _validate_service_planned(method, servers):
