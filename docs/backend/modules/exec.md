@@ -52,6 +52,22 @@ game-01
 
 ---
 
+## Ansible 项目目录（剧本任务）
+
+剧本任务不走动态 inventory，而是委托 `method_mgr` 的 `ansible_playbook` 执行器，
+在集中管理的 Ansible 项目目录内执行：
+
+- 目录位置由 `ANSIBLE_PROJECT_DIR` 配置（默认仓库根 `ansible/`，已含示例工程：
+  `site.yml` 入口剧本 + `common_check` 角色，约定见 `ansible/README.md`）
+- **一个平台方法 = 一个剧本 + 一组 tags**（`Method.config.playbook/tags`）；
+  剧本路径按项目目录内相对路径解析，禁止越出目录（路径穿越校验）
+- 主机与 inventory 由该目录自行维护，分组名约定与服务类型 code 一致，便于 `--limit` 圈选
+- 任务级 `tags` / `limit` / `inventory` / `extra_vars` 覆盖方法默认值；
+  inventory 全空时回退项目 `ansible.cfg` 的配置
+- 注意：角色级 tags 会附加到角色内全部任务，入口剧本只在任务级挂 tags
+
+---
+
 ## 执行权限：服务规划前置校验
 
 **未在「服务器分配」中规划服务类型的主机不允许作为执行目标**，两层拦截：

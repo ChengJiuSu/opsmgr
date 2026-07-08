@@ -1,0 +1,21 @@
+---
+# 平台入口剧本：一个「平台方法」= 本剧本 + 一组 tags。
+# 平台调用形如：ansible-playbook site.yml --tags <tags> [--limit <pattern>] [--extra-vars ...]
+#
+# 方法配置示例（method_mgr.Method.config）：
+#   {"playbook": "site.yml", "tags": "ping"}
+#   {"playbook": "site.yml", "tags": "sysinfo", "limit": "local"}
+
+- name: 平台能力入口
+  hosts: all
+  gather_facts: false
+
+  roles:
+    # 注意：不在角色级挂 tags（会附加到角色内全部任务），由角色内任务级 tags 圈选
+    - role: common_check
+
+  tasks:
+    - name: 打印任务级 extra-vars（演示参数透传）
+      tags: [echo]
+      ansible.builtin.debug:
+        msg: "extra-vars 传入 message={{ message | default('（未传 message）') }}"

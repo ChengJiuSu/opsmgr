@@ -1,0 +1,17 @@
+---
+- name: 连通性检查
+  tags: [ping]
+  ansible.builtin.ping:
+
+- name: 采集系统信息
+  tags: [sysinfo]
+  ansible.builtin.setup:
+    gather_subset: [min]
+
+- name: 输出系统概要
+  tags: [sysinfo]
+  ansible.builtin.debug:
+    msg: >-
+      {{ ansible_facts.hostname | default('unknown') }} /
+      {{ ansible_facts.distribution | default('?') }} {{ ansible_facts.distribution_version | default('') }} /
+      kernel {{ ansible_facts.kernel | default('?') }}
