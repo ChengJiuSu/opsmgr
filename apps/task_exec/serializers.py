@@ -58,8 +58,9 @@ class ExecutionTaskSerializer(serializers.ModelSerializer):
         model = ExecutionTask
         fields = [
             'id', 'name', 'task_type', 'task_type_display',
-            'command', 'pattern', 'server_ids', 'servers', 'credential', 'credential_name',
-            'method', 'method_name', 'method_code', 'tags', 'limit', 'inventory',
+            'command', 'pattern', 'playbook', 'server_ids', 'servers',
+            'credential', 'credential_name',
+            'method', 'method_name', 'method_code', 'tags', 'limit',
             'extra_vars', 'params',
             'timeout', 'status', 'status_display', 'return_code', 'output',
             'created_by_name', 'created_at', 'started_at', 'finished_at', 'duration',
@@ -76,18 +77,18 @@ class ExecutionTaskSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         task_type = attrs.get('task_type', getattr(self.instance, 'task_type', 'command'))
         command = attrs.get('command', getattr(self.instance, 'command', ''))
+        playbook = attrs.get('playbook', getattr(self.instance, 'playbook', ''))
         method = attrs.get('method', getattr(self.instance, 'method', None))
         servers = attrs.get('servers', None)
-        if task_type == 'command':
-            if not (command or '').strip():
-                raise serializers.ValidationError({'command': '命令类型任务必须填写 Shell 命令'})
-            if servers is not None and len(servers) == 0:
-                raise serializers.ValidationError({'server_ids': '命令类型任务必须选择至少一台主机'})
-            if self.instance is None and not servers:
-                raise serializers.ValidationError({'server_ids': '命令类型任务必须选择至少一台主机'})
-        if task_type == 'method':
-            if method is None:
-                raise serializers.ValidationError({'method': '平台方法任务必须选择一个方法'})
+        if task_type == 'command' and not (command or '').strip():
+            raise serializers.ValidationError({'command': '命令类型任务必须填写 Shell 命令'})
+        if task_type == 'playbook' and not (playbook or '').strip():
+            raise serializers.ValidationError({'playbook': 'Playbook 类型任务必须选择剧本文件'})
+        if task_type == 'method' and method is None:
+            raise serializers.ValidationError({'method': '平台方法任务必须选择一个方法'})
+        # 三类任务的执行主机统一来自平台服务器台账，均必选
+        if (servers is not None and len(servers) == 0) or (self.instance is None and not servers):
+            raise serializers.ValidationError({'server_ids': '必须选择至少一台目标主机'})
         self._validate_servers_planned(servers)
         if task_type == 'method':
             self._validate_service_planned(method, servers)
@@ -116,11 +117,7 @@ class ExecutionTaskSerializer(serializers.ModelSerializer):
 
     @staticmethod
     def _validate_service_planned(method, servers):
-        """部署前置校验：方法关联了服务类型时，目标主机必须已规划/已部署该服务。
-
-        仅在任务显式选择了目标主机时校验；走 inventory/limit 文本圈选的任务
-        无法可靠映射回主机台账，暂不拦截。
-        """
+        """部署前置校验：方法关联了服务类型时，目标主机必须已规划/已部署该服务。"""
         from apps.asset_mgr.models import ServerService
 
         if not method.service_type_id or not servers:

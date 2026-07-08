@@ -33,8 +33,12 @@ class BaseExecutor(ABC):
     provider = None
 
     @abstractmethod
-    def execute(self, task, method):
-        """执行方法。task 为 ExecutionTask，method 为 Method。返回 (rc, output)。"""
+    def execute(self, task, method, inventory_path=None):
+        """执行方法，返回 (rc, output)。
+
+        task 为 ExecutionTask，method 为 Method；inventory_path 为平台基于
+        任务所选主机生成的动态 inventory 文件（task_exec.runner 传入）。
+        """
         raise NotImplementedError
 
     def validate_config(self, config):

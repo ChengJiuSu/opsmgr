@@ -31,10 +31,16 @@ class Credential(models.Model):
 
 
 class ExecutionTask(models.Model):
-    """任务执行记录：命令（ansible ad-hoc shell）或剧本（ansible-playbook）。"""
+    """任务执行记录：命令 / Playbook 剧本 / 平台方法。
+
+    三类任务的执行主机统一来自平台服务器台账（按项目/渠道/环境筛选、
+    仅限已规划服务的主机），执行时动态生成 inventory；平台方法仅承载
+    运维后台能力（provider 化的既有剧本 tags、云主机管理等）。
+    """
 
     TYPE_CHOICES = [
         ('command', '命令'),
+        ('playbook', 'Playbook'),
         ('method', '平台方法'),
     ]
     STATUS_CHOICES = [
@@ -47,9 +53,7 @@ class ExecutionTask(models.Model):
     name = models.CharField('任务名称', max_length=150)
     task_type = models.CharField('任务类型', max_length=20, choices=TYPE_CHOICES, default='command')
 
-    # ── 命令任务（ad-hoc shell，基于所选主机动态 inventory）──
-    command = models.TextField('Shell 命令', blank=True)
-    pattern = models.CharField('主机匹配', max_length=100, default='all')
+    # ── 目标主机与连接（三类任务共用，执行时动态生成 inventory）──
     servers = models.ManyToManyField(
         'asset_mgr.Server', verbose_name='目标主机', related_name='exec_tasks', blank=True,
     )
@@ -58,14 +62,22 @@ class ExecutionTask(models.Model):
         related_name='tasks', verbose_name='连接凭据',
     )
 
+    # ── 命令任务（ad-hoc shell）──
+    command = models.TextField('Shell 命令', blank=True)
+    pattern = models.CharField('主机匹配', max_length=100, default='all')
+
+    # ── Playbook 任务（ANSIBLE_PROJECT_DIR 内相对路径）──
+    playbook = models.CharField('剧本路径', max_length=500, blank=True)
+
     # ── 平台方法任务（通过 method_mgr provider 执行）──
     method = models.ForeignKey(
         'method_mgr.Method', on_delete=models.SET_NULL, null=True, blank=True,
         related_name='tasks', verbose_name='平台方法',
     )
+
+    # ── Ansible 参数（playbook / 方法任务共用；tags/limit 覆盖方法默认值）──
     tags = models.CharField('Tags 覆盖', max_length=255, blank=True)
     limit = models.CharField('Limit 主机', max_length=255, blank=True)
-    inventory = models.CharField('Inventory 覆盖', max_length=500, blank=True)
     extra_vars = models.TextField('额外变量', blank=True)
     params = models.JSONField('方法参数', default=dict, blank=True)  # 预留
 

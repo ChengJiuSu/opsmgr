@@ -124,6 +124,10 @@ class ServerViewSet(viewsets.ModelViewSet):
         # 已规划筛选：assigned=service_type → 仅返回有服务记录的主机（服务器分配页专用）
         if params.get('assigned') == 'service_type':
             qs = qs.filter(services__isnull=False).distinct()
+        # 可执行筛选：executable=true → 仅返回已规划/已部署服务的主机
+        # （任务执行表单专用，与 task_exec 执行权限校验口径一致，offline 不算）
+        if params.get('executable') == 'true':
+            qs = qs.filter(services__status__in=('planned', 'deployed')).distinct()
         # 未分配筛选：unassigned=<维度字段名> / any（任一归属维度缺失）/ service_type（未规划任何服务）
         unassigned = params.get('unassigned')
         dict_fields = [field for _, field in self.DICT_FILTERS]

@@ -8,6 +8,9 @@ export const deleteTask = (id) => request.delete(`/api/exec/tasks/${id}/`)
 export const rerunTask = (id) => request.post(`/api/exec/tasks/${id}/rerun/`)
 export const getTaskOutput = (id) => request.get(`/api/exec/tasks/${id}/output/`)
 
+// 剧本列表（ANSIBLE_PROJECT_DIR 内可选剧本）
+export const getPlaybooks = () => request.get('/api/exec/playbooks/')
+
 // 凭据
 export const getCredentials = (params) => request.get('/api/exec/credentials/', { params })
 export const createCredential = (data) => request.post('/api/exec/credentials/', data)

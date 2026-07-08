@@ -200,6 +200,24 @@ class ServerApiTests(BaseApiTest):
         r = self.admin.get('/api/assets/servers/', {'assigned': 'service_type'})
         self.assertEqual([i['name'] for i in r.json()['data']['results']], ['planned-01'])
 
+    def test_server_list_executable_filter(self):
+        """executable=true 仅返回已规划/已部署服务的主机（任务表单数据源），offline 不算。"""
+        from .models import ServerService, ServiceType
+
+        nginx = ServiceType.objects.create(name='Nginx', code='nginx')
+        planned = Server.objects.create(name='planned-01', ip='10.1.3.1')
+        deployed = Server.objects.create(name='deployed-01', ip='10.1.3.2')
+        offline = Server.objects.create(name='offline-01', ip='10.1.3.3')
+        Server.objects.create(name='raw-01', ip='10.1.3.4')
+        ServerService.objects.create(server=planned, service_type=nginx, status='planned')
+        ServerService.objects.create(server=deployed, service_type=nginx, status='deployed')
+        link = ServerService.objects.create(server=offline, service_type=nginx, status='planned')
+        ServerService.objects.filter(pk=link.pk).update(status='offline')
+
+        r = self.admin.get('/api/assets/servers/', {'executable': 'true'})
+        names = sorted(i['name'] for i in r.json()['data']['results'])
+        self.assertEqual(names, ['deployed-01', 'planned-01'])
+
     def test_page_size_zero_returns_all(self):
         """page_size=0 跳过分页一次性返回全量，响应结构与分页时一致。"""
         for i in range(25):  # 超过默认页大小 20

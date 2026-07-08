@@ -105,7 +105,9 @@ region         = CharField(max_length=50, blank=True)
 
 服务维度筛选：`service_type`（id 或 code）、`service_status`（planned/deployed/offline，
 可与 `service_type` 组合）、`unassigned=service_type`（未规划任何服务的主机）、
-`assigned=service_type`（仅返回有服务记录的主机，服务器分配页数据源）。
+`assigned=service_type`（仅返回有服务记录的主机，服务器分配页数据源）、
+`executable=true`（仅返回已规划/已部署服务的主机，offline 不算；任务执行表单数据源，
+与 task_exec 执行权限校验口径一致）。
 `ServerSerializer` 附带 `services` 摘要（服务类型 + 状态 + 进程名/进程数）。
 
 ### 新增主机时分配服务

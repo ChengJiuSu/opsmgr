@@ -1,6 +1,12 @@
+import os
+
+from django.conf import settings
 from django.shortcuts import get_object_or_404
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema
 from rest_framework import viewsets
 from rest_framework.decorators import action
+from rest_framework.views import APIView
 
 from common.permissions import IsAdmin, IsAdminOrReadOnly
 from common.response import fail, ok
@@ -13,6 +19,33 @@ from .serializers import (
     TaskExecutionLogSerializer,
 )
 from .tasks import dispatch
+
+
+# 剧本扫描时跳过的目录：Ansible 工程的非剧本组成部分
+PLAYBOOK_EXCLUDE_DIRS = {
+    'roles', 'inventories', 'inventory', 'group_vars', 'host_vars',
+    'collections', 'files', 'templates', 'vars', 'library', 'filter_plugins',
+}
+
+
+class PlaybookListView(APIView):
+    """列出 ANSIBLE_PROJECT_DIR 内可选的剧本文件（相对路径，供任务表单下拉）。"""
+
+    permission_classes = [IsAdmin]
+
+    @extend_schema(responses=OpenApiTypes.OBJECT)
+    def get(self, request):
+        project_dir = getattr(settings, 'ANSIBLE_PROJECT_DIR', '')
+        if not project_dir or not os.path.isdir(project_dir):
+            return fail(f'Ansible 项目目录不存在：{project_dir!r}（请配置 ANSIBLE_PROJECT_DIR）')
+        playbooks = []
+        for root, dirs, files in os.walk(project_dir):
+            # 原地过滤，阻止 os.walk 深入非剧本目录与隐藏目录
+            dirs[:] = [d for d in dirs if d not in PLAYBOOK_EXCLUDE_DIRS and not d.startswith('.')]
+            for filename in sorted(files):
+                if filename.endswith(('.yml', '.yaml')) and not filename.startswith('.'):
+                    playbooks.append(os.path.relpath(os.path.join(root, filename), project_dir))
+        return ok({'results': sorted(playbooks)})
 
 
 class CredentialViewSet(viewsets.ModelViewSet):

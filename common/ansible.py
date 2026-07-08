@@ -33,3 +33,13 @@ def run_subprocess(cmd, timeout, cwd=None, env=None):
         return 124, f'任务执行超时（>{timeout}s），已终止。'
     except FileNotFoundError as exc:
         return 127, f'未找到可执行程序：{exc}. 请确认已安装 Ansible。'
+
+
+def resolve_within(project_dir, rel_or_abs):
+    """解析路径并防止越出项目目录（路径穿越），越界抛 ValueError。"""
+    base = os.path.realpath(project_dir)
+    target = rel_or_abs if os.path.isabs(rel_or_abs) else os.path.join(base, rel_or_abs)
+    target = os.path.realpath(target)
+    if not (target == base or target.startswith(base + os.sep)):
+        raise ValueError(f'路径越出 Ansible 项目目录：{rel_or_abs}')
+    return target

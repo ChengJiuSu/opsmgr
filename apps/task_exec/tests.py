@@ -28,8 +28,10 @@ ANSIBLE = bool(shutil.which('ansible') and shutil.which('ansible-playbook'))
 
 def _make_ansible_project():
     proj = tempfile.mkdtemp(prefix='ansible_proj_')
-    with open(os.path.join(proj, 'inventory.ini'), 'w') as f:
-        f.write('localhost ansible_connection=local\n')
+    # roles 目录内的 yml 不是剧本，用于验证剧本列表接口的目录排除
+    os.makedirs(os.path.join(proj, 'roles', 'demo', 'tasks'))
+    with open(os.path.join(proj, 'roles', 'demo', 'tasks', 'main.yml'), 'w') as f:
+        f.write('- debug: {msg: role task}\n')
     with open(os.path.join(proj, 'site.yml'), 'w') as f:
         f.write(
             '- hosts: all\n'
@@ -174,9 +176,33 @@ class ExecutionAPITests(TestCase):
 
     def test_method_task_requires_method(self):
         r = self._client().post('/api/exec/tasks/', {
-            'name': 'bad', 'task_type': 'method',
+            'name': 'bad', 'task_type': 'method', 'server_ids': [self.server.id],
         }, format='json')
         self.assertEqual(r.status_code, 400)
+        self.assertIn('必须选择一个方法', str(r.json()))
+
+    def test_all_task_types_require_servers(self):
+        """三类任务的执行主机统一来自平台台账，均必选至少一台。"""
+        c = self._client()
+        method = Method.objects.create(
+            name='m1', code='m1', provider='ansible_playbook', config={'playbook': 'site.yml'},
+        )
+        cases = [
+            {'name': 'c', 'task_type': 'command', 'command': 'uptime'},
+            {'name': 'p', 'task_type': 'playbook', 'playbook': 'site.yml'},
+            {'name': 'm', 'task_type': 'method', 'method': method.id},
+        ]
+        for payload in cases:
+            r = c.post('/api/exec/tasks/', payload, format='json')
+            self.assertEqual(r.status_code, 400, payload)
+            self.assertIn('必须选择至少一台目标主机', str(r.json()), payload)
+
+    def test_playbook_task_requires_playbook(self):
+        r = self._client().post('/api/exec/tasks/', {
+            'name': 'bad', 'task_type': 'playbook', 'server_ids': [self.server.id],
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('剧本', str(r.json()))
 
     def test_method_task_requires_service_planned(self):
         """部署前置校验：方法关联服务类型时，目标主机必须已规划/已部署该服务。"""
@@ -214,6 +240,7 @@ class ExecutionAPITests(TestCase):
         self.assertIn('ops_marker_123', task.output)
 
     def test_method_execution_with_tags(self):
+        """方法任务的主机来自所选服务器（平台生成动态 inventory）。"""
         if not ANSIBLE:
             self.skipTest('ansible 未安装')
         proj = _make_ansible_project()
@@ -221,11 +248,12 @@ class ExecutionAPITests(TestCase):
             with override_settings(ANSIBLE_PROJECT_DIR=proj):
                 method = Method.objects.create(
                     name='nginx', code='nginx', provider='ansible_playbook',
-                    config={'playbook': 'site.yml', 'tags': 'nginx', 'inventory': 'inventory.ini'},
+                    config={'playbook': 'site.yml', 'tags': 'nginx'},
                 )
                 c = self._client()
                 r = c.post('/api/exec/tasks/', {
                     'name': 'run nginx', 'task_type': 'method', 'method': method.id,
+                    'server_ids': [self.server.id],
                 }, format='json')
                 self.assertEqual(r.status_code, 201)
                 task = ExecutionTask.objects.get(pk=r.json()['id'])
@@ -236,10 +264,30 @@ class ExecutionAPITests(TestCase):
                 # 任务级 tags 覆盖
                 r = c.post('/api/exec/tasks/', {
                     'name': 'run redis', 'task_type': 'method', 'method': method.id, 'tags': 'redis',
+                    'server_ids': [self.server.id],
                 }, format='json')
                 task2 = ExecutionTask.objects.get(pk=r.json()['id'])
                 self.assertIn('redis restarted', task2.output)
                 self.assertNotIn('nginx restarted', task2.output)
+        finally:
+            shutil.rmtree(proj, ignore_errors=True)
+
+    def test_playbook_execution_with_tags(self):
+        """playbook 任务：所选主机动态 inventory + ANSIBLE_PROJECT_DIR 内剧本 + tags。"""
+        if not ANSIBLE:
+            self.skipTest('ansible 未安装')
+        proj = _make_ansible_project()
+        try:
+            with override_settings(ANSIBLE_PROJECT_DIR=proj):
+                r = self._client().post('/api/exec/tasks/', {
+                    'name': 'pb redis', 'task_type': 'playbook', 'playbook': 'site.yml',
+                    'tags': 'redis', 'server_ids': [self.server.id],
+                }, format='json')
+                self.assertEqual(r.status_code, 201)
+                task = ExecutionTask.objects.get(pk=r.json()['id'])
+                self.assertEqual(task.status, 'success')
+                self.assertIn('redis restarted', task.output)
+                self.assertNotIn('nginx restarted', task.output)
         finally:
             shutil.rmtree(proj, ignore_errors=True)
 
@@ -253,10 +301,47 @@ class ExecutionAPITests(TestCase):
                 )
                 r = self._client().post('/api/exec/tasks/', {
                     'name': 'evil', 'task_type': 'method', 'method': method.id,
+                    'server_ids': [self.server.id],
                 }, format='json')
                 task = ExecutionTask.objects.get(pk=r.json()['id'])
                 self.assertEqual(task.status, 'failed')
                 self.assertIn('越出', task.output)
+        finally:
+            shutil.rmtree(proj, ignore_errors=True)
+
+    def test_playbook_path_traversal_blocked(self):
+        proj = _make_ansible_project()
+        try:
+            with override_settings(ANSIBLE_PROJECT_DIR=proj):
+                r = self._client().post('/api/exec/tasks/', {
+                    'name': 'evil', 'task_type': 'playbook', 'playbook': '../../etc/passwd',
+                    'server_ids': [self.server.id],
+                }, format='json')
+                task = ExecutionTask.objects.get(pk=r.json()['id'])
+                self.assertEqual(task.status, 'failed')
+                self.assertIn('越出', task.output)
+        finally:
+            shutil.rmtree(proj, ignore_errors=True)
+
+    def test_playbook_list_api(self):
+        """剧本列表接口：仅返回项目目录内剧本，排除 roles 等目录；仅管理员可用。"""
+        proj = _make_ansible_project()
+        try:
+            with override_settings(ANSIBLE_PROJECT_DIR=proj):
+                r = self._client().get('/api/exec/playbooks/')
+                self.assertEqual(r.status_code, 200)
+                results = r.json()['data']['results']
+                self.assertIn('site.yml', results)
+                self.assertFalse(any(p.startswith('roles') for p in results))
+
+                # 非管理员 403
+                u = User.objects.create(username='viewer1')
+                u.set_password('Pass!2345xyz')
+                u.save()
+                c = APIClient()
+                login = c.post('/api/auth/login/', {'username': 'viewer1', 'password': 'Pass!2345xyz'}, format='json')
+                c.credentials(HTTP_AUTHORIZATION='Bearer ' + login.json()['access'])
+                self.assertEqual(c.get('/api/exec/playbooks/').status_code, 403)
         finally:
             shutil.rmtree(proj, ignore_errors=True)
 
@@ -266,6 +351,7 @@ class ExecutionAPITests(TestCase):
         )
         r = self._client().post('/api/exec/tasks/', {
             'name': 'cloud', 'task_type': 'method', 'method': method.id,
+            'server_ids': [self.server.id],
         }, format='json')
         task = ExecutionTask.objects.get(pk=r.json()['id'])
         self.assertEqual(task.status, 'failed')
@@ -278,6 +364,7 @@ class ExecutionAPITests(TestCase):
         )
         r = self._client().post('/api/exec/tasks/', {
             'name': 'log-test', 'task_type': 'method', 'method': method.id,
+            'server_ids': [self.server.id],
         }, format='json')
         task = ExecutionTask.objects.get(pk=r.json()['id'])
         logs = list(task.logs.all())
@@ -299,6 +386,7 @@ class ExecutionAPITests(TestCase):
         c = self._client()
         r = c.post('/api/exec/tasks/', {
             'name': 'rerun-test', 'task_type': 'method', 'method': method.id,
+            'server_ids': [self.server.id],
         }, format='json')
         task_id = r.json()['id']
         first_log = TaskExecutionLog.objects.get(task_id=task_id)
@@ -347,6 +435,7 @@ class ExecutionAPITests(TestCase):
         c = self._client()
         r = c.post('/api/exec/tasks/', {
             'name': 'list-test', 'task_type': 'method', 'method': method.id,
+            'server_ids': [self.server.id],
         }, format='json')
         task_id = r.json()['id']
         r = c.get(f'/api/exec/tasks/{task_id}/logs/')

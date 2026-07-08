@@ -1,8 +1,12 @@
 """任务执行分派。
 
-  - command：基于所选服务器生成临时动态 inventory，ansible ad-hoc shell 执行。
-  - method ：委托 method_mgr 对应 provider 执行器（如 ansible_playbook 走集中管理的
-             项目目录 + tags）。
+三类任务（command / playbook / method）的执行主机统一来自所选服务器，
+执行时生成临时动态 inventory（含服务类型分组），未规划服务的主机拦截：
+
+  - command ：ansible ad-hoc shell。
+  - playbook：ANSIBLE_PROJECT_DIR 内既有剧本，ansible-playbook + 动态 inventory。
+  - method  ：委托 method_mgr 对应 provider 执行器，动态 inventory 由本模块
+              生成后传入（ansible_playbook provider 即「剧本 + 平台管理的 tags」）。
 """
 import logging
 import os
@@ -10,7 +14,9 @@ import re
 import shutil
 import tempfile
 
-from common.ansible import run_subprocess
+from django.conf import settings
+
+from common.ansible import resolve_within, run_subprocess
 
 logger = logging.getLogger('apps.task_exec')
 
@@ -95,25 +101,80 @@ def _inventory_content(servers, credential, workdir):
     return '\n'.join(lines) + '\n'
 
 
-def _run_command(task):
+def _prepare_servers(task):
+    """三类任务共用的执行前置：取目标主机并做服务规划兜底校验。
+
+    创建时序列化器已拦截，此处兜底重跑时规划已变更的情况。
+    返回 (servers, error)，error 非空表示不允许执行。
+    """
     servers = list(task.servers.all())
     if not servers:
-        return 1, '未选择任何目标主机。'
-    if not task.command.strip():
-        return 1, '命令内容为空。'
-    # 执行前再校验一次服务规划（创建时序列化器已拦截，此处兜底重跑时规划已变更的情况）
+        return None, '未选择任何目标主机。'
     unplanned = _unplanned_servers(servers)
     if unplanned:
         names = '、'.join(f'{s.name}({s.ip})' for s in unplanned)
-        return 1, f'主机 {names} 未规划任何服务类型，不允许执行，请先在「配置管理 → 服务器分配」完成服务规划。'
+        return None, f'主机 {names} 未规划任何服务类型，不允许执行，请先在「配置管理 → 服务器分配」完成服务规划。'
+    return servers, None
+
+
+def _write_inventory(servers, credential, workdir):
+    """在临时工作目录内生成动态 inventory 文件，返回文件路径。"""
+    inventory_path = os.path.join(workdir, 'inventory.ini')
+    with open(inventory_path, 'w', encoding='utf-8') as f:
+        f.write(_inventory_content(servers, credential, workdir))
+    return inventory_path
+
+
+def _playbook_args(task):
+    """拼装 playbook / 方法任务共用的 ansible-playbook 追加参数。"""
+    args = []
+    if (task.tags or '').strip():
+        args += ['--tags', task.tags.strip()]
+    if (task.limit or '').strip():
+        args += ['--limit', task.limit.strip()]
+    if (task.extra_vars or '').strip():
+        args += ['--extra-vars', task.extra_vars.strip()]
+    return args
+
+
+def _run_command(task):
+    servers, error = _prepare_servers(task)
+    if error:
+        return 1, error
+    if not task.command.strip():
+        return 1, '命令内容为空。'
 
     workdir = tempfile.mkdtemp(prefix='ops_cmd_')
     try:
-        inventory_path = os.path.join(workdir, 'inventory.ini')
-        with open(inventory_path, 'w', encoding='utf-8') as f:
-            f.write(_inventory_content(servers, task.credential, workdir))
+        inventory_path = _write_inventory(servers, task.credential, workdir)
         cmd = ['ansible', task.pattern or 'all', '-i', inventory_path, '-m', 'shell', '-a', task.command]
         return run_subprocess(cmd, timeout=task.timeout or 300)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _run_playbook(task):
+    """执行 ANSIBLE_PROJECT_DIR 内的既有剧本，主机来自所选服务器（动态 inventory）。"""
+    servers, error = _prepare_servers(task)
+    if error:
+        return 1, error
+    project_dir = getattr(settings, 'ANSIBLE_PROJECT_DIR', '')
+    if not project_dir or not os.path.isdir(project_dir):
+        return 1, f'Ansible 项目目录不存在：{project_dir!r}（请配置 ANSIBLE_PROJECT_DIR）'
+    if not (task.playbook or '').strip():
+        return 1, '未指定剧本文件。'
+    try:
+        playbook_path = resolve_within(project_dir, task.playbook.strip())
+    except ValueError as exc:
+        return 1, str(exc)
+    if not os.path.isfile(playbook_path):
+        return 1, f'剧本文件不存在：{task.playbook}'
+
+    workdir = tempfile.mkdtemp(prefix='ops_pb_')
+    try:
+        inventory_path = _write_inventory(servers, task.credential, workdir)
+        cmd = ['ansible-playbook', playbook_path, '-i', inventory_path] + _playbook_args(task)
+        return run_subprocess(cmd, timeout=task.timeout or 300, cwd=project_dir)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -130,11 +191,23 @@ def _run_method(task):
         executor = get_executor(method.provider)
     except KeyError:
         return 1, f'未知 provider：{method.provider}'
-    return executor.execute(task, method)
+
+    # 方法任务的主机同样来自平台：生成动态 inventory 交给执行器
+    servers, error = _prepare_servers(task)
+    if error:
+        return 1, error
+    workdir = tempfile.mkdtemp(prefix='ops_mtd_')
+    try:
+        inventory_path = _write_inventory(servers, task.credential, workdir)
+        return executor.execute(task, method, inventory_path=inventory_path)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def run(task):
     """执行任务，返回 (return_code, output)。"""
     if task.task_type == 'method':
         return _run_method(task)
+    if task.task_type == 'playbook':
+        return _run_playbook(task)
     return _run_command(task)

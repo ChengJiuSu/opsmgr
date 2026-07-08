@@ -24,7 +24,8 @@ class Method(models.Model):
         null=True, blank=True, related_name='methods',
     )
     # provider 专属配置。ansible_playbook: {"playbook": "site.yml", "tags": "nginx,restart",
-    #   "inventory": "", "limit": ""}；cloud_host: {"action": "reboot", ...}
+    #   "limit": ""}（主机/inventory 由任务执行入口按所选服务器动态生成）；
+    #   cloud_host: {"action": "reboot", ...}
     config = models.JSONField('方法配置', default=dict, blank=True)
     # 预留：方法接受的参数定义，用于前端动态表单/校验
     params_schema = models.JSONField('参数定义', default=dict, blank=True)

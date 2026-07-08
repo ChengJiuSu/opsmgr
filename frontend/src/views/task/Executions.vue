@@ -6,6 +6,7 @@
         <el-input v-model="filter.keyword" placeholder="任务名称" clearable style="width:160px" @keyup.enter="handleSearch" @clear="handleSearch" />
         <el-select v-model="filter.task_type" placeholder="类型" clearable style="width:120px" @change="handleSearch">
           <el-option label="命令" value="command" />
+          <el-option label="Playbook" value="playbook" />
           <el-option label="平台方法" value="method" />
         </el-select>
         <el-select v-model="filter.status" placeholder="状态" clearable style="width:110px" @change="handleSearch">
@@ -23,17 +24,19 @@
     <!-- 表格 -->
     <el-table v-loading="loading" :data="tableData" stripe>
       <el-table-column prop="name" label="任务名称" min-width="140" show-overflow-tooltip />
-      <el-table-column label="类型" width="90">
+      <el-table-column label="类型" width="100">
         <template #default="{ row }">
-          <el-tag size="small" :type="row.task_type === 'method' ? 'warning' : 'info'">
+          <el-tag size="small" :type="typeTagType(row.task_type)">
             {{ row.task_type_display }}
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="目标 / 方法" min-width="140" show-overflow-tooltip>
+      <el-table-column label="内容 / 目标" min-width="180" show-overflow-tooltip>
         <template #default="{ row }">
           <span v-if="row.task_type === 'method'">{{ row.method_name || '-' }}<span v-if="row.tags" class="muted"> · {{ row.tags }}</span></span>
-          <span v-else>{{ row.servers?.length || 0 }} 台主机</span>
+          <span v-else-if="row.task_type === 'playbook'">{{ row.playbook || '-' }}<span v-if="row.tags" class="muted"> · {{ row.tags }}</span></span>
+          <span v-else class="muted">{{ (row.command || '').slice(0, 40) || '-' }}</span>
+          <span class="muted"> · {{ row.servers?.length || 0 }} 台</span>
         </template>
       </el-table-column>
       <el-table-column label="状态" width="100">
@@ -83,45 +86,25 @@
       <el-form-item label="任务类型">
         <el-radio-group v-model="form.task_type">
           <el-radio-button value="command">命令</el-radio-button>
+          <el-radio-button value="playbook">Playbook</el-radio-button>
           <el-radio-button value="method">平台方法</el-radio-button>
         </el-radio-group>
       </el-form-item>
 
       <!-- 命令模式 -->
-      <template v-if="form.task_type === 'command'">
-        <el-form-item label="Shell 命令" prop="command">
-          <el-input v-model="form.command" type="textarea" :rows="3" placeholder="如：systemctl restart nginx" />
-        </el-form-item>
-        <el-form-item label="目标主机" prop="server_ids">
-          <el-select v-model="form.server_ids" multiple filterable placeholder="选择目标服务器" style="width:100%">
-            <el-option
-              v-for="s in serverOptions"
-              :key="s.id"
-              :label="serverLabel(s)"
-              :value="s.id"
-              :disabled="!isServerPlanned(s)"
-            />
-          </el-select>
-          <div class="form-tip">仅已在「服务器分配」中规划服务类型的主机可作为执行目标</div>
-        </el-form-item>
-        <el-row :gutter="16">
-          <el-col :span="12">
-            <el-form-item label="连接凭据">
-              <el-select v-model="form.credential" clearable placeholder="默认免密/密钥" style="width:100%">
-                <el-option v-for="c in credentialOptions" :key="c.id" :label="c.name" :value="c.id" />
-              </el-select>
-            </el-form-item>
-          </el-col>
-          <el-col :span="12">
-            <el-form-item label="主机匹配">
-              <el-input v-model="form.pattern" placeholder="ansible 主机模式，默认 all" />
-            </el-form-item>
-          </el-col>
-        </el-row>
-      </template>
+      <el-form-item v-if="form.task_type === 'command'" label="Shell 命令" prop="command">
+        <el-input v-model="form.command" type="textarea" :rows="3" placeholder="如：systemctl restart nginx" />
+      </el-form-item>
+
+      <!-- Playbook 模式 -->
+      <el-form-item v-if="form.task_type === 'playbook'" label="剧本文件" prop="playbook">
+        <el-select v-model="form.playbook" filterable placeholder="选择 Ansible 项目目录内的剧本" style="width:100%">
+          <el-option v-for="p in playbookOptions" :key="p" :label="p" :value="p" />
+        </el-select>
+      </el-form-item>
 
       <!-- 平台方法模式 -->
-      <template v-else>
+      <template v-if="form.task_type === 'method'">
         <el-form-item label="平台方法" prop="method">
           <el-select v-model="form.method" filterable placeholder="选择已启用的方法" style="width:100%" @change="onMethodChange">
             <el-option v-for="m in methodOptions" :key="m.id" :label="`${m.name} (${m.provider_display})`" :value="m.id" />
@@ -134,26 +117,61 @@
           </template>
           <template v-else>{{ selectedMethod.provider_display }}（预留 provider）</template>
         </el-alert>
-        <template v-if="selectedMethod?.provider === 'ansible_playbook'">
-          <el-form-item label="Tags 覆盖">
-            <el-input v-model="form.tags" :placeholder="`留空用方法默认：${selectedMethod?.config?.tags || '（全部）'}`" />
+      </template>
+
+      <!-- 目标主机（三类任务共用）：按项目/渠道/环境筛选，仅显示已规划服务的主机 -->
+      <el-form-item label="目标主机" prop="server_ids">
+        <div class="dim-filter">
+          <el-select v-model="dimFilter.project_group" placeholder="项目组" clearable filterable @change="loadServers">
+            <el-option v-for="d in dictOptions.projects" :key="d.id" :label="d.name" :value="d.id" />
+          </el-select>
+          <el-select v-model="dimFilter.channel" placeholder="渠道" clearable filterable @change="loadServers">
+            <el-option v-for="d in dictOptions.channels" :key="d.id" :label="d.name" :value="d.id" />
+          </el-select>
+          <el-select v-model="dimFilter.env" placeholder="环境" clearable filterable @change="loadServers">
+            <el-option v-for="d in dictOptions.envs" :key="d.id" :label="d.name" :value="d.id" />
+          </el-select>
+        </div>
+        <el-select
+          v-model="form.server_ids" multiple filterable clearable
+          :loading="serversLoading" placeholder="选择目标服务器" style="width:100%"
+        >
+          <el-option v-for="s in serverOptions" :key="s.id" :label="serverLabel(s)" :value="s.id" />
+        </el-select>
+        <div class="form-tip">
+          仅显示已在「服务器分配」中规划服务的主机（未分配服务的主机不具备执行条件），可按项目组/渠道/环境缩小范围
+        </div>
+      </el-form-item>
+
+      <el-row :gutter="16">
+        <el-col :span="12">
+          <el-form-item label="连接凭据">
+            <el-select v-model="form.credential" clearable placeholder="默认免密/密钥" style="width:100%">
+              <el-option v-for="c in credentialOptions" :key="c.id" :label="c.name" :value="c.id" />
+            </el-select>
           </el-form-item>
-          <el-row :gutter="16">
-            <el-col :span="12">
-              <el-form-item label="Limit">
-                <el-input v-model="form.limit" placeholder="限定主机，可留空" />
-              </el-form-item>
-            </el-col>
-            <el-col :span="12">
-              <el-form-item label="Inventory">
-                <el-input v-model="form.inventory" placeholder="覆盖，可留空" />
-              </el-form-item>
-            </el-col>
-          </el-row>
-          <el-form-item label="额外变量">
-            <el-input v-model="form.extra_vars" type="textarea" :rows="2" placeholder="--extra-vars，如 key=val 或 JSON" />
+        </el-col>
+        <el-col :span="12">
+          <el-form-item v-if="form.task_type === 'command'" label="主机匹配">
+            <el-input v-model="form.pattern" placeholder="ansible 主机模式，默认 all" />
           </el-form-item>
-        </template>
+          <el-form-item v-else label="Limit">
+            <el-input v-model="form.limit" placeholder="进一步限定主机/分组，可留空" />
+          </el-form-item>
+        </el-col>
+      </el-row>
+
+      <!-- Ansible 参数（playbook / 方法任务） -->
+      <template v-if="form.task_type !== 'command'">
+        <el-form-item v-if="form.task_type === 'playbook' || selectedMethod?.provider === 'ansible_playbook'" label="Tags">
+          <el-input
+            v-model="form.tags"
+            :placeholder="form.task_type === 'method' ? `留空用方法默认：${selectedMethod?.config?.tags || '（全部）'}` : '如 nginx,restart，留空执行全部'"
+          />
+        </el-form-item>
+        <el-form-item label="额外变量">
+          <el-input v-model="form.extra_vars" type="textarea" :rows="2" placeholder="--extra-vars，如 key=val 或 JSON" />
+        </el-form-item>
       </template>
 
       <el-form-item label="超时(秒)">
@@ -186,9 +204,12 @@ import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { Plus, Delete, Search, Refresh, RefreshRight, View, Loading } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../../stores/auth'
-import { getServers } from '../../api/assets'
 import {
-  getTasks, createTask, deleteTask, rerunTask, getTaskOutput, getCredentials, getMethods,
+  getServers, fetchDictOptions, projectGroupApi, channelApi, environmentApi,
+} from '../../api/assets'
+import {
+  getTasks, createTask, deleteTask, rerunTask, getTaskOutput,
+  getCredentials, getMethods, getPlaybooks,
 } from '../../api/tasks'
 
 const authStore = useAuthStore()
@@ -201,21 +222,20 @@ const pageSize = ref(20)
 const filter = reactive({ keyword: '', task_type: '', status: '' })
 
 const serverOptions = ref([])
+const serversLoading = ref(false)
 const credentialOptions = ref([])
 const methodOptions = ref([])
+const playbookOptions = ref([])
+// 目标主机维度筛选（项目组/渠道/环境）与字典下拉数据
+const dimFilter = reactive({ project_group: '', channel: '', env: '' })
+const dictOptions = reactive({ projects: [], channels: [], envs: [] })
 
-// 服务器分配中有 planned/deployed 记录的主机才具备执行权限（与后端校验一致）
-function isServerPlanned(s) {
-  return (s.services || []).some(x => x.status === 'planned' || x.status === 'deployed')
-}
-
+// 后端 executable=true 已只返回已规划服务的主机，标签直接展示服务类型
 function serverLabel(s) {
-  const base = `${s.name} (${s.ip})`
-  if (!isServerPlanned(s)) return `${base} - 未规划服务`
   const codes = (s.services || [])
     .filter(x => x.status === 'planned' || x.status === 'deployed')
     .map(x => x.service_type_name)
-  return `${base} [${codes.join('/')}]`
+  return `${s.name} (${s.ip}) [${codes.join('/')}]`
 }
 
 const dialogVisible = ref(false)
@@ -223,7 +243,7 @@ const formRef = ref()
 const emptyForm = () => ({
   name: '', task_type: 'command',
   command: '', server_ids: [], credential: null, pattern: 'all',
-  method: null, tags: '', limit: '', inventory: '', extra_vars: '',
+  playbook: '', method: null, tags: '', limit: '', extra_vars: '',
   timeout: 300,
 })
 const form = reactive(emptyForm())
@@ -233,11 +253,15 @@ const rules = {
   command: [{
     validator: (_r, v, cb) => (form.task_type !== 'command' || (v || '').trim()) ? cb() : cb(new Error('请输入命令')),
   }],
-  server_ids: [{
-    validator: (_r, v, cb) => (form.task_type !== 'command' || (v && v.length)) ? cb() : cb(new Error('请至少选择一台主机')),
+  playbook: [{
+    validator: (_r, v, cb) => (form.task_type !== 'playbook' || v) ? cb() : cb(new Error('请选择剧本文件')),
   }],
   method: [{
     validator: (_r, v, cb) => (form.task_type !== 'method' || v) ? cb() : cb(new Error('请选择平台方法')),
+  }],
+  // 三类任务的执行主机统一来自平台台账，均必选
+  server_ids: [{
+    validator: (_r, v, cb) => (v && v.length) ? cb() : cb(new Error('请至少选择一台主机')),
   }],
 }
 
@@ -248,6 +272,7 @@ let pollTimer = null
 let listTimer = null
 
 const statusType = (s) => ({ pending: 'info', running: 'warning', success: 'success', failed: 'danger' }[s] || 'info')
+const typeTagType = (t) => ({ command: 'info', playbook: 'success', method: 'warning' }[t] || 'info')
 const formatTime = (t) => (t ? t.slice(0, 19).replace('T', ' ') : '')
 
 async function fetchData() {
@@ -273,35 +298,64 @@ function handleSearch() {
 function onMethodChange() {
   form.tags = ''
   form.limit = ''
-  form.inventory = ''
+}
+
+// 按维度筛选加载可执行主机（executable=true：仅已规划/已部署服务的主机）
+async function loadServers() {
+  serversLoading.value = true
+  try {
+    const params = { executable: 'true', page_size: 0 }
+    if (dimFilter.project_group) params.project_group = dimFilter.project_group
+    if (dimFilter.channel) params.channel = dimFilter.channel
+    if (dimFilter.env) params.env = dimFilter.env
+    const res = await getServers(params)
+    serverOptions.value = res.data?.results || []
+    // 维度切换后剔除已不在可选范围内的主机
+    const available = new Set(serverOptions.value.map((s) => s.id))
+    form.server_ids = form.server_ids.filter((id) => available.has(id))
+  } finally {
+    serversLoading.value = false
+  }
+}
+
+async function loadDictOptions() {
+  if (dictOptions.projects.length) return // 字典变化低频，弹窗生命周期内缓存
+  const [proj, chan, env] = await Promise.allSettled([
+    fetchDictOptions(projectGroupApi), fetchDictOptions(channelApi), fetchDictOptions(environmentApi),
+  ])
+  if (proj.status === 'fulfilled') dictOptions.projects = proj.value.data?.results || []
+  if (chan.status === 'fulfilled') dictOptions.channels = chan.value.data?.results || []
+  if (env.status === 'fulfilled') dictOptions.envs = env.value.data?.results || []
 }
 
 async function openDialog() {
   Object.assign(form, emptyForm())
+  Object.assign(dimFilter, { project_group: '', channel: '', env: '' })
   dialogVisible.value = true
   formRef.value?.clearValidate()
-  const [srv, cred, methods] = await Promise.allSettled([
-    getServers({ page_size: 200 }),
+  loadDictOptions()
+  loadServers()
+  const [cred, methods, playbooks] = await Promise.allSettled([
     getCredentials({ page_size: 200 }),
     getMethods({ page_size: 200, enabled: 'true' }),
+    getPlaybooks(),
   ])
-  if (srv.status === 'fulfilled') serverOptions.value = srv.value.data?.results || []
   if (cred.status === 'fulfilled') credentialOptions.value = cred.value.data?.results || []
   if (methods.status === 'fulfilled') methodOptions.value = methods.value.data?.results || []
+  if (playbooks.status === 'fulfilled') playbookOptions.value = playbooks.value.data?.results || []
 }
 
 function buildPayload() {
-  const p = { name: form.name, task_type: form.task_type, timeout: form.timeout }
+  const p = {
+    name: form.name, task_type: form.task_type, timeout: form.timeout,
+    server_ids: form.server_ids, credential: form.credential,
+  }
   if (form.task_type === 'command') {
-    Object.assign(p, {
-      command: form.command, server_ids: form.server_ids,
-      credential: form.credential, pattern: form.pattern,
-    })
+    Object.assign(p, { command: form.command, pattern: form.pattern })
+  } else if (form.task_type === 'playbook') {
+    Object.assign(p, { playbook: form.playbook, tags: form.tags, limit: form.limit, extra_vars: form.extra_vars })
   } else {
-    Object.assign(p, {
-      method: form.method, tags: form.tags, limit: form.limit,
-      inventory: form.inventory, extra_vars: form.extra_vars,
-    })
+    Object.assign(p, { method: form.method, tags: form.tags, limit: form.limit, extra_vars: form.extra_vars })
   }
   return p
 }
@@ -382,6 +436,8 @@ onUnmounted(() => {
 .toolbar-left { display: flex; gap: 8px; flex-wrap: wrap; }
 .muted { color: #909399; }
 .form-tip { color: #909399; font-size: 12px; line-height: 1.5; margin-top: 4px; }
+.dim-filter { display: flex; gap: 8px; width: 100%; margin-bottom: 8px; }
+.dim-filter .el-select { flex: 1; }
 code { background: #f5f7fa; padding: 1px 6px; border-radius: 3px; font-size: 12px; }
 .output-meta { display: flex; gap: 16px; align-items: center; margin-bottom: 12px; color: #606266; font-size: 13px; }
 .output-box {
