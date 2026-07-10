@@ -18,7 +18,7 @@ from rest_framework.test import APIClient
 from apps.asset_mgr.models import Server
 from apps.method_mgr.models import Method
 
-from .models import Credential, ExecutionTask, TaskExecutionLog
+from .models import Credential, ExecutionTask, TaskExecutionLog, TaskStep
 from .runner import _inventory_content
 from .tasks import OUTPUT_PREVIEW_LIMIT
 
@@ -125,15 +125,25 @@ class MethodModelTests(TestCase):
         self.assertEqual(r.status_code, 403)
 
 
+
 @override_settings(TASK_EXEC_BACKEND='sync')
 class ExecutionAPITests(TestCase):
+    """任务流 API 测试：任务=模块序列，新建/编辑仅保存，执行走 execute 动作。"""
+
     def setUp(self):
-        from apps.asset_mgr.models import ServerService, ServiceType
+        from apps.asset_mgr.models import Channel, Environment, ProjectGroup, ServerService, ServiceType
 
         self.admin = User.objects.create(username='admin1', is_staff=True, is_superuser=True)
         self.admin.set_password('Pass!2345xyz')
         self.admin.save()
-        self.server = Server.objects.create(name='local', ip='127.0.0.1')
+        # 主机范围三维度必选：准备默认维度并挂到测试主机上
+        self.pg = ProjectGroup.objects.create(name='主项目', code='ut-proj')
+        self.ch = Channel.objects.create(name='官服渠道', code='ut-official')
+        self.env = Environment.objects.create(name='单测环境', code='ut-env')
+        self.server = Server.objects.create(
+            name='local', ip='127.0.0.1',
+            project_group=self.pg, channel=self.ch, environment=self.env,
+        )
         # 执行权限前提：主机需在服务概要中已规划服务
         self.base_service = ServiceType.objects.create(name='基础服务', code='base')
         ServerService.objects.create(server=self.server, service_type=self.base_service, status='planned')
@@ -144,184 +154,333 @@ class ExecutionAPITests(TestCase):
         c.credentials(HTTP_AUTHORIZATION='Bearer ' + r.json()['access'])
         return c
 
-    def test_command_validation(self):
-        r = self._client().post('/api/exec/tasks/', {
-            'name': 'bad', 'task_type': 'command', 'server_ids': [self.server.id],
-        }, format='json')
-        self.assertEqual(r.status_code, 400)
+    @staticmethod
+    def _step(**overrides):
+        step = {'order': 1, 'name': '模块1', 'task_type': 'command', 'command': 'echo hi'}
+        step.update(overrides)
+        return step
 
-    def test_command_task_rejects_unplanned_server(self):
-        """执行权限校验：未规划任何服务类型的主机不允许作为执行目标。"""
-        unplanned = Server.objects.create(name='raw-01', ip='10.0.0.99')
-        r = self._client().post('/api/exec/tasks/', {
-            'name': 'cmd', 'task_type': 'command', 'command': 'uptime',
-            'server_ids': [self.server.id, unplanned.id],
-        }, format='json')
-        self.assertEqual(r.status_code, 400)
-        self.assertIn('未规划任何服务类型', str(r.json()))
-        self.assertIn('raw-01', str(r.json()))
+    def _create_task(self, c, steps=None, **overrides):
+        """保存一个任务流定义（默认带完整三维度），返回任务 id。"""
+        payload = {
+            'name': 'demo',
+            'project_group': self.pg.id, 'channel': self.ch.id, 'environment': self.env.id,
+            'steps': steps or [self._step()],
+        }
+        payload.update(overrides)
+        r = c.post('/api/exec/tasks/', payload, format='json')
+        self.assertEqual(r.status_code, 201, r.content)
+        return r.json()['id']
 
-    def test_run_command_guard_blocks_unplanned_server(self):
-        """兜底校验：创建后规划被撤销（如服务下线）时，重跑在 runner 层拦截。"""
-        from apps.asset_mgr.models import ServerService
+    # ── 保存 / 编辑（嵌套模块）───────────────────────────────
 
-        from . import runner
-
-        task = ExecutionTask.objects.create(name='guard', task_type='command', command='uptime')
-        task.servers.add(self.server)
-        ServerService.objects.filter(server=self.server).update(status='offline')
-        code, output = runner.run(task)
-        self.assertEqual(code, 1)
-        self.assertIn('未规划任何服务类型', output)
-
-    def test_method_task_requires_method(self):
-        r = self._client().post('/api/exec/tasks/', {
-            'name': 'bad', 'task_type': 'method', 'server_ids': [self.server.id],
-        }, format='json')
-        self.assertEqual(r.status_code, 400)
-        self.assertIn('必须选择一个方法', str(r.json()))
-
-    def test_all_task_types_require_servers(self):
-        """三类任务的执行主机统一来自平台台账，均必选至少一台。"""
+    def test_create_saves_flow_without_executing(self):
+        """新建仅保存任务流定义：不执行、不落日志，模块按序入库。"""
         c = self._client()
-        method = Method.objects.create(
-            name='m1', code='m1', provider='ansible_playbook', config={'playbook': 'site.yml'},
+        task_id = self._create_task(c, steps=[
+            self._step(name='步骤A'),
+            self._step(order=2, name='步骤B', task_type='playbook', playbook='site.yml', command=''),
+        ])
+        task = ExecutionTask.objects.get(pk=task_id)
+        self.assertEqual(task.status, 'pending')
+        self.assertEqual(task.logs.count(), 0)
+        self.assertEqual(
+            list(task.steps.values_list('order', 'name', 'task_type')),
+            [(1, '步骤A', 'command'), (2, '步骤B', 'playbook')],
         )
-        cases = [
-            {'name': 'c', 'task_type': 'command', 'command': 'uptime'},
-            {'name': 'p', 'task_type': 'playbook', 'playbook': 'site.yml'},
-            {'name': 'm', 'task_type': 'method', 'method': method.id},
-        ]
-        for payload in cases:
-            r = c.post('/api/exec/tasks/', payload, format='json')
-            self.assertEqual(r.status_code, 400, payload)
-            self.assertIn('必须选择至少一台目标主机', str(r.json()), payload)
 
-    def test_playbook_task_requires_playbook(self):
-        r = self._client().post('/api/exec/tasks/', {
-            'name': 'bad', 'task_type': 'playbook', 'server_ids': [self.server.id],
-        }, format='json')
+    def test_steps_required_and_content_validated(self):
+        """任务流至少一个模块；模块内容按类型校验。"""
+        c = self._client()
+        r = c.post('/api/exec/tasks/', {'name': 'empty', 'steps': []}, format='json')
         self.assertEqual(r.status_code, 400)
-        self.assertIn('剧本', str(r.json()))
+        self.assertIn('至少需要一个任务模块', str(r.json()))
 
-    def test_method_task_requires_service_planned(self):
-        """部署前置校验：方法关联服务类型时，目标主机必须已规划/已部署该服务。"""
+        cases = [
+            (self._step(command=''), '必须填写 Shell 命令'),
+            (self._step(task_type='playbook', command=''), '必须选择剧本文件'),
+            (self._step(task_type='method', command=''), '必须选择一个方法'),
+        ]
+        for step, keyword in cases:
+            r = c.post('/api/exec/tasks/', {'name': 'bad', 'steps': [step]}, format='json')
+            self.assertEqual(r.status_code, 400, step)
+            self.assertIn(keyword, str(r.json()), step)
+
+    def test_edit_replaces_steps_and_blocked_while_running(self):
+        """编辑整体替换模块序列（序号归一）；执行中禁止编辑。"""
+        c = self._client()
+        task_id = self._create_task(c)
+        r = c.patch(f'/api/exec/tasks/{task_id}/', {
+            'name': 'renamed',
+            'steps': [
+                self._step(order=9, name='新B', command='echo b'),
+                self._step(order=1, name='新C', command='echo c'),
+            ],
+        }, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        task = ExecutionTask.objects.get(pk=task_id)
+        self.assertEqual(task.name, 'renamed')
+        # 序号按提交顺序归一
+        self.assertEqual(list(task.steps.values_list('order', 'name')), [(1, '新B'), (2, '新C')])
+
+        ExecutionTask.objects.filter(pk=task_id).update(status='running')
+        r = c.patch(f'/api/exec/tasks/{task_id}/', {'name': 'again'}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('无法编辑', str(r.json()))
+
+    def test_legacy_task_migrated_to_single_step(self):
+        """存量任务经 0006 迁移应为单模块任务流（迁移在测试库建库时执行，此处验证行为等价）。"""
+        # 通过 ORM 直接构造"迁移后"形态，验证执行链路兼容单模块任务
+        task = ExecutionTask.objects.create(name='legacy')
+        TaskStep.objects.create(task=task, order=1, name='命令模块', task_type='command', command='echo 1')
+        self.assertEqual(task.steps.count(), 1)
+
+    # ── 主机匹配（全局 + 模块自定义）─────────────────────────
+
+    def test_matched_servers_global_and_custom_steps(self):
+        """matched_servers 返回全局匹配集与各模块主机来源；自定义模块附独立匹配结果。"""
+        from apps.asset_mgr.models import ProjectGroup, ServerService
+
+        c = self._client()
+        pg_b = ProjectGroup.objects.create(name='项目B', code='proj-b')
+        in_b = Server.objects.create(
+            name='dim-01', ip='10.0.1.1', project_group=pg_b, channel=self.ch, environment=self.env,
+        )
+        ServerService.objects.create(server=in_b, service_type=self.base_service, status='deployed')
+        # 未规划服务的主机即使维度匹配也不出现
+        Server.objects.create(name='raw-01', ip='10.0.1.2', project_group=self.pg, channel=self.ch, environment=self.env)
+
+        task_id = self._create_task(c, steps=[
+            self._step(name='全局步骤'),
+            self._step(order=2, name='定向步骤', use_custom_scope=True,
+                       project_group=pg_b.id, channel=self.ch.id, environment=self.env.id),
+        ])
+        r = c.get(f'/api/exec/tasks/{task_id}/matched_servers/')
+        data = r.json()['data']
+        # 全局 = 任务维度（主项目）匹配：仅 local；raw-01 未规划不出现
+        self.assertEqual([s['name'] for s in data['global']['results']], ['local'])
+        self.assertEqual(data['steps'][0]['custom'], False)
+        self.assertEqual(data['steps'][0]['total'], 1)
+        self.assertEqual(data['steps'][1]['custom'], True)
+        self.assertEqual([s['name'] for s in data['steps'][1]['servers']], ['dim-01'])
+
+    # ── 执行入口校验 ──────────────────────────────────────
+
+    def test_execute_selection_only_affects_global_steps(self):
+        """勾选子集仅作用于全局范围模块；自定义范围模块按其维度全量执行。"""
+        from apps.asset_mgr.models import ProjectGroup, ServerService
+
+        c = self._client()
+        pg_b = ProjectGroup.objects.create(name='项目B', code='proj-b')
+        custom_srv = Server.objects.create(
+            name='dim-01', ip='10.0.1.1', project_group=pg_b, channel=self.ch, environment=self.env,
+        )
+        ServerService.objects.create(server=custom_srv, service_type=self.base_service, status='planned')
+
+        task_id = self._create_task(c, steps=[
+            self._step(name='全局'),
+            self._step(order=2, name='定向', use_custom_scope=True,
+                       project_group=pg_b.id, channel=self.ch.id, environment=self.env.id),
+        ])
+        with mock.patch('apps.task_exec.runner.run', return_value=(0, 'ok', [])):
+            r = c.post(f'/api/exec/tasks/{task_id}/execute/', {'server_ids': [self.server.id]}, format='json')
+        self.assertEqual(r.status_code, 200)
+        task = ExecutionTask.objects.get(pk=task_id)
+        # 任务快照仅记录全局范围勾选（定向模块主机执行时实时解析）
+        self.assertEqual([s.id for s in task.servers.all()], [self.server.id])
+
+    def test_execute_rejects_out_of_scope_and_empty_step(self):
+        c = self._client()
+        raw = Server.objects.create(name='raw-02', ip='10.0.2.9')  # 未规划
+        task_id = self._create_task(c)
+
+        r = c.post(f'/api/exec/tasks/{task_id}/execute/', {'server_ids': [raw.id]}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('不在全局范围匹配集内', str(r.json()))
+
+        # 全局勾空 + 存在全局范围模块 → 拒绝
+        r = c.post(f'/api/exec/tasks/{task_id}/execute/', {'server_ids': []}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('未匹配/未勾选任何主机', str(r.json()))
+
+    def test_execute_custom_step_no_match_rejected(self):
+        """自定义范围模块维度无主机时拒绝执行。"""
+        from apps.asset_mgr.models import Environment
+
+        c = self._client()
+        env = Environment.objects.create(name='预发', code='staging')
+        task_id = self._create_task(c, steps=[
+            self._step(name='定向空', use_custom_scope=True,
+                       project_group=self.pg.id, channel=self.ch.id, environment=env.id),
+        ])
+        r = c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('自定义范围维度未匹配到可执行主机', str(r.json()))
+
+    def test_execute_blocked_while_running(self):
+        c = self._client()
+        task_id = self._create_task(c)
+        ExecutionTask.objects.filter(pk=task_id).update(status='running')
+        r = c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('正在执行中', str(r.json()))
+
+    def test_method_step_requires_service_planned(self):
+        """部署前置校验（执行时逐模块）：方法模块关联服务类型时目标主机必须已规划该服务。"""
         from apps.asset_mgr.models import ServerService, ServiceType
 
+        c = self._client()
         game = ServiceType.objects.create(name='游戏服', code='game-server')
         method = Method.objects.create(
             name='部署游戏服', code='deploy-game', provider='ansible_playbook',
             config={'playbook': 'site.yml'}, service_type=game,
         )
-        payload = {
-            'name': 'deploy', 'task_type': 'method', 'method': method.id,
-            'server_ids': [self.server.id],
-        }
-        # 未规划 → 拦截并提示先去配置管理规划
-        r = self._client().post('/api/exec/tasks/', payload, format='json')
+        task_id = self._create_task(c, steps=[
+            self._step(name='部署', task_type='method', method=method.id, command=''),
+        ])
+        r = c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
         self.assertEqual(r.status_code, 400)
         self.assertIn('未规划服务', str(r.json()))
-        # 规划后放行（mock dispatch，避免真实执行 ansible）
+        self.assertIn('模块「部署」', str(r.json()))
+
         ServerService.objects.create(server=self.server, service_type=game, status='planned')
-        with mock.patch('apps.task_exec.views.dispatch'):
-            r = self._client().post('/api/exec/tasks/', payload, format='json')
-        self.assertEqual(r.status_code, 201)
+        with mock.patch('apps.task_exec.views.dispatch', return_value=mock.Mock(id=1)):
+            r = c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
+        self.assertEqual(r.status_code, 200)
 
-    def test_command_execution_runs(self):
-        if not ANSIBLE:
-            self.skipTest('ansible 未安装')
-        r = self._client().post('/api/exec/tasks/', {
-            'name': 'echo', 'task_type': 'command', 'command': 'echo ops_marker_123',
-            'server_ids': [self.server.id],
-        }, format='json')
-        self.assertEqual(r.status_code, 201)
-        task = ExecutionTask.objects.get(pk=r.json()['id'])
-        self.assertEqual(task.status, 'success')
-        self.assertIn('ops_marker_123', task.output)
+    # ── 任务流执行与日志 ──────────────────────────────────
 
-    def test_method_execution_with_tags(self):
-        """方法任务的主机来自所选服务器（平台生成动态 inventory）。"""
+    def test_flow_runs_steps_in_order(self):
+        """混合类型任务流按序执行，输出分段，steps_result 逐模块落库。"""
         if not ANSIBLE:
             self.skipTest('ansible 未安装')
         proj = _make_ansible_project()
         try:
             with override_settings(ANSIBLE_PROJECT_DIR=proj):
+                c = self._client()
+                task_id = self._create_task(c, steps=[
+                    self._step(name='报数', command='echo ops_step_one'),
+                    self._step(order=2, name='重启redis', task_type='playbook',
+                               playbook='site.yml', tags='redis', command=''),
+                ])
+                r = c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
+                self.assertEqual(r.status_code, 200)
+                task = ExecutionTask.objects.get(pk=task_id)
+                self.assertEqual(task.status, 'success')
+                self.assertIn('模块 1/2：报数', task.output)
+                self.assertIn('ops_step_one', task.output)
+                self.assertIn('模块 2/2：重启redis', task.output)
+                self.assertIn('redis restarted', task.output)
+                # 顺序：模块1输出在模块2之前
+                self.assertLess(task.output.index('ops_step_one'), task.output.index('redis restarted'))
+
+                log = task.logs.get()
+                self.assertEqual([s['status'] for s in log.steps_result], ['success', 'success'])
+                self.assertEqual([s['name'] for s in log.steps_result], ['报数', '重启redis'])
+        finally:
+            shutil.rmtree(proj, ignore_errors=True)
+
+    def test_flow_aborts_on_step_failure(self):
+        """模块失败即中止：后续模块标记 skipped，任务失败。"""
+        if not ANSIBLE:
+            self.skipTest('ansible 未安装')
+        c = self._client()
+        task_id = self._create_task(c, steps=[
+            self._step(name='会失败', command='false'),
+            self._step(order=2, name='不该执行', command='echo should_not_run'),
+        ])
+        r = c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
+        self.assertEqual(r.status_code, 200)
+        task = ExecutionTask.objects.get(pk=task_id)
+        self.assertEqual(task.status, 'failed')
+        self.assertIn('中止后续 1 个模块', task.output)
+        self.assertNotIn('should_not_run', task.output)
+        log = task.logs.get()
+        self.assertEqual([s['status'] for s in log.steps_result], ['failed', 'skipped'])
+
+    def test_serial_mode_adds_forks(self):
+        """串行执行：命令模块的 ansible 命令行携带 --forks 1，并发不带。"""
+        c = self._client()
+        task_id = self._create_task(c, exec_mode='serial')
+        with mock.patch('apps.task_exec.runner.run_subprocess', return_value=(0, 'ok')) as m:
+            c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
+        cmd = m.call_args[0][0]
+        self.assertIn('--forks', cmd)
+        self.assertEqual(cmd[cmd.index('--forks') + 1], '1')
+
+        task2 = self._create_task(c)
+        with mock.patch('apps.task_exec.runner.run_subprocess', return_value=(0, 'ok')) as m:
+            c.post(f'/api/exec/tasks/{task2}/execute/', {}, format='json')
+        self.assertNotIn('--forks', m.call_args[0][0])
+
+    def test_method_executor_serial_forks_and_step_params(self):
+        """方法模块执行器：按 step 读取 tags/timeout，exec_mode 透传任务级串行。"""
+        from apps.method_mgr.executors import get_executor
+
+        proj = _make_ansible_project()
+        try:
+            with override_settings(ANSIBLE_PROJECT_DIR=proj):
                 method = Method.objects.create(
-                    name='nginx', code='nginx', provider='ansible_playbook',
+                    name='m-serial', code='m-serial', provider='ansible_playbook',
                     config={'playbook': 'site.yml', 'tags': 'nginx'},
                 )
-                c = self._client()
-                r = c.post('/api/exec/tasks/', {
-                    'name': 'run nginx', 'task_type': 'method', 'method': method.id,
-                    'server_ids': [self.server.id],
-                }, format='json')
-                self.assertEqual(r.status_code, 201)
-                task = ExecutionTask.objects.get(pk=r.json()['id'])
-                self.assertEqual(task.status, 'success')
-                self.assertIn('nginx restarted', task.output)
-                self.assertNotIn('redis restarted', task.output)
-
-                # 任务级 tags 覆盖
-                r = c.post('/api/exec/tasks/', {
-                    'name': 'run redis', 'task_type': 'method', 'method': method.id, 'tags': 'redis',
-                    'server_ids': [self.server.id],
-                }, format='json')
-                task2 = ExecutionTask.objects.get(pk=r.json()['id'])
-                self.assertIn('redis restarted', task2.output)
-                self.assertNotIn('nginx restarted', task2.output)
-        finally:
-            shutil.rmtree(proj, ignore_errors=True)
-
-    def test_playbook_execution_with_tags(self):
-        """playbook 任务：所选主机动态 inventory + ANSIBLE_PROJECT_DIR 内剧本 + tags。"""
-        if not ANSIBLE:
-            self.skipTest('ansible 未安装')
-        proj = _make_ansible_project()
-        try:
-            with override_settings(ANSIBLE_PROJECT_DIR=proj):
-                r = self._client().post('/api/exec/tasks/', {
-                    'name': 'pb redis', 'task_type': 'playbook', 'playbook': 'site.yml',
-                    'tags': 'redis', 'server_ids': [self.server.id],
-                }, format='json')
-                self.assertEqual(r.status_code, 201)
-                task = ExecutionTask.objects.get(pk=r.json()['id'])
-                self.assertEqual(task.status, 'success')
-                self.assertIn('redis restarted', task.output)
-                self.assertNotIn('nginx restarted', task.output)
-        finally:
-            shutil.rmtree(proj, ignore_errors=True)
-
-    def test_method_path_traversal_blocked(self):
-        proj = _make_ansible_project()
-        try:
-            with override_settings(ANSIBLE_PROJECT_DIR=proj):
-                method = Method.objects.create(
-                    name='evil', code='evil', provider='ansible_playbook',
-                    config={'playbook': '../../etc/passwd'},
+                task = ExecutionTask.objects.create(name='t', exec_mode='serial')
+                step = TaskStep.objects.create(
+                    task=task, order=1, name='m', task_type='method', method=method, tags='redis',
                 )
-                r = self._client().post('/api/exec/tasks/', {
-                    'name': 'evil', 'task_type': 'method', 'method': method.id,
-                    'server_ids': [self.server.id],
-                }, format='json')
-                task = ExecutionTask.objects.get(pk=r.json()['id'])
-                self.assertEqual(task.status, 'failed')
-                self.assertIn('越出', task.output)
+                with mock.patch(
+                    'apps.method_mgr.executors.ansible_playbook.run_subprocess', return_value=(0, 'ok'),
+                ) as m:
+                    get_executor('ansible_playbook').execute(step, method, inventory_path='/tmp/inv.ini')
+                cmd = m.call_args[0][0]
+                self.assertIn('--forks', cmd)
+                # 模块级 tags 覆盖方法默认
+                self.assertEqual(cmd[cmd.index('--tags') + 1], 'redis')
         finally:
             shutil.rmtree(proj, ignore_errors=True)
+
+    def test_runner_guard_blocks_unplanned_server(self):
+        """兜底校验：执行排队期间规划被撤销（服务下线）时，runner 层拦截。"""
+        from apps.asset_mgr.models import ServerService
+
+        from . import runner
+
+        task = ExecutionTask.objects.create(name='guard')
+        TaskStep.objects.create(task=task, order=1, name='cmd', task_type='command', command='uptime')
+        task.servers.add(self.server)
+        ServerService.objects.filter(server=self.server).update(status='offline')
+        code, output, results = runner.run(task)
+        self.assertEqual(code, 1)
+        self.assertIn('未规划任何服务类型', output)
+        self.assertEqual(results[0]['status'], 'failed')
 
     def test_playbook_path_traversal_blocked(self):
         proj = _make_ansible_project()
         try:
             with override_settings(ANSIBLE_PROJECT_DIR=proj):
-                r = self._client().post('/api/exec/tasks/', {
-                    'name': 'evil', 'task_type': 'playbook', 'playbook': '../../etc/passwd',
-                    'server_ids': [self.server.id],
-                }, format='json')
-                task = ExecutionTask.objects.get(pk=r.json()['id'])
+                c = self._client()
+                task_id = self._create_task(c, steps=[
+                    self._step(name='evil', task_type='playbook', playbook='../../etc/passwd', command=''),
+                ])
+                c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
+                task = ExecutionTask.objects.get(pk=task_id)
                 self.assertEqual(task.status, 'failed')
                 self.assertIn('越出', task.output)
         finally:
             shutil.rmtree(proj, ignore_errors=True)
+
+    def test_cloud_host_provider_reserved(self):
+        method = Method.objects.create(
+            name='reboot', code='reboot-vm', provider='cloud_host', config={'action': 'reboot'},
+        )
+        c = self._client()
+        task_id = self._create_task(c, steps=[
+            self._step(name='cloud', task_type='method', method=method.id, command=''),
+        ])
+        c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
+        task = ExecutionTask.objects.get(pk=task_id)
+        self.assertEqual(task.status, 'failed')
+        self.assertIn('预留', task.output)
 
     def test_playbook_list_api(self):
         """剧本列表接口：仅返回项目目录内剧本，排除 roles 等目录；仅管理员可用。"""
@@ -334,7 +493,6 @@ class ExecutionAPITests(TestCase):
                 self.assertIn('site.yml', results)
                 self.assertFalse(any(p.startswith('roles') for p in results))
 
-                # 非管理员 403
                 u = User.objects.create(username='viewer1')
                 u.set_password('Pass!2345xyz')
                 u.save()
@@ -345,71 +503,43 @@ class ExecutionAPITests(TestCase):
         finally:
             shutil.rmtree(proj, ignore_errors=True)
 
-    def test_cloud_host_provider_reserved(self):
-        method = Method.objects.create(
-            name='reboot', code='reboot-vm', provider='cloud_host', config={'action': 'reboot'},
-        )
-        r = self._client().post('/api/exec/tasks/', {
-            'name': 'cloud', 'task_type': 'method', 'method': method.id,
-            'server_ids': [self.server.id],
-        }, format='json')
-        task = ExecutionTask.objects.get(pk=r.json()['id'])
-        self.assertEqual(task.status, 'failed')
-        self.assertIn('预留', task.output)
-
-    def test_execution_creates_log_record(self):
-        """任务执行后必须落一条执行日志，结果与任务快照一致。"""
-        method = Method.objects.create(
-            name='reboot2', code='reboot-vm2', provider='cloud_host', config={'action': 'reboot'},
-        )
-        r = self._client().post('/api/exec/tasks/', {
-            'name': 'log-test', 'task_type': 'method', 'method': method.id,
-            'server_ids': [self.server.id],
-        }, format='json')
-        task = ExecutionTask.objects.get(pk=r.json()['id'])
-        logs = list(task.logs.all())
-        self.assertEqual(len(logs), 1)
-        log = logs[0]
-        self.assertEqual(log.trigger_type, 'create')
-        self.assertEqual(log.triggered_by, self.admin)
-        self.assertEqual(log.status, task.status)
-        self.assertEqual(log.return_code, task.return_code)
-        self.assertEqual(log.output, task.output)
-        self.assertIsNotNone(log.started_at)
-        self.assertIsNotNone(log.finished_at)
-
-    def test_rerun_appends_log_and_keeps_history(self):
-        """重跑追加新日志，历史记录及其输出不被覆盖。"""
-        method = Method.objects.create(
-            name='reboot3', code='reboot-vm3', provider='cloud_host', config={'action': 'reboot'},
-        )
+    def test_execute_records_log_with_snapshot(self):
+        """执行落日志：trigger=execute，含全局主机快照、执行方式与模块结果。"""
         c = self._client()
-        r = c.post('/api/exec/tasks/', {
-            'name': 'rerun-test', 'task_type': 'method', 'method': method.id,
-            'server_ids': [self.server.id],
-        }, format='json')
-        task_id = r.json()['id']
-        first_log = TaskExecutionLog.objects.get(task_id=task_id)
-        first_output = first_log.output
+        task_id = self._create_task(c, exec_mode='serial')
+        with mock.patch('apps.task_exec.runner.run', return_value=(0, 'ok', [{'order': 1, 'status': 'success'}])):
+            r = c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
+        self.assertEqual(r.status_code, 200)
+        task = ExecutionTask.objects.get(pk=task_id)
+        log = task.logs.get()
+        self.assertEqual(log.trigger_type, 'execute')
+        self.assertEqual(log.exec_mode, 'serial')
+        self.assertEqual(log.servers_snapshot, [{'id': self.server.id, 'name': 'local', 'ip': '127.0.0.1'}])
+        self.assertEqual(log.steps_result, [{'order': 1, 'status': 'success'}])
+        self.assertEqual(log.triggered_by, self.admin)
 
-        c.post(f'/api/exec/tasks/{task_id}/rerun/')
+    def test_repeat_execute_appends_log(self):
+        """反复执行追加日志，历史输出不被覆盖。"""
+        c = self._client()
+        task_id = self._create_task(c)
+        with mock.patch('apps.task_exec.runner.run', side_effect=[(0, 'first run', []), (1, 'second run', [])]):
+            c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
+            c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
         logs = TaskExecutionLog.objects.filter(task_id=task_id).order_by('id')
         self.assertEqual(logs.count(), 2)
-        self.assertEqual(logs[0].output, first_output)  # 历史保留
-        self.assertEqual(logs[1].trigger_type, 'rerun')
-        self.assertEqual(logs[1].triggered_by, self.admin)
+        self.assertEqual(logs[0].output, 'first run')
+        self.assertEqual(logs[1].output, 'second run')
+        self.assertEqual(ExecutionTask.objects.get(pk=task_id).status, 'failed')
 
     def test_long_output_persisted_to_file(self):
         """输出超过预览上限时全量落盘，数据库仅存截断预览。"""
         long_output = 'x' * (OUTPUT_PREVIEW_LIMIT + 500)
         log_dir = tempfile.mkdtemp(prefix='task_logs_')
         try:
-            # 日志详情 API 读取时同样依赖 TASK_LOG_DIR，故 API 断言也须在 override 内执行
             with override_settings(TASK_LOG_DIR=log_dir):
-                with mock.patch('apps.task_exec.runner.run', return_value=(0, long_output)):
-                    task = ExecutionTask.objects.create(
-                        name='long', task_type='command', command='echo', created_by=self.admin,
-                    )
+                with mock.patch('apps.task_exec.runner.run', return_value=(0, long_output, [])):
+                    task = ExecutionTask.objects.create(name='long', created_by=self.admin)
+                    TaskStep.objects.create(task=task, order=1, name='cmd', task_type='command', command='echo')
                     task.servers.add(self.server)
                     from .tasks import dispatch
                     log = dispatch(task, triggered_by=self.admin)
@@ -421,33 +551,42 @@ class ExecutionAPITests(TestCase):
                 with open(full_path, encoding='utf-8') as f:
                     self.assertEqual(f.read(), long_output)
 
-                # 日志详情 API 返回完整输出
                 r = self._client().get(f'/api/exec/tasks/{task.id}/logs/{log.id}/')
                 self.assertEqual(len(r.json()['data']['output']), len(long_output))
         finally:
             shutil.rmtree(log_dir, ignore_errors=True)
 
     def test_logs_api_list(self):
-        """日志列表接口返回执行历史，且不含输出大字段。"""
-        method = Method.objects.create(
-            name='reboot4', code='reboot-vm4', provider='cloud_host', config={'action': 'reboot'},
-        )
+        """日志列表接口返回执行历史（含主机数/执行方式/模块结果），不含输出大字段。"""
         c = self._client()
-        r = c.post('/api/exec/tasks/', {
-            'name': 'list-test', 'task_type': 'method', 'method': method.id,
-            'server_ids': [self.server.id],
-        }, format='json')
-        task_id = r.json()['id']
+        task_id = self._create_task(c, name='list-test')
+        with mock.patch('apps.task_exec.runner.run', return_value=(0, 'ok', [{'order': 1, 'status': 'success'}])):
+            c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
         r = c.get(f'/api/exec/tasks/{task_id}/logs/')
         data = r.json()['data']
         self.assertEqual(len(data), 1)
         self.assertNotIn('output', data[0])
-        self.assertEqual(data[0]['trigger_type'], 'create')
-        self.assertEqual(data[0]['triggered_by_name'], 'admin1')
+        self.assertEqual(data[0]['trigger_type'], 'execute')
+        self.assertEqual(data[0]['server_count'], 1)
+        self.assertEqual(data[0]['exec_mode'], 'parallel')
+        self.assertEqual(data[0]['steps_result'][0]['status'], 'success')
+
+    def test_task_type_filter_matches_step_type(self):
+        """列表 task_type 筛选 = 包含该类型模块的任务。"""
+        c = self._client()
+        self._create_task(c, name='cmd-only')
+        self._create_task(c, name='with-pb', steps=[
+            self._step(name='a'),
+            self._step(order=2, name='b', task_type='playbook', playbook='site.yml', command=''),
+        ])
+        names = [t['name'] for t in c.get('/api/exec/tasks/', {'task_type': 'playbook'}).json()['data']['results']]
+        self.assertEqual(names, ['with-pb'])
+        names = [t['name'] for t in c.get('/api/exec/tasks/', {'task_type': 'command'}).json()['data']['results']]
+        self.assertEqual(sorted(names), ['cmd-only', 'with-pb'])
 
     def test_clean_task_logs_command(self):
         """清理命令删除过期日志记录及落盘文件，保留期内的不动。"""
-        task = ExecutionTask.objects.create(name='old', task_type='command', command='echo')
+        task = ExecutionTask.objects.create(name='old')
         old_log = TaskExecutionLog.objects.create(task=task, status='success')
         new_log = TaskExecutionLog.objects.create(task=task, status='success')
         TaskExecutionLog.objects.filter(pk=old_log.pk).update(
@@ -479,3 +618,76 @@ class ExecutionAPITests(TestCase):
         listing = c.get('/api/exec/credentials/').json()['data']['results']
         self.assertNotIn('password', listing[0])
         self.assertTrue(listing[0]['has_password'])
+
+    # ── 主机范围三维度必选 ─────────────────────────────────
+
+    def test_task_requires_all_dimensions(self):
+        """任务全局主机范围不再支持留空=不限，三维度必选。"""
+        c = self._client()
+        r = c.post('/api/exec/tasks/', {'name': 'no-dim', 'steps': [self._step()]}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('必须选择项目组', str(r.json()))
+
+        r = c.post('/api/exec/tasks/', {
+            'name': 'partial', 'project_group': self.pg.id, 'channel': self.ch.id,
+            'steps': [self._step()],
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('必须选择环境', str(r.json()))
+
+    def test_custom_scope_requires_all_dimensions(self):
+        """模块自定义主机范围同策略：三维度必选。"""
+        c = self._client()
+        r = c.post('/api/exec/tasks/', {
+            'name': 'bad', 'project_group': self.pg.id, 'channel': self.ch.id, 'environment': self.env.id,
+            'steps': [self._step(use_custom_scope=True, project_group=self.pg.id)],
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('自定义主机范围必须选择', str(r.json()))
+
+    def test_execute_legacy_task_without_dims_rejected(self):
+        """兜底：存量维度不全的任务不予执行，提示补全。"""
+        task = ExecutionTask.objects.create(name='legacy')
+        TaskStep.objects.create(task=task, order=1, name='cmd', task_type='command', command='echo')
+        r = self._client().post(f'/api/exec/tasks/{task.id}/execute/', {}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('主机范围', str(r.json()))
+
+    # ── 变量管理与执行注入 ─────────────────────────────────
+
+    def test_variable_crud_and_key_validation(self):
+        """变量 CRUD：key 须为合法 ansible 变量名；普通用户只读。"""
+        c = self._client()
+        r = c.post('/api/exec/variables/', {
+            'key': 'app_env', 'value': 'prod', 'description': '环境标识',
+        }, format='json')
+        self.assertEqual(r.status_code, 201)
+        r = c.post('/api/exec/variables/', {'key': '1bad-key', 'value': 'x'}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('变量名', str(r.json()))
+
+        u = User.objects.create(username='viewer2')
+        u.set_password('Pass!2345xyz')
+        u.save()
+        vc = APIClient()
+        login = vc.post('/api/auth/login/', {'username': 'viewer2', 'password': 'Pass!2345xyz'}, format='json')
+        vc.credentials(HTTP_AUTHORIZATION='Bearer ' + login.json()['access'])
+        self.assertEqual(vc.get('/api/exec/variables/').status_code, 200)  # 只读（含 Jenkins 等外部拉取场景）
+        self.assertEqual(vc.post('/api/exec/variables/', {'key': 'x', 'value': '1'}, format='json').status_code, 403)
+
+    def test_variables_injected_as_extra_vars(self):
+        """执行注入：启用变量以 JSON -e 注入，禁用不注入；模块额外变量后置覆盖。"""
+        from .models import ExecVariable
+
+        ExecVariable.objects.create(key='app_env', value='prod')
+        ExecVariable.objects.create(key='disabled_var', value='x', enabled=False)
+        c = self._client()
+        task_id = self._create_task(c, steps=[self._step(extra_vars='override=1')])
+        with mock.patch('apps.task_exec.runner.run_subprocess', return_value=(0, 'ok')) as m:
+            c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
+        cmd = m.call_args[0][0]
+        idxs = [i for i, a in enumerate(cmd) if a == '--extra-vars']
+        self.assertEqual(len(idxs), 2)
+        self.assertIn('app_env', cmd[idxs[0] + 1])
+        self.assertNotIn('disabled_var', cmd[idxs[0] + 1])
+        self.assertEqual(cmd[idxs[1] + 1], 'override=1')  # 模块变量在后，ansible 同名覆盖

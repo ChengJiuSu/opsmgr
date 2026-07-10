@@ -7,17 +7,32 @@
 
 ## 职责
 
-统一的任务执行入口，三种任务类型：
+**任务 = 任务流**：由多个**任务模块**（`TaskStep`）按序组成的可保存、可编辑、
+可反复执行的任务定义。类型下沉到模块级，一个任务流可混合编排三种模块：
 
-| 类型 | 说明 | 执行方式 |
+| 模块类型 | 说明 | 执行方式 |
 |------|------|----------|
 | `command` | Shell 命令 | ansible ad-hoc shell |
-| `playbook` | 直接执行 `ANSIBLE_PROJECT_DIR` 内既有剧本 | ansible-playbook + 任务级 tags/limit/extra-vars |
+| `playbook` | 直接执行 `ANSIBLE_PROJECT_DIR` 内既有剧本 | ansible-playbook + 模块级 tags/extra-vars |
 | `method` | 平台方法（仅承载运维后台能力：剧本+平台管理的 tags、云主机管理等） | 委托 `method_mgr` 对应 provider 执行器 |
 
-**三类任务的执行主机统一来自平台服务器台账**（前端按项目组/渠道/环境筛选、
-仅可选已规划服务的主机），执行时基于所选主机动态生成 inventory。
-同时管理连接凭据与执行日志（每次执行落一条日志，重跑追加）。
+**执行语义**：模块间按 order 顺序执行，任一模块失败即中止后续（标记
+skipped）；模块内主机按任务级 exec_mode 并发/串行（串行 = `--forks 1`）。
+
+**主机范围**：任务级项目组/渠道/环境为全局默认，**三维度必选**（不支持
+留空=不限，未选齐不予保存与执行）；模块可 `use_custom_scope` 自定义三维度
+独立匹配（同样三维度必选）。执行时实时匹配可执行主机（仅已规划服务的
+主机）：全局范围主机默认全选、可勾除；自定义范围模块按其维度全量执行。
+
+**执行变量**（`ExecVariable`）：启用中的变量在执行时以 `--extra-vars`
+JSON 注入三类模块（命令内可用 Jinja `{{ var }}` 引用），模块自身的额外
+变量作为后一个 `-e` 传入（ansible 同名覆盖）。变量列表 API 亦可供
+Jenkins 等外部系统拉取，配合服务器接口（`executable=true`）自行拼装
+ansible 调用（规划中）。
+
+**保存与执行分离**：新建/编辑仅保存定义（嵌套模块整体替换）；执行为独立
+动作，每次执行落一条执行日志（含全局主机快照与逐模块结果 steps_result），
+任务本体字段仅为「最近一次执行」快照。
 
 ---
 
@@ -25,11 +40,13 @@
 
 ```
 apps/task_exec/
-├── models.py        # Credential / ExecutionTask / TaskExecutionLog
-├── serializers.py   # 凭据脱敏、任务校验（含服务规划前置校验）
-├── views.py         # 凭据/任务 ViewSet + rerun/output/logs 动作
-├── runner.py        # 执行分派：动态 inventory 生成 + ansible 调用
-├── tasks.py         # dispatch：thread/celery/sync 三种后端
+├── models.py        # ExecVariable（执行变量）/ Credential / ExecutionTask（任务流）
+│                    #   / TaskStep（任务模块）/ TaskExecutionLog
+│                    #   match_executable_servers：全局/模块维度匹配共用口径
+├── serializers.py   # 变量 key 校验、凭据脱敏、嵌套模块整体读写与内容校验、方法 service_type 执行校验
+├── views.py         # 变量/凭据/任务 ViewSet + matched_servers/execute/output/logs 动作 + 剧本列表
+├── runner.py        # 任务流执行：逐模块解析主机 + 动态 inventory + 变量注入 + ansible 调用，失败中止
+├── tasks.py         # dispatch：thread/celery/sync 三种后端（日志落主机快照与模块结果）
 └── management/      # clean_task_logs 日志清理命令
 ```
 
@@ -71,8 +88,11 @@ Ansible 项目目录内执行剧本：
 - **主机与 inventory 不再由该目录维护**：执行主机来自任务所选服务器，
   平台动态生成 inventory（含服务类型分组，剧本内可用 `service_types` 变量
   与 `[<服务 code>]` 分组）
-- playbook 任务：剧本由 `GET /api/exec/playbooks/` 列表选择（扫描项目目录内
-  `*.yml/*.yaml`，排除 roles/inventories/group_vars 等非剧本目录）
+- playbook 模块：**直接选「方法管理」登记的 Ansible 剧本方法**（provider =
+  `ansible_playbook` 区分剧本类与其他平台方法），剧本路径与 tags 候选均
+  取自方法 `config`，不再扫描目录匹配（后端 playbook/tags 字段仍为自由
+  字符串；`GET /api/exec/playbooks/` 保留供方法管理登记时参考）；
+  平台方法模块则只列其他 provider（如云主机管理）
 - 方法任务：**一个平台方法 = 一个剧本 + 一组 tags**（`Method.config.playbook/tags`），
   任务级 `tags` / `limit` 覆盖方法默认值
 - 剧本路径按项目目录内相对路径解析，禁止越出目录
@@ -81,42 +101,56 @@ Ansible 项目目录内执行剧本：
 
 ---
 
-## 执行权限：服务规划前置校验
+## 执行权限与执行时校验
 
-**未在「服务器分配」中规划服务类型的主机不允许作为执行目标**，两层拦截：
+**未在「服务器分配」中规划服务类型的主机不具备执行条件**，主机相关校验
+全部在执行入口（保存任务不校验主机）：
 
 | 层级 | 时机 | 规则 |
 |------|------|------|
-| `ExecutionTaskSerializer._validate_servers_planned` | 创建任务 | 所选主机必须有 ≥1 条 planned/deployed 服务记录，否则 400 并提示去「配置管理 → 服务器分配」 |
-| `runner._prepare_servers` 守卫 | 每次执行（三类任务共用） | 兜底重跑场景：创建后规划被撤销（服务全部下线）时返回失败，不生成 inventory |
-| `ExecutionTaskSerializer._validate_service_planned` | 创建方法任务 | 方法关联了服务类型时，目标主机必须已规划/已部署**该**服务（更严格的部署前置校验） |
+| `match_executable_servers` | 执行表单/执行入口 | 只匹配已规划/已部署服务的主机（offline 不算），按维度过滤（留空=不限）；任务全局与模块自定义共用口径 |
+| `execute` 动作校验 | 发起执行 | `server_ids` 仅作用于全局范围模块，必须在全局匹配集内；逐模块解析主机后必须 ≥1 台；执行中禁止再次发起 |
+| `validate_service_planned` | 发起执行（方法模块，逐个） | 方法关联了服务类型时，该模块的目标主机必须已规划/已部署**该**服务（部署前置校验） |
+| `runner._guard` | 每个模块执行前 | 兜底：执行排队期间规划被撤销（服务全部下线）时该模块失败，不生成 inventory |
 
-前端任务创建页联动：未规划主机在目标主机选择器中禁用并标注「未规划服务」，
-已规划主机在标签中展示其服务类型。
+**执行方式**：`exec_mode = parallel`（并发，ansible 默认并发数）/
+`serial`（串行，命令行加 `--forks 1` 逐台执行），任务级统一、全部模块生效。
+
+前端流程：新建/编辑（模块卡片编排，保存定义）→ 列表「执行」→ 执行表单
+（任务流预览 + 全局范围主机默认全选、可勾除）→ 确认框（任务名称/维度/
+逐模块流程，生产环境标红）→ 自动定位任务列表下方的执行日志面板，轮询至完成。
 
 ---
 
 ## 接口
 
 ```
-GET/POST/DELETE /api/exec/credentials/        凭据 CRUD（仅管理员；密钥/密码只写不回显）
-GET             /api/exec/playbooks/          剧本列表（仅管理员；ANSIBLE_PROJECT_DIR 内相对路径）
-GET/POST/DELETE /api/exec/tasks/              任务列表/创建（创建即调度执行）/删除
-POST            /api/exec/tasks/{id}/rerun/   重跑（追加执行日志）
-GET             /api/exec/tasks/{id}/output/  轻量轮询：状态与输出
-GET             /api/exec/tasks/{id}/logs/    执行历史列表（不含输出大字段）
-GET             /api/exec/tasks/{id}/logs/{log_id}/  单条日志详情（超长输出从落盘文件读取）
+GET/POST/DELETE     /api/exec/credentials/        凭据 CRUD（仅管理员；密钥/密码只写不回显）
+GET/POST/PUT/PATCH/DELETE /api/exec/variables/    执行变量 CRUD（普通用户只读；供任务注入与外部系统拉取）
+GET                 /api/exec/playbooks/          剧本列表（仅管理员；ANSIBLE_PROJECT_DIR 内相对路径）
+GET/POST/PUT/PATCH/DELETE /api/exec/tasks/        任务流 CRUD（steps 嵌套整体读写；保存不执行；执行中禁止编辑）
+GET                 /api/exec/tasks/{id}/matched_servers/  执行表单数据源：{global: {...}, steps: [{order,name,custom,total,servers?}]}
+POST                /api/exec/tasks/{id}/execute/ 发起执行，body {server_ids:[...]} 仅作用于全局范围模块（缺省=全部全局匹配主机）
+GET                 /api/exec/tasks/{id}/output/  轻量轮询：状态与输出
+GET                 /api/exec/tasks/{id}/logs/    执行历史列表（含主机数/执行方式/逐模块结果 steps_result）
+GET                 /api/exec/tasks/{id}/logs/{log_id}/  单条日志详情（完整输出 + 主机快照）
 ```
 
-任务读写权限：普通用户只读，管理员可创建/重跑（`IsAdminOrReadOnly`）。
+任务读写权限：普通用户只读，管理员可保存/编辑/执行（`IsAdminOrReadOnly`）。
+列表 `task_type` 筛选语义 = 包含该类型模块的任务（`steps__task_type`）。
 
-### 任务创建校验规则
+### 保存校验规则（仅内容字段）
 
 | 规则 | 说明 |
 |------|------|
-| 目标主机 | 三类任务均必选 `server_ids` 至少一台（执行主机统一来自平台台账） |
-| 命令任务 | `command` 必填 |
-| playbook 任务 | `playbook` 必填（项目目录内相对路径） |
-| 方法任务 | `method` 必填且启用 |
-| 服务规划 | 所选主机必须已规划服务（见上节） |
-| 超时 | `timeout` 秒，默认 300 |
+| 任务流 | `steps` 至少 1 个模块；编辑时整体替换、序号按提交顺序归一 |
+| 命令模块 | `command` 必填 |
+| playbook 模块 | `playbook` 必填（项目目录内相对路径） |
+| 方法模块 | `method` 必填且启用 |
+| 主机范围 | 任务全局三维度**必选**；模块 `use_custom_scope` 时自定义三维度同样必选 |
+| 执行方式 | `exec_mode` 默认 parallel |
+| 变量 | `ExecVariable.key` 须为合法 ansible 变量名（字母/下划线开头） |
+| 超时 | 模块级 `timeout` 秒，默认 300 |
+
+主机相关校验见上节「执行时校验」。存量数据：0006 迁移将旧单动作任务
+自动平移为单模块任务流。

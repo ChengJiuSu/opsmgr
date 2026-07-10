@@ -69,16 +69,22 @@ const router = createRouter({
           meta: { title: '服务类型' },
         },
         {
+          path: 'task/methods',
+          name: 'TaskMethods',
+          component: () => import('../views/task/Methods.vue'),
+          meta: { title: '方法管理', staff: true },
+        },
+        {
           path: 'task/executions',
           name: 'TaskExecutions',
           component: () => import('../views/task/Executions.vue'),
           meta: { title: '任务执行' },
         },
         {
-          path: 'task/methods',
-          name: 'TaskMethods',
-          component: () => import('../views/task/Methods.vue'),
-          meta: { title: '方法管理', staff: true },
+          path: 'task/variables',
+          name: 'TaskVariables',
+          component: () => import('../views/task/Variables.vue'),
+          meta: { title: '变量管理' },
         },
         {
           path: 'task/credentials',

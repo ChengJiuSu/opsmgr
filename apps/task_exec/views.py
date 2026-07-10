@@ -11,12 +11,14 @@ from rest_framework.views import APIView
 from common.permissions import IsAdmin, IsAdminOrReadOnly
 from common.response import fail, ok
 
-from .models import Credential, ExecutionTask
+from .models import Credential, ExecutionTask, ExecVariable
 from .serializers import (
     CredentialSerializer,
     ExecutionTaskSerializer,
+    ExecVariableSerializer,
     TaskExecutionLogDetailSerializer,
     TaskExecutionLogSerializer,
+    validate_service_planned,
 )
 from .tasks import dispatch
 
@@ -56,13 +58,46 @@ class CredentialViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAdmin]
 
 
-class ExecutionTaskViewSet(viewsets.ModelViewSet):
-    """任务执行：创建即调度执行；普通用户只读，管理员可创建/重跑。"""
+class ExecVariableViewSet(viewsets.ModelViewSet):
+    """执行变量管理：任务执行注入 --extra-vars；亦供外部系统（如 Jenkins）拉取。
 
-    queryset = ExecutionTask.objects.select_related('credential', 'created_by').prefetch_related('servers')
+    普通用户只读，管理员可维护。
+    """
+
+    queryset = ExecVariable.objects.all()
+    serializer_class = ExecVariableSerializer
+    permission_classes = [IsAdminOrReadOnly]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        params = self.request.query_params
+        enabled = params.get('enabled')
+        keyword = params.get('keyword')
+        if enabled in ('true', 'false'):
+            qs = qs.filter(enabled=(enabled == 'true'))
+        if keyword:
+            from django.db.models import Q
+            qs = qs.filter(Q(key__icontains=keyword) | Q(description__icontains=keyword))
+        return qs
+
+
+class ExecutionTaskViewSet(viewsets.ModelViewSet):
+    """任务模块：新建/编辑仅保存定义，执行走 execute 动作（主机按维度实时匹配）。
+
+    普通用户只读，管理员可保存/编辑/执行。
+    """
+
+    queryset = (
+        ExecutionTask.objects
+        .select_related('credential', 'created_by', 'project_group', 'channel', 'environment')
+        .prefetch_related(
+            'servers',
+            'steps__method', 'steps__project_group', 'steps__channel', 'steps__environment',
+        )
+    )
     serializer_class = ExecutionTaskSerializer
     permission_classes = [IsAdminOrReadOnly]
-    http_method_names = ['get', 'post', 'delete', 'head', 'options']
+    http_method_names = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options']
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -71,7 +106,8 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
         status = params.get('status')
         keyword = params.get('keyword')
         if task_type:
-            qs = qs.filter(task_type=task_type)
+            # 类型下沉到模块后，筛选语义 = 包含该类型模块的任务
+            qs = qs.filter(steps__task_type=task_type).distinct()
         if status:
             qs = qs.filter(status=status)
         if keyword:
@@ -79,22 +115,92 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
         return qs
 
     def perform_create(self, serializer):
-        task = serializer.save(created_by=self.request.user, status='pending')
-        dispatch(task, triggered_by=self.request.user, trigger_type='create')
+        # 仅保存任务定义，不触发执行
+        serializer.save(created_by=self.request.user)
+
+    def update(self, request, *args, **kwargs):
+        if self.get_object().status == 'running':
+            return fail('任务正在执行中，无法编辑')
+        return super().update(request, *args, **kwargs)
+
+    @action(detail=True, methods=['get'])
+    def matched_servers(self, request, pk=None):
+        """执行表单数据源：全局范围匹配主机 + 各模块的主机来源与自定义匹配结果。"""
+        from apps.asset_mgr.serializers import ServerSerializer
+
+        task = self.get_object()
+        global_servers = list(task.matched_servers())
+        steps = []
+        for step in task.steps.all():
+            entry = {
+                'order': step.order, 'name': step.name, 'task_type': step.task_type,
+                'task_type_display': step.get_task_type_display(),
+                'custom': step.use_custom_scope,
+            }
+            if step.use_custom_scope:
+                servers = list(step.matched_servers())
+                entry['total'] = len(servers)
+                entry['servers'] = ServerSerializer(servers, many=True).data
+            else:
+                entry['total'] = len(global_servers)
+            steps.append(entry)
+        return ok({
+            'global': {'results': ServerSerializer(global_servers, many=True).data, 'total': len(global_servers)},
+            'steps': steps,
+        })
 
     @action(detail=True, methods=['post'])
-    def rerun(self, request, pk=None):
+    def execute(self, request, pk=None):
+        """执行任务流。body.server_ids 可选，仅作用于全局范围模块（缺省=全部全局匹配主机）；
+        自定义范围模块按其维度全量执行。逐模块校验主机非空与方法服务规划。"""
         task = self.get_object()
         if task.status == 'running':
-            return fail('任务正在执行中，无法重跑')
+            return fail('任务正在执行中，请等待完成后再发起')
+        steps = list(task.steps.all())
+        if not steps:
+            return fail('任务未配置任何模块，请先编辑任务添加模块')
+        # 兜底存量任务：主机范围三维度必选，未选齐不予执行
+        if not (task.project_group_id and task.channel_id and task.environment_id):
+            return fail('任务未配置完整的主机范围（项目组/渠道/环境必选），请先编辑任务补全')
+
+        # 全局范围主机：维度匹配 ∩ 勾选子集
+        matched = {s.id: s for s in task.matched_servers()}
+        server_ids = request.data.get('server_ids')
+        if server_ids is None:
+            selected_global = list(matched.values())
+        else:
+            if not isinstance(server_ids, list):
+                return fail('server_ids 必须为主机 id 数组（缺省表示全部全局匹配主机）')
+            invalid = [i for i in server_ids if i not in matched]
+            if invalid:
+                return fail(f'主机 id {invalid} 不在全局范围匹配集内，请刷新执行页面后重试')
+            selected_global = [matched[i] for i in server_ids]
+
+        # 逐模块解析主机并校验执行条件
+        for step in steps:
+            servers = list(step.matched_servers()) if step.use_custom_scope else selected_global
+            if not servers:
+                scope = '自定义范围维度未匹配到可执行主机' if step.use_custom_scope \
+                    else '全局范围未匹配/未勾选任何主机'
+                return fail(f'模块「{step.name}」{scope}，无法执行')
+            if step.task_type == 'method':
+                error = validate_service_planned(step.method, servers)
+                if error:
+                    return fail(f'模块「{step.name}」：{error}')
+
+        # 固化全局范围主机到任务快照，重置最近一次执行状态
+        task.servers.set(selected_global)
         task.status = 'pending'
         task.return_code = None
         task.output = ''
         task.started_at = None
         task.finished_at = None
         task.save(update_fields=['status', 'return_code', 'output', 'started_at', 'finished_at'])
-        dispatch(task, triggered_by=request.user, trigger_type='rerun')
-        return ok(ExecutionTaskSerializer(task).data, msg='已重新调度执行')
+        log = dispatch(task, triggered_by=request.user, trigger_type='execute')
+        return ok(
+            {'task': ExecutionTaskSerializer(task).data, 'log_id': log.id, 'step_count': len(steps)},
+            msg=f'已发起执行（{len(steps)} 个模块，{task.get_exec_mode_display()}）',
+        )
 
     @action(detail=True, methods=['get'])
     def output(self, request, pk=None):

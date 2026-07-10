@@ -61,9 +61,9 @@ def execute_task(task_id, log_id=None):
     task.save(update_fields=['status', 'started_at'])
     log.save(update_fields=['status', 'started_at'])
 
-    rc, output, status = -1, '', 'failed'
+    rc, output, status, steps_result = -1, '', 'failed', []
     try:
-        rc, output = runner.run(task)
+        rc, output, steps_result = runner.run(task)
         output = output or ''
         status = 'success' if rc == 0 else 'failed'
     except Exception as exc:  # noqa: BLE001 - 兜底，保证状态落库
@@ -77,9 +77,10 @@ def execute_task(task_id, log_id=None):
         task.save(update_fields=['return_code', 'output', 'status', 'finished_at'])
 
         log.return_code, log.output, log.status, log.finished_at = rc, preview, status, finished_at
+        log.steps_result = steps_result
         if len(output) > OUTPUT_PREVIEW_LIMIT:
             log.log_file = _persist_full_output(log, output)
-        log.save(update_fields=['return_code', 'output', 'status', 'finished_at', 'log_file'])
+        log.save(update_fields=['return_code', 'output', 'status', 'finished_at', 'log_file', 'steps_result'])
 
 
 def _run_in_thread(task_id, log_id):
@@ -94,14 +95,16 @@ def _run_in_thread(task_id, log_id):
     threading.Thread(target=_worker, daemon=True).start()
 
 
-def dispatch(task, triggered_by=None, trigger_type='create'):
-    """创建本次执行的日志记录，并按配置的后端调度执行。"""
+def dispatch(task, triggered_by=None, trigger_type='execute'):
+    """创建本次执行的日志记录（含执行范围快照），并按配置的后端调度执行。"""
     from .models import TaskExecutionLog
 
     log = TaskExecutionLog.objects.create(
         task=task,
         trigger_type=trigger_type,
         triggered_by=triggered_by or task.created_by,
+        exec_mode=task.exec_mode,
+        servers_snapshot=[{'id': s.id, 'name': s.name, 'ip': s.ip} for s in task.servers.all()],
     )
     backend = getattr(settings, 'TASK_EXEC_BACKEND', 'thread')
     if backend == 'sync':

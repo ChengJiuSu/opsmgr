@@ -1,18 +1,27 @@
-"""任务执行分派。
+"""任务执行分派（任务流）。
 
-三类任务（command / playbook / method）的执行主机统一来自所选服务器，
-执行时生成临时动态 inventory（含服务类型分组），未规划服务的主机拦截：
+任务 = 任务流：模块（TaskStep）按 order 顺序执行，任一模块失败即中止
+后续模块；模块内主机按任务 exec_mode 并发/串行（串行 = --forks 1）。
 
+每个模块执行前解析主机并生成临时动态 inventory：
+  - 全局范围模块：任务 servers 快照（执行时勾选的全局范围主机）；
+  - 自定义范围模块：按模块自己的维度实时匹配（仅已规划服务的主机）。
+
+模块类型：
   - command ：ansible ad-hoc shell。
-  - playbook：ANSIBLE_PROJECT_DIR 内既有剧本，ansible-playbook + 动态 inventory。
-  - method  ：委托 method_mgr 对应 provider 执行器，动态 inventory 由本模块
-              生成后传入（ansible_playbook provider 即「剧本 + 平台管理的 tags」）。
+  - playbook：ANSIBLE_PROJECT_DIR 内既有剧本。
+  - method  ：委托 method_mgr 对应 provider 执行器（传入 step，其
+              tags/extra_vars/timeout 为模块级、exec_mode 透传任务级）。
+
+run(task) 返回 (return_code, output, steps_result)。
 """
+import json
 import logging
 import os
 import re
 import shutil
 import tempfile
+import time
 
 from django.conf import settings
 
@@ -55,10 +64,10 @@ def _unplanned_servers(servers):
 
 
 def _inventory_content(servers, credential, workdir):
-    """生成 INI 格式动态 inventory（命令任务用）。
+    """生成 INI 格式动态 inventory。
 
     以主机名为 inventory 别名（ansible 日志按主机名显示执行结果），并从服务概要
-    注入 service_types 主机变量，同时按服务类型 code 生成分组，供 pattern 圈选。
+    注入 service_types 主机变量，同时按服务类型 code 生成分组，供剧本圈选。
     """
     lines = []
     key_file = None
@@ -101,22 +110,6 @@ def _inventory_content(servers, credential, workdir):
     return '\n'.join(lines) + '\n'
 
 
-def _prepare_servers(task):
-    """三类任务共用的执行前置：取目标主机并做服务规划兜底校验。
-
-    创建时序列化器已拦截，此处兜底重跑时规划已变更的情况。
-    返回 (servers, error)，error 非空表示不允许执行。
-    """
-    servers = list(task.servers.all())
-    if not servers:
-        return None, '未选择任何目标主机。'
-    unplanned = _unplanned_servers(servers)
-    if unplanned:
-        names = '、'.join(f'{s.name}({s.ip})' for s in unplanned)
-        return None, f'主机 {names} 未规划任何服务类型，不允许执行，请先在「配置管理 → 服务器分配」完成服务规划。'
-    return servers, None
-
-
 def _write_inventory(servers, credential, workdir):
     """在临时工作目录内生成动态 inventory 文件，返回文件路径。"""
     inventory_path = os.path.join(workdir, 'inventory.ini')
@@ -125,64 +118,86 @@ def _write_inventory(servers, credential, workdir):
     return inventory_path
 
 
-def _playbook_args(task):
-    """拼装 playbook / 方法任务共用的 ansible-playbook 追加参数。"""
+def _forks_args(task):
+    """执行方式参数：串行 = --forks 1 逐台执行；并发用 ansible 默认并发数。"""
+    return ['--forks', '1'] if task.exec_mode == 'serial' else []
+
+
+def extra_vars_args(step):
+    """拼装 --extra-vars 参数：先注入「变量管理」全部启用变量（JSON），
+    模块自身的额外变量作为后一个 -e 传入（ansible 后者覆盖前者同名项）。
+    """
+    from .models import ExecVariable
+
     args = []
-    if (task.tags or '').strip():
-        args += ['--tags', task.tags.strip()]
-    if (task.limit or '').strip():
-        args += ['--limit', task.limit.strip()]
-    if (task.extra_vars or '').strip():
-        args += ['--extra-vars', task.extra_vars.strip()]
+    variables = {v.key: v.value for v in ExecVariable.objects.filter(enabled=True)}
+    if variables:
+        args += ['--extra-vars', json.dumps(variables, ensure_ascii=False)]
+    if (getattr(step, 'extra_vars', '') or '').strip():
+        args += ['--extra-vars', step.extra_vars.strip()]
     return args
 
 
-def _run_command(task):
-    servers, error = _prepare_servers(task)
-    if error:
-        return 1, error
-    if not task.command.strip():
-        return 1, '命令内容为空。'
+def _step_servers(step, task):
+    """解析模块的执行主机：自定义范围实时匹配，否则用任务全局范围快照。"""
+    if step.use_custom_scope:
+        return list(step.matched_servers())
+    return list(task.servers.all())
 
+
+def _guard(servers):
+    """模块执行前置：主机非空且均已规划服务（兜底执行排队期间规划被撤销）。"""
+    if not servers:
+        return '未匹配到可执行主机（自定义范围维度无主机，或全局范围未勾选）。'
+    unplanned = _unplanned_servers(servers)
+    if unplanned:
+        names = '、'.join(f'{s.name}({s.ip})' for s in unplanned)
+        return f'主机 {names} 未规划任何服务类型，不允许执行，请先在「配置管理 → 服务器分配」完成服务规划。'
+    return None
+
+
+def _run_command_step(step, task, servers):
+    if not step.command.strip():
+        return 1, '命令内容为空。'
     workdir = tempfile.mkdtemp(prefix='ops_cmd_')
     try:
         inventory_path = _write_inventory(servers, task.credential, workdir)
-        cmd = ['ansible', task.pattern or 'all', '-i', inventory_path, '-m', 'shell', '-a', task.command]
-        return run_subprocess(cmd, timeout=task.timeout or 300)
+        cmd = ['ansible', 'all', '-i', inventory_path] + _forks_args(task) \
+            + extra_vars_args(step) + ['-m', 'shell', '-a', step.command]
+        return run_subprocess(cmd, timeout=step.timeout or 300)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def _run_playbook(task):
-    """执行 ANSIBLE_PROJECT_DIR 内的既有剧本，主机来自所选服务器（动态 inventory）。"""
-    servers, error = _prepare_servers(task)
-    if error:
-        return 1, error
+def _run_playbook_step(step, task, servers):
     project_dir = getattr(settings, 'ANSIBLE_PROJECT_DIR', '')
     if not project_dir or not os.path.isdir(project_dir):
         return 1, f'Ansible 项目目录不存在：{project_dir!r}（请配置 ANSIBLE_PROJECT_DIR）'
-    if not (task.playbook or '').strip():
+    if not (step.playbook or '').strip():
         return 1, '未指定剧本文件。'
     try:
-        playbook_path = resolve_within(project_dir, task.playbook.strip())
+        playbook_path = resolve_within(project_dir, step.playbook.strip())
     except ValueError as exc:
         return 1, str(exc)
     if not os.path.isfile(playbook_path):
-        return 1, f'剧本文件不存在：{task.playbook}'
+        return 1, f'剧本文件不存在：{step.playbook}'
 
     workdir = tempfile.mkdtemp(prefix='ops_pb_')
     try:
         inventory_path = _write_inventory(servers, task.credential, workdir)
-        cmd = ['ansible-playbook', playbook_path, '-i', inventory_path] + _playbook_args(task)
-        return run_subprocess(cmd, timeout=task.timeout or 300, cwd=project_dir)
+        cmd = ['ansible-playbook', playbook_path, '-i', inventory_path] + _forks_args(task)
+        if (step.tags or '').strip():
+            cmd += ['--tags', step.tags.strip()]
+        cmd += extra_vars_args(step)
+        return run_subprocess(cmd, timeout=step.timeout or 300, cwd=project_dir)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def _run_method(task):
+def _run_method_step(step, task, servers):
     from apps.method_mgr.executors import get_executor
 
-    method = task.method
+    method = step.method
     if method is None:
         return 1, '未指定平台方法。'
     if not method.enabled:
@@ -192,22 +207,63 @@ def _run_method(task):
     except KeyError:
         return 1, f'未知 provider：{method.provider}'
 
-    # 方法任务的主机同样来自平台：生成动态 inventory 交给执行器
-    servers, error = _prepare_servers(task)
-    if error:
-        return 1, error
     workdir = tempfile.mkdtemp(prefix='ops_mtd_')
     try:
         inventory_path = _write_inventory(servers, task.credential, workdir)
-        return executor.execute(task, method, inventory_path=inventory_path)
+        # 执行器按 step 读取 tags/extra_vars/timeout（模块级）与 exec_mode（透传任务级）
+        return executor.execute(step, method, inventory_path=inventory_path)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+_STEP_HANDLERS = {
+    'command': _run_command_step,
+    'playbook': _run_playbook_step,
+    'method': _run_method_step,
+}
+
+
 def run(task):
-    """执行任务，返回 (return_code, output)。"""
-    if task.task_type == 'method':
-        return _run_method(task)
-    if task.task_type == 'playbook':
-        return _run_playbook(task)
-    return _run_command(task)
+    """按 order 顺序执行任务流的全部模块，返回 (return_code, output, steps_result)。
+
+    任一模块失败（rc != 0）即中止，后续模块标记 skipped。
+    """
+    steps = list(task.steps.all())
+    if not steps:
+        return 1, '任务未配置任何模块，请编辑任务后重试。', []
+
+    outputs, results = [], []
+    total = len(steps)
+    failed_rc = None
+    for idx, step in enumerate(steps, 1):
+        if failed_rc is not None:
+            results.append({
+                'order': step.order, 'name': step.name, 'task_type': step.task_type,
+                'status': 'skipped', 'return_code': None, 'duration': None, 'server_count': None,
+            })
+            continue
+
+        servers = _step_servers(step, task)
+        scope = '自定义范围' if step.use_custom_scope else '全局范围'
+        header = f'═══ 模块 {idx}/{total}：{step.name}（{step.get_task_type_display()} · {scope} {len(servers)} 台）═══'
+        started = time.monotonic()
+        error = _guard(servers)
+        if error:
+            rc, out = 1, error
+        else:
+            rc, out = _STEP_HANDLERS[step.task_type](step, task, servers)
+        duration = round(time.monotonic() - started, 2)
+
+        outputs.append(f'{header}\n{out}')
+        results.append({
+            'order': step.order, 'name': step.name, 'task_type': step.task_type,
+            'status': 'success' if rc == 0 else 'failed', 'return_code': rc,
+            'duration': duration, 'server_count': len(servers),
+        })
+        if rc != 0:
+            failed_rc = rc
+            remaining = total - idx
+            if remaining:
+                outputs.append(f'✖ 模块「{step.name}」执行失败，中止后续 {remaining} 个模块。')
+
+    return (failed_rc if failed_rc is not None else 0), '\n\n'.join(outputs), results

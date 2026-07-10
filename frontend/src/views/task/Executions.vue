@@ -1,10 +1,10 @@
 <template>
+  <!-- 任务列表 -->
   <el-card shadow="never">
-    <!-- 工具栏 -->
     <div class="toolbar">
       <div class="toolbar-left">
         <el-input v-model="filter.keyword" placeholder="任务名称" clearable style="width:160px" @keyup.enter="handleSearch" @clear="handleSearch" />
-        <el-select v-model="filter.task_type" placeholder="类型" clearable style="width:120px" @change="handleSearch">
+        <el-select v-model="filter.task_type" placeholder="包含模块类型" clearable style="width:140px" @change="handleSearch">
           <el-option label="命令" value="command" />
           <el-option label="Playbook" value="playbook" />
           <el-option label="平台方法" value="method" />
@@ -18,28 +18,38 @@
         <el-button :icon="Search" @click="handleSearch">查询</el-button>
         <el-button :icon="Refresh" @click="fetchData">刷新</el-button>
       </div>
-      <el-button v-if="authStore.isStaff" type="primary" :icon="Plus" @click="openDialog">新建任务</el-button>
+      <el-button v-if="authStore.isStaff" type="primary" :icon="Plus" @click="openForm()">新建任务</el-button>
     </div>
 
-    <!-- 表格 -->
     <el-table v-loading="loading" :data="tableData" stripe>
-      <el-table-column prop="name" label="任务名称" min-width="140" show-overflow-tooltip />
-      <el-table-column label="类型" width="100">
+      <el-table-column prop="name" label="任务名称" min-width="130" show-overflow-tooltip />
+      <el-table-column label="任务流" min-width="180">
         <template #default="{ row }">
-          <el-tag size="small" :type="typeTagType(row.task_type)">
-            {{ row.task_type_display }}
+          <el-tooltip :content="flowTooltip(row)" placement="top">
+            <span class="flow-cell">
+              <el-tag
+                v-for="s in row.steps" :key="s.id"
+                size="small" :type="typeTagType(s.task_type)" effect="plain" class="flow-tag"
+              >{{ s.task_type_display }}</el-tag>
+            </span>
+          </el-tooltip>
+        </template>
+      </el-table-column>
+      <el-table-column label="项目组 / 渠道 / 环境" min-width="160" show-overflow-tooltip>
+        <template #default="{ row }">
+          <span :class="{ unset: !row.project_group_name }">{{ row.project_group_name || '不限' }}</span> /
+          <span :class="{ unset: !row.channel_name }">{{ row.channel_name || '不限' }}</span> /
+          <span :class="{ unset: !row.environment_name, prod: row.environment_is_prod }">{{ row.environment_name || '不限' }}</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="执行方式" width="90">
+        <template #default="{ row }">
+          <el-tag size="small" :type="row.exec_mode === 'serial' ? 'warning' : 'info'" effect="plain">
+            {{ row.exec_mode_display }}
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="内容 / 目标" min-width="180" show-overflow-tooltip>
-        <template #default="{ row }">
-          <span v-if="row.task_type === 'method'">{{ row.method_name || '-' }}<span v-if="row.tags" class="muted"> · {{ row.tags }}</span></span>
-          <span v-else-if="row.task_type === 'playbook'">{{ row.playbook || '-' }}<span v-if="row.tags" class="muted"> · {{ row.tags }}</span></span>
-          <span v-else class="muted">{{ (row.command || '').slice(0, 40) || '-' }}</span>
-          <span class="muted"> · {{ row.servers?.length || 0 }} 台</span>
-        </template>
-      </el-table-column>
-      <el-table-column label="状态" width="100">
+      <el-table-column label="最近状态" width="100">
         <template #default="{ row }">
           <el-tag size="small" :type="statusType(row.status)">
             <el-icon v-if="row.status === 'running'" class="is-loading"><Loading /></el-icon>
@@ -47,20 +57,18 @@
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="返回码" width="80">
-        <template #default="{ row }">{{ row.return_code ?? '-' }}</template>
-      </el-table-column>
       <el-table-column label="耗时" width="80">
         <template #default="{ row }">{{ row.duration != null ? row.duration + 's' : '-' }}</template>
       </el-table-column>
-      <el-table-column prop="created_by_name" label="发起人" width="100" />
+      <el-table-column prop="created_by_name" label="发起人" width="90" />
       <el-table-column prop="created_at" label="创建时间" width="160">
         <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
       </el-table-column>
-      <el-table-column label="操作" width="200" fixed="right">
+      <el-table-column label="操作" width="280" fixed="right">
         <template #default="{ row }">
-          <el-button size="small" :icon="View" @click="openOutput(row)">输出</el-button>
-          <el-button v-if="authStore.isStaff" size="small" :icon="RefreshRight" :disabled="row.status === 'running'" @click="handleRerun(row)">重跑</el-button>
+          <el-button v-if="authStore.isStaff" size="small" type="primary" :icon="CaretRight" :disabled="row.status === 'running'" @click="openExec(row)">执行</el-button>
+          <el-button v-if="authStore.isStaff" size="small" :icon="EditPen" :disabled="row.status === 'running'" @click="openForm(row)">编辑</el-button>
+          <el-button size="small" :icon="View" @click="openLogs(row)">日志</el-button>
           <el-button v-if="authStore.isStaff" size="small" type="danger" :icon="Delete" @click="handleDelete(row)" />
         </template>
       </el-table-column>
@@ -77,139 +85,314 @@
     />
   </el-card>
 
-  <!-- 新建任务弹窗 -->
-  <el-dialog v-model="dialogVisible" title="新建执行任务" width="640px" top="6vh">
-    <el-form ref="formRef" :model="form" :rules="rules" label-width="90px">
-      <el-form-item label="任务名称" prop="name">
-        <el-input v-model="form.name" placeholder="如：重启 nginx" />
-      </el-form-item>
-      <el-form-item label="任务类型">
-        <el-radio-group v-model="form.task_type">
-          <el-radio-button value="command">命令</el-radio-button>
-          <el-radio-button value="playbook">Playbook</el-radio-button>
-          <el-radio-button value="method">平台方法</el-radio-button>
-        </el-radio-group>
-      </el-form-item>
-
-      <!-- 命令模式 -->
-      <el-form-item v-if="form.task_type === 'command'" label="Shell 命令" prop="command">
-        <el-input v-model="form.command" type="textarea" :rows="3" placeholder="如：systemctl restart nginx" />
-      </el-form-item>
-
-      <!-- Playbook 模式 -->
-      <el-form-item v-if="form.task_type === 'playbook'" label="剧本文件" prop="playbook">
-        <el-select v-model="form.playbook" filterable placeholder="选择 Ansible 项目目录内的剧本" style="width:100%">
-          <el-option v-for="p in playbookOptions" :key="p" :label="p" :value="p" />
-        </el-select>
-      </el-form-item>
-
-      <!-- 平台方法模式 -->
-      <template v-if="form.task_type === 'method'">
-        <el-form-item label="平台方法" prop="method">
-          <el-select v-model="form.method" filterable placeholder="选择已启用的方法" style="width:100%" @change="onMethodChange">
-            <el-option v-for="m in methodOptions" :key="m.id" :label="`${m.name} (${m.provider_display})`" :value="m.id" />
-          </el-select>
-        </el-form-item>
-        <el-alert v-if="selectedMethod" type="info" :closable="false" style="margin-bottom:12px">
-          <template v-if="selectedMethod.provider === 'ansible_playbook'">
-            剧本：<code>{{ selectedMethod.config?.playbook }}</code>
-            <span v-if="selectedMethod.config?.tags"> · 默认 tags：<code>{{ selectedMethod.config.tags }}</code></span>
-          </template>
-          <template v-else>{{ selectedMethod.provider_display }}（预留 provider）</template>
-        </el-alert>
-      </template>
-
-      <!-- 目标主机（三类任务共用）：按项目/渠道/环境筛选，仅显示已规划服务的主机 -->
-      <el-form-item label="目标主机" prop="server_ids">
-        <div class="dim-filter">
-          <el-select v-model="dimFilter.project_group" placeholder="项目组" clearable filterable @change="loadServers">
-            <el-option v-for="d in dictOptions.projects" :key="d.id" :label="d.name" :value="d.id" />
-          </el-select>
-          <el-select v-model="dimFilter.channel" placeholder="渠道" clearable filterable @change="loadServers">
-            <el-option v-for="d in dictOptions.channels" :key="d.id" :label="d.name" :value="d.id" />
-          </el-select>
-          <el-select v-model="dimFilter.env" placeholder="环境" clearable filterable @change="loadServers">
-            <el-option v-for="d in dictOptions.envs" :key="d.id" :label="d.name" :value="d.id" />
-          </el-select>
-        </div>
-        <el-select
-          v-model="form.server_ids" multiple filterable clearable
-          :loading="serversLoading" placeholder="选择目标服务器" style="width:100%"
+  <!-- 执行日志面板（任务列表下方） -->
+  <el-card v-if="logPanel.task" ref="logPanelRef" shadow="never" style="margin-top: 16px">
+    <template #header>
+      <div class="log-header">
+        <span>
+          执行日志 — {{ logPanel.task.name }}
+          <el-tag size="small" :type="statusType(logPanel.task.status)" style="margin-left:8px">
+            <el-icon v-if="logPanel.task.status === 'running'" class="is-loading"><Loading /></el-icon>
+            {{ logPanel.task.status_display || logPanel.task.status }}
+          </el-tag>
+        </span>
+        <el-button size="small" text :icon="Close" @click="closeLogs">关闭</el-button>
+      </div>
+    </template>
+    <div class="log-body">
+      <div class="log-list">
+        <el-table
+          :data="logPanel.logs" size="small" highlight-current-row
+          :row-class-name="() => 'log-row'"
+          @current-change="selectLog"
+          ref="logTableRef"
         >
-          <el-option v-for="s in serverOptions" :key="s.id" :label="serverLabel(s)" :value="s.id" />
-        </el-select>
-        <div class="form-tip">
-          仅显示已在「服务器分配」中规划服务的主机（未分配服务的主机不具备执行条件），可按项目组/渠道/环境缩小范围
+          <el-table-column label="执行时间" min-width="130">
+            <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
+          </el-table-column>
+          <el-table-column prop="triggered_by_name" label="触发人" width="80" />
+          <el-table-column label="模块" width="70">
+            <template #default="{ row }">
+              <span :class="{ danger: stepsFailed(row) }">{{ stepsSummary(row) }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="主机" width="60">
+            <template #default="{ row }">{{ row.server_count }}台</template>
+          </el-table-column>
+          <el-table-column label="方式" width="60">
+            <template #default="{ row }">{{ row.exec_mode === 'serial' ? '串行' : '并发' }}</template>
+          </el-table-column>
+          <el-table-column label="状态" width="80">
+            <template #default="{ row }">
+              <el-tag size="small" :type="statusType(row.status)">{{ row.status_display }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="耗时" width="70">
+            <template #default="{ row }">{{ row.duration != null ? row.duration + 's' : '-' }}</template>
+          </el-table-column>
+        </el-table>
+      </div>
+      <div class="log-output">
+        <div class="output-meta">
+          <span v-if="logPanel.current">返回码：{{ logPanel.current.return_code ?? '-' }}</span>
+          <span v-if="currentServers" class="muted">{{ currentServers }}</span>
+          <el-tag v-if="logPanel.polling" type="info" size="small">实时刷新中…</el-tag>
         </div>
-      </el-form-item>
+        <pre class="output-box">{{ logPanel.output || '（暂无输出）' }}</pre>
+      </div>
+    </div>
+  </el-card>
 
+  <!-- 新建 / 编辑任务弹窗（任务流定义，仅保存不执行） -->
+  <el-dialog v-model="formVisible" :title="form.id ? '编辑任务' : '新建任务'" width="760px" top="4vh">
+    <el-form ref="formRef" :model="form" :rules="rules" label-width="90px">
       <el-row :gutter="16">
         <el-col :span="12">
-          <el-form-item label="连接凭据">
-            <el-select v-model="form.credential" clearable placeholder="默认免密/密钥" style="width:100%">
+          <el-form-item label="任务名称" prop="name">
+            <el-input v-model="form.name" placeholder="如：版本发布流程" />
+          </el-form-item>
+        </el-col>
+        <el-col :span="6">
+          <el-form-item label="执行方式" label-width="76px">
+            <el-radio-group v-model="form.exec_mode">
+              <el-radio-button value="parallel">并发</el-radio-button>
+              <el-radio-button value="serial">串行</el-radio-button>
+            </el-radio-group>
+          </el-form-item>
+        </el-col>
+        <el-col :span="6">
+          <el-form-item label="凭据" label-width="50px">
+            <el-select v-model="form.credential" clearable placeholder="免密/密钥" style="width:100%">
               <el-option v-for="c in credentialOptions" :key="c.id" :label="c.name" :value="c.id" />
             </el-select>
           </el-form-item>
         </el-col>
-        <el-col :span="12">
-          <el-form-item v-if="form.task_type === 'command'" label="主机匹配">
-            <el-input v-model="form.pattern" placeholder="ansible 主机模式，默认 all" />
-          </el-form-item>
-          <el-form-item v-else label="Limit">
-            <el-input v-model="form.limit" placeholder="进一步限定主机/分组，可留空" />
-          </el-form-item>
-        </el-col>
       </el-row>
 
-      <!-- Ansible 参数（playbook / 方法任务） -->
-      <template v-if="form.task_type !== 'command'">
-        <el-form-item v-if="form.task_type === 'playbook' || selectedMethod?.provider === 'ansible_playbook'" label="Tags">
-          <el-input
-            v-model="form.tags"
-            :placeholder="form.task_type === 'method' ? `留空用方法默认：${selectedMethod?.config?.tags || '（全部）'}` : '如 nginx,restart，留空执行全部'"
-          />
-        </el-form-item>
-        <el-form-item label="额外变量">
-          <el-input v-model="form.extra_vars" type="textarea" :rows="2" placeholder="--extra-vars，如 key=val 或 JSON" />
-        </el-form-item>
-      </template>
-
-      <el-form-item label="超时(秒)">
-        <el-input-number v-model="form.timeout" :min="10" :max="3600" style="width:100%" />
+      <!-- 全局主机范围（三维度必选，不再支持留空=不限） -->
+      <el-form-item label="全局范围" required>
+        <div class="dim-filter">
+          <el-select v-model="form.project_group" placeholder="项目组（必选）" filterable @change="updateMatchedCount">
+            <el-option v-for="d in dictOptions.projects" :key="d.id" :label="d.name" :value="d.id" />
+          </el-select>
+          <el-select v-model="form.channel" placeholder="渠道（必选）" filterable @change="updateMatchedCount">
+            <el-option v-for="d in dictOptions.channels" :key="d.id" :label="d.name" :value="d.id" />
+          </el-select>
+          <el-select v-model="form.environment" placeholder="环境（必选）" filterable @change="updateMatchedCount">
+            <el-option v-for="d in dictOptions.envs" :key="d.id" :label="d.name" :value="d.id" />
+          </el-select>
+        </div>
+        <div class="form-tip">
+          任务流的默认主机范围，项目组/渠道/环境<b>必选</b>（未选齐不予保存与执行），当前匹配
+          <b :class="{ danger: matchedCount === 0 }">{{ matchedCount ?? '…' }}</b> 台可执行主机；
+          模块可单独指定范围，具体主机在「执行」时确认
+        </div>
       </el-form-item>
+
+      <!-- 任务流模块列表 -->
+      <el-divider content-position="left">任务流（{{ form.steps.length }} 个模块，按序执行，失败中止）</el-divider>
+      <div v-for="(step, i) in form.steps" :key="i" class="step-card">
+        <div class="step-head">
+          <el-tag size="small" type="info" effect="dark" class="step-no">{{ i + 1 }}</el-tag>
+          <el-input v-model="step.name" :placeholder="`模块名称，如：${stepNamePlaceholder(step)}`" style="width:200px" size="small" />
+          <el-radio-group v-model="step.task_type" size="small">
+            <el-radio-button value="command">命令</el-radio-button>
+            <el-radio-button value="playbook">Playbook</el-radio-button>
+            <el-radio-button value="method">平台方法</el-radio-button>
+          </el-radio-group>
+          <span class="step-actions">
+            <el-button size="small" text :icon="Top" :disabled="i === 0" @click="moveStep(i, -1)" />
+            <el-button size="small" text :icon="Bottom" :disabled="i === form.steps.length - 1" @click="moveStep(i, 1)" />
+            <el-button size="small" text type="danger" :icon="Delete" :disabled="form.steps.length === 1" @click="form.steps.splice(i, 1)" />
+          </span>
+        </div>
+
+        <div class="step-body">
+          <el-input
+            v-if="step.task_type === 'command'"
+            v-model="step.command" type="textarea" :rows="2" placeholder="Shell 命令，如：systemctl restart nginx"
+          />
+          <!-- playbook 模块直接选「方法管理」登记的 Ansible 剧本方法（provider 区分），剧本/tags 取自方法配置 -->
+          <template v-if="step.task_type === 'playbook'">
+            <el-select
+              v-model="step.pbMethod" filterable style="width:100%"
+              placeholder="选择方法管理登记的 Ansible 剧本方法"
+              no-data-text="方法管理暂无 Ansible 剧本类方法，请先登记"
+              @change="onPbMethodChange(step)"
+            >
+              <el-option v-for="m in playbookMethods" :key="m.id" :label="`${m.name}（${m.config?.playbook || '-'}）`" :value="m.id" />
+            </el-select>
+            <div v-if="pbMethodInfo(step)" class="form-tip">
+              剧本：<code>{{ pbMethodInfo(step).config?.playbook }}</code>
+              · 可选 tags：<code>{{ pbMethodInfo(step).config?.tags || '（未登记，留空执行全部）' }}</code>
+            </div>
+          </template>
+          <template v-if="step.task_type === 'method'">
+            <el-select
+              v-model="step.method" filterable style="width:100%"
+              placeholder="选择已启用的平台方法（非剧本类 provider）"
+              no-data-text="方法管理暂无其他 provider 的平台方法"
+              @change="step.tagsArr = []"
+            >
+              <el-option v-for="m in otherMethods" :key="m.id" :label="`${m.name} (${m.provider_display})`" :value="m.id" />
+            </el-select>
+          </template>
+
+          <!-- tags 统一取自「方法管理」登记：playbook 模块=该剧本关联方法的 tags 并集；方法模块=该方法自己的 tags -->
+          <div v-if="step.task_type !== 'command'" class="step-row">
+            <el-select
+              v-model="step.tagsArr" multiple filterable clearable collapse-tags size="small" style="flex:1"
+              :placeholder="step.task_type === 'method' ? 'Tags 覆盖（留空用方法默认）' : 'Tags（留空执行全部）'"
+              :no-data-text="step.task_type === 'playbook' ? '方法管理中未登记该剧本的 tags' : '该方法未配置 tags'"
+            >
+              <el-option v-for="t in stepTagOptions(step)" :key="t" :label="t" :value="t" />
+            </el-select>
+            <el-input v-model="step.extra_vars" placeholder="额外变量 --extra-vars（可留空）" style="flex:2" size="small" />
+          </div>
+
+          <div class="step-row">
+            <span class="step-label">超时</span>
+            <el-input-number v-model="step.timeout" :min="10" :max="3600" size="small" style="width:130px" />
+            <span class="step-label">主机范围</span>
+            <el-radio-group v-model="step.use_custom_scope" size="small">
+              <el-radio-button :value="false">跟随全局</el-radio-button>
+              <el-radio-button :value="true">自定义</el-radio-button>
+            </el-radio-group>
+            <template v-if="step.use_custom_scope">
+              <el-select v-model="step.project_group" placeholder="项目组" clearable size="small" style="width:120px" @change="updateStepCount(step)">
+                <el-option v-for="d in dictOptions.projects" :key="d.id" :label="d.name" :value="d.id" />
+              </el-select>
+              <el-select v-model="step.channel" placeholder="渠道" clearable size="small" style="width:110px" @change="updateStepCount(step)">
+                <el-option v-for="d in dictOptions.channels" :key="d.id" :label="d.name" :value="d.id" />
+              </el-select>
+              <el-select v-model="step.environment" placeholder="环境" clearable size="small" style="width:110px" @change="updateStepCount(step)">
+                <el-option v-for="d in dictOptions.envs" :key="d.id" :label="d.name" :value="d.id" />
+              </el-select>
+              <span class="form-tip" style="margin:0">匹配 <b :class="{ danger: step._matched === 0 }">{{ step._matched ?? '…' }}</b> 台</span>
+            </template>
+          </div>
+        </div>
+      </div>
+      <el-button size="small" :icon="Plus" style="width:100%" @click="addStep">添加模块</el-button>
     </el-form>
-    <el-alert type="warning" :closable="false" show-icon style="margin-bottom: 4px">
-      任务将通过 Ansible 在目标主机上执行，请谨慎操作。
-    </el-alert>
     <template #footer>
-      <el-button @click="dialogVisible = false">取消</el-button>
-      <el-button type="primary" :loading="submitting" @click="handleSubmit">提交执行</el-button>
+      <el-button @click="formVisible = false">取消</el-button>
+      <el-button type="primary" :loading="submitting" @click="handleSave">保存</el-button>
     </template>
   </el-dialog>
 
-  <!-- 输出抽屉 -->
-  <el-drawer v-model="outputVisible" :title="`执行输出 - ${current?.name || ''}`" size="60%">
-    <div class="output-meta">
-      <el-tag :type="statusType(current?.status)" size="small">{{ current?.status_display || current?.status }}</el-tag>
-      <span>返回码：{{ current?.return_code ?? '-' }}</span>
-      <span v-if="current?.duration != null">耗时：{{ current.duration }}s</span>
-      <el-tag v-if="polling" type="info" size="small">实时刷新中…</el-tag>
-    </div>
-    <pre class="output-box">{{ current?.output || '（暂无输出）' }}</pre>
-  </el-drawer>
+  <!-- 执行任务弹窗：任务流预览 + 全局主机勾选 -->
+  <el-dialog v-model="execVisible" :title="`执行任务 — ${execTask?.name || ''}`" width="760px" top="4vh">
+    <el-descriptions :column="3" border size="small" style="margin-bottom: 12px">
+      <el-descriptions-item label="项目组">{{ execTask?.project_group_name || '不限' }}</el-descriptions-item>
+      <el-descriptions-item label="渠道">{{ execTask?.channel_name || '不限' }}</el-descriptions-item>
+      <el-descriptions-item label="环境">
+        <span :class="{ prod: execTask?.environment_is_prod }">{{ execTask?.environment_name || '不限' }}</span>
+      </el-descriptions-item>
+    </el-descriptions>
+
+    <div class="exec-hosts-header"><span>任务流（按序执行，失败中止后续模块）</span></div>
+    <el-table :data="execTask?.steps || []" size="small" style="margin-bottom: 14px">
+      <el-table-column label="#" width="42">
+        <template #default="{ $index }">{{ $index + 1 }}</template>
+      </el-table-column>
+      <el-table-column prop="name" label="模块" min-width="110" show-overflow-tooltip />
+      <el-table-column label="类型" width="90">
+        <template #default="{ row }">
+          <el-tag size="small" :type="typeTagType(row.task_type)" effect="plain">{{ row.task_type_display }}</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="内容" min-width="150" show-overflow-tooltip>
+        <template #default="{ row }">{{ stepContent(row) }}</template>
+      </el-table-column>
+      <el-table-column label="执行主机" width="150">
+        <template #default="{ row }">
+          <span :class="{ danger: stepHostCount(row) === 0 }">{{ stepHostLabel(row) }}</span>
+        </template>
+      </el-table-column>
+    </el-table>
+
+    <template v-if="hasGlobalStep">
+      <div class="exec-hosts-header">
+        <span>全局范围主机（默认全选，取消勾选即排除；仅作用于「跟随全局」的模块）</span>
+        <span class="muted">已选 {{ execSelection.length }} / {{ execGlobal.length }} 台</span>
+      </div>
+      <el-table
+        ref="hostTableRef"
+        v-loading="execLoading"
+        :data="execGlobal"
+        size="small" stripe max-height="260"
+        @selection-change="(rows) => (execSelection = rows)"
+      >
+        <el-table-column type="selection" width="42" />
+        <el-table-column prop="name" label="主机名" min-width="120" show-overflow-tooltip />
+        <el-table-column prop="ip" label="IP" width="130" />
+        <el-table-column label="环境" width="100">
+          <template #default="{ row }">
+            <span :class="{ prod: row.environment_is_prod, unset: !row.environment_name }">{{ row.environment_name || '未分配' }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="已规划服务" min-width="140" show-overflow-tooltip>
+          <template #default="{ row }">{{ serviceCodes(row) }}</template>
+        </el-table-column>
+      </el-table>
+      <el-alert v-if="!execLoading && !execGlobal.length" type="warning" :closable="false" show-icon style="margin-top:8px">
+        全局范围未匹配到可执行主机（仅已在「服务器分配」中规划服务的主机可执行）
+      </el-alert>
+    </template>
+
+    <template #footer>
+      <el-button @click="execVisible = false">取消</el-button>
+      <el-button type="primary" :disabled="!canExec" @click="confirmVisible = true">
+        执行（{{ execTask?.steps?.length || 0 }} 个模块）
+      </el-button>
+    </template>
+  </el-dialog>
+
+  <!-- 执行确认框：任务信息 + 逐模块流程 -->
+  <el-dialog v-model="confirmVisible" title="确认执行" width="600px" append-to-body>
+    <el-descriptions :column="1" border size="small">
+      <el-descriptions-item label="任务名称">{{ execTask?.name }}</el-descriptions-item>
+      <el-descriptions-item label="项目组">{{ execTask?.project_group_name || '不限' }}</el-descriptions-item>
+      <el-descriptions-item label="渠道">{{ execTask?.channel_name || '不限' }}</el-descriptions-item>
+      <el-descriptions-item label="环境">
+        <span :class="{ prod: hasProdTarget }">{{ execTask?.environment_name || '不限' }}</span>
+      </el-descriptions-item>
+    </el-descriptions>
+    <div class="flow-title">任务流程（模块按序执行，失败中止后续）</div>
+    <ol class="flow-steps">
+      <li v-for="s in execTask?.steps || []" :key="s.id">
+        <b>{{ s.name }}</b>（{{ s.task_type_display }}）：{{ stepContent(s) }} → {{ stepHostLabel(s) }}
+      </li>
+      <li>{{ execTask?.exec_mode === 'serial' ? '各模块内主机串行逐台执行（--forks 1）' : '各模块内主机并发执行' }}</li>
+      <li>执行结果落一条执行日志（含逐模块结果），可在任务列表下方查看</li>
+    </ol>
+    <el-alert v-if="hasProdTarget" type="error" :closable="false" show-icon style="margin-top:10px">
+      目标包含生产环境主机，请再次确认操作影响！
+    </el-alert>
+    <el-alert v-else type="warning" :closable="false" show-icon style="margin-top:10px">
+      任务将通过 Ansible 在目标主机上执行，请谨慎操作。
+    </el-alert>
+    <template #footer>
+      <el-button @click="confirmVisible = false">取消</el-button>
+      <el-button :type="hasProdTarget ? 'danger' : 'primary'" :loading="executing" @click="doExecute">确认执行</el-button>
+    </template>
+  </el-dialog>
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
-import { Plus, Delete, Search, Refresh, RefreshRight, View, Loading } from '@element-plus/icons-vue'
+import { ref, reactive, computed, nextTick, onMounted, onUnmounted } from 'vue'
+import {
+  Plus, Delete, Search, Refresh, View, Loading, CaretRight, EditPen, Close, Top, Bottom,
+} from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../../stores/auth'
 import {
   getServers, fetchDictOptions, projectGroupApi, channelApi, environmentApi,
 } from '../../api/assets'
 import {
-  getTasks, createTask, deleteTask, rerunTask, getTaskOutput,
-  getCredentials, getMethods, getPlaybooks,
+  getTasks, createTask, updateTask, deleteTask, getMatchedServers, executeTask,
+  getTaskOutput, getTaskLogs, getTaskLogDetail, getCredentials, getMethods,
 } from '../../api/tasks'
 
 const authStore = useAuthStore()
@@ -221,59 +404,28 @@ const page = ref(1)
 const pageSize = ref(20)
 const filter = reactive({ keyword: '', task_type: '', status: '' })
 
-const serverOptions = ref([])
-const serversLoading = ref(false)
 const credentialOptions = ref([])
 const methodOptions = ref([])
-const playbookOptions = ref([])
-// 目标主机维度筛选（项目组/渠道/环境）与字典下拉数据
-const dimFilter = reactive({ project_group: '', channel: '', env: '' })
 const dictOptions = reactive({ projects: [], channels: [], envs: [] })
-
-// 后端 executable=true 已只返回已规划服务的主机，标签直接展示服务类型
-function serverLabel(s) {
-  const codes = (s.services || [])
-    .filter(x => x.status === 'planned' || x.status === 'deployed')
-    .map(x => x.service_type_name)
-  return `${s.name} (${s.ip}) [${codes.join('/')}]`
-}
-
-const dialogVisible = ref(false)
-const formRef = ref()
-const emptyForm = () => ({
-  name: '', task_type: 'command',
-  command: '', server_ids: [], credential: null, pattern: 'all',
-  playbook: '', method: null, tags: '', limit: '', extra_vars: '',
-  timeout: 300,
-})
-const form = reactive(emptyForm())
-const selectedMethod = computed(() => methodOptions.value.find((m) => m.id === form.method) || null)
-const rules = {
-  name: [{ required: true, message: '请输入任务名称' }],
-  command: [{
-    validator: (_r, v, cb) => (form.task_type !== 'command' || (v || '').trim()) ? cb() : cb(new Error('请输入命令')),
-  }],
-  playbook: [{
-    validator: (_r, v, cb) => (form.task_type !== 'playbook' || v) ? cb() : cb(new Error('请选择剧本文件')),
-  }],
-  method: [{
-    validator: (_r, v, cb) => (form.task_type !== 'method' || v) ? cb() : cb(new Error('请选择平台方法')),
-  }],
-  // 三类任务的执行主机统一来自平台台账，均必选
-  server_ids: [{
-    validator: (_r, v, cb) => (v && v.length) ? cb() : cb(new Error('请至少选择一台主机')),
-  }],
-}
-
-const outputVisible = ref(false)
-const current = ref(null)
-const polling = ref(false)
-let pollTimer = null
-let listTimer = null
 
 const statusType = (s) => ({ pending: 'info', running: 'warning', success: 'success', failed: 'danger' }[s] || 'info')
 const typeTagType = (t) => ({ command: 'info', playbook: 'success', method: 'warning' }[t] || 'info')
 const formatTime = (t) => (t ? t.slice(0, 19).replace('T', ' ') : '')
+
+const flowTooltip = (row) => (row.steps || []).map((s, i) => `${i + 1}. ${s.name}`).join('　')
+
+function stepContent(s) {
+  if (s.task_type === 'method') return `${s.method_name || '-'}${s.tags ? ' · ' + s.tags : ''}`
+  if (s.task_type === 'playbook') return `${s.playbook || '-'}${s.tags ? ' · ' + s.tags : ''}`
+  return (s.command || '').slice(0, 50) || '-'
+}
+
+function serviceCodes(s) {
+  return (s.services || [])
+    .filter((x) => x.status === 'planned' || x.status === 'deployed')
+    .map((x) => x.service_type_name)
+    .join(' / ') || '-'
+}
 
 async function fetchData() {
   loading.value = true
@@ -285,6 +437,11 @@ async function fetchData() {
     const res = await getTasks(params)
     tableData.value = res.data?.results || []
     total.value = res.data?.total || 0
+    // 日志面板打开时同步任务最新状态
+    if (logPanel.task) {
+      const fresh = tableData.value.find((t) => t.id === logPanel.task.id)
+      if (fresh) logPanel.task = fresh
+    }
   } finally {
     loading.value = false
   }
@@ -295,31 +452,8 @@ function handleSearch() {
   fetchData()
 }
 
-function onMethodChange() {
-  form.tags = ''
-  form.limit = ''
-}
-
-// 按维度筛选加载可执行主机（executable=true：仅已规划/已部署服务的主机）
-async function loadServers() {
-  serversLoading.value = true
-  try {
-    const params = { executable: 'true', page_size: 0 }
-    if (dimFilter.project_group) params.project_group = dimFilter.project_group
-    if (dimFilter.channel) params.channel = dimFilter.channel
-    if (dimFilter.env) params.env = dimFilter.env
-    const res = await getServers(params)
-    serverOptions.value = res.data?.results || []
-    // 维度切换后剔除已不在可选范围内的主机
-    const available = new Set(serverOptions.value.map((s) => s.id))
-    form.server_ids = form.server_ids.filter((id) => available.has(id))
-  } finally {
-    serversLoading.value = false
-  }
-}
-
 async function loadDictOptions() {
-  if (dictOptions.projects.length) return // 字典变化低频，弹窗生命周期内缓存
+  if (dictOptions.projects.length) return
   const [proj, chan, env] = await Promise.allSettled([
     fetchDictOptions(projectGroupApi), fetchDictOptions(channelApi), fetchDictOptions(environmentApi),
   ])
@@ -328,82 +462,350 @@ async function loadDictOptions() {
   if (env.status === 'fulfilled') dictOptions.envs = env.value.data?.results || []
 }
 
-async function openDialog() {
-  Object.assign(form, emptyForm())
-  Object.assign(dimFilter, { project_group: '', channel: '', env: '' })
-  dialogVisible.value = true
+// 按维度取匹配主机数（page_size=1 仅拿 total）
+async function fetchMatchedCount({ project_group, channel, environment }) {
+  const params = { executable: 'true', page_size: 1 }
+  if (project_group) params.project_group = project_group
+  if (channel) params.channel = channel
+  if (environment) params.env = environment
+  const res = await getServers(params)
+  return res.data?.total ?? 0
+}
+
+// ── 新建 / 编辑（任务流定义，仅保存）────────────────────
+const formVisible = ref(false)
+const formRef = ref()
+const matchedCount = ref(null)
+const emptyStep = () => ({
+  name: '', task_type: 'command', command: '', playbook: '', pbMethod: null, method: null,
+  tagsArr: [], extra_vars: '', timeout: 300,
+  use_custom_scope: false, project_group: null, channel: null, environment: null,
+  _matched: null,
+})
+const emptyForm = () => ({
+  id: null, name: '',
+  project_group: null, channel: null, environment: null,
+  exec_mode: 'parallel', credential: null,
+  steps: [emptyStep()],
+})
+const form = reactive(emptyForm())
+const rules = {
+  name: [{ required: true, message: '请输入任务名称' }],
+}
+
+const methodInfo = (step) => methodOptions.value.find((m) => m.id === step.method) || null
+const stepNamePlaceholder = (step) =>
+  ({ command: '重启服务', playbook: '发布配置', method: '部署游戏服' }[step.task_type])
+
+const splitTags = (s) => (s || '').split(',').map((t) => t.trim()).filter(Boolean)
+
+// provider 区分：playbook 模块选 Ansible 剧本类方法，平台方法模块选其余 provider
+const playbookMethods = computed(() => methodOptions.value.filter((m) => m.provider === 'ansible_playbook'))
+const otherMethods = computed(() => methodOptions.value.filter((m) => m.provider !== 'ansible_playbook'))
+const pbMethodInfo = (step) => playbookMethods.value.find((m) => m.id === step.pbMethod) || null
+
+// 选定剧本方法后，剧本路径直接取方法配置；tags 清空待选
+function onPbMethodChange(step) {
+  step.playbook = pbMethodInfo(step)?.config?.playbook || ''
+  step.tagsArr = []
+}
+
+// tags 候选统一来自「方法管理」配置：playbook 模块=所选剧本方法的 tags，方法模块=该方法自身 tags；
+// 已选值（如编辑历史任务）合并进候选，避免回显丢失
+function stepTagOptions(step) {
+  const tokens = new Set()
+  if (step.task_type === 'playbook') {
+    splitTags(pbMethodInfo(step)?.config?.tags).forEach((t) => tokens.add(t))
+  } else if (step.task_type === 'method') {
+    splitTags(methodInfo(step)?.config?.tags).forEach((t) => tokens.add(t))
+  }
+  ;(step.tagsArr || []).forEach((t) => tokens.add(t))
+  return [...tokens]
+}
+
+async function updateMatchedCount() {
+  matchedCount.value = null
+  try {
+    matchedCount.value = await fetchMatchedCount(form)
+  } catch {
+    matchedCount.value = null
+  }
+}
+
+async function updateStepCount(step) {
+  step._matched = null
+  try {
+    step._matched = await fetchMatchedCount(step)
+  } catch {
+    step._matched = null
+  }
+}
+
+function addStep() {
+  form.steps.push(emptyStep())
+}
+
+function moveStep(i, delta) {
+  const j = i + delta
+  ;[form.steps[i], form.steps[j]] = [form.steps[j], form.steps[i]]
+}
+
+async function openForm(row) {
+  Object.assign(form, emptyForm(), { steps: [emptyStep()] })
+  if (row) {
+    Object.assign(form, {
+      id: row.id, name: row.name,
+      project_group: row.project_group || null, channel: row.channel || null,
+      environment: row.environment || null,
+      exec_mode: row.exec_mode || 'parallel', credential: row.credential || null,
+      steps: (row.steps || []).map((s) => ({
+        name: s.name, task_type: s.task_type, command: s.command || '',
+        playbook: s.playbook || '', pbMethod: null, method: s.method || null,
+        tagsArr: splitTags(s.tags), extra_vars: s.extra_vars || '', timeout: s.timeout || 300,
+        use_custom_scope: s.use_custom_scope || false,
+        project_group: s.project_group || null, channel: s.channel || null,
+        environment: s.environment || null, _matched: null,
+      })),
+    })
+    form.steps.filter((s) => s.use_custom_scope).forEach(updateStepCount)
+  }
+  formVisible.value = true
   formRef.value?.clearValidate()
   loadDictOptions()
-  loadServers()
-  const [cred, methods, playbooks] = await Promise.allSettled([
+  updateMatchedCount()
+  const [cred, methods] = await Promise.allSettled([
     getCredentials({ page_size: 200 }),
     getMethods({ page_size: 200, enabled: 'true' }),
-    getPlaybooks(),
   ])
   if (cred.status === 'fulfilled') credentialOptions.value = cred.value.data?.results || []
   if (methods.status === 'fulfilled') methodOptions.value = methods.value.data?.results || []
-  if (playbooks.status === 'fulfilled') playbookOptions.value = playbooks.value.data?.results || []
+  // 编辑回显：按剧本路径把 playbook 模块关联回方法管理的剧本方法
+  form.steps
+    .filter((s) => s.task_type === 'playbook' && !s.pbMethod && s.playbook)
+    .forEach((s) => {
+      const m = playbookMethods.value.find((x) => x.config?.playbook === s.playbook)
+      if (m) s.pbMethod = m.id
+    })
+}
+
+function validateSteps() {
+  const typeNames = { command: '命令', playbook: 'Playbook', method: '平台方法' }
+  for (const [i, s] of form.steps.entries()) {
+    if (!s.name.trim()) s.name = `${typeNames[s.task_type]}模块${i + 1}` // 空名自动补
+    const label = `模块 ${i + 1}「${s.name}」`
+    if (s.task_type === 'command' && !s.command.trim()) return `${label}：请填写 Shell 命令`
+    if (s.task_type === 'playbook' && !s.playbook) return `${label}：请选择方法管理登记的剧本方法`
+    if (s.task_type === 'method' && !s.method) return `${label}：请选择平台方法`
+    if (s.use_custom_scope && (!s.project_group || !s.channel || !s.environment)) {
+      return `${label}：自定义主机范围必须选齐项目组/渠道/环境`
+    }
+  }
+  return null
 }
 
 function buildPayload() {
-  const p = {
-    name: form.name, task_type: form.task_type, timeout: form.timeout,
-    server_ids: form.server_ids, credential: form.credential,
+  return {
+    name: form.name,
+    project_group: form.project_group, channel: form.channel, environment: form.environment,
+    exec_mode: form.exec_mode, credential: form.credential,
+    steps: form.steps.map((s, i) => ({
+      order: i + 1, name: s.name, task_type: s.task_type,
+      command: s.task_type === 'command' ? s.command : '',
+      playbook: s.task_type === 'playbook' ? s.playbook : '',
+      method: s.task_type === 'method' ? s.method : null,
+      tags: s.task_type === 'command' ? '' : s.tagsArr.join(','),
+      extra_vars: s.task_type === 'command' ? '' : s.extra_vars,
+      timeout: s.timeout,
+      use_custom_scope: s.use_custom_scope,
+      project_group: s.use_custom_scope ? s.project_group : null,
+      channel: s.use_custom_scope ? s.channel : null,
+      environment: s.use_custom_scope ? s.environment : null,
+    })),
   }
-  if (form.task_type === 'command') {
-    Object.assign(p, { command: form.command, pattern: form.pattern })
-  } else if (form.task_type === 'playbook') {
-    Object.assign(p, { playbook: form.playbook, tags: form.tags, limit: form.limit, extra_vars: form.extra_vars })
-  } else {
-    Object.assign(p, { method: form.method, tags: form.tags, limit: form.limit, extra_vars: form.extra_vars })
-  }
-  return p
 }
 
-async function handleSubmit() {
+async function handleSave() {
   await formRef.value.validate()
+  if (!form.project_group || !form.channel || !form.environment) {
+    ElMessage.error('全局主机范围的项目组/渠道/环境必选，请选齐后再保存')
+    return
+  }
+  const stepError = validateSteps()
+  if (stepError) {
+    ElMessage.error(stepError)
+    return
+  }
   submitting.value = true
   try {
-    await createTask(buildPayload())
-    ElMessage.success('任务已提交执行')
-    dialogVisible.value = false
+    if (form.id) {
+      await updateTask(form.id, buildPayload())
+      ElMessage.success('任务已保存')
+    } else {
+      await createTask(buildPayload())
+      ElMessage.success('任务已保存，可在列表中点击「执行」发起')
+    }
+    formVisible.value = false
     fetchData()
   } finally {
     submitting.value = false
   }
 }
 
-async function handleRerun(row) {
-  await rerunTask(row.id)
-  ElMessage.success('已重新调度')
-  fetchData()
-}
-
 async function handleDelete(row) {
-  await ElMessageBox.confirm(`确定删除任务「${row.name}」吗？`, '警告', { type: 'warning' })
+  await ElMessageBox.confirm(`确定删除任务「${row.name}」及其全部执行日志吗？`, '警告', { type: 'warning' })
   await deleteTask(row.id)
   ElMessage.success('删除成功')
+  if (logPanel.task?.id === row.id) closeLogs()
   fetchData()
 }
 
-function openOutput(row) {
-  current.value = { ...row }
-  outputVisible.value = true
-  if (row.status === 'pending' || row.status === 'running') {
-    startPolling(row.id)
+// ── 执行（任务流预览 + 全局主机勾选 + 确认框）────────────
+const execVisible = ref(false)
+const confirmVisible = ref(false)
+const execLoading = ref(false)
+const executing = ref(false)
+const execTask = ref(null)
+const execGlobal = ref([])
+const execStepsInfo = ref([]) // matched_servers 返回的模块主机来源（含自定义匹配结果）
+const execSelection = ref([])
+const hostTableRef = ref()
+
+const hasGlobalStep = computed(() => (execTask.value?.steps || []).some((s) => !s.use_custom_scope))
+const stepInfoByOrder = computed(() => Object.fromEntries(execStepsInfo.value.map((s) => [s.order, s])))
+
+const stepHostCount = (step) => {
+  if (step.use_custom_scope) return stepInfoByOrder.value[step.order]?.total ?? 0
+  return execSelection.value.length
+}
+const stepHostLabel = (step) =>
+  step.use_custom_scope ? `自定义 · ${stepHostCount(step)} 台` : `全局 · 已选 ${stepHostCount(step)} 台`
+
+const canExec = computed(() =>
+  (execTask.value?.steps || []).length > 0 &&
+  (execTask.value?.steps || []).every((s) => stepHostCount(s) > 0),
+)
+
+const hasProdTarget = computed(() => {
+  if (execTask.value?.environment_is_prod) return true
+  if (execSelection.value.some((s) => s.environment_is_prod)) return true
+  return execStepsInfo.value.some((st) => st.custom && (st.servers || []).some((s) => s.environment_is_prod))
+})
+
+async function openExec(row) {
+  execTask.value = row
+  execGlobal.value = []
+  execStepsInfo.value = []
+  execSelection.value = []
+  execVisible.value = true
+  execLoading.value = true
+  try {
+    const res = await getMatchedServers(row.id)
+    execGlobal.value = res.data?.global?.results || []
+    execStepsInfo.value = res.data?.steps || []
+    // 全局范围默认全选，取消勾选即排除
+    await nextTick()
+    hostTableRef.value?.toggleAllSelection()
+  } finally {
+    execLoading.value = false
   }
 }
 
-function startPolling(id) {
+async function doExecute() {
+  executing.value = true
+  try {
+    const res = await executeTask(execTask.value.id, {
+      server_ids: execSelection.value.map((s) => s.id),
+    })
+    ElMessage.success(res.msg || '已发起执行')
+    confirmVisible.value = false
+    execVisible.value = false
+    fetchData()
+    // 直接跳转执行日志：定位面板并轮询至完成
+    openLogs({ ...execTask.value, status: 'running' }, { live: true })
+  } finally {
+    executing.value = false
+  }
+}
+
+// ── 执行日志面板 ─────────────────────────────────────────
+const logPanel = reactive({ task: null, logs: [], current: null, output: '', polling: false })
+const logPanelRef = ref()
+const logTableRef = ref()
+let pollTimer = null
+let listTimer = null
+
+const stepsSummary = (log) => {
+  const steps = log.steps_result || []
+  if (!steps.length) return '-'
+  const ok = steps.filter((s) => s.status === 'success').length
+  return `${ok}/${steps.length}`
+}
+const stepsFailed = (log) => (log.steps_result || []).some((s) => s.status === 'failed')
+
+const currentServers = computed(() => {
+  const snap = logPanel.current?.servers_snapshot
+  if (!snap?.length) return ''
+  const names = snap.slice(0, 5).map((s) => s.name).join('、')
+  return `全局主机：${names}${snap.length > 5 ? ` 等 ${snap.length} 台` : ''}`
+})
+
+async function openLogs(row, { live = false } = {}) {
+  logPanel.task = row
+  logPanel.current = null
+  logPanel.output = ''
+  await refreshLogs()
+  await nextTick()
+  logPanelRef.value?.$el?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  if (live || row.status === 'running' || row.status === 'pending') startPolling()
+}
+
+function closeLogs() {
+  logPanel.task = null
   stopPolling()
-  polling.value = true
+}
+
+async function refreshLogs() {
+  if (!logPanel.task) return
+  const res = await getTaskLogs(logPanel.task.id)
+  logPanel.logs = res.data || []
+  if (logPanel.logs.length) {
+    await nextTick()
+    logTableRef.value?.setCurrentRow(logPanel.logs[0])
+  } else {
+    logPanel.output = '（该任务暂无执行记录，点击列表「执行」发起）'
+  }
+}
+
+async function selectLog(log) {
+  if (!log || !logPanel.task) return
+  logPanel.current = log
+  const isLatest = logPanel.logs[0]?.id === log.id
+  const running = ['pending', 'running'].includes(logPanel.task.status)
+  if (isLatest && running) {
+    // 最新一次且执行中：输出走轻量轮询实时刷新
+    logPanel.output = logPanel.task.output || '（执行中，等待输出…）'
+    return
+  }
+  const res = await getTaskLogDetail(logPanel.task.id, log.id)
+  logPanel.current = res.data
+  logPanel.output = res.data?.output || '（暂无输出）'
+}
+
+function startPolling() {
+  stopPolling()
+  if (!logPanel.task) return
+  logPanel.polling = true
+  const taskId = logPanel.task.id
   pollTimer = setInterval(async () => {
     try {
-      const res = await getTaskOutput(id)
-      current.value = { ...current.value, ...res.data }
+      const res = await getTaskOutput(taskId)
+      if (logPanel.task?.id !== taskId) return stopPolling()
+      logPanel.task = { ...logPanel.task, ...res.data }
+      logPanel.output = res.data.output || '（执行中，等待输出…）'
       if (res.data.status === 'success' || res.data.status === 'failed') {
         stopPolling()
         fetchData()
+        refreshLogs() // 执行完成：刷新日志列表并选中最新记录
       }
     } catch {
       stopPolling()
@@ -412,7 +814,7 @@ function startPolling(id) {
 }
 
 function stopPolling() {
-  polling.value = false
+  logPanel.polling = false
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
 }
 
@@ -435,11 +837,43 @@ onUnmounted(() => {
 .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .toolbar-left { display: flex; gap: 8px; flex-wrap: wrap; }
 .muted { color: #909399; }
+.unset { color: #c0c4cc; }
+.prod { color: #f56c6c; font-weight: 600; }
+.danger { color: #f56c6c; }
 .form-tip { color: #909399; font-size: 12px; line-height: 1.5; margin-top: 4px; }
-.dim-filter { display: flex; gap: 8px; width: 100%; margin-bottom: 8px; }
+.dim-filter { display: flex; gap: 8px; width: 100%; }
 .dim-filter .el-select { flex: 1; }
 code { background: #f5f7fa; padding: 1px 6px; border-radius: 3px; font-size: 12px; }
-.output-meta { display: flex; gap: 16px; align-items: center; margin-bottom: 12px; color: #606266; font-size: 13px; }
+.flow-cell { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+.flow-tag { margin: 0; }
+
+/* 任务流模块卡片 */
+.step-card {
+  border: 1px solid #e4e7ed;
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  background: #fafafa;
+}
+.step-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.step-no { flex-shrink: 0; }
+.step-actions { margin-left: auto; display: flex; }
+.step-body { display: flex; flex-direction: column; gap: 8px; }
+.step-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.step-label { font-size: 12px; color: #606266; flex-shrink: 0; }
+
+.exec-hosts-header {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 8px; font-size: 13px; color: #606266;
+}
+.flow-title { font-weight: 600; margin: 14px 0 6px; font-size: 14px; }
+.flow-steps { margin: 0; padding-left: 20px; color: #606266; font-size: 13px; line-height: 1.9; }
+.log-header { display: flex; justify-content: space-between; align-items: center; }
+.log-body { display: flex; gap: 16px; }
+.log-list { width: 50%; min-width: 420px; }
+.log-list :deep(.log-row) { cursor: pointer; }
+.log-output { flex: 1; min-width: 0; }
+.output-meta { display: flex; gap: 16px; align-items: center; margin-bottom: 8px; color: #606266; font-size: 13px; }
 .output-box {
   background: #1e1e1e;
   color: #d4d4d4;
@@ -450,7 +884,8 @@ code { background: #f5f7fa; padding: 1px 6px; border-radius: 3px; font-size: 12p
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-all;
-  max-height: calc(100vh - 160px);
+  height: 420px;
   overflow-y: auto;
+  margin: 0;
 }
 </style>

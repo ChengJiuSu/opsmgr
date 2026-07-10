@@ -36,17 +36,20 @@ class AnsiblePlaybookExecutor(BaseExecutor):
         if not os.path.isfile(playbook_path):
             return 1, f'剧本文件不存在：{config["playbook"]}'
 
-        # 任务级覆盖方法默认值
+        # 模块级覆盖方法默认值（task 为 TaskStep，tags/extra_vars/timeout 均模块级）
+        from apps.task_exec.runner import extra_vars_args
+
         tags = (task.tags or config.get('tags') or '').strip()
-        limit = (task.limit or config.get('limit') or '').strip()
-        extra_vars = (task.extra_vars or '').strip()
+        limit = (config.get('limit') or '').strip()
 
         cmd = ['ansible-playbook', playbook_path, '-i', inventory_path]
+        if getattr(task, 'exec_mode', '') == 'serial':
+            cmd += ['--forks', '1']  # 串行：逐台执行
         if tags:
             cmd += ['--tags', tags]
         if limit:
             cmd += ['--limit', limit]
-        if extra_vars:
-            cmd += ['--extra-vars', extra_vars]
+        # 变量管理启用变量 + 模块额外变量（后者覆盖同名项）
+        cmd += extra_vars_args(task)
 
         return run_subprocess(cmd, timeout=task.timeout or 300, cwd=project_dir)
