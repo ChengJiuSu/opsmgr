@@ -16,6 +16,7 @@ from .serializers import (
     CredentialSerializer,
     ExecutionTaskSerializer,
     ExecVariableSerializer,
+    ExecVariableVersionSerializer,
     TaskExecutionLogDetailSerializer,
     TaskExecutionLogSerializer,
     validate_service_planned,
@@ -59,14 +60,21 @@ class CredentialViewSet(viewsets.ModelViewSet):
 
 
 class ExecVariableViewSet(viewsets.ModelViewSet):
-    """执行变量管理：任务执行注入 --extra-vars；亦供外部系统（如 Jenkins）拉取。
+    """执行变量管理：按任务/模块有效维度加载注入 --extra-vars；亦供外部系统拉取。
 
-    普通用户只读，管理员可维护。
+    普通用户只读，管理员可维护；每次保存/回滚落版本快照（默认保留 10 版）。
     """
 
-    queryset = ExecVariable.objects.all()
+    queryset = ExecVariable.objects.select_related('project_group', 'channel', 'environment')
     serializer_class = ExecVariableSerializer
     permission_classes = [IsAdminOrReadOnly]
+
+    # 查询参数 → 维度外键映射（纯数字按 id、否则按 code，与服务器接口一致）
+    DICT_FILTERS = (
+        ('project_group', 'project_group'),
+        ('channel', 'channel'),
+        ('env', 'environment'),
+    )
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -75,10 +83,46 @@ class ExecVariableViewSet(viewsets.ModelViewSet):
         keyword = params.get('keyword')
         if enabled in ('true', 'false'):
             qs = qs.filter(enabled=(enabled == 'true'))
+        for param, field in self.DICT_FILTERS:
+            value = params.get(param)
+            if value:
+                if value.isdigit():
+                    qs = qs.filter(**{f'{field}_id': value})
+                else:
+                    qs = qs.filter(**{f'{field}__code': value})
         if keyword:
             from django.db.models import Q
             qs = qs.filter(Q(key__icontains=keyword) | Q(description__icontains=keyword))
         return qs
+
+    @action(detail=True, methods=['get'])
+    def versions(self, request, pk=None):
+        """历史版本列表（新→旧，最多保留 EXEC_VARIABLE_VERSION_LIMIT 版）。"""
+        variable = self.get_object()
+        qs = variable.versions.select_related('created_by', 'project_group', 'channel', 'environment')
+        return ok(ExecVariableVersionSerializer(qs, many=True).data)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAdmin])
+    def rollback(self, request, pk=None):
+        """回滚到指定历史版本：套用快照内容并生成一条新版本记录。"""
+        from .models import snapshot_variable
+
+        variable = self.get_object()
+        version_no = request.data.get('version')
+        version = variable.versions.filter(version=version_no).first()
+        if version is None:
+            return fail(f'版本 {version_no} 不存在（超出保留范围或参数有误）')
+        variable.value = version.value
+        variable.description = version.description
+        variable.enabled = version.enabled
+        # 维度快照为弱关联：字典项已被删除的维度保持当前值不动
+        for field in ('project_group_id', 'channel_id', 'environment_id'):
+            snap = getattr(version, field)
+            if snap is not None:
+                setattr(variable, field, snap)
+        variable.save()
+        snapshot_variable(variable, user=request.user)
+        return ok(ExecVariableSerializer(variable).data, msg=f'已回滚到版本 {version_no}')
 
 
 class ExecutionTaskViewSet(viewsets.ModelViewSet):

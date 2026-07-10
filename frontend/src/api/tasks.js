@@ -15,11 +15,13 @@ export const getTaskLogDetail = (id, logId) => request.get(`/api/exec/tasks/${id
 // 剧本列表（ANSIBLE_PROJECT_DIR 内可选剧本）
 export const getPlaybooks = () => request.get('/api/exec/playbooks/')
 
-// 执行变量（任务执行注入 --extra-vars；亦供 Jenkins 等外部系统拉取）
+// 执行变量（按维度加载注入 --extra-vars；亦供 Jenkins 等外部系统拉取）
 export const getVariables = (params) => request.get('/api/exec/variables/', { params })
 export const createVariable = (data) => request.post('/api/exec/variables/', data)
 export const updateVariable = (id, data) => request.patch(`/api/exec/variables/${id}/`, data)
 export const deleteVariable = (id) => request.delete(`/api/exec/variables/${id}/`)
+export const getVariableVersions = (id) => request.get(`/api/exec/variables/${id}/versions/`)
+export const rollbackVariable = (id, version) => request.post(`/api/exec/variables/${id}/rollback/`, { version })
 
 // 凭据
 export const getCredentials = (params) => request.get('/api/exec/credentials/', { params })

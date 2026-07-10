@@ -1,26 +1,94 @@
 import re
 
+import yaml
 from django.db import transaction
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
-from .models import Credential, ExecutionTask, ExecVariable, TaskExecutionLog, TaskStep
+from .models import (
+    Credential,
+    ExecutionTask,
+    ExecVariable,
+    ExecVariableVersion,
+    TaskExecutionLog,
+    TaskStep,
+    snapshot_variable,
+)
 
 VARIABLE_KEY_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
 
 
 class ExecVariableSerializer(serializers.ModelSerializer):
-    """执行变量序列化器：key 须为合法 ansible 变量名。"""
+    """执行变量序列化器：key 须为合法 ansible 变量名，值须为合法 YAML，
+    生效维度三选必填；每次保存落一条版本快照。"""
+
+    project_group_name = serializers.CharField(source='project_group.name', read_only=True, default=None)
+    channel_name = serializers.CharField(source='channel.name', read_only=True, default=None)
+    environment_name = serializers.CharField(source='environment.name', read_only=True, default=None)
 
     class Meta:
         model = ExecVariable
-        fields = ['id', 'key', 'value', 'description', 'enabled', 'created_at', 'updated_at']
+        fields = [
+            'id', 'key', 'value', 'description',
+            'project_group', 'project_group_name', 'channel', 'channel_name',
+            'environment', 'environment_name',
+            'enabled', 'created_at', 'updated_at',
+        ]
 
     def validate_key(self, value):
         if not VARIABLE_KEY_RE.match(value):
             raise serializers.ValidationError('变量名须以字母/下划线开头，仅含字母、数字、下划线')
         return value
+
+    def validate_value(self, value):
+        if (value or '').strip():
+            try:
+                yaml.safe_load(value)
+            except yaml.YAMLError as exc:
+                raise serializers.ValidationError(f'变量值不是合法 YAML：{exc}')
+        return value
+
+    def validate(self, attrs):
+        # 生效条件三维度必选：执行时按任务/模块有效维度精确匹配加载
+        for field, label in (('project_group', '项目组'), ('channel', '渠道'), ('environment', '环境')):
+            value = attrs.get(field, getattr(self.instance, field, None) if self.instance else None)
+            if value is None:
+                raise serializers.ValidationError({field: f'必须选择{label}（变量生效条件三维度必选）'})
+        return attrs
+
+    def _user(self):
+        request = self.context.get('request')
+        return getattr(request, 'user', None)
+
+    @transaction.atomic
+    def create(self, validated_data):
+        variable = super().create(validated_data)
+        snapshot_variable(variable, user=self._user())
+        return variable
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        variable = super().update(instance, validated_data)
+        snapshot_variable(variable, user=self._user())
+        return variable
+
+
+class ExecVariableVersionSerializer(serializers.ModelSerializer):
+    """变量版本序列化器：历史快照列表与回滚数据源。"""
+
+    created_by_name = serializers.CharField(source='created_by.username', read_only=True, default='')
+    project_group_name = serializers.CharField(source='project_group.name', read_only=True, default=None)
+    channel_name = serializers.CharField(source='channel.name', read_only=True, default=None)
+    environment_name = serializers.CharField(source='environment.name', read_only=True, default=None)
+
+    class Meta:
+        model = ExecVariableVersion
+        fields = [
+            'id', 'version', 'value', 'description', 'enabled',
+            'project_group_name', 'channel_name', 'environment_name',
+            'created_by_name', 'created_at',
+        ]
 
 
 class CredentialSerializer(serializers.ModelSerializer):

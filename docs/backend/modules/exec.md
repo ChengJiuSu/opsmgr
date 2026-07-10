@@ -24,11 +24,15 @@ skipped）；模块内主机按任务级 exec_mode 并发/串行（串行 = `--f
 独立匹配（同样三维度必选）。执行时实时匹配可执行主机（仅已规划服务的
 主机）：全局范围主机默认全选、可勾除；自定义范围模块按其维度全量执行。
 
-**执行变量**（`ExecVariable`）：启用中的变量在执行时以 `--extra-vars`
-JSON 注入三类模块（命令内可用 Jinja `{{ var }}` 引用），模块自身的额外
-变量作为后一个 `-e` 传入（ansible 同名覆盖）。变量列表 API 亦可供
-Jenkins 等外部系统拉取，配合服务器接口（`executable=true`）自行拼装
-ansible 调用（规划中）。
+**执行变量**（`ExecVariable`）：变量绑定**项目组/渠道/环境生效条件**
+（三维度必选），执行时仅加载与**模块有效维度**（自定义范围用模块维度，
+否则任务全局维度）精确匹配的启用变量；变量值为 **YAML 文本**（保存时
+校验），解析后以 `--extra-vars` JSON 注入三类模块（命令内可用 Jinja
+`{{ var }}` / `{{ var.子键 }}` 引用），模块自身的额外变量作为后一个
+`-e` 传入（ansible 同名覆盖）。每次保存/回滚落一条**版本快照**
+（`ExecVariableVersion`，`EXEC_VARIABLE_VERSION_LIMIT` 默认保留 10 版），
+支持回滚。变量列表 API 亦可供 Jenkins 等外部系统拉取，配合服务器接口
+（`executable=true`）自行拼装 ansible 调用（规划中）。
 
 **保存与执行分离**：新建/编辑仅保存定义（嵌套模块整体替换）；执行为独立
 动作，每次执行落一条执行日志（含全局主机快照与逐模块结果 steps_result），
@@ -128,7 +132,9 @@ Ansible 项目目录内执行剧本：
 
 ```
 GET/POST/DELETE     /api/exec/credentials/        凭据 CRUD（仅管理员；密钥/密码只写不回显）
-GET/POST/PUT/PATCH/DELETE /api/exec/variables/    执行变量 CRUD（普通用户只读；供任务注入与外部系统拉取）
+GET/POST/PUT/PATCH/DELETE /api/exec/variables/    执行变量 CRUD（普通用户只读；支持 project_group/channel/env 筛选）
+GET                 /api/exec/variables/{id}/versions/  历史版本列表（默认保留 10 版）
+POST                /api/exec/variables/{id}/rollback/  回滚到指定版本 body {version}（仅管理员，回滚亦落新版本）
 GET                 /api/exec/playbooks/          剧本列表（仅管理员；ANSIBLE_PROJECT_DIR 内相对路径）
 GET/POST/PUT/PATCH/DELETE /api/exec/tasks/        任务流 CRUD（steps 嵌套整体读写；保存不执行；执行中禁止编辑）
 GET                 /api/exec/tasks/{id}/matched_servers/  执行表单数据源：{global: {...}, steps: [{order,name,custom,total,servers?}]}
@@ -151,7 +157,7 @@ GET                 /api/exec/tasks/{id}/logs/{log_id}/  单条日志详情（�
 | 方法模块 | `method` 必填且启用；`params` 须为 JSON 对象（预留给 provider 消费），无 tags/额外变量 |
 | 主机范围 | 任务全局三维度**必选**；模块 `use_custom_scope` 时自定义三维度同样必选 |
 | 执行方式 | `exec_mode` 默认 parallel |
-| 变量 | `ExecVariable.key` 须为合法 ansible 变量名（字母/下划线开头） |
+| 变量 | `key` 须为合法 ansible 变量名；`value` 须为合法 YAML；生效条件三维度必选 |
 | 超时 | 模块级 `timeout` 秒，默认 300 |
 
 主机相关校验见上节「执行时校验」。存量数据：0006 迁移将旧单动作任务

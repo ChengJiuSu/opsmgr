@@ -657,16 +657,30 @@ class ExecutionAPITests(TestCase):
 
     # ── 变量管理与执行注入 ─────────────────────────────────
 
-    def test_variable_crud_and_key_validation(self):
-        """变量 CRUD：key 须为合法 ansible 变量名；普通用户只读。"""
-        c = self._client()
-        r = c.post('/api/exec/variables/', {
+    def _variable_payload(self, **overrides):
+        payload = {
             'key': 'app_env', 'value': 'prod', 'description': '环境标识',
-        }, format='json')
+            'project_group': self.pg.id, 'channel': self.ch.id, 'environment': self.env.id,
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_variable_crud_and_key_validation(self):
+        """变量 CRUD：key 须为合法 ansible 变量名、值须为合法 YAML、三维度必选；普通用户只读。"""
+        c = self._client()
+        r = c.post('/api/exec/variables/', self._variable_payload(), format='json')
         self.assertEqual(r.status_code, 201)
-        r = c.post('/api/exec/variables/', {'key': '1bad-key', 'value': 'x'}, format='json')
+        r = c.post('/api/exec/variables/', self._variable_payload(key='1bad-key'), format='json')
         self.assertEqual(r.status_code, 400)
         self.assertIn('变量名', str(r.json()))
+        # 非法 YAML
+        r = c.post('/api/exec/variables/', self._variable_payload(key='bad_yaml', value='a: [1,'), format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('YAML', str(r.json()))
+        # 生效条件三维度必选
+        r = c.post('/api/exec/variables/', {'key': 'no_dim', 'value': 'x'}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('必须选择项目组', str(r.json()))
 
         u = User.objects.create(username='viewer2')
         u.set_password('Pass!2345xyz')
@@ -675,7 +689,36 @@ class ExecutionAPITests(TestCase):
         login = vc.post('/api/auth/login/', {'username': 'viewer2', 'password': 'Pass!2345xyz'}, format='json')
         vc.credentials(HTTP_AUTHORIZATION='Bearer ' + login.json()['access'])
         self.assertEqual(vc.get('/api/exec/variables/').status_code, 200)  # 只读（含 Jenkins 等外部拉取场景）
-        self.assertEqual(vc.post('/api/exec/variables/', {'key': 'x', 'value': '1'}, format='json').status_code, 403)
+        self.assertEqual(vc.post('/api/exec/variables/', self._variable_payload(key='x'), format='json').status_code, 403)
+
+    def test_variable_versions_and_rollback(self):
+        """版本历史：每次保存落快照、默认保留 10 版、回滚套用快照并生成新版本。"""
+        c = self._client()
+        var_id = c.post(
+            '/api/exec/variables/', self._variable_payload(key='cfg', value='v: 1'), format='json',
+        ).json()['id']
+
+        c.patch(f'/api/exec/variables/{var_id}/', {'value': 'v: 2'}, format='json')
+        versions = c.get(f'/api/exec/variables/{var_id}/versions/').json()['data']
+        self.assertEqual([v['version'] for v in versions], [2, 1])
+        self.assertEqual(versions[1]['value'], 'v: 1')
+
+        # 回滚到 v1：值恢复且追加新版本 v3
+        r = c.post(f'/api/exec/variables/{var_id}/rollback/', {'version': 1}, format='json')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()['data']['value'], 'v: 1')
+        versions = c.get(f'/api/exec/variables/{var_id}/versions/').json()['data']
+        self.assertEqual(versions[0]['version'], 3)
+        # 不存在的版本
+        r = c.post(f'/api/exec/variables/{var_id}/rollback/', {'version': 99}, format='json')
+        self.assertEqual(r.status_code, 400)
+
+        # 保留上限：连续更新超过 10 版后只留最近 10 条
+        for i in range(12):
+            c.patch(f'/api/exec/variables/{var_id}/', {'value': f'v: {i + 10}'}, format='json')
+        versions = c.get(f'/api/exec/variables/{var_id}/versions/').json()['data']
+        self.assertEqual(len(versions), 10)
+        self.assertEqual(versions[0]['version'], 15)  # 3 + 12
 
     def test_method_step_params_json_roundtrip(self):
         """方法模块参数：JSON 对象保存回显；非对象类型 400。"""
@@ -699,12 +742,25 @@ class ExecutionAPITests(TestCase):
         self.assertEqual(r.status_code, 400)
         self.assertIn('JSON 对象', str(r.json()))
 
-    def test_variables_injected_as_extra_vars(self):
-        """执行注入：启用变量以 JSON -e 注入，禁用不注入；模块额外变量后置覆盖。"""
+    def test_variables_injected_by_dimensions(self):
+        """执行注入：仅加载与模块有效维度精确匹配的启用变量，YAML 解析后 JSON 注入。"""
+        from apps.asset_mgr.models import Environment
+
         from .models import ExecVariable
 
-        ExecVariable.objects.create(key='app_env', value='prod')
-        ExecVariable.objects.create(key='disabled_var', value='x', enabled=False)
+        other_env = Environment.objects.create(name='预发2', code='staging2')
+        ExecVariable.objects.create(
+            key='app_conf', value='mode: prod\nports:\n  - 80\n  - 443',
+            project_group=self.pg, channel=self.ch, environment=self.env,
+        )
+        ExecVariable.objects.create(  # 维度不匹配：不注入
+            key='other_dim_var', value='x',
+            project_group=self.pg, channel=self.ch, environment=other_env,
+        )
+        ExecVariable.objects.create(  # 停用：不注入
+            key='disabled_var', value='x', enabled=False,
+            project_group=self.pg, channel=self.ch, environment=self.env,
+        )
         c = self._client()
         task_id = self._create_task(c, steps=[self._step(extra_vars='override=1')])
         with mock.patch('apps.task_exec.runner.run_subprocess', return_value=(0, 'ok')) as m:
@@ -712,6 +768,10 @@ class ExecutionAPITests(TestCase):
         cmd = m.call_args[0][0]
         idxs = [i for i, a in enumerate(cmd) if a == '--extra-vars']
         self.assertEqual(len(idxs), 2)
-        self.assertIn('app_env', cmd[idxs[0] + 1])
-        self.assertNotIn('disabled_var', cmd[idxs[0] + 1])
+        injected = cmd[idxs[0] + 1]
+        self.assertIn('"app_conf"', injected)
+        self.assertIn('"mode": "prod"', injected)   # YAML 解析为结构化 JSON
+        self.assertIn('[80, 443]', injected)
+        self.assertNotIn('other_dim_var', injected)
+        self.assertNotIn('disabled_var', injected)
         self.assertEqual(cmd[idxs[1] + 1], 'override=1')  # 模块变量在后，ansible 同名覆盖

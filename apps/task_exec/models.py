@@ -28,16 +28,31 @@ def match_executable_servers(project_group_id=None, channel_id=None, environment
 
 
 class ExecVariable(models.Model):
-    """执行变量：任务执行时以 --extra-vars 注入三类模块（命令 Jinja 引用 /
-    playbook / 平台方法），模块自身的额外变量后置覆盖同名项。
+    """执行变量：任务执行时按模块有效维度（项目组/渠道/环境）加载，
+    变量值为 YAML 文本，解析后以 --extra-vars 注入三类模块（命令 Jinja
+    引用 / playbook / 平台方法），模块自身的额外变量后置覆盖同名项。
 
+    每次保存/回滚落一条版本快照（ExecVariableVersion，默认保留 10 版）。
     同时作为对外数据源：后续 Jenkins 等外部系统可经 API 获取变量列表，
     配合服务器接口（executable=true）自行拼装 ansible 调用（规划中）。
     """
 
     key = models.CharField('变量名', max_length=100, unique=True)
-    value = models.TextField('变量值', blank=True)
+    value = models.TextField('变量值（YAML）', blank=True)
     description = models.CharField('说明', max_length=255, blank=True)
+    # 生效条件：与任务/模块的有效维度精确匹配才注入（三维度必选）
+    project_group = models.ForeignKey(
+        'asset_mgr.ProjectGroup', verbose_name='项目组', on_delete=models.PROTECT,
+        null=True, blank=True, related_name='exec_variables',
+    )
+    channel = models.ForeignKey(
+        'asset_mgr.Channel', verbose_name='渠道', on_delete=models.PROTECT,
+        null=True, blank=True, related_name='exec_variables',
+    )
+    environment = models.ForeignKey(
+        'asset_mgr.Environment', verbose_name='环境', on_delete=models.PROTECT,
+        null=True, blank=True, related_name='exec_variables',
+    )
     enabled = models.BooleanField('启用', default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -50,6 +65,71 @@ class ExecVariable(models.Model):
 
     def __str__(self):
         return self.key
+
+
+class ExecVariableVersion(models.Model):
+    """执行变量版本快照：每次保存/回滚落一条，按变量保留最近 N 版
+    （settings.EXEC_VARIABLE_VERSION_LIMIT，默认 10），支持回滚。
+
+    维度快照用 SET_NULL 弱关联：字典项删除不影响历史版本记录。
+    """
+
+    variable = models.ForeignKey(
+        ExecVariable, on_delete=models.CASCADE, related_name='versions', verbose_name='所属变量',
+    )
+    version = models.PositiveIntegerField('版本号')
+    value = models.TextField('变量值（YAML）', blank=True)
+    description = models.CharField('说明', max_length=255, blank=True)
+    enabled = models.BooleanField('启用', default=True)
+    project_group = models.ForeignKey(
+        'asset_mgr.ProjectGroup', on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
+    )
+    channel = models.ForeignKey(
+        'asset_mgr.Channel', on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
+    )
+    environment = models.ForeignKey(
+        'asset_mgr.Environment', on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='+', verbose_name='操作人',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = '执行变量版本'
+        verbose_name_plural = '执行变量版本'
+        db_table = 'task_variable_version'
+        ordering = ['-version']
+        constraints = [
+            models.UniqueConstraint(fields=['variable', 'version'], name='uniq_variable_version'),
+        ]
+
+    def __str__(self):
+        return f'{self.variable_id}#v{self.version}'
+
+
+def snapshot_variable(variable, user=None):
+    """给变量落一条版本快照，并按保留上限清理旧版本。
+
+    每次保存/回滚后调用；版本号在该变量内自增。
+    """
+    limit = getattr(settings, 'EXEC_VARIABLE_VERSION_LIMIT', 10)
+    last = variable.versions.order_by('-version').first()
+    ExecVariableVersion.objects.create(
+        variable=variable,
+        version=(last.version + 1) if last else 1,
+        value=variable.value,
+        description=variable.description,
+        enabled=variable.enabled,
+        project_group_id=variable.project_group_id,
+        channel_id=variable.channel_id,
+        environment_id=variable.environment_id,
+        created_by=user,
+    )
+    stale = list(variable.versions.order_by('-version').values_list('id', flat=True)[limit:])
+    if stale:
+        ExecVariableVersion.objects.filter(id__in=stale).delete()
 
 
 class Credential(models.Model):

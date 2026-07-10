@@ -23,6 +23,8 @@ import shutil
 import tempfile
 import time
 
+import yaml
+
 from django.conf import settings
 
 from common.ansible import resolve_within, run_subprocess
@@ -123,14 +125,35 @@ def _forks_args(task):
     return ['--forks', '1'] if task.exec_mode == 'serial' else []
 
 
+def _effective_dims(step):
+    """模块生效维度：自定义范围用模块自身维度，否则用任务全局维度。"""
+    if getattr(step, 'use_custom_scope', False):
+        return step.project_group_id, step.channel_id, step.environment_id
+    task = step.task
+    return task.project_group_id, task.channel_id, task.environment_id
+
+
 def extra_vars_args(step):
-    """拼装 --extra-vars 参数：先注入「变量管理」全部启用变量（JSON），
-    模块自身的额外变量作为后一个 -e 传入（ansible 后者覆盖前者同名项）。
+    """拼装 --extra-vars 参数：按模块有效维度（项目组/渠道/环境精确匹配）
+    加载「变量管理」启用变量，YAML 解析后以 JSON 注入；模块自身的额外变量
+    作为后一个 -e 传入（ansible 后者覆盖前者同名项）。
     """
     from .models import ExecVariable
 
+    pg, ch, env = _effective_dims(step)
     args = []
-    variables = {v.key: v.value for v in ExecVariable.objects.filter(enabled=True)}
+    variables = {}
+    for var in ExecVariable.objects.filter(
+        enabled=True, project_group_id=pg, channel_id=ch, environment_id=env,
+    ):
+        raw = var.value or ''
+        if not raw.strip():
+            variables[var.key] = ''
+            continue
+        try:
+            variables[var.key] = yaml.safe_load(raw)
+        except yaml.YAMLError:
+            variables[var.key] = raw  # 保存时已校验，此处兜底按原文注入
     if variables:
         args += ['--extra-vars', json.dumps(variables, ensure_ascii=False)]
     if (getattr(step, 'extra_vars', '') or '').strip():
