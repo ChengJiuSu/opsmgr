@@ -187,6 +187,8 @@ class TaskStep(models.Model):
     )
     tags = models.CharField('Tags', max_length=255, blank=True)
     extra_vars = models.TextField('额外变量', blank=True)
+    # 平台方法模块的参数（JSON 对象，预留给 provider 消费，如云主机管理）
+    params = models.JSONField('方法参数', default=dict, blank=True)
     timeout = models.PositiveIntegerField('超时(秒)', default=300)
 
     # ── 主机范围：默认跟随任务全局，自定义时按模块维度独立匹配 ──

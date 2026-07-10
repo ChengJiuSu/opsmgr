@@ -179,7 +179,7 @@ class ExecutionAPITests(TestCase):
         c = self._client()
         task_id = self._create_task(c, steps=[
             self._step(name='步骤A'),
-            self._step(order=2, name='步骤B', task_type='playbook', playbook='site.yml', command=''),
+            self._step(order=2, name='步骤B', task_type='playbook', playbook='site.yml', tags='nginx', command=''),
         ])
         task = ExecutionTask.objects.get(pk=task_id)
         self.assertEqual(task.status, 'pending')
@@ -198,7 +198,9 @@ class ExecutionAPITests(TestCase):
 
         cases = [
             (self._step(command=''), '必须填写 Shell 命令'),
-            (self._step(task_type='playbook', command=''), '必须选择剧本文件'),
+            (self._step(task_type='playbook', command=''), '必须选择剧本方法'),
+            # playbook tags 必选：不允许留空执行全部
+            (self._step(task_type='playbook', playbook='site.yml', command=''), '必须选择一个 tags'),
             (self._step(task_type='method', command=''), '必须选择一个方法'),
         ]
         for step, keyword in cases:
@@ -460,7 +462,7 @@ class ExecutionAPITests(TestCase):
             with override_settings(ANSIBLE_PROJECT_DIR=proj):
                 c = self._client()
                 task_id = self._create_task(c, steps=[
-                    self._step(name='evil', task_type='playbook', playbook='../../etc/passwd', command=''),
+                    self._step(name='evil', task_type='playbook', playbook='../../etc/passwd', tags='x', command=''),
                 ])
                 c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
                 task = ExecutionTask.objects.get(pk=task_id)
@@ -577,7 +579,7 @@ class ExecutionAPITests(TestCase):
         self._create_task(c, name='cmd-only')
         self._create_task(c, name='with-pb', steps=[
             self._step(name='a'),
-            self._step(order=2, name='b', task_type='playbook', playbook='site.yml', command=''),
+            self._step(order=2, name='b', task_type='playbook', playbook='site.yml', tags='nginx', command=''),
         ])
         names = [t['name'] for t in c.get('/api/exec/tasks/', {'task_type': 'playbook'}).json()['data']['results']]
         self.assertEqual(names, ['with-pb'])
@@ -674,6 +676,28 @@ class ExecutionAPITests(TestCase):
         vc.credentials(HTTP_AUTHORIZATION='Bearer ' + login.json()['access'])
         self.assertEqual(vc.get('/api/exec/variables/').status_code, 200)  # 只读（含 Jenkins 等外部拉取场景）
         self.assertEqual(vc.post('/api/exec/variables/', {'key': 'x', 'value': '1'}, format='json').status_code, 403)
+
+    def test_method_step_params_json_roundtrip(self):
+        """方法模块参数：JSON 对象保存回显；非对象类型 400。"""
+        method = Method.objects.create(
+            name='reboot-p', code='reboot-p', provider='cloud_host', config={'action': 'reboot'},
+        )
+        c = self._client()
+        task_id = self._create_task(c, steps=[
+            self._step(name='带参', task_type='method', method=method.id, command='',
+                       params={'region': 'cn-sh', 'count': 2}),
+        ])
+        r = c.get(f'/api/exec/tasks/{task_id}/')
+        self.assertEqual(r.json()['steps'][0]['params'], {'region': 'cn-sh', 'count': 2})
+
+        r = c.post('/api/exec/tasks/', {
+            'name': 'bad-params',
+            'project_group': self.pg.id, 'channel': self.ch.id, 'environment': self.env.id,
+            'steps': [self._step(name='坏参', task_type='method', method=method.id, command='',
+                                 params=['not', 'a', 'dict'])],
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('JSON 对象', str(r.json()))
 
     def test_variables_injected_as_extra_vars(self):
         """执行注入：启用变量以 JSON -e 注入，禁用不注入；模块额外变量后置覆盖。"""

@@ -232,23 +232,33 @@
               v-model="step.method" filterable style="width:100%"
               placeholder="选择已启用的平台方法（非剧本类 provider）"
               no-data-text="方法管理暂无其他 provider 的平台方法"
-              @change="step.tagsArr = []"
             >
               <el-option v-for="m in otherMethods" :key="m.id" :label="`${m.name} (${m.provider_display})`" :value="m.id" />
             </el-select>
           </template>
 
-          <!-- tags 统一取自「方法管理」登记：playbook 模块=该剧本关联方法的 tags 并集；方法模块=该方法自己的 tags -->
-          <div v-if="step.task_type !== 'command'" class="step-row">
+          <!-- playbook：tags 单选必填（候选取自所选剧本方法登记，不支持留空执行全部） -->
+          <div v-if="step.task_type === 'playbook'" class="step-row">
             <el-select
-              v-model="step.tagsArr" multiple filterable clearable collapse-tags size="small" style="flex:1"
-              :placeholder="step.task_type === 'method' ? 'Tags 覆盖（留空用方法默认）' : 'Tags（留空执行全部）'"
-              :no-data-text="step.task_type === 'playbook' ? '方法管理中未登记该剧本的 tags' : '该方法未配置 tags'"
+              v-model="step.tag" filterable size="small" style="flex:1"
+              placeholder="Tags（必选，单选一个）"
+              no-data-text="所选剧本方法未登记 tags，请先在方法管理补全"
             >
               <el-option v-for="t in stepTagOptions(step)" :key="t" :label="t" :value="t" />
             </el-select>
             <el-input v-model="step.extra_vars" placeholder="额外变量 --extra-vars（可留空）" style="flex:2" size="small" />
           </div>
+          <!-- 平台方法：JSON 参数框（预留给 provider 消费，如云主机管理） -->
+          <el-input
+            v-if="step.task_type === 'method'"
+            v-model="step.paramsText" type="textarea" :rows="10" class="params-input"
+            placeholder='方法参数（JSON 对象，可留空），如：
+{
+  "region": "cn-shanghai",
+  "instance_ids": ["i-xxx", "i-yyy"],
+  "count": 2
+}'
+          />
 
           <div class="step-row">
             <span class="step-label">超时</span>
@@ -478,7 +488,7 @@ const formRef = ref()
 const matchedCount = ref(null)
 const emptyStep = () => ({
   name: '', task_type: 'command', command: '', playbook: '', pbMethod: null, method: null,
-  tagsArr: [], extra_vars: '', timeout: 300,
+  tag: '', extra_vars: '', paramsText: '', timeout: 300,
   use_custom_scope: false, project_group: null, channel: null, environment: null,
   _matched: null,
 })
@@ -507,19 +517,13 @@ const pbMethodInfo = (step) => playbookMethods.value.find((m) => m.id === step.p
 // 选定剧本方法后，剧本路径直接取方法配置；tags 清空待选
 function onPbMethodChange(step) {
   step.playbook = pbMethodInfo(step)?.config?.playbook || ''
-  step.tagsArr = []
+  step.tag = ''
 }
 
-// tags 候选统一来自「方法管理」配置：playbook 模块=所选剧本方法的 tags，方法模块=该方法自身 tags；
-// 已选值（如编辑历史任务）合并进候选，避免回显丢失
+// playbook 模块 tags 候选来自「方法管理」所选剧本方法的登记；已选值合并进候选避免编辑回显丢失
 function stepTagOptions(step) {
-  const tokens = new Set()
-  if (step.task_type === 'playbook') {
-    splitTags(pbMethodInfo(step)?.config?.tags).forEach((t) => tokens.add(t))
-  } else if (step.task_type === 'method') {
-    splitTags(methodInfo(step)?.config?.tags).forEach((t) => tokens.add(t))
-  }
-  ;(step.tagsArr || []).forEach((t) => tokens.add(t))
+  const tokens = new Set(splitTags(pbMethodInfo(step)?.config?.tags))
+  if (step.tag) tokens.add(step.tag)
   return [...tokens]
 }
 
@@ -561,7 +565,9 @@ async function openForm(row) {
       steps: (row.steps || []).map((s) => ({
         name: s.name, task_type: s.task_type, command: s.command || '',
         playbook: s.playbook || '', pbMethod: null, method: s.method || null,
-        tagsArr: splitTags(s.tags), extra_vars: s.extra_vars || '', timeout: s.timeout || 300,
+        tag: splitTags(s.tags)[0] || '', extra_vars: s.extra_vars || '',
+        paramsText: s.params && Object.keys(s.params).length ? JSON.stringify(s.params, null, 2) : '',
+        timeout: s.timeout || 300,
         use_custom_scope: s.use_custom_scope || false,
         project_group: s.project_group || null, channel: s.channel || null,
         environment: s.environment || null, _matched: null,
@@ -594,8 +600,23 @@ function validateSteps() {
     if (!s.name.trim()) s.name = `${typeNames[s.task_type]}模块${i + 1}` // 空名自动补
     const label = `模块 ${i + 1}「${s.name}」`
     if (s.task_type === 'command' && !s.command.trim()) return `${label}：请填写 Shell 命令`
-    if (s.task_type === 'playbook' && !s.playbook) return `${label}：请选择方法管理登记的剧本方法`
-    if (s.task_type === 'method' && !s.method) return `${label}：请选择平台方法`
+    if (s.task_type === 'playbook') {
+      if (!s.playbook) return `${label}：请选择方法管理登记的剧本方法`
+      if (!s.tag) return `${label}：必须选择一个 tags（不支持留空执行全部）`
+    }
+    if (s.task_type === 'method') {
+      if (!s.method) return `${label}：请选择平台方法`
+      if (s.paramsText.trim()) {
+        try {
+          const parsed = JSON.parse(s.paramsText)
+          if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+            return `${label}：方法参数必须为 JSON 对象（如 {"key": "value"}）`
+          }
+        } catch {
+          return `${label}：方法参数不是合法 JSON，请检查格式`
+        }
+      }
+    }
     if (s.use_custom_scope && (!s.project_group || !s.channel || !s.environment)) {
       return `${label}：自定义主机范围必须选齐项目组/渠道/环境`
     }
@@ -613,8 +634,9 @@ function buildPayload() {
       command: s.task_type === 'command' ? s.command : '',
       playbook: s.task_type === 'playbook' ? s.playbook : '',
       method: s.task_type === 'method' ? s.method : null,
-      tags: s.task_type === 'command' ? '' : s.tagsArr.join(','),
-      extra_vars: s.task_type === 'command' ? '' : s.extra_vars,
+      tags: s.task_type === 'playbook' ? s.tag : '',
+      extra_vars: s.task_type === 'playbook' ? s.extra_vars : '',
+      params: s.task_type === 'method' && s.paramsText.trim() ? JSON.parse(s.paramsText) : {},
       timeout: s.timeout,
       use_custom_scope: s.use_custom_scope,
       project_group: s.use_custom_scope ? s.project_group : null,
@@ -861,6 +883,7 @@ code { background: #f5f7fa; padding: 1px 6px; border-radius: 3px; font-size: 12p
 .step-body { display: flex; flex-direction: column; gap: 8px; }
 .step-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .step-label { font-size: 12px; color: #606266; flex-shrink: 0; }
+.params-input :deep(textarea) { font-family: 'Courier New', monospace; font-size: 12px; }
 
 .exec-hosts-header {
   display: flex; justify-content: space-between; align-items: center;

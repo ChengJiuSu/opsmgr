@@ -92,7 +92,9 @@ Ansible 项目目录内执行剧本：
   `ansible_playbook` 区分剧本类与其他平台方法），剧本路径与 tags 候选均
   取自方法 `config`，不再扫描目录匹配（后端 playbook/tags 字段仍为自由
   字符串；`GET /api/exec/playbooks/` 保留供方法管理登记时参考）；
-  平台方法模块则只列其他 provider（如云主机管理）
+  **tags 单选且必填**（不支持留空执行全部）；
+  平台方法模块则只列其他 provider（如云主机管理），无 tags/额外变量，
+  改为模块级 JSON 参数框（`TaskStep.params`，预留给 provider 消费）
 - 方法任务：**一个平台方法 = 一个剧本 + 一组 tags**（`Method.config.playbook/tags`），
   任务级 `tags` / `limit` 覆盖方法默认值
 - 剧本路径按项目目录内相对路径解析，禁止越出目录
@@ -145,8 +147,8 @@ GET                 /api/exec/tasks/{id}/logs/{log_id}/  单条日志详情（�
 |------|------|
 | 任务流 | `steps` 至少 1 个模块；编辑时整体替换、序号按提交顺序归一 |
 | 命令模块 | `command` 必填 |
-| playbook 模块 | `playbook` 必填（项目目录内相对路径） |
-| 方法模块 | `method` 必填且启用 |
+| playbook 模块 | `playbook` 必填；`tags` 必填且单选一个（不支持留空执行全部） |
+| 方法模块 | `method` 必填且启用；`params` 须为 JSON 对象（预留给 provider 消费），无 tags/额外变量 |
 | 主机范围 | 任务全局三维度**必选**；模块 `use_custom_scope` 时自定义三维度同样必选 |
 | 执行方式 | `exec_mode` 默认 parallel |
 | 变量 | `ExecVariable.key` 须为合法 ansible 变量名（字母/下划线开头） |

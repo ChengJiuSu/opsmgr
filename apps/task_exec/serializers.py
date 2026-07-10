@@ -97,10 +97,17 @@ class TaskStepSerializer(serializers.ModelSerializer):
         model = TaskStep
         fields = [
             'id', 'order', 'name', 'task_type', 'task_type_display',
-            'command', 'playbook', 'method', 'method_name', 'tags', 'extra_vars', 'timeout',
+            'command', 'playbook', 'method', 'method_name', 'tags', 'extra_vars', 'params', 'timeout',
             'use_custom_scope', 'project_group', 'project_group_name',
             'channel', 'channel_name', 'environment', 'environment_name', 'environment_is_prod',
         ]
+
+    def validate_params(self, value):
+        if value in (None, ''):
+            return {}
+        if not isinstance(value, dict):
+            raise serializers.ValidationError('方法参数必须为 JSON 对象（如 {"key": "value"}）')
+        return value
 
     def validate(self, attrs):
         task_type = attrs.get('task_type', 'command')
@@ -108,8 +115,12 @@ class TaskStepSerializer(serializers.ModelSerializer):
         label = f'模块「{name}」' if name else '模块'
         if task_type == 'command' and not (attrs.get('command') or '').strip():
             raise serializers.ValidationError({'command': f'{label}为命令类型，必须填写 Shell 命令'})
-        if task_type == 'playbook' and not (attrs.get('playbook') or '').strip():
-            raise serializers.ValidationError({'playbook': f'{label}为 Playbook 类型，必须选择剧本文件'})
+        if task_type == 'playbook':
+            if not (attrs.get('playbook') or '').strip():
+                raise serializers.ValidationError({'playbook': f'{label}为 Playbook 类型，必须选择剧本方法'})
+            # tags 必选：不允许留空执行全部
+            if not (attrs.get('tags') or '').strip():
+                raise serializers.ValidationError({'tags': f'{label}必须选择一个 tags（不支持留空执行全部）'})
         if task_type == 'method' and attrs.get('method') is None:
             raise serializers.ValidationError({'method': f'{label}为平台方法类型，必须选择一个方法'})
         # 自定义主机范围时三维度必选（与任务全局范围同策略，不支持留空=不限）
