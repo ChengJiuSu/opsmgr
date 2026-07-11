@@ -5,6 +5,7 @@
         <el-input v-model="filter.keyword" placeholder="方法名称" clearable style="width:160px" @keyup.enter="fetchData" @clear="fetchData" />
         <el-select v-model="filter.provider" placeholder="Provider" clearable style="width:150px" @change="fetchData">
           <el-option label="Ansible 剧本" value="ansible_playbook" />
+          <el-option label="Jenkins 构建" value="jenkins" />
           <el-option label="云主机管理" value="cloud_host" />
         </el-select>
         <el-button :icon="Search" @click="fetchData">查询</el-button>
@@ -13,7 +14,7 @@
     </div>
 
     <el-alert type="info" :closable="false" show-icon style="margin-bottom:12px">
-      平台方法用于集中管理可复用的执行能力。Ansible 剧本方法 = 指定剧本文件 + tags；云主机管理等 provider 为后续扩展预留。
+      平台方法用于集中管理可复用的执行能力。Ansible 剧本方法 = 指定剧本文件 + tags；Jenkins 构建方法 = 指定 Job 触发 CI（连接信息在「系统配置」维护 jenkins.url / jenkins.user / jenkins.api_token）；云主机管理等 provider 为后续扩展预留。
     </el-alert>
 
     <el-table v-loading="loading" :data="tableData" stripe>
@@ -21,17 +22,23 @@
       <el-table-column prop="code" label="标识" width="150" />
       <el-table-column label="Provider" width="130">
         <template #default="{ row }">
-          <el-tag size="small" :type="row.provider === 'ansible_playbook' ? 'success' : 'warning'">
+          <el-tag size="small" :type="providerTagType(row.provider)">
             {{ row.provider_display }}
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="剧本 / Tags" min-width="200">
+      <el-table-column label="剧本 / Job" min-width="200">
         <template #default="{ row }">
           <span v-if="row.provider === 'ansible_playbook'">
             <code>{{ row.config?.playbook || '-' }}</code>
             <el-tag v-if="row.config?.tags" size="small" type="info" style="margin-left:6px">
               tags: {{ row.config.tags }}
+            </el-tag>
+          </span>
+          <span v-else-if="row.provider === 'jenkins'">
+            <el-tag size="small" type="info">job 由任务参数指定</el-tag>
+            <el-tag v-if="Object.keys(row.config?.default_params || {}).length" size="small" type="info" style="margin-left:6px">
+              默认参数 {{ Object.keys(row.config.default_params).length }} 项
             </el-tag>
           </span>
           <span v-else class="muted">—</span>
@@ -69,6 +76,7 @@
       <el-form-item label="Provider">
         <el-select v-model="form.provider" style="width:100%">
           <el-option label="Ansible 剧本" value="ansible_playbook" />
+          <el-option label="Jenkins 构建" value="jenkins" />
           <el-option label="云主机管理（预留）" value="cloud_host" />
         </el-select>
       </el-form-item>
@@ -87,6 +95,21 @@
         <el-form-item label="默认 Limit">
           <el-input v-model="form.config.limit" placeholder="可留空" />
         </el-form-item>
+      </template>
+
+      <!-- jenkins 专属配置：不绑定具体 job，job_name 在任务模块参数中指定 -->
+      <template v-else-if="form.provider === 'jenkins'">
+        <el-form-item label="默认参数">
+          <el-input v-model="rawParams" type="textarea" :rows="4" placeholder='JSON 键值对，如 {"BRANCH": "master"}；任务模块 params 可覆盖' />
+        </el-form-item>
+        <el-form-item label="UNSTABLE">
+          <el-switch v-model="form.config.allow_unstable" />
+          <span class="form-tip">开启后 UNSTABLE 构建结果视为成功</span>
+        </el-form-item>
+        <el-alert type="warning" :closable="false" style="margin-bottom:18px">
+          Jenkins 方法为公共方法，不绑定具体 job：任务模块的方法参数中通过
+          <code>"job_name"</code> 指定要触发的 job。
+        </el-alert>
       </template>
 
       <!-- 其他 provider：通用 JSON 配置 -->
@@ -131,9 +154,12 @@ const dialogVisible = ref(false)
 const editRow = ref(null)
 const formRef = ref()
 const rawConfig = ref('{}')
+// jenkins 默认构建参数（JSON 文本，提交时解析进 config.default_params）
+const rawParams = ref('{}')
 const emptyForm = () => ({
   name: '', code: '', provider: 'ansible_playbook', description: '', service_type: null,
-  enabled: true, config: { playbook: '', tags: '', inventory: '', limit: '' },
+  enabled: true,
+  config: { playbook: '', tags: '', inventory: '', limit: '', allow_unstable: false },
 })
 const form = reactive(emptyForm())
 const rules = {
@@ -144,6 +170,10 @@ const rules = {
       (form.provider !== 'ansible_playbook' || form.config.playbook)
         ? cb() : cb(new Error('请填写剧本文件')),
   }],
+}
+
+function providerTagType(provider) {
+  return { ansible_playbook: 'success', jenkins: 'primary' }[provider] || 'warning'
 }
 
 async function fetchData() {
@@ -166,11 +196,16 @@ function openDialog(row = null) {
     Object.assign(form, {
       name: row.name, code: row.code, provider: row.provider,
       description: row.description, enabled: row.enabled, service_type: row.service_type,
-      config: { playbook: '', tags: '', inventory: '', limit: '', ...(row.config || {}) },
+      config: {
+        playbook: '', tags: '', inventory: '', limit: '', allow_unstable: false,
+        ...(row.config || {}),
+      },
     })
     rawConfig.value = JSON.stringify(row.config || {}, null, 2)
+    rawParams.value = JSON.stringify(row.config?.default_params || {}, null, 2)
   } else {
     rawConfig.value = '{}'
+    rawParams.value = '{}'
   }
   dialogVisible.value = true
   formRef.value?.clearValidate()
@@ -179,7 +214,23 @@ function openDialog(row = null) {
 async function handleSubmit() {
   await formRef.value.validate()
   let config = form.config
-  if (form.provider !== 'ansible_playbook') {
+  if (form.provider === 'jenkins') {
+    let defaultParams
+    try {
+      defaultParams = JSON.parse(rawParams.value || '{}')
+    } catch {
+      ElMessage.error('默认参数 JSON 格式不正确')
+      return
+    }
+    if (defaultParams === null || Array.isArray(defaultParams) || typeof defaultParams !== 'object') {
+      ElMessage.error('默认参数必须为 JSON 键值对对象')
+      return
+    }
+    config = {
+      default_params: defaultParams,
+      allow_unstable: !!form.config.allow_unstable,
+    }
+  } else if (form.provider !== 'ansible_playbook') {
     try {
       config = JSON.parse(rawConfig.value || '{}')
     } catch {
@@ -228,5 +279,6 @@ onMounted(() => {
 .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .toolbar-left { display: flex; gap: 8px; }
 .muted { color: #c0c4cc; }
+.form-tip { margin-left: 8px; color: #909399; font-size: 12px; }
 code { background: #f5f7fa; padding: 1px 6px; border-radius: 3px; font-size: 12px; }
 </style>

@@ -110,6 +110,7 @@ LOCAL_APPS = [
     'apps.dashboard',
     'apps.method_mgr',
     'apps.task_exec',
+    'apps.artifact_mgr',
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
@@ -234,6 +235,12 @@ TASK_EXEC_BACKEND = config('TASK_EXEC_BACKEND', default='thread')
 TASK_LOG_DIR = config('TASK_LOG_DIR', default=str(BASE_DIR / 'logs' / 'tasks'))
 # 执行日志保留天数，clean_task_logs 命令据此清理过期记录与文件
 TASK_LOG_RETENTION_DAYS = config('TASK_LOG_RETENTION_DAYS', default=90, cast=int)
+
+# ── 构建制品（Jenkins CI 上报）───────────────────────────
+# CI 上报的代码压缩包落盘根目录，按 项目组/渠道/环境/版本 分层
+ARTIFACT_ROOT = config('ARTIFACT_ROOT', default=str(MEDIA_ROOT / 'artifacts'))
+# 平台对外基础地址：拼接制品带签名下载 URL（CD 目标主机经此拉包），生产必须配置
+SITE_BASE_URL = config('SITE_BASE_URL', default='http://127.0.0.1:8000')
 
 # ── Ansible 集中管理项目 ──────────────────────────────────
 # 平台方法（ansible_playbook provider）在此目录内执行既有剧本并通过 --tags 触发；

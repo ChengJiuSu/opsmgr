@@ -46,6 +46,7 @@
           <el-menu-item v-if="authStore.isStaff" index="/task/methods">方法管理</el-menu-item>
           <el-menu-item index="/task/variables">变量管理</el-menu-item>
           <el-menu-item index="/task/executions">任务列表</el-menu-item>
+          <el-menu-item index="/task/artifacts">制品管理</el-menu-item>
           <el-menu-item v-if="authStore.isStaff" index="/task/credentials">连接凭据</el-menu-item>
         </el-sub-menu>
         <el-menu-item index="/audit/logs">

@@ -11,6 +11,7 @@ class Method(models.Model):
 
     PROVIDER_CHOICES = [
         ('ansible_playbook', 'Ansible 剧本'),
+        ('jenkins', 'Jenkins 构建'),  # 触发 Jenkins job 构建（CI），连接信息在系统配置维护
         ('cloud_host', '云主机管理'),  # 预留：对接云平台 API
     ]
 
@@ -25,6 +26,8 @@ class Method(models.Model):
     )
     # provider 专属配置。ansible_playbook: {"playbook": "site.yml", "tags": "nginx,restart",
     #   "limit": ""}（主机/inventory 由任务执行入口按所选服务器动态生成）；
+    #   jenkins: {"default_params": {"BRANCH": "master"}, "allow_unstable": false}
+    #   （job 不绑定在方法上，由任务模块 params.job_name 指定；构建参数被模块 params 覆盖合并）；
     #   cloud_host: {"action": "reboot", ...}
     config = models.JSONField('方法配置', default=dict, blank=True)
     # 预留：方法接受的参数定义，用于前端动态表单/校验

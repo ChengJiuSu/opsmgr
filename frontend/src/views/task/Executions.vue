@@ -246,17 +246,25 @@
             >
               <el-option v-for="t in stepTagOptions(step)" :key="t" :label="t" :value="t" />
             </el-select>
-            <el-input v-model="step.extra_vars" placeholder="额外变量 --extra-vars（可留空）" style="flex:2" size="small" />
+            <el-input
+              v-model="step.extra_vars" style="flex:2" size="small"
+              placeholder="额外变量 --extra-vars（可留空）；CD 剧本自动注入最新制品 package_url/package_version/package_md5"
+            />
           </div>
-          <!-- 平台方法：JSON 参数框（预留给 provider 消费，如云主机管理） -->
+          <!-- 平台方法：JSON 参数框（jenkins 构建参数覆盖方法默认参数；其余 provider 自行消费） -->
           <el-input
             v-if="step.task_type === 'method'"
             v-model="step.paramsText" type="textarea" :rows="10" class="params-input"
-            placeholder='方法参数（JSON 对象，可留空），如：
+            placeholder='方法参数（JSON 对象）。Jenkins 方法必须用 job_name 指定要触发的 job，其余键为构建参数（覆盖方法默认参数），如：
+{
+  "job_name": "build-app",
+  "BRANCH": "master",
+  "CHANNEL": "official"
+}
+其他 provider（云主机管理等）由对应执行器消费，如：
 {
   "region": "cn-shanghai",
-  "instance_ids": ["i-xxx", "i-yyy"],
-  "count": 2
+  "instance_ids": ["i-xxx", "i-yyy"]
 }'
           />
 

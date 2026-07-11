@@ -87,6 +87,12 @@ const router = createRouter({
           meta: { title: '任务执行' },
         },
         {
+          path: 'task/artifacts',
+          name: 'TaskArtifacts',
+          component: () => import('../views/task/Artifacts.vue'),
+          meta: { title: '制品管理' },
+        },
+        {
           path: 'task/credentials',
           name: 'TaskCredentials',
           component: () => import('../views/task/Credentials.vue'),

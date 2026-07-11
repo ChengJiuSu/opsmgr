@@ -775,3 +775,92 @@ class ExecutionAPITests(TestCase):
         self.assertNotIn('other_dim_var', injected)
         self.assertNotIn('disabled_var', injected)
         self.assertEqual(cmd[idxs[1] + 1], 'override=1')  # 模块变量在后，ansible 同名覆盖
+
+
+@override_settings(TASK_EXEC_BACKEND='sync')
+class ArtifactInjectTests(TestCase):
+    """CD 制品变量注入：按模块有效维度取最新制品，params.artifact_version 可锁定版本。"""
+
+    # 复用任务流 API 测试的环境准备与辅助方法（不继承，避免父类用例重复执行）
+    setUp = ExecutionAPITests.setUp
+    _client = ExecutionAPITests._client
+    _step = staticmethod(ExecutionAPITests._step)
+    _create_task = ExecutionAPITests._create_task
+
+    def _make_artifact(self, version, **overrides):
+        from apps.artifact_mgr.models import Artifact
+
+        fields = dict(
+            project_group=self.pg, channel=self.ch, environment=self.env, version=version,
+            file_path=f'p/c/e/{version}/app.tar.gz', original_name='app.tar.gz',
+            md5='a' * 32, size=10,
+        )
+        fields.update(overrides)
+        return Artifact.objects.create(**fields)
+
+    def _run_step_cmd(self, c, task_id):
+        """mock 子进程执行一次任务，返回捕获到的 ansible 命令行。"""
+        with mock.patch('apps.task_exec.runner.run_subprocess', return_value=(0, 'ok')) as m:
+            c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
+        return m.call_args[0][0]
+
+    def test_latest_artifact_injected_as_extra_vars(self):
+        self._make_artifact('1.0.0')
+        latest = self._make_artifact('1.1.0', md5='b' * 32)
+        c = self._client()
+        cmd = self._run_step_cmd(c, self._create_task(c))
+        idxs = [i for i, a in enumerate(cmd) if a == '--extra-vars']
+        self.assertEqual(len(idxs), 1)
+        injected = cmd[idxs[0] + 1]
+        self.assertIn('"package_version": "1.1.0"', injected)
+        self.assertIn(f'"package_md5": "{"b" * 32}"', injected)
+        self.assertIn(f'/api/artifacts/{latest.id}/download/?sig=', injected)
+
+    def test_no_artifact_no_injection(self):
+        c = self._client()
+        cmd = self._run_step_cmd(c, self._create_task(c))
+        self.assertNotIn('--extra-vars', cmd)
+
+    def test_locked_version_injected(self):
+        target = self._make_artifact('1.0.0')
+        self._make_artifact('1.1.0')
+        c = self._client()
+        task_id = self._create_task(c, steps=[self._step(params={'artifact_version': '1.0.0'})])
+        cmd = self._run_step_cmd(c, task_id)
+        injected = cmd[cmd.index('--extra-vars') + 1]
+        self.assertIn('"package_version": "1.0.0"', injected)
+        self.assertIn(f'/api/artifacts/{target.id}/download/', injected)
+
+    def test_locked_version_missing_fails_step(self):
+        self._make_artifact('1.0.0')
+        c = self._client()
+        task_id = self._create_task(c, steps=[self._step(params={'artifact_version': '9.9.9'})])
+        with mock.patch('apps.task_exec.runner.run_subprocess', return_value=(0, 'ok')):
+            c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
+        task = ExecutionTask.objects.get(pk=task_id)
+        self.assertEqual(task.status, 'failed')
+        self.assertIn('未找到锁定版本的构建制品', task.output)
+        log = TaskExecutionLog.objects.get(task=task)
+        self.assertEqual(log.steps_result[0]['status'], 'failed')
+
+    def test_artifact_vars_follow_custom_scope_dims(self):
+        """自定义范围模块按模块自身维度取制品，而非任务全局维度。"""
+        from apps.asset_mgr.models import Environment, ServerService
+
+        other_env = Environment.objects.create(name='预发', code='ut-staging')
+        other_srv = Server.objects.create(
+            name='stage', ip='127.0.0.1',
+            project_group=self.pg, channel=self.ch, environment=other_env,
+        )
+        ServerService.objects.create(server=other_srv, service_type=self.base_service, status='planned')
+        self._make_artifact('1.0.0')  # 全局维度制品
+        scoped = self._make_artifact('2.0.0', environment=other_env)
+        c = self._client()
+        task_id = self._create_task(c, steps=[self._step(
+            use_custom_scope=True,
+            project_group=self.pg.id, channel=self.ch.id, environment=other_env.id,
+        )])
+        cmd = self._run_step_cmd(c, task_id)
+        injected = cmd[cmd.index('--extra-vars') + 1]
+        self.assertIn('"package_version": "2.0.0"', injected)
+        self.assertIn(f'/api/artifacts/{scoped.id}/download/', injected)

@@ -125,6 +125,34 @@ def _forks_args(task):
     return ['--forks', '1'] if task.exec_mode == 'serial' else []
 
 
+class ArtifactLookupError(Exception):
+    """制品查询失败（如锁定版本不存在），模块应直接失败。"""
+
+
+def _artifact_vars(step):
+    """按模块有效维度查询构建制品，返回注入 CD 剧本的变量字典。
+
+    - step.params.artifact_version 非空：锁定该版本，不存在则抛
+      ArtifactLookupError 使模块 fail fast；
+    - 未锁定：取该维度最新制品；无制品返回空 dict（静默跳过，不影响非 CD 模块）。
+    """
+    from apps.artifact_mgr.models import Artifact
+
+    pg, ch, env = _effective_dims(step)
+    locked = str((getattr(step, 'params', None) or {}).get('artifact_version') or '').strip()
+    artifact = Artifact.latest_for(pg, ch, env, version=locked or None)
+    if locked and artifact is None:
+        raise ArtifactLookupError(
+            f'未找到锁定版本的构建制品：version={locked}（请确认该维度下 CI 已上报此版本）。')
+    if artifact is None:
+        return {}
+    return {
+        'package_url': artifact.download_url(),
+        'package_version': artifact.version,
+        'package_md5': artifact.md5,
+    }
+
+
 def _effective_dims(step):
     """模块生效维度：自定义范围用模块自身维度，否则用任务全局维度。"""
     if getattr(step, 'use_custom_scope', False):
@@ -156,6 +184,10 @@ def extra_vars_args(step):
             variables[var.key] = raw  # 保存时已校验，此处兜底按原文注入
     if variables:
         args += ['--extra-vars', json.dumps(variables, ensure_ascii=False)]
+    # CD 制品变量：变量管理之后、模块 extra_vars 之前注入（模块手填可覆盖）
+    artifact_vars = _artifact_vars(step)
+    if artifact_vars:
+        args += ['--extra-vars', json.dumps(artifact_vars, ensure_ascii=False)]
     if (getattr(step, 'extra_vars', '') or '').strip():
         args += ['--extra-vars', step.extra_vars.strip()]
     return args
@@ -274,7 +306,10 @@ def run(task):
         if error:
             rc, out = 1, error
         else:
-            rc, out = _STEP_HANDLERS[step.task_type](step, task, servers)
+            try:
+                rc, out = _STEP_HANDLERS[step.task_type](step, task, servers)
+            except ArtifactLookupError as exc:
+                rc, out = 1, str(exc)
         duration = round(time.monotonic() - started, 2)
 
         outputs.append(f'{header}\n{out}')
