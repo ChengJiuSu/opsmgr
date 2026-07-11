@@ -18,6 +18,9 @@ django-celery-results>=2.5.0
 # 任务执行（命令 / 剧本均通过 Ansible 下发）
 ansible-core>=2.16
 
+# Jenkins 集成（平台方法 jenkins provider 直连 Jenkins REST API）
+requests>=2.32.0
+
 # 数据库（生产 MySQL）
 mysqlclient>=2.2.0
 
