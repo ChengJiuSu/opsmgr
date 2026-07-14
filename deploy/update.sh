@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# OpsManager 日常更新脚本（在目标服务器上、项目根目录执行）
+#   bash deploy/update.sh
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+export DJANGO_SETTINGS_MODULE=ops_manager.settings.prod
+
+echo "==> 拉取最新代码"
+git pull --ff-only
+
+echo "==> 更新后端依赖"
+venv/bin/pip install -r requirements.txt
+
+echo "==> 数据库迁移"
+venv/bin/python manage.py migrate --noinput
+
+echo "==> 收集静态文件"
+venv/bin/python manage.py collectstatic --noinput
+
+echo "==> 构建前端"
+(cd frontend && npm ci && npm run build)
+
+echo "==> 重启后端服务"
+sudo systemctl restart ops-manager
+
+echo "更新完成：$(git log -1 --oneline)"
