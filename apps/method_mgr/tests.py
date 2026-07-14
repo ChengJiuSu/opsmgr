@@ -101,6 +101,28 @@ class JenkinsExecutorTests(TestCase):
         args, _ = session.post.call_args
         self.assertEqual(args[0], f'{BASE}/job/build-app/buildWithParameters')
 
+    def test_console_note_annotations_stripped(self):
+        """Jenkins ConsoleNote 注解（\\x1b[8mha:<base64>\\x1b[0m）应从日志中剥除。"""
+        session = self._session()
+        noisy = ('\x1b[8mha:////4KQ/A3tkXrmJjdpGoVZnjv1EdD71LRtv+xyUn6P9Ves4AAAAlx+L==\x1b[0m'
+                 'Started by user admin\n'
+                 'ha:////4GTp8LxWlrNTCUBWOjBi6dxkveeKqzgnlYK3cThQPkMVAAAAoh+L==[Pipeline] node\n')
+
+        def _get(url, **kwargs):
+            if url.startswith(QUEUE_URL):
+                return FakeResp(json_data={'executable': {'url': BUILD_URL, 'number': 12}})
+            if 'progressiveText' in url:
+                return FakeResp(text=noisy, headers={'X-Text-Size': str(len(noisy))})
+            return FakeResp(json_data={'result': 'SUCCESS'})
+
+        session.get.side_effect = _get
+        rc, output = self._execute(session)
+        self.assertEqual(rc, 0)
+        self.assertNotIn('ha:////', output)
+        self.assertNotIn('\x1b[', output)
+        self.assertIn('Started by user admin', output)
+        self.assertIn('[Pipeline] node', output)
+
     def test_missing_job_name(self):
         rc, output = self._execute(self._session(), step=_step(params={'BRANCH': 'x'}))
         self.assertEqual(rc, 1)

@@ -17,6 +17,7 @@
 artifact_version 亦为平台保留键（CD 锁定制品版本用），不透传给 Jenkins。
 Jenkins 连接信息读系统配置：jenkins.url / jenkins.user / jenkins.api_token。
 """
+import re
 import time
 from urllib.parse import quote
 
@@ -25,6 +26,12 @@ import requests
 from .base import BaseExecutor, register
 
 POLL_INTERVAL = 2  # 队列/日志轮询间隔（秒）
+
+# Jenkins ConsoleNote 注解：日志流中形如 \x1b[8mha:<base64>\x1b[0m 的隐藏段
+# （Jenkins 网页用它渲染超链接），progressiveText 原样透出，平台展示需剥除。
+# ESC 序列可能在传输/存储中丢失，故 ESC 部分按可选匹配。
+CONSOLE_NOTE_RE = re.compile(r'(?:\x1b\[8m)?ha:////[A-Za-z0-9+/=]+(?:\x1b\[0m)?')
+ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*m')
 
 # 平台保留键，不作为 Jenkins 构建参数透传：
 #   job_name 指定触发的 job（本执行器消费）；artifact_version 由 task_exec.runner 消费
@@ -162,7 +169,9 @@ class JenkinsExecutor(BaseExecutor):
             resp = session.get(f'{build_url}logText/progressiveText',
                                params={'start': start}, timeout=30)
             if resp.ok and resp.text:
-                lines.append(resp.text.rstrip('\n'))
+                text = CONSOLE_NOTE_RE.sub('', resp.text)
+                text = ANSI_ESCAPE_RE.sub('', text)
+                lines.append(text.rstrip('\n'))
             start = int(resp.headers.get('X-Text-Size', start) or start)
             if resp.headers.get('X-More-Data') != 'true':
                 return None
