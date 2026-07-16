@@ -22,6 +22,9 @@ echo "==> 构建前端"
 (cd frontend && npm ci && npm run build)
 
 echo "==> 重启后端服务"
-sudo systemctl restart ops-manager
+# supervisor 托管（deploy/ops-manager.conf）；程序名不同时以环境变量覆盖：
+#   SUPERVISOR_PROGRAM=xxx bash deploy/update.sh
+# 仍用 systemd（deploy/ops-manager.service）时改回：sudo systemctl restart ops-manager
+manager restart ops-manager-01
 
 echo "更新完成：$(git log -1 --oneline)"

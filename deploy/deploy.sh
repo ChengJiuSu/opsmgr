@@ -38,8 +38,9 @@ venv/bin/python manage.py createsuperuser || true
 cat <<'EOF'
 
 部署完成。剩余手工步骤：
-  1. sudo cp deploy/ops-manager.service /etc/systemd/system/
-     sudo systemctl daemon-reload && sudo systemctl enable --now ops-manager
+  1. sudo cp deploy/ops-manager.conf /home/ubuntu/apps/supervisor/conf.d
+     （改路径/用户/程序名）manager update devops-manager-01
+     （备选 systemd：deploy/ops-manager.service，见 deploy/README.md）
   2. sudo cp deploy/nginx.conf /etc/nginx/conf.d/ops-manager.conf
      （改 server_name / 路径）sudo nginx -t && sudo systemctl reload nginx
   3. 浏览器登录，「系统配置」页维护 jenkins.url / jenkins.user / jenkins.api_token

@@ -10,7 +10,8 @@
 | `env.example` | 生产环境变量模板，复制为项目根 `.env` |
 | `deploy.sh` | 首次部署：venv、依赖、迁移、collectstatic、前端构建 |
 | `update.sh` | 日常更新：拉代码、迁移、构建、重启服务 |
-| `ops-manager.service` | gunicorn systemd 单元 |
+| `ops-manager.conf` | gunicorn supervisor 配置（默认托管方式） |
+| `ops-manager.service` | gunicorn systemd 单元（备选托管方式） |
 | `nginx.conf` | nginx 站点配置 |
 
 ## 首次部署
@@ -24,14 +25,23 @@ cd /opt/devops-manager
 cp deploy/env.example .env && vim .env       # SECRET_KEY / ALLOWED_HOSTS / DB / SITE_BASE_URL
 bash deploy/deploy.sh
 
-sudo cp deploy/ops-manager.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now ops-manager
+# 后端托管（默认 supervisor，改路径/用户/程序名后安装）
+sudo cp deploy/ops-manager.conf /etc/supervisor/conf.d/
+sudo supervisorctl reread && sudo supervisorctl update
 
 sudo cp deploy/nginx.conf /etc/nginx/conf.d/ops-manager.conf   # 改 server_name / 路径
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
-部署路径非 `/opt/devops-manager` 时，同步修改 `ops-manager.service` 与 `nginx.conf` 中路径。
+备选 systemd 托管：
+
+```bash
+sudo cp deploy/ops-manager.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now ops-manager
+```
+
+部署路径与配置内路径不一致时，同步修改 `ops-manager.conf`（或 `ops-manager.service`）与 `nginx.conf`。
+supervisor 程序名改动时，`update.sh` 重启用 `SUPERVISOR_PROGRAM=<程序名>` 覆盖（默认 `ops-manager-01`）。
 
 ## 上线后配置
 
