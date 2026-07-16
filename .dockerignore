@@ -1,0 +1,11 @@
+# 构建上下文瘦身：仅后端代码进镜像
+.git
+venv
+frontend/node_modules
+frontend/dist
+media
+logs
+db.sqlite3*
+*.pyc
+__pycache__
+.env

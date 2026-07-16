@@ -12,6 +12,7 @@
 | `update.sh` | 日常更新：拉代码、迁移、构建、重启服务 |
 | `ops-manager.conf` | gunicorn supervisor 配置（默认托管方式） |
 | `ops-manager.service` | gunicorn systemd 单元（备选托管方式） |
+| `docker/` | 后端容器化：Dockerfile + entrypoint（compose 文件在仓库根） |
 | `nginx.conf` | nginx 站点配置 |
 
 ## 首次部署
@@ -42,6 +43,39 @@ sudo systemctl daemon-reload && sudo systemctl enable --now ops-manager
 
 部署路径与配置内路径不一致时，同步修改 `ops-manager.conf`（或 `ops-manager.service`）与 `nginx.conf`。
 supervisor 程序名改动时，`update.sh` 重启用 `SUPERVISOR_PROGRAM=<程序名>` 覆盖（默认 `ops-manager-01`）。
+
+## Docker Compose 部署（后端，可选内置 MySQL）
+
+前置：docker + docker compose v2。前端构建产物仍由宿主机 nginx 提供
+（`location ~ ^/(api|admin)/` 反代 `127.0.0.1:8000` 不变）。
+
+```bash
+cd /path/to/devops-manager
+cp deploy/env.example .env && vim .env
+```
+
+**方式 A：使用外部 MySQL**（`.env` 的 `DB_HOST` 指向外部库）：
+
+```bash
+docker compose up -d --build
+```
+
+**方式 B：使用内置 MySQL**（`--profile mysql` 启用，数据落 `mysql-data` 卷）：
+
+```bash
+# .env 需设：DB_HOST=mysql、DB_PASSWORD、MYSQL_ROOT_PASSWORD
+docker compose --profile mysql up -d --build
+```
+
+说明：
+
+- backend 入口自动执行 `migrate` + `collectstatic`，并带 60s 数据库重试等待
+  （内置 MySQL 首次初始化较慢，无需 depends_on）。
+- 挂载卷：`media`（制品）、`logs`、`ansible`（剧本目录）、`~/.ssh`（只读，
+  Ansible 免密私钥）。容器内以 root 运行，SSH 私钥权限需 600。
+- 管理员账号：`docker compose exec backend python manage.py createsuperuser`。
+- 日常更新：`git pull && docker compose up -d --build`（前端另行 `npm run build`）。
+- 查看日志：`docker compose logs -f backend`。
 
 ## 上线后配置
 

@@ -1,0 +1,50 @@
+# OpsManager 后端 docker-compose 部署（前端构建产物仍由宿主机 nginx 提供）
+#
+# 使用外部 MySQL（.env 的 DB_HOST 指向外部库）：
+#   docker compose up -d --build
+# 使用内置 MySQL（.env 设 DB_HOST=mysql，并配置 MYSQL_ROOT_PASSWORD）：
+#   docker compose --profile mysql up -d --build
+#
+# 说明：backend 入口自带数据库重试等待，无需 depends_on；
+# ~/.ssh 只读挂载供 Ansible 免密连接目标主机。
+name: ops-manager
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+    image: ops-manager-backend:latest
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./media:/app/media          # 制品落盘
+      - ./logs:/app/logs            # 应用日志
+      - ./ansible:/app/ansible      # Ansible 剧本项目目录
+      - ~/.ssh:/root/.ssh:ro        # Ansible SSH 私钥（免密）
+
+  # 可选内置 MySQL：--profile mysql 启用；不启用时用外部库
+  mysql:
+    image: mysql:8.4
+    profiles: ["mysql"]
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?使用内置 MySQL 需在 .env 配置 MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME:-ops_manager}
+      MYSQL_USER: ${DB_USER:-ops}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?使用内置 MySQL 需在 .env 配置 DB_PASSWORD}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  mysql-data:
