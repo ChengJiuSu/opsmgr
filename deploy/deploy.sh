@@ -39,7 +39,7 @@ cat <<'EOF'
 
 部署完成。剩余手工步骤：
   1. sudo cp deploy/ops-manager.conf /home/ubuntu/apps/supervisor/conf.d
-     （改路径/用户/程序名）manager update devops-manager-01
+     （改路径/用户/程序名）/home/ubuntu/scripts/manager.sh update devops-manager-01
      （备选 systemd：deploy/ops-manager.service，见 deploy/README.md）
   2. sudo cp deploy/nginx.conf /etc/nginx/conf.d/ops-manager.conf
      （改 server_name / 路径）sudo nginx -t && sudo systemctl reload nginx
