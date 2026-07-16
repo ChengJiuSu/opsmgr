@@ -6,6 +6,7 @@
         <el-select v-model="filter.provider" placeholder="Provider" clearable style="width:150px" @change="fetchData">
           <el-option label="Ansible 剧本" value="ansible_playbook" />
           <el-option label="Jenkins 构建" value="jenkins" />
+          <el-option label="JumpServer 注册" value="jumpserver" />
           <el-option label="云主机管理" value="cloud_host" />
         </el-select>
         <el-button :icon="Search" @click="fetchData">查询</el-button>
@@ -14,7 +15,7 @@
     </div>
 
     <el-alert type="info" :closable="false" show-icon style="margin-bottom:12px">
-      平台方法用于集中管理可复用的执行能力。Ansible 剧本方法 = 指定剧本文件 + tags；Jenkins 构建方法 = 指定 Job 触发 CI（连接信息在「系统配置」维护 jenkins.url / jenkins.user / jenkins.api_token）；云主机管理等 provider 为后续扩展预留。
+      平台方法用于集中管理可复用的执行能力。Ansible 剧本方法 = 指定剧本文件 + tags；Jenkins 构建方法 = 指定 Job 触发 CI（连接信息在「系统配置」维护 jenkins.url / jenkins.user / jenkins.api_token）；JumpServer 注册方法 = 把目标主机注册为 JumpServer 资产（jumpserver.url / jumpserver.token）；云主机管理等 provider 为后续扩展预留。
     </el-alert>
 
     <el-table v-loading="loading" :data="tableData" stripe>
@@ -77,6 +78,7 @@
         <el-select v-model="form.provider" style="width:100%">
           <el-option label="Ansible 剧本" value="ansible_playbook" />
           <el-option label="Jenkins 构建" value="jenkins" />
+          <el-option label="JumpServer 注册" value="jumpserver" />
           <el-option label="云主机管理（预留）" value="cloud_host" />
         </el-select>
       </el-form-item>
@@ -111,6 +113,12 @@
           <code>"job_name"</code> 指定要触发的 job。
         </el-alert>
       </template>
+
+      <!-- jumpserver：无专属配置，把模块目标主机注册为 JumpServer 资产 -->
+      <el-alert v-else-if="form.provider === 'jumpserver'" type="info" :closable="false" style="margin-bottom:18px">
+        执行时把模块匹配到的目标主机注册为 JumpServer 资产（已存在的自动跳过），
+        无需额外配置；连接信息在「系统配置」维护 <code>jumpserver.url</code> / <code>jumpserver.token</code>。
+      </el-alert>
 
       <!-- 其他 provider：通用 JSON 配置 -->
       <el-form-item v-else label="配置 (JSON)">
@@ -173,7 +181,7 @@ const rules = {
 }
 
 function providerTagType(provider) {
-  return { ansible_playbook: 'success', jenkins: 'primary' }[provider] || 'warning'
+  return { ansible_playbook: 'success', jenkins: 'primary', jumpserver: 'danger' }[provider] || 'warning'
 }
 
 async function fetchData() {

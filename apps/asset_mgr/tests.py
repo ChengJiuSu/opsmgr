@@ -3,7 +3,7 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 from rest_framework.test import APIClient
 
-from .models import Channel, CloudProvider, Environment, ProjectGroup, Server
+from .models import Channel, CloudProvider, Environment, ProjectGroup, Server, ServerService, ServiceType
 
 User = get_user_model()
 
@@ -244,3 +244,171 @@ class ServerApiTests(BaseApiTest):
         self.assertEqual(data['by_env'].get('生产'), 2)
         self.assertEqual(data['by_project'].get('仙侠项目组'), 1)
         self.assertEqual(data['by_project'].get('未分配'), 1)
+
+
+class ServerBatchApiTests(BaseApiTest):
+    """批量编辑/删除接口：字段白名单、部署保护、权限。"""
+
+    def setUp(self):
+        self.admin = self._client()
+        self.s1 = Server.objects.create(name='b-01', ip='10.9.0.1')
+        self.s2 = Server.objects.create(name='b-02', ip='10.9.0.2')
+
+    def test_batch_update_fields(self):
+        r = self.admin.post('/api/assets/servers/batch/update/', {
+            'server_ids': [self.s1.id, self.s2.id],
+            'update': {'status': 'maintenance', 'ssh_port': 2222, 'region': 'cn-sh'},
+        }, format='json')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()['data']['updated'], 2)
+        self.s1.refresh_from_db()
+        self.assertEqual((self.s1.status, self.s1.ssh_port, self.s1.region), ('maintenance', 2222, 'cn-sh'))
+
+    def test_batch_update_rejects_unknown_field_and_bad_values(self):
+        r = self.admin.post('/api/assets/servers/batch/update/', {
+            'server_ids': [self.s1.id], 'update': {'ip': '1.1.1.1'},
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        r = self.admin.post('/api/assets/servers/batch/update/', {
+            'server_ids': [self.s1.id], 'update': {'ssh_port': 70000},
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        r = self.admin.post('/api/assets/servers/batch/update/', {
+            'server_ids': [self.s1.id], 'update': {'status': 'bad'},
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+
+    def test_batch_delete_blocks_deployed(self):
+        st = ServiceType.objects.create(name='网关', code='gate')
+        ServerService.objects.create(server=self.s1, service_type=st, status='deployed')
+        r = self.admin.post('/api/assets/servers/batch/delete/', {
+            'server_ids': [self.s1.id, self.s2.id],
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('已部署', r.json()['msg'])
+        # 无部署服务的主机可删
+        r = self.admin.post('/api/assets/servers/batch/delete/', {
+            'server_ids': [self.s2.id],
+        }, format='json')
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(Server.objects.filter(id=self.s2.id).exists())
+
+    def test_batch_requires_admin(self):
+        normal = self._client(is_staff=False)
+        for url in ('/api/assets/servers/batch/update/', '/api/assets/servers/batch/delete/',
+                    '/api/assets/servers/register-jumpserver/'):
+            r = normal.post(url, {'server_ids': [self.s1.id], 'update': {'status': 'running'}}, format='json')
+            self.assertEqual(r.status_code, 403, url)
+
+
+class ServerImportExportTests(BaseApiTest):
+    """CSV 模板 / 导入 / 导出。"""
+
+    def setUp(self):
+        self.admin = self._client()
+        self.group = ProjectGroup.objects.create(name='传奇项目组', code='legend')
+
+    def _import(self, content, mode='skip'):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        f = SimpleUploadedFile('servers.csv', content.encode('utf-8'), content_type='text/csv')
+        return self.admin.post(f'/api/assets/servers/import/?mode={mode}',
+                               {'file': f, 'mode': mode}, format='multipart')
+
+    def test_template_download(self):
+        r = self.admin.get('/api/assets/servers/import-template/')
+        self.assertEqual(r.status_code, 200)
+        self.assertIn('text/csv', r['Content-Type'])
+        body = r.content.decode('utf-8-sig')
+        self.assertTrue(body.startswith('name,ip,'))
+
+    def test_import_create_and_skip_update(self):
+        csv_text = (
+            'name,ip,os,cpu,memory,status,project_group,channel,environment,cloud_provider,region,ssh_port,ssh_user,remark\n'
+            'imp-01,10.8.0.1,Ubuntu,4,8192,running,legend,,prod,aliyun,cn-hz,22,root,首次导入\n'
+            'imp-02,10.8.0.2,,,,,,,,,,,,\n'
+        )
+        r = self._import(csv_text)
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(r.json()['data'], {'created': 2, 'updated': 0, 'skipped': 0})
+        srv = Server.objects.get(ip='10.8.0.1')
+        self.assertEqual(srv.project_group.code, 'legend')
+        self.assertEqual(srv.environment.code, 'prod')
+        self.assertEqual(Server.objects.get(ip='10.8.0.2').ssh_user, 'root')
+
+        # skip 模式重复导入全部跳过
+        r = self._import(csv_text)
+        self.assertEqual(r.json()['data'], {'created': 0, 'updated': 0, 'skipped': 2})
+
+        # update 模式按 IP 更新
+        r = self._import(
+            'name,ip,status\nimp-01-renamed,10.8.0.1,maintenance\n', mode='update')
+        self.assertEqual(r.json()['data'], {'created': 0, 'updated': 1, 'skipped': 0})
+        srv.refresh_from_db()
+        self.assertEqual((srv.name, srv.status), ('imp-01-renamed', 'maintenance'))
+
+    def test_import_validation_errors_abort_all(self):
+        csv_text = (
+            'name,ip,status,project_group\n'
+            'ok-01,10.8.1.1,running,legend\n'
+            ',bad-ip,flying,nope\n'
+        )
+        r = self._import(csv_text)
+        self.assertEqual(r.status_code, 400)
+        errors = r.json()['data']['errors']
+        self.assertEqual(errors[0]['line'], 3)
+        joined = ' '.join(errors[0]['errors'])
+        self.assertIn('name 不能为空', joined)
+        self.assertIn('ip 格式非法', joined)
+        # 任一行有错则整体不写库
+        self.assertFalse(Server.objects.filter(ip='10.8.1.1').exists())
+
+    def test_export_roundtrip(self):
+        Server.objects.create(name='exp-01', ip='10.8.2.1', project_group=self.group, ssh_port=2222)
+        r = self.admin.get('/api/assets/servers/export/')
+        self.assertEqual(r.status_code, 200)
+        body = r.content.decode('utf-8-sig')
+        self.assertIn('exp-01,10.8.2.1', body)
+        self.assertIn('legend', body)
+
+
+class ServerJumpServerTests(BaseApiTest):
+    """JumpServer 注册接口：配置缺失报错、逐台结果汇总（mock HTTP）。"""
+
+    def setUp(self):
+        self.admin = self._client()
+        self.s1 = Server.objects.create(name='js-01', ip='10.7.0.1')
+
+    def test_missing_config_returns_friendly_error(self):
+        r = self.admin.post('/api/assets/servers/register-jumpserver/', {
+            'server_ids': [self.s1.id],
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('jumpserver.url', r.json()['msg'])
+
+    def test_register_with_mocked_api(self):
+        from unittest import mock
+        from apps.system_cfg.models import SystemConfig
+        SystemConfig.objects.create(key='jumpserver.url', value='http://js.local')
+        SystemConfig.objects.create(key='jumpserver.token', value='tkn')
+
+        def fake_response(status=200, payload=None):
+            resp = mock.Mock()
+            resp.status_code = status
+            resp.ok = 200 <= status < 300
+            resp.json.return_value = payload if payload is not None else {}
+            resp.text = ''
+            return resp
+
+        with mock.patch('common.jumpserver.requests.Session') as session_cls:
+            session = session_cls.return_value
+            session.headers = {}
+            # 查重返回空 → 创建成功
+            session.get.return_value = fake_response(200, {'results': []})
+            session.post.return_value = fake_response(201, {'id': 'x'})
+            r = self.admin.post('/api/assets/servers/register-jumpserver/', {
+                'server_ids': [self.s1.id],
+            }, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        data = r.json()['data']
+        self.assertEqual((data['total'], data['succeeded'], data['failed']), (1, 1, 0))
+        self.assertEqual(data['results'][0]['msg'], '注册成功')

@@ -33,11 +33,13 @@ class BaseExecutor(ABC):
     provider = None
 
     @abstractmethod
-    def execute(self, task, method, inventory_path=None):
+    def execute(self, task, method, inventory_path=None, servers=None):
         """执行方法，返回 (rc, output)。
 
         task 为 ExecutionTask，method 为 Method；inventory_path 为平台基于
-        任务所选主机生成的动态 inventory 文件（task_exec.runner 传入）。
+        任务所选主机生成的动态 inventory 文件（task_exec.runner 传入）；
+        servers 为模块匹配到的 Server 列表（不走 Ansible 的 provider，
+        如 jumpserver 注册，直接消费主机对象）。
         """
         raise NotImplementedError
 

@@ -1,11 +1,23 @@
+import csv
+import io
+
+from django.core.exceptions import ValidationError
+from django.core.validators import validate_ipv46_address
+from django.db import transaction
 from django.db.models import ProtectedError, Q
+from django.http import HttpResponse
+from django.utils import timezone
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema
 from rest_framework import viewsets
 from rest_framework.decorators import action
+from rest_framework.views import APIView
 
-from common.permissions import IsAdminOrReadCreate
+from common.jumpserver import register_servers
+from common.permissions import IsAdmin, IsAdminOrReadCreate
 from common.response import fail, ok
 
-from .models import Channel, CloudProvider, Environment, ProjectGroup, Server, ServiceType
+from .models import Channel, CloudProvider, Environment, ProjectGroup, Server, ServerService, ServiceType
 from .serializers import (
     ChannelSerializer,
     CloudProviderSerializer,
@@ -14,6 +26,22 @@ from .serializers import (
     ServerSerializer,
     ServiceTypeSerializer,
 )
+
+# CSV 导入导出列（顺序即模板列顺序）：字典外键列填字典编码（code），name/ip 必填
+CSV_COLUMNS = [
+    'name', 'ip', 'os', 'cpu', 'memory', 'status',
+    'project_group', 'channel', 'environment', 'cloud_provider',
+    'region', 'ssh_port', 'ssh_user', 'remark',
+]
+# CSV 字典外键列 → (模型, 展示名)
+CSV_DICT_FIELDS = {
+    'project_group': (ProjectGroup, '项目组'),
+    'channel': (Channel, '渠道'),
+    'environment': (Environment, '环境'),
+    'cloud_provider': (CloudProvider, '云厂商'),
+}
+# 批量编辑允许的普通字段（字典外键分配走「配置管理 → 服务器分配」的批量分配）
+BATCH_UPDATE_FIELDS = ('status', 'os', 'region', 'ssh_user', 'ssh_port', 'remark')
 
 
 class BaseDictViewSet(viewsets.ModelViewSet):
@@ -162,4 +190,290 @@ class ServerViewSet(viewsets.ModelViewSet):
             'by_status': by_status,
             'by_env': by_env,
             'by_project': by_project,
+        })
+
+    @action(detail=False, methods=['get'])
+    def export(self, request):
+        """导出服务器 CSV：应用与列表页一致的筛选参数，列与导入模板一致（可回导）。"""
+        response = HttpResponse(content_type='text/csv; charset=utf-8')
+        response['Content-Disposition'] = 'attachment; filename="servers.csv"'
+        response.write('\ufeff')  # BOM：Excel 直接打开不乱码
+        writer = csv.writer(response)
+        writer.writerow(CSV_COLUMNS)
+        for s in self.get_queryset():
+            writer.writerow([
+                s.name, s.ip, s.os, s.cpu, s.memory, s.status,
+                s.project_group.code if s.project_group else '',
+                s.channel.code if s.channel else '',
+                s.environment.code if s.environment else '',
+                s.cloud_provider.code if s.cloud_provider else '',
+                s.region, s.ssh_port, s.ssh_user, s.remark,
+            ])
+        return response
+
+
+class ServerImportTemplateView(APIView):
+    """下载服务器导入 CSV 模板：表头 + 一行示例，字典列填编码（code）。"""
+
+    permission_classes = [IsAdminOrReadCreate]
+
+    @extend_schema(responses=OpenApiTypes.BINARY)
+    def get(self, request):
+        response = HttpResponse(content_type='text/csv; charset=utf-8')
+        response['Content-Disposition'] = 'attachment; filename="servers_import_template.csv"'
+        response.write('\ufeff')
+        writer = csv.writer(response)
+        writer.writerow(CSV_COLUMNS)
+        writer.writerow([
+            'web-server-01', '192.168.1.100', 'Ubuntu 22.04', '4', '8192', 'running',
+            'legend', 'official', 'prod', 'aliyun',
+            'cn-hangzhou', '22', 'root', '示例行，导入前请删除',
+        ])
+        return response
+
+
+class ServerBatchUpdateView(APIView):
+    """批量编辑服务器普通字段（状态/系统/地域/SSH 用户/SSH 端口/备注）。
+
+    请求体::
+
+        {"server_ids": [1, 2], "update": {"status": "maintenance", "ssh_port": 2222}}
+
+    仅提交的字段会被更新；字典外键归属走「配置管理 → 服务器分配」批量分配。
+    """
+
+    permission_classes = [IsAdmin]
+
+    @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
+    def post(self, request):
+        server_ids = request.data.get('server_ids')
+        update = request.data.get('update')
+        if not isinstance(server_ids, list) or not server_ids:
+            return fail('server_ids 必须为非空数组')
+        if not isinstance(update, dict) or not update:
+            return fail('update 必须为非空对象')
+        unknown = set(update) - set(BATCH_UPDATE_FIELDS)
+        if unknown:
+            return fail(f'不支持批量编辑的字段：{", ".join(sorted(unknown))}')
+
+        servers = Server.objects.filter(id__in=server_ids)
+        if servers.count() != len(set(server_ids)):
+            return fail('存在无效的服务器 id')
+
+        fields = {}
+        if 'status' in update:
+            valid = {key for key, _ in Server.STATUS_CHOICES}
+            if update['status'] not in valid:
+                return fail(f'status 必须为 {" / ".join(sorted(valid))}')
+            fields['status'] = update['status']
+        if 'ssh_port' in update:
+            port = update['ssh_port']
+            if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+                return fail('ssh_port 必须为 1-65535 的整数')
+            fields['ssh_port'] = port
+        for key in ('os', 'region', 'ssh_user', 'remark'):
+            if key in update:
+                fields[key] = str(update[key] or '')
+
+        with transaction.atomic():
+            updated = servers.update(**fields, updated_at=timezone.now())
+        return ok({'updated': updated})
+
+
+class ServerBatchDeleteView(APIView):
+    """批量删除服务器。存在「已部署」服务的主机禁止删除（先走下线流程）。
+
+    请求体::
+
+        {"server_ids": [1, 2, 3]}
+    """
+
+    permission_classes = [IsAdmin]
+
+    @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
+    def post(self, request):
+        server_ids = request.data.get('server_ids')
+        if not isinstance(server_ids, list) or not server_ids:
+            return fail('server_ids 必须为非空数组')
+        servers = Server.objects.filter(id__in=server_ids)
+        if servers.count() != len(set(server_ids)):
+            return fail('存在无效的服务器 id')
+
+        deployed = sorted(set(
+            ServerService.objects
+            .filter(server_id__in=server_ids, status='deployed')
+            .values_list('server__name', flat=True)
+        ))
+        if deployed:
+            names = '、'.join(deployed[:5]) + ('…' if len(deployed) > 5 else '')
+            return fail(f'主机 {names} 存在「已部署」服务，请先在「服务器分配」标记下线后再删除')
+
+        with transaction.atomic():
+            deleted = servers.count()
+            servers.delete()  # 服务记录 CASCADE 一并删除
+        return ok({'deleted': deleted})
+
+
+class ServerImportView(APIView):
+    """CSV 批量导入服务器。
+
+    multipart 表单::
+
+        file: CSV 文件（模板见 servers/import-template/）
+        mode: skip（默认，IP 已存在跳过）| update（IP 已存在则更新其余字段）
+
+    全量校验通过才写库（原子），任一行有错则整体不导入并返回逐行错误。
+    """
+
+    permission_classes = [IsAdmin]
+
+    @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
+    def post(self, request):
+        upload = request.FILES.get('file')
+        mode = request.data.get('mode', 'skip')
+        if upload is None:
+            return fail('请上传 CSV 文件（表单字段 file）')
+        if mode not in ('skip', 'update'):
+            return fail('mode 必须为 skip 或 update')
+        try:
+            text = upload.read().decode('utf-8-sig')
+        except UnicodeDecodeError:
+            return fail('文件编码必须为 UTF-8（模板下载后请保持编码另存）')
+
+        reader = csv.DictReader(io.StringIO(text))
+        headers = [h.strip() for h in (reader.fieldnames or [])]
+        missing = {'name', 'ip'} - set(headers)
+        if missing:
+            return fail(f'CSV 缺少必需列：{", ".join(sorted(missing))}（请使用导入模板）')
+
+        # 字典缓存：code/name → 对象（导入按编码填写，兼容按名称填写）
+        dict_cache = {
+            key: {**{o.code: o for o in model.objects.all()},
+                  **{o.name: o for o in model.objects.all()}}
+            for key, (model, _) in CSV_DICT_FIELDS.items()
+        }
+        existing_by_ip = {}
+        for s in Server.objects.all():
+            existing_by_ip.setdefault(s.ip, []).append(s)
+
+        errors, to_create, to_update, skipped = [], [], [], 0
+        seen_ips = set()
+        for lineno, row in enumerate(reader, start=2):  # 第 1 行为表头
+            parsed, row_errors = self._parse_row(row, dict_cache)
+            if parsed is None and row_errors is None:
+                continue  # 空行
+            ip = parsed.get('ip')
+            if ip and ip in seen_ips:
+                row_errors.append('文件内 IP 重复')
+            if ip:
+                seen_ips.add(ip)
+            if row_errors:
+                errors.append({'line': lineno, 'ip': ip or '', 'errors': row_errors})
+                continue
+            matched = existing_by_ip.get(ip, [])
+            if len(matched) > 1:
+                errors.append({'line': lineno, 'ip': ip, 'errors': ['平台已存在多台同 IP 主机，无法确定更新目标']})
+            elif matched:
+                if mode == 'update':
+                    to_update.append((matched[0], parsed))
+                else:
+                    skipped += 1
+            else:
+                to_create.append(Server(**parsed))
+        if errors:
+            return fail('导入校验未通过，已中止（未写入任何数据）', data={'errors': errors})
+
+        with transaction.atomic():
+            Server.objects.bulk_create(to_create)
+            for server, parsed in to_update:
+                for field, value in parsed.items():
+                    setattr(server, field, value)
+                server.save()
+        return ok({'created': len(to_create), 'updated': len(to_update), 'skipped': skipped})
+
+    @staticmethod
+    def _parse_row(row, dict_cache):
+        """解析单行，返回 (字段字典, 错误列表)；整行为空返回 (None, None)。"""
+        get = lambda key: (row.get(key) or '').strip()  # noqa: E731
+        if not any(get(key) for key in CSV_COLUMNS):
+            return None, None
+        errors = []
+        parsed = {'name': get('name'), 'ip': get('ip')}
+        if not parsed['name']:
+            errors.append('name 不能为空')
+        if not parsed['ip']:
+            errors.append('ip 不能为空')
+        else:
+            try:
+                validate_ipv46_address(parsed['ip'])
+            except ValidationError:
+                errors.append(f'ip 格式非法：{parsed["ip"]}')
+
+        status = get('status') or 'running'
+        valid_status = {key for key, _ in Server.STATUS_CHOICES}
+        if status not in valid_status:
+            errors.append(f'status 非法：{status}（可选 {"/".join(sorted(valid_status))}）')
+        parsed['status'] = status
+
+        for key, default in (('cpu', 0), ('memory', 0), ('ssh_port', 22)):
+            raw = get(key)
+            if not raw:
+                parsed[key] = default
+                continue
+            try:
+                value = int(raw)
+                if value < 0 or (key == 'ssh_port' and not 1 <= value <= 65535):
+                    raise ValueError
+                parsed[key] = value
+            except ValueError:
+                errors.append(f'{key} 必须为合法整数：{raw}')
+
+        for key, (_, label) in CSV_DICT_FIELDS.items():
+            raw = get(key)
+            if not raw:
+                parsed[key] = None
+                continue
+            obj = dict_cache[key].get(raw)
+            if obj is None:
+                errors.append(f'{label}不存在：{raw}（填字典编码，可在对应字典页查看）')
+            else:
+                parsed[key] = obj
+
+        parsed['os'] = get('os')
+        parsed['region'] = get('region')
+        parsed['ssh_user'] = get('ssh_user') or 'root'
+        parsed['remark'] = get('remark')
+        return parsed, errors
+
+
+class ServerRegisterJumpServerView(APIView):
+    """把选中服务器注册到 JumpServer（幂等：已存在的资产跳过）。
+
+    请求体::
+
+        {"server_ids": [1, 2, 3]}
+
+    连接信息读系统配置 jumpserver.url / jumpserver.token（详见 common.jumpserver）。
+    """
+
+    permission_classes = [IsAdmin]
+
+    @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
+    def post(self, request):
+        server_ids = request.data.get('server_ids')
+        if not isinstance(server_ids, list) or not server_ids:
+            return fail('server_ids 必须为非空数组')
+        servers = list(Server.objects.filter(id__in=server_ids))
+        if len(servers) != len(set(server_ids)):
+            return fail('存在无效的服务器 id')
+        try:
+            results = register_servers(servers)
+        except ValueError as exc:
+            return fail(str(exc))
+        succeeded = sum(1 for r in results if r['ok'])
+        return ok({
+            'total': len(results),
+            'succeeded': succeeded,
+            'failed': len(results) - succeeded,
+            'results': results,
         })

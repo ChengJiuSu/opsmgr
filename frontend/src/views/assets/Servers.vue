@@ -21,11 +21,34 @@
           <el-option v-for="o in dicts.cloudProviders" :key="o.id" :label="o.name" :value="o.code" />
         </el-select>
       </div>
-      <el-button type="primary" :icon="Plus" @click="openDialog()">新增服务器</el-button>
+      <div class="toolbar-right">
+        <template v-if="authStore.isStaff">
+          <el-button :icon="EditPen" :disabled="!selection.length" @click="openBatchEdit">
+            批量编辑<template v-if="selection.length">（{{ selection.length }}）</template>
+          </el-button>
+          <el-button :icon="Connection" :disabled="!selection.length" @click="handleRegisterJumpServer">
+            注册 JumpServer<template v-if="selection.length">（{{ selection.length }}）</template>
+          </el-button>
+          <el-button type="danger" :icon="Delete" :disabled="!selection.length" @click="handleBatchDelete">
+            批量删除<template v-if="selection.length">（{{ selection.length }}）</template>
+          </el-button>
+          <el-divider direction="vertical" />
+          <el-button :icon="Upload" @click="openImport">导入</el-button>
+        </template>
+        <el-button :icon="Download" @click="handleExport">导出</el-button>
+        <el-button type="primary" :icon="Plus" @click="openDialog()">新增服务器</el-button>
+      </div>
     </div>
 
-    <!-- 表格 -->
-    <el-table v-loading="loading" :data="tableData" stripe>
+    <!-- 表格（支持跨页多选做批量操作） -->
+    <el-table
+      v-loading="loading"
+      :data="tableData"
+      row-key="id"
+      stripe
+      @selection-change="(rows) => (selection = rows)"
+    >
+      <el-table-column v-if="authStore.isStaff" type="selection" width="46" reserve-selection />
       <el-table-column prop="name" label="名称" min-width="120" />
       <el-table-column prop="ip" label="IP 地址" width="130" />
       <el-table-column label="配置" width="110">
@@ -186,14 +209,111 @@
       <el-button type="primary" :loading="submitting" @click="handleSubmit">确定</el-button>
     </template>
   </el-dialog>
+
+  <!-- 批量编辑弹窗：仅勾选「修改」的字段会被提交 -->
+  <el-dialog v-model="batchEditVisible" :title="`批量编辑（已选 ${selection.length} 台服务器）`" width="480px">
+    <el-alert type="info" :closable="false" show-icon style="margin-bottom:16px">
+      仅勾选「修改」的字段会应用到所有选中主机；归属维度（项目组/环境等）请走「配置管理 → 服务器分配」
+    </el-alert>
+    <el-form label-width="90px">
+      <el-form-item v-for="field in batchFields" :key="field.key" :label="field.label">
+        <div class="batch-line">
+          <el-checkbox v-model="batchForm[field.key].on">修改</el-checkbox>
+          <el-select
+            v-if="field.key === 'status'"
+            v-model="batchForm.status.value" :disabled="!batchForm.status.on" style="flex:1"
+          >
+            <el-option label="运行中" value="running" />
+            <el-option label="已停止" value="stopped" />
+            <el-option label="维护中" value="maintenance" />
+          </el-select>
+          <el-input-number
+            v-else-if="field.key === 'ssh_port'"
+            v-model="batchForm.ssh_port.value" :disabled="!batchForm.ssh_port.on"
+            :min="1" :max="65535" style="flex:1"
+          />
+          <el-input
+            v-else
+            v-model="batchForm[field.key].value" :disabled="!batchForm[field.key].on"
+            :placeholder="field.placeholder"
+          />
+        </div>
+      </el-form-item>
+    </el-form>
+    <template #footer>
+      <el-button @click="batchEditVisible = false">取消</el-button>
+      <el-button type="primary" :loading="submitting" @click="handleBatchEdit">确定</el-button>
+    </template>
+  </el-dialog>
+
+  <!-- CSV 导入弹窗 -->
+  <el-dialog v-model="importVisible" title="批量导入服务器" width="560px">
+    <el-alert type="info" :closable="false" show-icon style="margin-bottom:12px">
+      按模板填写（字典列填编码，如环境 prod）；任一行校验失败则整体不导入并提示逐行错误
+    </el-alert>
+    <div class="import-toolbar">
+      <el-button size="small" :icon="Download" @click="handleTemplateDownload">下载 CSV 模板</el-button>
+      <el-radio-group v-model="importMode" size="small">
+        <el-radio-button value="skip">IP 已存在时跳过</el-radio-button>
+        <el-radio-button value="update">IP 已存在时更新</el-radio-button>
+      </el-radio-group>
+    </div>
+    <el-upload
+      ref="uploadRef"
+      drag
+      :auto-upload="false"
+      :limit="1"
+      accept=".csv"
+      :on-change="(file) => (importFile = file.raw)"
+      :on-remove="() => (importFile = null)"
+    >
+      <el-icon size="36" color="#c0c4cc"><Upload /></el-icon>
+      <div class="el-upload__text">拖拽 CSV 文件到此处，或<em>点击选择</em></div>
+    </el-upload>
+    <el-table v-if="importErrors.length" :data="importErrors" size="small" max-height="220" style="margin-top:12px">
+      <el-table-column prop="line" label="行号" width="70" />
+      <el-table-column prop="ip" label="IP" width="130" />
+      <el-table-column label="错误">
+        <template #default="{ row }">{{ row.errors.join('；') }}</template>
+      </el-table-column>
+    </el-table>
+    <template #footer>
+      <el-button @click="importVisible = false">取消</el-button>
+      <el-button type="primary" :loading="submitting" :disabled="!importFile" @click="handleImport">导入</el-button>
+    </template>
+  </el-dialog>
+
+  <!-- JumpServer 注册结果弹窗 -->
+  <el-dialog v-model="jsResultVisible" title="JumpServer 注册结果" width="620px">
+    <el-alert
+      :type="jsResult.failed ? 'warning' : 'success'" :closable="false" show-icon style="margin-bottom:12px"
+    >
+      共 {{ jsResult.total }} 台：成功 {{ jsResult.succeeded }}，失败 {{ jsResult.failed }}
+    </el-alert>
+    <el-table :data="jsResult.results" size="small" max-height="320">
+      <el-table-column prop="name" label="主机名" min-width="120" />
+      <el-table-column prop="ip" label="IP" width="130" />
+      <el-table-column label="结果" width="80">
+        <template #default="{ row }">
+          <el-tag size="small" :type="row.ok ? 'success' : 'danger'">{{ row.ok ? '成功' : '失败' }}</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column prop="msg" label="说明" min-width="160" show-overflow-tooltip />
+    </el-table>
+    <template #footer>
+      <el-button @click="jsResultVisible = false">关闭</el-button>
+    </template>
+  </el-dialog>
 </template>
 
 <script setup>
 import { ref, reactive, onMounted } from 'vue'
-import { Plus, Edit, Delete } from '@element-plus/icons-vue'
+import { Plus, Edit, Delete, EditPen, Connection, Upload, Download } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   getServers, createServer, updateServer, deleteServer,
+  batchUpdateServers, batchDeleteServers, registerJumpServer,
+  exportServers, getServerImportTemplate, importServers,
   projectGroupApi, channelApi, environmentApi, cloudProviderApi, serviceTypeApi, fetchDictOptions,
 } from '../../api/assets'
 import { useAuthStore } from '../../stores/auth'
@@ -315,6 +435,142 @@ async function handleDelete(row) {
   fetchData()
 }
 
+// ── 批量操作 ─────────────────────────────────────────────
+const selection = ref([])
+const batchEditVisible = ref(false)
+// 批量编辑字段定义与表单：仅勾选 on 的字段提交
+const batchFields = [
+  { key: 'status', label: '状态' },
+  { key: 'os', label: '操作系统', placeholder: '如 Ubuntu 22.04（留空表示清空）' },
+  { key: 'region', label: '地域/机房', placeholder: '如 cn-hangzhou（留空表示清空）' },
+  { key: 'ssh_user', label: 'SSH 用户', placeholder: '如 root' },
+  { key: 'ssh_port', label: 'SSH 端口' },
+  { key: 'remark', label: '备注', placeholder: '留空表示清空' },
+]
+const batchForm = reactive({
+  status: { on: false, value: 'running' },
+  os: { on: false, value: '' },
+  region: { on: false, value: '' },
+  ssh_user: { on: false, value: 'root' },
+  ssh_port: { on: false, value: 22 },
+  remark: { on: false, value: '' },
+})
+
+function openBatchEdit() {
+  batchFields.forEach(({ key }) => (batchForm[key].on = false))
+  batchEditVisible.value = true
+}
+
+async function handleBatchEdit() {
+  const update = {}
+  batchFields.forEach(({ key }) => {
+    if (batchForm[key].on) update[key] = batchForm[key].value
+  })
+  if (!Object.keys(update).length) {
+    ElMessage.warning('请至少勾选一个要修改的字段')
+    return
+  }
+  submitting.value = true
+  try {
+    const res = await batchUpdateServers({ server_ids: selection.value.map((r) => r.id), update })
+    ElMessage.success(`已更新 ${res.data?.updated ?? 0} 台服务器`)
+    batchEditVisible.value = false
+    selection.value = []
+    fetchData()
+  } finally {
+    submitting.value = false
+  }
+}
+
+async function handleBatchDelete() {
+  await ElMessageBox.confirm(
+    `确定删除选中的 ${selection.value.length} 台服务器吗？其服务规划记录将一并删除，且不可恢复。`,
+    '警告',
+    { type: 'warning', confirmButtonText: '删除', confirmButtonClass: 'el-button--danger' },
+  )
+  const res = await batchDeleteServers({ server_ids: selection.value.map((r) => r.id) })
+  ElMessage.success(`已删除 ${res.data?.deleted ?? 0} 台服务器`)
+  selection.value = []
+  fetchData()
+}
+
+// ── JumpServer 注册 ─────────────────────────────────────
+const jsResultVisible = ref(false)
+const jsResult = ref({ total: 0, succeeded: 0, failed: 0, results: [] })
+
+async function handleRegisterJumpServer() {
+  await ElMessageBox.confirm(
+    `将选中的 ${selection.value.length} 台服务器注册为 JumpServer 资产（已存在的自动跳过）？`,
+    '提示',
+    { type: 'info' },
+  )
+  submitting.value = true
+  try {
+    const res = await registerJumpServer({ server_ids: selection.value.map((r) => r.id) })
+    jsResult.value = res.data || { total: 0, succeeded: 0, failed: 0, results: [] }
+    jsResultVisible.value = true
+  } finally {
+    submitting.value = false
+  }
+}
+
+// ── CSV 导入导出 ─────────────────────────────────────────
+const importVisible = ref(false)
+const importMode = ref('skip')
+const importFile = ref(null)
+const importErrors = ref([])
+const uploadRef = ref()
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+async function handleExport() {
+  const params = {}
+  Object.entries(filter).forEach(([key, value]) => {
+    if (value) params[key] = value
+  })
+  const blob = await exportServers(params)
+  downloadBlob(blob, 'servers.csv')
+}
+
+async function handleTemplateDownload() {
+  downloadBlob(await getServerImportTemplate(), 'servers_import_template.csv')
+}
+
+function openImport() {
+  importFile.value = null
+  importErrors.value = []
+  importMode.value = 'skip'
+  uploadRef.value?.clearFiles()
+  importVisible.value = true
+}
+
+async function handleImport() {
+  const formData = new FormData()
+  formData.append('file', importFile.value)
+  formData.append('mode', importMode.value)
+  submitting.value = true
+  importErrors.value = []
+  try {
+    const res = await importServers(formData)
+    const { created = 0, updated = 0, skipped = 0 } = res.data || {}
+    ElMessage.success(`导入完成：新增 ${created}，更新 ${updated}，跳过 ${skipped}`)
+    importVisible.value = false
+    fetchData()
+  } catch (error) {
+    // 校验失败：后端返回逐行错误明细，展示在弹窗内便于修正
+    importErrors.value = error.response?.data?.data?.errors || []
+  } finally {
+    submitting.value = false
+  }
+}
+
 onMounted(() => {
   loadDicts()
   fetchData()
@@ -324,5 +580,9 @@ onMounted(() => {
 <style scoped>
 .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .toolbar-left { display: flex; gap: 8px; flex-wrap: wrap; }
+.toolbar-right { display: flex; gap: 8px; align-items: center; flex-shrink: 0; flex-wrap: wrap; }
 .form-tip { color: #909399; font-size: 12px; line-height: 1.5; margin-top: 4px; }
+.batch-line { display: flex; gap: 10px; align-items: center; width: 100%; }
+.batch-line > :last-child { flex: 1; }
+.import-toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
 </style>

@@ -9,6 +9,6 @@ from .base import BaseExecutor, register
 @register('cloud_host')
 class CloudHostExecutor(BaseExecutor):
 
-    def execute(self, task, method, inventory_path=None):
+    def execute(self, task, method, inventory_path=None, servers=None):
         action = (method.config or {}).get('action', '')
         return 1, f'云主机管理方法暂未实现（预留 provider）。config.action={action!r}'

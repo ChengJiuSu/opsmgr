@@ -265,8 +265,9 @@ def _run_method_step(step, task, servers):
     workdir = tempfile.mkdtemp(prefix='ops_mtd_')
     try:
         inventory_path = _write_inventory(servers, task.credential, workdir)
-        # 执行器按 step 读取 tags/extra_vars/timeout（模块级）与 exec_mode（透传任务级）
-        return executor.execute(step, method, inventory_path=inventory_path)
+        # 执行器按 step 读取 tags/extra_vars/timeout（模块级）与 exec_mode（透传任务级）；
+        # servers 供不走 Ansible 的 provider（如 jumpserver）直接消费主机对象
+        return executor.execute(step, method, inventory_path=inventory_path, servers=servers)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

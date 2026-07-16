@@ -181,3 +181,44 @@ class JenkinsExecutorTests(TestCase):
         })
         self.assertFalse(s.is_valid())
         self.assertIn('config', s.errors)
+
+
+class JumpServerExecutorTests(TestCase):
+    """jumpserver 执行器：注册发现、目标为空、逐台结果与返回码。"""
+
+    def setUp(self):
+        self.method = Method.objects.create(name='注册跳板机', code='js-reg', provider='jumpserver')
+        self.step = SimpleNamespace(params={}, timeout=60)
+
+    def test_provider_registered(self):
+        from .executors import available_providers
+        self.assertIn('jumpserver', available_providers())
+
+    def test_no_servers(self):
+        from .executors import get_executor
+        rc, out = get_executor('jumpserver').execute(self.step, self.method, servers=[])
+        self.assertEqual(rc, 1)
+        self.assertIn('没有可注册的目标主机', out)
+
+    def test_missing_config(self):
+        from apps.asset_mgr.models import Server
+        from .executors import get_executor
+        srv = Server.objects.create(name='js-x', ip='10.6.0.1')
+        rc, out = get_executor('jumpserver').execute(self.step, self.method, servers=[srv])
+        self.assertEqual(rc, 1)
+        self.assertIn('jumpserver.url', out)
+
+    def test_partial_failure_rc(self):
+        from unittest import mock
+        from apps.asset_mgr.models import Server
+        from .executors import get_executor
+        s1 = Server.objects.create(name='js-1', ip='10.6.0.2')
+        s2 = Server.objects.create(name='js-2', ip='10.6.0.3')
+        results = [
+            {'id': s1.id, 'name': s1.name, 'ip': s1.ip, 'ok': True, 'msg': '注册成功'},
+            {'id': s2.id, 'name': s2.name, 'ip': s2.ip, 'ok': False, 'msg': '注册失败：HTTP 400'},
+        ]
+        with mock.patch('apps.method_mgr.executors.jumpserver.register_servers', return_value=results):
+            rc, out = get_executor('jumpserver').execute(self.step, self.method, servers=[s1, s2])
+        self.assertEqual(rc, 1)
+        self.assertIn('成功 1，失败 1', out)

@@ -59,7 +59,7 @@ apps/task_exec/
 ## 动态 inventory（三类任务共用）
 
 `runner._inventory_content` 基于任务所选主机生成临时 INI inventory
-（方法任务由 runner 生成后以 `inventory_path` 传给 provider 执行器）：
+（方法任务由 runner 生成后以 `inventory_path` 传给 provider 执行器，同时传 `servers`（模块匹配到的 Server 列表）供不走 Ansible 的 provider——如 `jumpserver` 注册——直接消费主机对象）：
 
 - **主机名作 inventory 别名**：ansible 日志按主机名（而非 IP）显示各主机执行结果；
   名称中的非法字符净化为 `_`，空名回退 IP，重名主机追加 IP 保证别名唯一

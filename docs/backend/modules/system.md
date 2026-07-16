@@ -74,3 +74,5 @@ class SystemConfigViewSet(viewsets.ModelViewSet):
 | `MAX_UPLOAD_SIZE` | `104857600` | 最大上传字节（100MB）|
 | `MAINTENANCE_MODE` | `false` | 全站维护模式 |
 | `LOGIN_RETRY_LIMIT` | `5` | 登录失败次数上限 |
+| `jumpserver.url` | `http://192.168.1.10` | JumpServer 地址（服务器注册用） |
+| `jumpserver.token` | `<API Token>` | JumpServer 个人 API Token |

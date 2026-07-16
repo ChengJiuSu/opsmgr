@@ -5,6 +5,23 @@ export const createServer = (data) => request.post('/api/assets/servers/', data)
 export const updateServer = (id, data) => request.put(`/api/assets/servers/${id}/`, data)
 export const deleteServer = (id) => request.delete(`/api/assets/servers/${id}/`)
 
+// 服务器批量操作（仅管理员）
+export const batchUpdateServers = (data) => request.post('/api/assets/servers/batch/update/', data)
+export const batchDeleteServers = (data) => request.post('/api/assets/servers/batch/delete/', data)
+// 注册到 JumpServer：逐台调用外部 API，放宽超时
+export const registerJumpServer = (data) =>
+  request.post('/api/assets/servers/register-jumpserver/', data, { timeout: 120000 })
+
+// CSV 导入导出（blob 响应由调用方触发下载）
+export const exportServers = (params) =>
+  request.get('/api/assets/servers/export/', { params, responseType: 'blob' })
+export const getServerImportTemplate = () =>
+  request.get('/api/assets/servers/import-template/', { responseType: 'blob' })
+export const importServers = (formData) =>
+  request.post('/api/assets/servers/import/', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' }, timeout: 60000,
+  })
+
 // CMDB 字典模块通用接口工厂：项目组 / 渠道 / 环境 / 云厂商
 const createDictApi = (path) => ({
   list: (params) => request.get(`/api/assets/${path}/`, { params }),

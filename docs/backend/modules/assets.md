@@ -135,6 +135,12 @@ region         = CharField(max_length=50, blank=True)
 | GET/POST | `/api/assets/servers/` | 服务器列表（多维过滤）/ 创建 |
 | GET/PUT/PATCH/DELETE | `/api/assets/servers/{id}/` | 详情 / 更新 / 删除 |
 | GET | `/api/assets/servers/stats/` | 按状态 / 环境 / 项目组统计 |
+| GET | `/api/assets/servers/export/` | 导出 CSV（应用列表筛选参数，列与导入模板一致） |
+| GET | `/api/assets/servers/import-template/` | 下载导入 CSV 模板（表头 + 示例行） |
+| POST | `/api/assets/servers/import/` | CSV 批量导入（multipart：file + mode=skip/update，管理员） |
+| POST | `/api/assets/servers/batch/update/` | 批量编辑普通字段（status/os/region/ssh_user/ssh_port/remark，管理员） |
+| POST | `/api/assets/servers/batch/delete/` | 批量删除（存在「已部署」服务的主机拒绝，管理员） |
+| POST | `/api/assets/servers/register-jumpserver/` | 注册到 JumpServer（幂等，逐台结果，管理员） |
 | GET/POST | `/api/assets/project-groups/` | 项目组列表 / 创建 |
 | GET/POST | `/api/assets/channels/` | 渠道列表 / 创建 |
 | GET/POST | `/api/assets/environments/` | 环境列表 / 创建 |
@@ -145,9 +151,29 @@ region         = CharField(max_length=50, blank=True)
 
 ---
 
+## CSV 导入导出
+
+- 列：`name,ip,os,cpu,memory,status,project_group,channel,environment,cloud_provider,region,ssh_port,ssh_user,remark`，
+  字典外键列填字典**编码**（兼容名称），`name`/`ip` 必填。
+- 导入全量校验通过才写库（原子）；任一行有错返回 400，`data.errors` 携带
+  `[{line, ip, errors[]}]` 逐行明细。`mode=skip`（默认）IP 已存在跳过，`mode=update` 按 IP 更新。
+- 导出应用与列表页一致的筛选参数，带 BOM，Excel 可直接打开，可回导。
+
+## JumpServer 注册
+
+`common/jumpserver.py` 为公共实现（asset_mgr 接口与 method_mgr `jumpserver` 执行器共用）：
+按 IP 查重幂等，逐台返回 `{id, name, ip, ok, msg}`。连接信息读系统配置：
+
+| key | 说明 |
+|-----|------|
+| `jumpserver.url` | JumpServer 地址（必填） |
+| `jumpserver.token` | 个人 API Token（必填，`Authorization: Token`） |
+| `jumpserver.org_id` | 组织 id（可选，多组织时写入 X-JMS-ORG） |
+| `jumpserver.platform_id` | 平台 id（可选，默认 1=Linux） |
+| `jumpserver.node_id` | 挂载节点 id（可选） |
+
 ## 扩展建议
 
 - **区服（游戏服）模块**：项目组 × 渠道 × 环境 × 区服 链路，区服关联部署主机后可按区服圈选执行目标
 - **云账号**：对接 `method_mgr` 的 `cloud_host` 执行器时，为云厂商挂载 AK/SK 账号（加密存储、不回显）
-- 批量导入：支持 Excel/CSV 批量录入服务器
 - SSH 连通性检测：异步任务定期探测服务器

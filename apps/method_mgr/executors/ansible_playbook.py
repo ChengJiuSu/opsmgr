@@ -20,7 +20,7 @@ class AnsiblePlaybookExecutor(BaseExecutor):
         if not (config or {}).get('playbook'):
             raise ValueError('ansible_playbook 方法必须在 config.playbook 指定剧本文件')
 
-    def execute(self, task, method, inventory_path=None):
+    def execute(self, task, method, inventory_path=None, servers=None):
         project_dir = getattr(settings, 'ANSIBLE_PROJECT_DIR', '')
         if not project_dir or not os.path.isdir(project_dir):
             return 1, f'Ansible 项目目录不存在：{project_dir!r}（请配置 ANSIBLE_PROJECT_DIR）'

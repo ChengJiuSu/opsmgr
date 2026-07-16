@@ -12,6 +12,7 @@ class Method(models.Model):
     PROVIDER_CHOICES = [
         ('ansible_playbook', 'Ansible 剧本'),
         ('jenkins', 'Jenkins 构建'),  # 触发 Jenkins job 构建（CI），连接信息在系统配置维护
+        ('jumpserver', 'JumpServer 注册'),  # 目标主机注册为 JumpServer 资产，连接信息在系统配置维护
         ('cloud_host', '云主机管理'),  # 预留：对接云平台 API
     ]
 

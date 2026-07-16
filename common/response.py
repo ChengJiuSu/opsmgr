@@ -10,8 +10,9 @@ def ok(data=None, msg='success'):
     return Response({'code': 0, 'msg': msg, 'data': data})
 
 
-def fail(msg='error', code=1, status=400):
-    return Response({'code': code, 'msg': msg, 'data': None}, status=status)
+def fail(msg='error', code=1, status=400, data=None):
+    # data 供需要附带明细的失败场景使用（如导入逐行校验错误），默认保持 None
+    return Response({'code': code, 'msg': msg, 'data': data}, status=status)
 
 
 def custom_exception_handler(exc, context):
