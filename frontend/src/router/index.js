@@ -86,6 +86,13 @@ const router = createRouter({
           component: () => import('../views/task/Executions.vue'),
           meta: { title: '任务执行' },
         },
+        // 独立执行日志页：URL 可分享定位到某任务的某次执行（logId 可省略=最新一次）
+        {
+          path: 'task/executions/:taskId(\\d+)/logs/:logId(\\d+)?',
+          name: 'TaskLog',
+          component: () => import('../views/task/TaskLog.vue'),
+          meta: { title: '执行日志', activeMenu: '/task/executions' },
+        },
         {
           path: 'task/artifacts',
           name: 'TaskArtifacts',

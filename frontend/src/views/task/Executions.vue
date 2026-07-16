@@ -137,11 +137,36 @@
           <span v-if="logPanel.current">返回码：{{ logPanel.current.return_code ?? '-' }}</span>
           <span v-if="currentServers" class="muted">{{ currentServers }}</span>
           <el-tag v-if="logPanel.polling" type="info" size="small">实时刷新中…</el-tag>
+          <span class="output-expand">
+            <el-button size="small" :icon="FullScreen" @click="outputFullVisible = true">全屏查看</el-button>
+            <el-button size="small" :icon="TopRight" @click="openLogPage">独立页打开</el-button>
+          </span>
         </div>
-        <pre class="output-box">{{ logPanel.output || '（暂无输出）' }}</pre>
+        <pre ref="outputBoxRef" class="output-box">{{ logPanel.output || '（暂无输出）' }}</pre>
       </div>
     </div>
   </el-card>
+
+  <!-- 执行日志全屏浮层：与面板共用同一份输出数据，实时轮询同步生效 -->
+  <el-dialog v-model="outputFullVisible" fullscreen :lock-scroll="true" class="output-full-dialog">
+    <template #header>
+      <div class="output-full-header">
+        <span>
+          执行日志 — {{ logPanel.task?.name }}
+          <el-tag v-if="logPanel.task" size="small" :type="statusType(logPanel.task.status)" style="margin-left:8px">
+            <el-icon v-if="logPanel.task.status === 'running'" class="is-loading"><Loading /></el-icon>
+            {{ logPanel.task.status_display || logPanel.task.status }}
+          </el-tag>
+        </span>
+        <span class="output-meta" style="margin-bottom:0">
+          <span v-if="logPanel.current">返回码：{{ logPanel.current.return_code ?? '-' }}</span>
+          <span v-if="currentServers" class="muted">{{ currentServers }}</span>
+          <el-tag v-if="logPanel.polling" type="info" size="small">实时刷新中…</el-tag>
+        </span>
+      </div>
+    </template>
+    <pre ref="outputFullRef" class="output-box output-box-full">{{ logPanel.output || '（暂无输出）' }}</pre>
+  </el-dialog>
 
   <!-- 新建 / 编辑任务弹窗（任务流定义，仅保存不执行） -->
   <el-dialog v-model="formVisible" :title="form.id ? '编辑任务' : '新建任务'" width="760px" top="4vh">
@@ -399,9 +424,10 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, nextTick, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, nextTick, watch, onMounted, onUnmounted } from 'vue'
+import { useRouter } from 'vue-router'
 import {
-  Plus, Delete, Search, Refresh, View, Loading, CaretRight, EditPen, Close, Top, Bottom,
+  Plus, Delete, Search, Refresh, View, Loading, CaretRight, EditPen, Close, Top, Bottom, FullScreen, TopRight,
 } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../../stores/auth'
@@ -414,6 +440,7 @@ import {
 } from '../../api/tasks'
 
 const authStore = useAuthStore()
+const router = useRouter()
 const loading = ref(false)
 const submitting = ref(false)
 const tableData = ref([])
@@ -761,8 +788,20 @@ async function doExecute() {
 const logPanel = reactive({ task: null, logs: [], current: null, output: '', polling: false })
 const logPanelRef = ref()
 const logTableRef = ref()
+const outputFullVisible = ref(false)
+const outputBoxRef = ref()
+const outputFullRef = ref()
 let pollTimer = null
 let listTimer = null
+
+// 实时轮询期间输出更新后自动滚到底部，跟随最新日志
+watch(() => logPanel.output, async () => {
+  if (!logPanel.polling) return
+  await nextTick()
+  for (const el of [outputBoxRef.value, outputFullRef.value]) {
+    if (el) el.scrollTop = el.scrollHeight
+  }
+})
 
 const stepsSummary = (log) => {
   const steps = log.steps_result || []
@@ -791,7 +830,17 @@ async function openLogs(row, { live = false } = {}) {
 
 function closeLogs() {
   logPanel.task = null
+  outputFullVisible.value = false
   stopPolling()
+}
+
+// 新标签页打开独立日志页（URL 可分享，定位到当前选中的执行记录）
+function openLogPage() {
+  const { href } = router.resolve({
+    name: 'TaskLog',
+    params: { taskId: logPanel.task.id, logId: logPanel.current?.id },
+  })
+  window.open(href, '_blank')
 }
 
 async function refreshLogs() {
@@ -905,6 +954,7 @@ code { background: #f5f7fa; padding: 1px 6px; border-radius: 3px; font-size: 12p
 .log-list :deep(.log-row) { cursor: pointer; }
 .log-output { flex: 1; min-width: 0; }
 .output-meta { display: flex; gap: 16px; align-items: center; margin-bottom: 8px; color: #606266; font-size: 13px; }
+.output-expand { margin-left: auto; }
 .output-box {
   background: #1e1e1e;
   color: #d4d4d4;
@@ -915,8 +965,16 @@ code { background: #f5f7fa; padding: 1px 6px; border-radius: 3px; font-size: 12p
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-all;
-  height: 420px;
+  /* 面板内随视口拉高，小屏保底 420px */
+  height: max(420px, calc(100vh - 400px));
   overflow-y: auto;
   margin: 0;
 }
+/* 全屏浮层：输出区占满视口剩余高度 */
+.output-box-full { height: calc(100vh - 90px); border-radius: 0; }
+.output-full-header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding-right: 24px; font-size: 15px; font-weight: 600;
+}
+.output-full-dialog :deep(.el-dialog__body) { padding: 0 16px 16px; }
 </style>

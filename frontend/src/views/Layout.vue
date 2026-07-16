@@ -7,7 +7,7 @@
         <span v-if="!collapsed" class="logo-text">OpsManager</span>
       </div>
       <el-menu
-        :default-active="route.path"
+        :default-active="route.meta.activeMenu || route.path"
         :collapse="collapsed"
         router
         background-color="#001529"
