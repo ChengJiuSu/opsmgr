@@ -295,6 +295,26 @@
         </template>
       </el-table-column>
     </el-table>
+    <!-- 补充规划：为当前主机追加尚未绑定的服务类型（一台主机可承载多个服务） -->
+    <el-divider content-position="left">补充规划</el-divider>
+    <div class="append-plan">
+      <el-select
+        v-model="appendForm.serviceTypeIds"
+        multiple
+        style="flex:1"
+        :placeholder="appendableTypes.length ? '选择要追加的服务类型' : '所有启用的服务类型均已绑定'"
+        :disabled="!appendableTypes.length"
+      >
+        <el-option v-for="o in appendableTypes" :key="o.id" :label="o.name" :value="o.id" />
+      </el-select>
+      <el-input-number v-model="appendForm.processCount" :min="1" :max="99" style="width:120px" />
+      <el-button
+        type="primary"
+        :loading="submitting"
+        :disabled="!appendForm.serviceTypeIds.length"
+        @click="handleAppendPlan"
+      >追加</el-button>
+    </div>
     <template #footer>
       <el-button @click="serviceDialogVisible = false">关闭</el-button>
     </template>
@@ -376,6 +396,14 @@ const extraOptions = reactive({
 })
 const planForm = reactive({ serviceTypeIds: [], processCount: 1 })
 const allocateForm = reactive({ serverIds: [], serviceTypeIds: [], processCount: 1 })
+// 服务管理弹窗的补充规划表单
+const appendForm = reactive({ serviceTypeIds: [], processCount: 1 })
+
+// 当前主机可追加的服务类型 = 启用字典项 - 已有记录（任意状态，与后端幂等跳过口径一致）
+const appendableTypes = computed(() => {
+  const bound = new Set((serviceRow.value?.services || []).map((s) => s.service_type))
+  return dicts.serviceTypes.filter((o) => !bound.has(o.id))
+})
 
 // filterValue 为 null 的卡片不参与未分配筛选（未规划主机不在本页列表，点击改为打开分配服务弹窗）
 const overviewCards = computed(() => [
@@ -580,7 +608,27 @@ async function handleAllocate() {
 
 function openServiceDialog(row) {
   serviceRow.value = row
+  appendForm.serviceTypeIds = []
+  appendForm.processCount = 1
   serviceDialogVisible.value = true
+}
+
+// 补充规划：为当前主机追加服务类型（复用批量规划接口，单主机多类型）
+async function handleAppendPlan() {
+  submitting.value = true
+  try {
+    const res = await planServices({
+      server_ids: [serviceRow.value.id],
+      service_type_ids: appendForm.serviceTypeIds,
+      process_count: appendForm.processCount,
+    })
+    ElMessage.success(`已追加 ${res.data?.created ?? 0} 条服务规划`)
+    appendForm.serviceTypeIds = []
+    appendForm.processCount = 1
+    refreshAll()
+  } finally {
+    submitting.value = false
+  }
 }
 
 // 操作后刷新列表与概览，并同步服务管理弹窗中的行数据
@@ -658,4 +706,5 @@ onMounted(() => {
 .region-line { display: flex; gap: 8px; width: 100%; }
 .form-tip { color: #909399; font-size: 12px; line-height: 1.5; margin-top: 4px; }
 .allocate-filter { display: flex; gap: 8px; width: 100%; }
+.append-plan { display: flex; gap: 8px; align-items: flex-start; }
 </style>
