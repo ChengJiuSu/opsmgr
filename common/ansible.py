@@ -6,6 +6,7 @@
 import logging
 import os
 import subprocess
+import sys
 
 logger = logging.getLogger('apps.task_exec')
 
@@ -13,6 +14,10 @@ logger = logging.getLogger('apps.task_exec')
 def build_env():
     """构造关闭交互/主机指纹校验的 Ansible 运行环境。"""
     env = os.environ.copy()
+    # ansible 通常与本服务装在同一 venv，PATH 头部插入解释器目录，
+    # 保证未 activate venv / systemd 默认 PATH 下也能找到可执行文件
+    venv_bin = os.path.dirname(sys.executable)
+    env['PATH'] = venv_bin + os.pathsep + env.get('PATH', '')
     env['ANSIBLE_HOST_KEY_CHECKING'] = 'False'
     env['ANSIBLE_RETRY_FILES_ENABLED'] = 'False'
     env['ANSIBLE_FORCE_COLOR'] = 'False'

@@ -12,6 +12,8 @@ User=ops
 Group=ops
 WorkingDirectory=/opt/devops-manager
 Environment=DJANGO_SETTINGS_MODULE=ops_manager.settings.prod
+# venv/bin 置于 PATH 头部：任务执行需在 PATH 上找到 ansible/ansible-playbook
+Environment=PATH=/opt/devops-manager/venv/bin:/usr/local/bin:/usr/bin:/bin
 # --timeout 600：任务执行 / Jenkins 日志同步为长请求，勿调小
 ExecStart=/opt/devops-manager/venv/bin/gunicorn ops_manager.wsgi:application \
     --bind 127.0.0.1:8000 \
