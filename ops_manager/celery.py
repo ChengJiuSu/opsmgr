@@ -8,7 +8,10 @@ import os
 
 from celery import Celery
 
-os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'ops_manager.settings.dev')
+# 默认 prod：本模块经 ops_manager/__init__.py 在 wsgi 之前被导入，
+# 这里的 setdefault 先于 wsgi.py 生效——若默认 dev 会把生产进程拖回 SQLite。
+# 开发环境跑 worker 时显式指定：DJANGO_SETTINGS_MODULE=ops_manager.settings.dev celery -A ops_manager worker
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'ops_manager.settings.prod')
 
 app = Celery('ops_manager')
 app.config_from_object('django.conf:settings', namespace='CELERY')
