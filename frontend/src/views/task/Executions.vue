@@ -12,6 +12,7 @@
         <el-select v-model="filter.status" placeholder="状态" clearable style="width:110px" @change="handleSearch">
           <el-option label="等待中" value="pending" />
           <el-option label="执行中" value="running" />
+          <el-option label="等待确认" value="paused" />
           <el-option label="成功" value="success" />
           <el-option label="失败" value="failed" />
         </el-select>
@@ -66,8 +67,8 @@
       </el-table-column>
       <el-table-column label="操作" width="280" fixed="right">
         <template #default="{ row }">
-          <el-button v-if="authStore.isStaff" size="small" type="primary" :icon="CaretRight" :disabled="row.status === 'running'" @click="openExec(row)">执行</el-button>
-          <el-button v-if="authStore.isStaff" size="small" :icon="EditPen" :disabled="row.status === 'running'" @click="openForm(row)">编辑</el-button>
+          <el-button v-if="authStore.isStaff" size="small" type="primary" :icon="CaretRight" :disabled="['running', 'paused'].includes(row.status)" @click="openExec(row)">执行</el-button>
+          <el-button v-if="authStore.isStaff" size="small" :icon="EditPen" :disabled="['running', 'paused'].includes(row.status)" @click="openForm(row)">编辑</el-button>
           <el-button size="small" :icon="View" @click="openLogs(row)">日志</el-button>
           <el-button v-if="authStore.isStaff" size="small" type="danger" :icon="Delete" @click="handleDelete(row)" />
         </template>
@@ -142,7 +143,24 @@
             <el-button size="small" :icon="TopRight" @click="openLogPage">独立页打开</el-button>
           </span>
         </div>
-        <pre ref="outputBoxRef" class="output-box">{{ logPanel.output || '（暂无输出）' }}</pre>
+        <!-- 暂停确认操作条：任务流停在「暂停确认」模块时展示 -->
+        <el-alert v-if="logPanel.task.status === 'paused'" type="warning" :closable="false" show-icon class="pause-bar">
+          <template #title>
+            <span class="pause-line">
+              任务流已暂停，等待人工确认后继续
+              <span v-if="authStore.isStaff" class="pause-actions">
+                <el-button size="small" type="primary" :loading="confirming" @click="handleConfirm('continue')">继续执行</el-button>
+                <el-button size="small" type="danger" :loading="confirming" @click="handleConfirm('abort')">中止任务流</el-button>
+              </span>
+            </span>
+          </template>
+        </el-alert>
+        <StepOutput
+          :output="logPanel.output"
+          :steps-result="logPanel.current?.steps_result || []"
+          :follow="logPanel.polling"
+          class="output-host"
+        />
       </div>
     </div>
   </el-card>
@@ -165,7 +183,23 @@
         </span>
       </div>
     </template>
-    <pre ref="outputFullRef" class="output-box output-box-full">{{ logPanel.output || '（暂无输出）' }}</pre>
+    <el-alert v-if="logPanel.task?.status === 'paused'" type="warning" :closable="false" show-icon class="pause-bar">
+      <template #title>
+        <span class="pause-line">
+          任务流已暂停，等待人工确认后继续
+          <span v-if="authStore.isStaff" class="pause-actions">
+            <el-button size="small" type="primary" :loading="confirming" @click="handleConfirm('continue')">继续执行</el-button>
+            <el-button size="small" type="danger" :loading="confirming" @click="handleConfirm('abort')">中止任务流</el-button>
+          </span>
+        </span>
+      </template>
+    </el-alert>
+    <StepOutput
+      :output="logPanel.output"
+      :steps-result="logPanel.current?.steps_result || []"
+      :follow="logPanel.polling"
+      class="output-host output-host-full"
+    />
   </el-dialog>
 
   <!-- 新建 / 编辑任务弹窗（任务流定义，仅保存不执行） -->
@@ -224,6 +258,7 @@
             <el-radio-button value="command">命令</el-radio-button>
             <el-radio-button value="playbook">Playbook</el-radio-button>
             <el-radio-button value="method">平台方法</el-radio-button>
+            <el-radio-button value="pause">暂停确认</el-radio-button>
           </el-radio-group>
           <span class="step-actions">
             <el-button size="small" text :icon="Top" :disabled="i === 0" @click="moveStep(i, -1)" />
@@ -261,6 +296,14 @@
               <el-option v-for="m in otherMethods" :key="m.id" :label="`${m.name} (${m.provider_display})`" :value="m.id" />
             </el-select>
           </template>
+          <!-- 暂停确认：无内容配置，执行到此暂停等待人工继续/中止 -->
+          <el-alert
+            v-if="step.task_type === 'pause'"
+            type="warning" :closable="false" show-icon
+          >
+            任务流执行到本模块时暂停，等待管理员在日志面板确认「继续」或「中止」；
+            超过下方超时时间未确认将自动中止任务流。
+          </el-alert>
 
           <!-- playbook：tags 单选必填（候选取自所选剧本方法登记，不支持留空执行全部） -->
           <div v-if="step.task_type === 'playbook'" class="step-row">
@@ -294,14 +337,17 @@
           />
 
           <div class="step-row">
-            <span class="step-label">超时</span>
+            <span class="step-label">{{ step.task_type === 'pause' ? '确认超时' : '超时' }}</span>
             <el-input-number v-model="step.timeout" :min="10" :max="3600" size="small" style="width:130px" />
+            <!-- 暂停确认模块不涉及目标主机 -->
+            <template v-if="step.task_type !== 'pause'">
             <span class="step-label">主机范围</span>
             <el-radio-group v-model="step.use_custom_scope" size="small">
               <el-radio-button :value="false">跟随全局</el-radio-button>
               <el-radio-button :value="true">自定义</el-radio-button>
             </el-radio-group>
-            <template v-if="step.use_custom_scope">
+            </template>
+            <template v-if="step.task_type !== 'pause' && step.use_custom_scope">
               <el-select v-model="step.project_group" placeholder="项目组" clearable size="small" style="width:120px" @change="updateStepCount(step)">
                 <el-option v-for="d in dictOptions.projects" :key="d.id" :label="d.name" :value="d.id" />
               </el-select>
@@ -424,19 +470,20 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, nextTick, watch, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, nextTick, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   Plus, Delete, Search, Refresh, View, Loading, CaretRight, EditPen, Close, Top, Bottom, FullScreen, TopRight,
 } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../../stores/auth'
+import StepOutput from '../../components/StepOutput.vue'
 import {
   getServers, fetchDictOptions, projectGroupApi, channelApi, environmentApi,
 } from '../../api/assets'
 import {
   getTasks, createTask, updateTask, deleteTask, getMatchedServers, executeTask,
-  getTaskOutput, getTaskLogs, getTaskLogDetail, getCredentials, getMethods,
+  getTaskOutput, getTaskLogs, getTaskLogDetail, getCredentials, getMethods, confirmTask,
 } from '../../api/tasks'
 
 const authStore = useAuthStore()
@@ -453,13 +500,14 @@ const credentialOptions = ref([])
 const methodOptions = ref([])
 const dictOptions = reactive({ projects: [], channels: [], envs: [] })
 
-const statusType = (s) => ({ pending: 'info', running: 'warning', success: 'success', failed: 'danger' }[s] || 'info')
-const typeTagType = (t) => ({ command: 'info', playbook: 'success', method: 'warning' }[t] || 'info')
+const statusType = (s) => ({ pending: 'info', running: 'warning', paused: 'primary', success: 'success', failed: 'danger' }[s] || 'info')
+const typeTagType = (t) => ({ command: 'info', playbook: 'success', method: 'warning', pause: 'danger' }[t] || 'info')
 const formatTime = (t) => (t ? t.slice(0, 19).replace('T', ' ') : '')
 
 const flowTooltip = (row) => (row.steps || []).map((s, i) => `${i + 1}. ${s.name}`).join('　')
 
 function stepContent(s) {
+  if (s.task_type === 'pause') return `等待人工确认（超时 ${s.timeout || 300}s）`
   if (s.task_type === 'method') return `${s.method_name || '-'}${s.tags ? ' · ' + s.tags : ''}`
   if (s.task_type === 'playbook') return `${s.playbook || '-'}${s.tags ? ' · ' + s.tags : ''}`
   return (s.command || '').slice(0, 50) || '-'
@@ -540,7 +588,7 @@ const rules = {
 
 const methodInfo = (step) => methodOptions.value.find((m) => m.id === step.method) || null
 const stepNamePlaceholder = (step) =>
-  ({ command: '重启服务', playbook: '发布配置', method: '部署游戏服' }[step.task_type])
+  ({ command: '重启服务', playbook: '发布配置', method: '部署游戏服', pause: '上线前确认' }[step.task_type])
 
 const splitTags = (s) => (s || '').split(',').map((t) => t.trim()).filter(Boolean)
 
@@ -634,6 +682,7 @@ function validateSteps() {
   for (const [i, s] of form.steps.entries()) {
     if (!s.name.trim()) s.name = `${typeNames[s.task_type]}模块${i + 1}` // 空名自动补
     const label = `模块 ${i + 1}「${s.name}」`
+    if (s.task_type === 'pause') continue // 暂停确认无内容与主机范围
     if (s.task_type === 'command' && !s.command.trim()) return `${label}：请填写 Shell 命令`
     if (s.task_type === 'playbook') {
       if (!s.playbook) return `${label}：请选择方法管理登记的剧本方法`
@@ -673,10 +722,10 @@ function buildPayload() {
       extra_vars: s.task_type === 'playbook' ? s.extra_vars : '',
       params: s.task_type === 'method' && s.paramsText.trim() ? JSON.parse(s.paramsText) : {},
       timeout: s.timeout,
-      use_custom_scope: s.use_custom_scope,
-      project_group: s.use_custom_scope ? s.project_group : null,
-      channel: s.use_custom_scope ? s.channel : null,
-      environment: s.use_custom_scope ? s.environment : null,
+      use_custom_scope: s.task_type !== 'pause' && s.use_custom_scope,
+      project_group: s.task_type !== 'pause' && s.use_custom_scope ? s.project_group : null,
+      channel: s.task_type !== 'pause' && s.use_custom_scope ? s.channel : null,
+      environment: s.task_type !== 'pause' && s.use_custom_scope ? s.environment : null,
     })),
   }
 }
@@ -727,19 +776,22 @@ const execStepsInfo = ref([]) // matched_servers 返回的模块主机来源（�
 const execSelection = ref([])
 const hostTableRef = ref()
 
-const hasGlobalStep = computed(() => (execTask.value?.steps || []).some((s) => !s.use_custom_scope))
+const hasGlobalStep = computed(() => (execTask.value?.steps || []).some((s) => s.task_type !== 'pause' && !s.use_custom_scope))
 const stepInfoByOrder = computed(() => Object.fromEntries(execStepsInfo.value.map((s) => [s.order, s])))
 
 const stepHostCount = (step) => {
   if (step.use_custom_scope) return stepInfoByOrder.value[step.order]?.total ?? 0
   return execSelection.value.length
 }
-const stepHostLabel = (step) =>
-  step.use_custom_scope ? `自定义 · ${stepHostCount(step)} 台` : `全局 · 已选 ${stepHostCount(step)} 台`
+const stepHostLabel = (step) => {
+  if (step.task_type === 'pause') return '人工确认'
+  return step.use_custom_scope ? `自定义 · ${stepHostCount(step)} 台` : `全局 · 已选 ${stepHostCount(step)} 台`
+}
 
+// 暂停确认模块不涉及主机，不参与「每模块必须有主机」校验
 const canExec = computed(() =>
   (execTask.value?.steps || []).length > 0 &&
-  (execTask.value?.steps || []).every((s) => stepHostCount(s) > 0),
+  (execTask.value?.steps || []).every((s) => s.task_type === 'pause' || stepHostCount(s) > 0),
 )
 
 const hasProdTarget = computed(() => {
@@ -789,19 +841,8 @@ const logPanel = reactive({ task: null, logs: [], current: null, output: '', pol
 const logPanelRef = ref()
 const logTableRef = ref()
 const outputFullVisible = ref(false)
-const outputBoxRef = ref()
-const outputFullRef = ref()
 let pollTimer = null
 let listTimer = null
-
-// 实时轮询期间输出更新后自动滚到底部，跟随最新日志
-watch(() => logPanel.output, async () => {
-  if (!logPanel.polling) return
-  await nextTick()
-  for (const el of [outputBoxRef.value, outputFullRef.value]) {
-    if (el) el.scrollTop = el.scrollHeight
-  }
-})
 
 const stepsSummary = (log) => {
   const steps = log.steps_result || []
@@ -825,13 +866,29 @@ async function openLogs(row, { live = false } = {}) {
   await refreshLogs()
   await nextTick()
   logPanelRef.value?.$el?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-  if (live || row.status === 'running' || row.status === 'pending') startPolling()
+  if (live || ['running', 'pending', 'paused'].includes(row.status)) startPolling()
 }
 
 function closeLogs() {
   logPanel.task = null
   outputFullVisible.value = false
   stopPolling()
+}
+
+// 暂停确认：继续 / 中止（中止需二次确认）
+const confirming = ref(false)
+async function handleConfirm(action) {
+  if (action === 'abort') {
+    await ElMessageBox.confirm('确定中止任务流吗？后续模块将不再执行。', '警告', { type: 'warning' })
+  }
+  confirming.value = true
+  try {
+    await confirmTask(logPanel.task.id, action)
+    ElMessage.success(action === 'continue' ? '已确认，任务流继续执行' : '已发送中止指令')
+    // 状态由轮询自动刷新，无需手动改
+  } finally {
+    confirming.value = false
+  }
 }
 
 // 新标签页打开独立日志页（URL 可分享，定位到当前选中的执行记录）
@@ -859,7 +916,7 @@ async function selectLog(log) {
   if (!log || !logPanel.task) return
   logPanel.current = log
   const isLatest = logPanel.logs[0]?.id === log.id
-  const running = ['pending', 'running'].includes(logPanel.task.status)
+  const running = ['pending', 'running', 'paused'].includes(logPanel.task.status)
   if (isLatest && running) {
     // 最新一次且执行中：输出走轻量轮询实时刷新
     logPanel.output = logPanel.task.output || '（执行中，等待输出…）'
@@ -900,7 +957,7 @@ function stopPolling() {
 onMounted(() => {
   fetchData()
   listTimer = setInterval(() => {
-    if (tableData.value.some((t) => t.status === 'running' || t.status === 'pending')) {
+    if (tableData.value.some((t) => ['running', 'pending', 'paused'].includes(t.status))) {
       fetchData()
     }
   }, 5000)
@@ -950,31 +1007,21 @@ code { background: #f5f7fa; padding: 1px 6px; border-radius: 3px; font-size: 12p
 .flow-steps { margin: 0; padding-left: 20px; color: #606266; font-size: 13px; line-height: 1.9; }
 .log-header { display: flex; justify-content: space-between; align-items: center; }
 .log-body { display: flex; gap: 16px; }
-.log-list { width: 50%; min-width: 420px; }
+/* 执行记录列表占 1/3，详细日志占 2/3 */
+.log-list { width: 33.33%; min-width: 300px; flex-shrink: 0; }
 .log-list :deep(.log-row) { cursor: pointer; }
 .log-output { flex: 1; min-width: 0; }
 .output-meta { display: flex; gap: 16px; align-items: center; margin-bottom: 8px; color: #606266; font-size: 13px; }
 .output-expand { margin-left: auto; }
-.output-box {
-  background: #1e1e1e;
-  color: #d4d4d4;
-  padding: 16px;
-  border-radius: 6px;
-  font-family: 'Courier New', monospace;
-  font-size: 13px;
-  line-height: 1.5;
-  white-space: pre-wrap;
-  word-break: break-all;
-  /* 面板内随视口拉高，小屏保底 420px */
-  height: max(420px, calc(100vh - 400px));
-  overflow-y: auto;
-  margin: 0;
-}
-/* 全屏浮层：输出区占满视口剩余高度 */
-.output-box-full { height: calc(100vh - 90px); border-radius: 0; }
+/* 输出区高度：面板内随视口拉高（小屏保底 420px），全屏占满剩余高度 */
+.output-host { height: max(420px, calc(100vh - 400px)); }
+.output-host-full { height: calc(100vh - 90px); border-radius: 0; }
 .output-full-header {
   display: flex; justify-content: space-between; align-items: center;
   padding-right: 24px; font-size: 15px; font-weight: 600;
 }
 .output-full-dialog :deep(.el-dialog__body) { padding: 0 16px 16px; }
+.pause-bar { margin-bottom: 8px; }
+.pause-line { display: flex; align-items: center; gap: 12px; }
+.pause-actions { display: inline-flex; gap: 8px; }
 </style>

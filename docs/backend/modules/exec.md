@@ -15,6 +15,7 @@
 | `command` | Shell 命令 | ansible ad-hoc shell |
 | `playbook` | 直接执行 `ANSIBLE_PROJECT_DIR` 内既有剧本 | ansible-playbook + 模块级 tags/extra-vars |
 | `method` | 平台方法（仅承载运维后台能力：剧本+平台管理的 tags、云主机管理等） | 委托 `method_mgr` 对应 provider 执行器 |
+| `pause` | 暂停确认：任务流停在该模块等待人工继续/中止，timeout 为等待上限（超时自动中止） | runner 置任务 `paused` 并轮询 `pause_action`，确认接口写 continue/abort |
 
 **执行语义**：模块间按 order 顺序执行，任一模块失败即中止后续（标记
 skipped）；模块内主机按任务级 exec_mode 并发/串行（串行 = `--forks 1`）。
@@ -127,6 +128,16 @@ Ansible 项目目录内执行剧本：
 逐模块流程，生产环境标红）→ 自动定位任务列表下方的执行日志面板，轮询至完成。
 
 ---
+
+## 暂停确认（pause 模块）
+
+- 执行到 pause 模块：任务状态置 `paused`，把已完成模块输出实时落库
+  （runner 每模块结束也会持久化进度），前端轮询可见暂停提示。
+- 确认：`POST /api/exec/tasks/{id}/confirm/` `{"action": "continue"|"abort"}`
+  （仅管理员、仅 paused 状态可操作）；动作写入 `ExecutionTask.pause_action`，
+  runner 每 2s 轮询消费后清空并恢复 `running`。
+- abort → 模块 rc=1，后续模块 skipped；超时未确认 → rc=124 中止。
+- paused 状态下任务禁止编辑与重复发起。
 
 ## 接口
 

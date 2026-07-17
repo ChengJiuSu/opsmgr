@@ -9,6 +9,8 @@ export const deleteTask = (id) => request.delete(`/api/exec/tasks/${id}/`)
 export const getMatchedServers = (id) => request.get(`/api/exec/tasks/${id}/matched_servers/`)
 export const executeTask = (id, data) => request.post(`/api/exec/tasks/${id}/execute/`, data)
 export const getTaskOutput = (id) => request.get(`/api/exec/tasks/${id}/output/`)
+// 暂停确认：任务流停在「暂停确认」模块时继续（continue）或中止（abort）
+export const confirmTask = (id, action) => request.post(`/api/exec/tasks/${id}/confirm/`, { action })
 export const getTaskLogs = (id) => request.get(`/api/exec/tasks/${id}/logs/`)
 export const getTaskLogDetail = (id, logId) => request.get(`/api/exec/tasks/${id}/logs/${logId}/`)
 

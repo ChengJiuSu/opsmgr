@@ -54,21 +54,41 @@
           <span v-if="current">返回码：{{ current.return_code ?? '-' }}</span>
           <span v-if="currentServers" class="muted">{{ currentServers }}</span>
         </div>
-        <pre ref="outputRef" class="output-box">{{ output || '（暂无输出）' }}</pre>
+        <!-- 暂停确认操作条：任务流停在「暂停确认」模块时展示 -->
+        <el-alert v-if="task?.status === 'paused'" type="warning" :closable="false" show-icon class="pause-bar">
+          <template #title>
+            <span class="pause-line">
+              任务流已暂停，等待人工确认后继续
+              <span v-if="authStore.isStaff" class="pause-actions">
+                <el-button size="small" type="primary" :loading="confirming" @click="handleConfirm('continue')">继续执行</el-button>
+                <el-button size="small" type="danger" :loading="confirming" @click="handleConfirm('abort')">中止任务流</el-button>
+              </span>
+            </span>
+          </template>
+        </el-alert>
+        <StepOutput
+          :output="output"
+          :steps-result="current?.steps_result || []"
+          :follow="polling"
+          class="output-host"
+        />
       </div>
     </div>
   </el-card>
 </template>
 
 <script setup>
-import { ref, computed, nextTick, watch, onMounted, onUnmounted } from 'vue'
+import { ref, computed, nextTick, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { Back, CopyDocument, Loading, Refresh } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
-import { getTask, getTaskLogs, getTaskLogDetail, getTaskOutput } from '../../api/tasks'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { getTask, getTaskLogs, getTaskLogDetail, getTaskOutput, confirmTask } from '../../api/tasks'
+import { useAuthStore } from '../../stores/auth'
+import StepOutput from '../../components/StepOutput.vue'
 
 const route = useRoute()
 const router = useRouter()
+const authStore = useAuthStore()
 const taskId = Number(route.params.taskId)
 
 const loading = ref(false)
@@ -77,11 +97,10 @@ const logs = ref([])
 const current = ref(null)
 const output = ref('')
 const polling = ref(false)
-const outputRef = ref()
 const logTableRef = ref()
 let pollTimer = null
 
-const statusType = (s) => ({ pending: 'info', running: 'warning', success: 'success', failed: 'danger' }[s] || 'info')
+const statusType = (s) => ({ pending: 'info', running: 'warning', paused: 'primary', success: 'success', failed: 'danger' }[s] || 'info')
 const formatTime = (t) => (t ? t.slice(0, 19).replace('T', ' ') : '')
 
 const stepsSummary = (log) => {
@@ -97,13 +116,6 @@ const currentServers = computed(() => {
   if (!snap?.length) return ''
   const names = snap.slice(0, 5).map((s) => s.name).join('、')
   return `全局主机：${names}${snap.length > 5 ? ` 等 ${snap.length} 台` : ''}`
-})
-
-// 实时轮询期间输出更新后自动滚到底部
-watch(output, async () => {
-  if (!polling.value) return
-  await nextTick()
-  if (outputRef.value) outputRef.value.scrollTop = outputRef.value.scrollHeight
 })
 
 async function init() {
@@ -134,7 +146,7 @@ async function selectLog(log) {
     router.replace({ name: 'TaskLog', params: { taskId, logId: log.id } })
   }
   const isLatest = logs.value[0]?.id === log.id
-  const running = ['pending', 'running'].includes(task.value?.status)
+  const running = ['pending', 'running', 'paused'].includes(task.value?.status)
   if (isLatest && running) {
     // 最新一次且执行中：输出走轻量轮询实时刷新
     output.value = task.value?.output || '（执行中，等待输出…）'
@@ -170,6 +182,21 @@ function stopPolling() {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
 }
 
+// 暂停确认：继续 / 中止（中止需二次确认），状态由轮询自动刷新
+const confirming = ref(false)
+async function handleConfirm(action) {
+  if (action === 'abort') {
+    await ElMessageBox.confirm('确定中止任务流吗？后续模块将不再执行。', '警告', { type: 'warning' })
+  }
+  confirming.value = true
+  try {
+    await confirmTask(taskId, action)
+    ElMessage.success(action === 'continue' ? '已确认，任务流继续执行' : '已发送中止指令')
+  } finally {
+    confirming.value = false
+  }
+}
+
 async function copyLink() {
   const url = window.location.href
   try {
@@ -193,23 +220,14 @@ onUnmounted(stopPolling)
 .muted { color: #909399; }
 .danger { color: #f56c6c; }
 .log-body { display: flex; gap: 16px; }
-.log-list { width: 420px; flex-shrink: 0; }
+/* 执行记录列表占 1/3，详细日志占 2/3 */
+.log-list { width: 33.33%; min-width: 300px; flex-shrink: 0; }
 .log-list :deep(.log-row) { cursor: pointer; }
 .log-output { flex: 1; min-width: 0; }
 .output-meta { display: flex; gap: 16px; align-items: center; margin-bottom: 8px; color: #606266; font-size: 13px; min-height: 20px; }
-.output-box {
-  background: #1e1e1e;
-  color: #d4d4d4;
-  padding: 16px;
-  border-radius: 6px;
-  font-family: 'Courier New', monospace;
-  font-size: 13px;
-  line-height: 1.5;
-  white-space: pre-wrap;
-  word-break: break-all;
-  /* 独立页：输出区占满视口剩余高度 */
-  height: max(480px, calc(100vh - 260px));
-  overflow-y: auto;
-  margin: 0;
-}
+.pause-bar { margin-bottom: 8px; }
+.pause-line { display: flex; align-items: center; gap: 12px; }
+.pause-actions { display: inline-flex; gap: 8px; }
+/* 独立页输出区高度：占满视口剩余高度（视觉样式在 StepOutput 组件内） */
+.output-host { height: max(480px, calc(100vh - 260px)); }
 </style>

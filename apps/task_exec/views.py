@@ -163,7 +163,7 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
         serializer.save(created_by=self.request.user)
 
     def update(self, request, *args, **kwargs):
-        if self.get_object().status == 'running':
+        if self.get_object().status in ('running', 'paused'):
             return fail('任务正在执行中，无法编辑')
         return super().update(request, *args, **kwargs)
 
@@ -198,7 +198,7 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
         """执行任务流。body.server_ids 可选，仅作用于全局范围模块（缺省=全部全局匹配主机）；
         自定义范围模块按其维度全量执行。逐模块校验主机非空与方法服务规划。"""
         task = self.get_object()
-        if task.status == 'running':
+        if task.status in ('running', 'paused'):
             return fail('任务正在执行中，请等待完成后再发起')
         steps = list(task.steps.all())
         if not steps:
@@ -220,8 +220,10 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
                 return fail(f'主机 id {invalid} 不在全局范围匹配集内，请刷新执行页面后重试')
             selected_global = [matched[i] for i in server_ids]
 
-        # 逐模块解析主机并校验执行条件
+        # 逐模块解析主机并校验执行条件（暂停确认模块不涉及主机）
         for step in steps:
+            if step.task_type == 'pause':
+                continue
             servers = list(step.matched_servers()) if step.use_custom_scope else selected_global
             if not servers:
                 scope = '自定义范围维度未匹配到可执行主机' if step.use_custom_scope \
@@ -237,14 +239,31 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
         task.status = 'pending'
         task.return_code = None
         task.output = ''
+        task.pause_action = ''  # 清残留确认信号，避免上次未消费的动作误触发
         task.started_at = None
         task.finished_at = None
-        task.save(update_fields=['status', 'return_code', 'output', 'started_at', 'finished_at'])
+        task.save(update_fields=['status', 'return_code', 'output', 'pause_action', 'started_at', 'finished_at'])
         log = dispatch(task, triggered_by=request.user, trigger_type='execute')
         return ok(
             {'task': ExecutionTaskSerializer(task).data, 'log_id': log.id, 'step_count': len(steps)},
             msg=f'已发起执行（{len(steps)} 个模块，{task.get_exec_mode_display()}）',
         )
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAdmin])
+    def confirm(self, request, pk=None):
+        """暂停确认：任务流停在「暂停确认」模块时，continue 继续 / abort 中止。
+
+        仅 paused 状态可操作；动作写入 pause_action 由 runner 轮询消费。
+        """
+        action_value = request.data.get('action')
+        if action_value not in ('continue', 'abort'):
+            return fail('action 必须为 continue（继续）或 abort（中止）')
+        from .models import ExecutionTask
+
+        updated = ExecutionTask.objects.filter(pk=pk, status='paused').update(pause_action=action_value)
+        if not updated:
+            return fail('任务当前不在「等待确认」状态，无法操作')
+        return ok({'action': action_value})
 
     @action(detail=True, methods=['get'])
     def output(self, request, pk=None):

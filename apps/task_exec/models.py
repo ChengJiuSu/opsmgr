@@ -173,6 +173,7 @@ class ExecutionTask(models.Model):
     STATUS_CHOICES = [
         ('pending', '等待中'),
         ('running', '执行中'),
+        ('paused', '等待确认'),  # 任务流执行到「暂停确认」模块，等待人工继续/中止
         ('success', '成功'),
         ('failed', '失败'),
     ]
@@ -210,6 +211,8 @@ class ExecutionTask(models.Model):
     status = models.CharField('状态', max_length=20, choices=STATUS_CHOICES, default='pending')
     return_code = models.IntegerField('返回码', null=True, blank=True)
     output = models.TextField('执行输出', blank=True)
+    # 暂停确认信号：paused 时由确认接口写 continue/abort，runner 轮询消费后清空
+    pause_action = models.CharField('暂停确认动作', max_length=20, blank=True, default='')
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
         related_name='exec_tasks', verbose_name='发起人',
@@ -249,6 +252,7 @@ class TaskStep(models.Model):
         ('command', '命令'),
         ('playbook', 'Playbook'),
         ('method', '平台方法'),
+        ('pause', '暂停确认'),  # 任务流暂停等待人工确认，timeout 为等待上限
     ]
 
     task = models.ForeignKey(

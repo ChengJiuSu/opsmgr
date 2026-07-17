@@ -19,6 +19,7 @@ from apps.asset_mgr.models import Server
 from apps.method_mgr.models import Method
 
 from .models import Credential, ExecutionTask, TaskExecutionLog, TaskStep
+from . import runner
 from .runner import _inventory_content
 from .tasks import OUTPUT_PREVIEW_LIMIT
 
@@ -864,3 +865,107 @@ class ArtifactInjectTests(TestCase):
         injected = cmd[cmd.index('--extra-vars') + 1]
         self.assertIn('"package_version": "2.0.0"', injected)
         self.assertIn(f'/api/artifacts/{scoped.id}/download/', injected)
+
+
+class PauseStepTests(TestCase):
+    """暂停确认模块：runner 等待确认（继续/中止/超时）与 confirm 接口。"""
+
+    def setUp(self):
+        self.user = User.objects.create(username='admin_p', is_staff=True, is_superuser=True)
+        self.user.set_password('Pass!2345xyz')
+        self.user.save()
+        self.task = ExecutionTask.objects.create(name='暂停流', created_by=self.user)
+        self.step = TaskStep.objects.create(
+            task=self.task, order=1, name='上线前确认', task_type='pause', timeout=30,
+        )
+
+    def _client(self, username='admin_p'):
+        c = APIClient()
+        r = c.post('/api/auth/login/', {'username': username, 'password': 'Pass!2345xyz'}, format='json')
+        c.credentials(HTTP_AUTHORIZATION='Bearer ' + r.json()['access'])
+        return c
+
+    def _run_with_action(self, action):
+        """mock 等待间隔的 sleep：首轮未读到动作进入 sleep 时写入确认动作，
+        下一轮轮询即消费（单线程注入，规避 SQLite 测试库跨线程锁）。"""
+        task_pk = self.task.pk
+
+        def _inject_action(_seconds):
+            ExecutionTask.objects.filter(pk=task_pk).update(pause_action=action)
+
+        with mock.patch.object(runner.time, 'sleep', side_effect=_inject_action):
+            return runner.run(self.task)
+
+    def test_pause_continue(self):
+        rc, output, results = self._run_with_action('continue')
+        self.assertEqual(rc, 0)
+        self.assertIn('已人工确认', output)
+        self.assertEqual(results[0]['status'], 'success')
+        self.assertIsNone(results[0]['server_count'])
+        self.task.refresh_from_db()
+        # 确认后状态恢复 running（最终状态由 tasks.execute_task 落）且信号被清空
+        self.assertEqual(self.task.status, 'running')
+        self.assertEqual(self.task.pause_action, '')
+
+    def test_pause_abort(self):
+        rc, output, results = self._run_with_action('abort')
+        self.assertEqual(rc, 1)
+        self.assertIn('中止', output)
+        self.assertEqual(results[0]['status'], 'failed')
+
+    def test_pause_timeout(self):
+        self.step.timeout = 1
+        self.step.save()
+        # sleep 置空转忙等，1s 超时后返回 124
+        with mock.patch.object(runner.time, 'sleep'):
+            rc, output, results = runner.run(self.task)
+        self.assertEqual(rc, 124)
+        self.assertIn('超时', output)
+
+    def test_pause_aborts_following_steps(self):
+        TaskStep.objects.create(
+            task=self.task, order=2, name='后续命令', task_type='command', command='echo hi',
+        )
+        rc, output, results = self._run_with_action('abort')
+        self.assertEqual(rc, 1)
+        self.assertEqual(results[1]['status'], 'skipped')
+
+    def test_confirm_api_requires_paused(self):
+        c = self._client()
+        r = c.post(f'/api/exec/tasks/{self.task.id}/confirm/', {'action': 'continue'}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('等待确认', r.json()['msg'])
+
+        ExecutionTask.objects.filter(pk=self.task.pk).update(status='paused')
+        r = c.post(f'/api/exec/tasks/{self.task.id}/confirm/', {'action': 'bad'}, format='json')
+        self.assertEqual(r.status_code, 400)
+        r = c.post(f'/api/exec/tasks/{self.task.id}/confirm/', {'action': 'continue'}, format='json')
+        self.assertEqual(r.status_code, 200)
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.pause_action, 'continue')
+
+    def test_confirm_api_requires_admin(self):
+        normal = User.objects.create(username='user_p', is_staff=False)
+        normal.set_password('Pass!2345xyz')
+        normal.save()
+        ExecutionTask.objects.filter(pk=self.task.pk).update(status='paused')
+        c = self._client('user_p')
+        r = c.post(f'/api/exec/tasks/{self.task.id}/confirm/', {'action': 'continue'}, format='json')
+        self.assertEqual(r.status_code, 403)
+
+    def test_pause_step_saved_without_content(self):
+        """pause 模块保存无需命令/剧本/方法内容。"""
+        from apps.asset_mgr.models import Channel, Environment, ProjectGroup
+
+        pg = ProjectGroup.objects.create(name='暂停项目', code='pause-proj')
+        ch = Channel.objects.create(name='暂停渠道', code='pause-ch')
+        env = Environment.objects.create(name='暂停环境', code='pause-env')
+        c = self._client()
+        r = c.post('/api/exec/tasks/', {
+            'name': '带确认的流',
+            'project_group': pg.id, 'channel': ch.id, 'environment': env.id,
+            'steps': [
+                {'order': 1, 'name': '确认', 'task_type': 'pause', 'timeout': 600},
+            ],
+        }, format='json')
+        self.assertEqual(r.status_code, 201, r.content)

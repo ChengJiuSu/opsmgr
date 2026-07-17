@@ -278,6 +278,49 @@ _STEP_HANDLERS = {
     'method': _run_method_step,
 }
 
+# 执行进度预览上限（与 tasks.OUTPUT_PREVIEW_LIMIT 一致）；暂停确认轮询间隔（秒）
+PROGRESS_PREVIEW_LIMIT = 60000
+PAUSE_POLL_INTERVAL = 2
+
+
+def _persist_progress(task, outputs):
+    """把已完成模块的输出实时写入任务快照，供前端轮询展示执行进度。
+
+    仅更新 output 字段；最终完整输出与状态由 tasks.execute_task 统一落库。
+    """
+    from .models import ExecutionTask
+
+    preview = '\n\n'.join(outputs)[-PROGRESS_PREVIEW_LIMIT:]
+    ExecutionTask.objects.filter(pk=task.pk).update(output=preview)
+
+
+def _wait_confirmation(step, task):
+    """暂停确认模块：置任务为 paused，轮询确认动作直至继续/中止/超时。
+
+    确认接口（views.confirm）向 pause_action 写 continue/abort，
+    本函数消费后清空并把状态恢复为 running。
+    """
+    from .models import ExecutionTask
+
+    timeout = step.timeout or 300
+    ExecutionTask.objects.filter(pk=task.pk).update(status='paused', pause_action='')
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() < deadline:
+            action = (
+                ExecutionTask.objects.filter(pk=task.pk)
+                .values_list('pause_action', flat=True)
+                .first()
+            )
+            if action == 'continue':
+                return 0, '✔ 已人工确认，继续执行任务流。'
+            if action == 'abort':
+                return 1, '✖ 确认人选择中止，任务流终止。'
+            time.sleep(PAUSE_POLL_INTERVAL)
+        return 124, f'等待人工确认超时（>{timeout}s），任务流中止。'
+    finally:
+        ExecutionTask.objects.filter(pk=task.pk).update(status='running', pause_action='')
+
 
 def run(task):
     """按 order 顺序执行任务流的全部模块，返回 (return_code, output, steps_result)。
@@ -299,30 +342,41 @@ def run(task):
             })
             continue
 
-        servers = _step_servers(step, task)
-        scope = '自定义范围' if step.use_custom_scope else '全局范围'
-        header = f'═══ 模块 {idx}/{total}：{step.name}（{step.get_task_type_display()} · {scope} {len(servers)} 台）═══'
         started = time.monotonic()
-        error = _guard(servers)
-        if error:
-            rc, out = 1, error
+        if step.task_type == 'pause':
+            # 暂停确认模块：不涉及目标主机，等待人工继续/中止
+            servers = []
+            header = f'═══ 模块 {idx}/{total}：{step.name}（暂停确认 · 等待人工处理）═══'
+            prompt = f'⏸ 任务流已暂停，等待人工确认…（超过 {step.timeout or 300}s 未确认将自动中止）'
+            _persist_progress(task, outputs + [f'{header}\n{prompt}'])
+            rc, out = _wait_confirmation(step, task)
         else:
-            try:
-                rc, out = _STEP_HANDLERS[step.task_type](step, task, servers)
-            except ArtifactLookupError as exc:
-                rc, out = 1, str(exc)
+            servers = _step_servers(step, task)
+            scope = '自定义范围' if step.use_custom_scope else '全局范围'
+            header = f'═══ 模块 {idx}/{total}：{step.name}（{step.get_task_type_display()} · {scope} {len(servers)} 台）═══'
+            error = _guard(servers)
+            if error:
+                rc, out = 1, error
+            else:
+                try:
+                    rc, out = _STEP_HANDLERS[step.task_type](step, task, servers)
+                except ArtifactLookupError as exc:
+                    rc, out = 1, str(exc)
         duration = round(time.monotonic() - started, 2)
 
         outputs.append(f'{header}\n{out}')
         results.append({
             'order': step.order, 'name': step.name, 'task_type': step.task_type,
             'status': 'success' if rc == 0 else 'failed', 'return_code': rc,
-            'duration': duration, 'server_count': len(servers),
+            'duration': duration,
+            'server_count': None if step.task_type == 'pause' else len(servers),
         })
         if rc != 0:
             failed_rc = rc
             remaining = total - idx
             if remaining:
                 outputs.append(f'✖ 模块「{step.name}」执行失败，中止后续 {remaining} 个模块。')
+        # 每个模块结束即持久化进度，前端轮询可见已完成模块的输出
+        _persist_progress(task, outputs)
 
     return (failed_rc if failed_rc is not None else 0), '\n\n'.join(outputs), results
