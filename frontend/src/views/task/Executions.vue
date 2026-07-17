@@ -43,10 +43,10 @@
           <span :class="{ unset: !row.environment_name, prod: row.environment_is_prod }">{{ row.environment_name || '不限' }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="执行方式" width="90">
+      <el-table-column label="主机执行" width="90">
         <template #default="{ row }">
           <el-tag size="small" :type="row.exec_mode === 'serial' ? 'warning' : 'info'" effect="plain">
-            {{ row.exec_mode_display }}
+            {{ row.exec_mode === 'serial' ? '串行' : `并发×${row.forks || 10}` }}
           </el-tag>
         </template>
       </el-table-column>
@@ -212,11 +212,14 @@
           </el-form-item>
         </el-col>
         <el-col :span="6">
-          <el-form-item label="执行方式" label-width="76px">
-            <el-radio-group v-model="form.exec_mode">
-              <el-radio-button value="parallel">并发</el-radio-button>
-              <el-radio-button value="serial">串行</el-radio-button>
-            </el-radio-group>
+          <el-form-item label-width="76px">
+            <template #label>
+              <el-tooltip content="模块内同时执行的主机数量（台）：默认 10 台一批；填 1 = 逐台串行执行；模块之间的并行用模块卡片上的「与相邻并行模块并发」" placement="top">
+                <span>主机并发</span>
+              </el-tooltip>
+            </template>
+            <el-input-number v-model="form.forks" :min="1" :max="200" controls-position="right" style="width:100%" />
+            <div class="form-tip">同时执行的主机台数，1 = 逐台串行</div>
           </el-form-item>
         </el-col>
         <el-col :span="6">
@@ -339,8 +342,11 @@
           <div class="step-row">
             <span class="step-label">{{ step.task_type === 'pause' ? '确认超时' : '超时' }}</span>
             <el-input-number v-model="step.timeout" :min="10" :max="3600" size="small" style="width:130px" />
-            <!-- 暂停确认模块不涉及目标主机 -->
+            <!-- 暂停确认模块不涉及目标主机，也不允许并行 -->
             <template v-if="step.task_type !== 'pause'">
+            <el-tooltip content="相邻的、勾选并行的模块合并为一个并行组同时执行，组内全部成功才进入下一模块；不勾选=按序串行" placement="top">
+              <el-checkbox v-model="step.run_parallel" size="small">与相邻并行模块并发</el-checkbox>
+            </el-tooltip>
             <span class="step-label">主机范围</span>
             <el-radio-group v-model="step.use_custom_scope" size="small">
               <el-radio-button :value="false">跟随全局</el-radio-button>
@@ -386,9 +392,10 @@
         <template #default="{ $index }">{{ $index + 1 }}</template>
       </el-table-column>
       <el-table-column prop="name" label="模块" min-width="110" show-overflow-tooltip />
-      <el-table-column label="类型" width="90">
+      <el-table-column label="类型" width="120">
         <template #default="{ row }">
           <el-tag size="small" :type="typeTagType(row.task_type)" effect="plain">{{ row.task_type_display }}</el-tag>
+          <el-tag v-if="row.run_parallel" size="small" type="danger" effect="plain" style="margin-left:4px">并行</el-tag>
         </template>
       </el-table-column>
       <el-table-column label="内容" min-width="150" show-overflow-tooltip>
@@ -451,9 +458,9 @@
     <div class="flow-title">任务流程（模块按序执行，失败中止后续）</div>
     <ol class="flow-steps">
       <li v-for="s in execTask?.steps || []" :key="s.id">
-        <b>{{ s.name }}</b>（{{ s.task_type_display }}）：{{ stepContent(s) }} → {{ stepHostLabel(s) }}
+        <b>{{ s.name }}</b>（{{ s.task_type_display }}{{ s.run_parallel ? ' · 并行' : '' }}）：{{ stepContent(s) }} → {{ stepHostLabel(s) }}
       </li>
-      <li>{{ execTask?.exec_mode === 'serial' ? '各模块内主机串行逐台执行（--forks 1）' : '各模块内主机并发执行' }}</li>
+      <li>{{ execTask?.exec_mode === 'serial' ? '各模块内主机串行逐台执行（--forks 1）' : `各模块内主机并发执行（每批 ${execTask?.forks || 10} 台）` }}</li>
       <li>执行结果落一条执行日志（含逐模块结果），可在任务列表下方查看</li>
     </ol>
     <el-alert v-if="hasProdTarget" type="error" :closable="false" show-icon style="margin-top:10px">
@@ -571,14 +578,14 @@ const formRef = ref()
 const matchedCount = ref(null)
 const emptyStep = () => ({
   name: '', task_type: 'command', command: '', playbook: '', pbMethod: null, method: null,
-  tag: '', extra_vars: '', paramsText: '', timeout: 300,
+  tag: '', extra_vars: '', paramsText: '', timeout: 300, run_parallel: false,
   use_custom_scope: false, project_group: null, channel: null, environment: null,
   _matched: null,
 })
 const emptyForm = () => ({
   id: null, name: '',
   project_group: null, channel: null, environment: null,
-  exec_mode: 'parallel', credential: null,
+  forks: 10, credential: null,
   steps: [emptyStep()],
 })
 const form = reactive(emptyForm())
@@ -644,13 +651,14 @@ async function openForm(row) {
       id: row.id, name: row.name,
       project_group: row.project_group || null, channel: row.channel || null,
       environment: row.environment || null,
-      exec_mode: row.exec_mode || 'parallel', credential: row.credential || null,
+      forks: row.exec_mode === 'serial' ? 1 : (row.forks || 10), credential: row.credential || null,
       steps: (row.steps || []).map((s) => ({
         name: s.name, task_type: s.task_type, command: s.command || '',
         playbook: s.playbook || '', pbMethod: null, method: s.method || null,
         tag: splitTags(s.tags)[0] || '', extra_vars: s.extra_vars || '',
         paramsText: s.params && Object.keys(s.params).length ? JSON.stringify(s.params, null, 2) : '',
         timeout: s.timeout || 300,
+        run_parallel: s.run_parallel || false,
         use_custom_scope: s.use_custom_scope || false,
         project_group: s.project_group || null, channel: s.channel || null,
         environment: s.environment || null, _matched: null,
@@ -712,7 +720,8 @@ function buildPayload() {
   return {
     name: form.name,
     project_group: form.project_group, channel: form.channel, environment: form.environment,
-    exec_mode: form.exec_mode, credential: form.credential,
+    exec_mode: (form.forks || 10) === 1 ? 'serial' : 'parallel',
+    forks: form.forks || 10, credential: form.credential,
     steps: form.steps.map((s, i) => ({
       order: i + 1, name: s.name, task_type: s.task_type,
       command: s.task_type === 'command' ? s.command : '',
@@ -722,6 +731,7 @@ function buildPayload() {
       extra_vars: s.task_type === 'playbook' ? s.extra_vars : '',
       params: s.task_type === 'method' && s.paramsText.trim() ? JSON.parse(s.paramsText) : {},
       timeout: s.timeout,
+      run_parallel: s.task_type !== 'pause' && !!s.run_parallel,
       use_custom_scope: s.task_type !== 'pause' && s.use_custom_scope,
       project_group: s.task_type !== 'pause' && s.use_custom_scope ? s.project_group : null,
       channel: s.task_type !== 'pause' && s.use_custom_scope ? s.channel : null,

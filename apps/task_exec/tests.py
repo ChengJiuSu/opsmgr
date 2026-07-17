@@ -411,10 +411,19 @@ class ExecutionAPITests(TestCase):
         self.assertIn('--forks', cmd)
         self.assertEqual(cmd[cmd.index('--forks') + 1], '1')
 
+        # 并发（默认）：按任务并发数分批，默认 10
         task2 = self._create_task(c)
         with mock.patch('apps.task_exec.runner.run_subprocess', return_value=(0, 'ok')) as m:
             c.post(f'/api/exec/tasks/{task2}/execute/', {}, format='json')
-        self.assertNotIn('--forks', m.call_args[0][0])
+        cmd = m.call_args[0][0]
+        self.assertEqual(cmd[cmd.index('--forks') + 1], '10')
+
+        # 自定义并发数
+        task3 = self._create_task(c, forks=25)
+        with mock.patch('apps.task_exec.runner.run_subprocess', return_value=(0, 'ok')) as m:
+            c.post(f'/api/exec/tasks/{task3}/execute/', {}, format='json')
+        cmd = m.call_args[0][0]
+        self.assertEqual(cmd[cmd.index('--forks') + 1], '25')
 
     def test_method_executor_serial_forks_and_step_params(self):
         """方法模块执行器：按 step 读取 tags/timeout，exec_mode 透传任务级串行。"""
@@ -571,7 +580,7 @@ class ExecutionAPITests(TestCase):
         self.assertNotIn('output', data[0])
         self.assertEqual(data[0]['trigger_type'], 'execute')
         self.assertEqual(data[0]['server_count'], 1)
-        self.assertEqual(data[0]['exec_mode'], 'parallel')
+        self.assertEqual(data[0]['exec_mode'], 'parallel')  # 默认主机执行方式为并发（分批）
         self.assertEqual(data[0]['steps_result'][0]['status'], 'success')
 
     def test_task_type_filter_matches_step_type(self):
@@ -969,3 +978,85 @@ class PauseStepTests(TestCase):
             ],
         }, format='json')
         self.assertEqual(r.status_code, 201, r.content)
+
+
+class ParallelStageTests(TestCase):
+    """模块间并行组：分组规则、并发执行、组内失败中止后续阶段。"""
+
+    def setUp(self):
+        self.user = User.objects.create(username='admin_pl', is_staff=True, is_superuser=True)
+        self.user.set_password('Pass!2345xyz')
+        self.user.save()
+        self.task = ExecutionTask.objects.create(name='并行流', created_by=self.user)
+
+    def _step(self, order, name, parallel=False, task_type='command'):
+        return TaskStep.objects.create(
+            task=self.task, order=order, name=name, task_type=task_type,
+            command='echo hi' if task_type == 'command' else '',
+            run_parallel=parallel, timeout=30,
+        )
+
+    def test_build_stages_grouping(self):
+        s1 = self._step(1, '串1')
+        s2 = self._step(2, '并A', parallel=True)
+        s3 = self._step(3, '并B', parallel=True)
+        s4 = self._step(4, '暂停', task_type='pause')
+        s5 = self._step(5, '并C', parallel=True)
+        stages = runner._build_stages([s1, s2, s3, s4, s5])
+        self.assertEqual([[x.name for x in st] for st in stages],
+                         [['串1'], ['并A', '并B'], ['暂停'], ['并C']])
+
+    def test_parallel_group_runs_concurrently(self):
+        import threading
+        self._step(1, '并A', parallel=True)
+        self._step(2, '并B', parallel=True)
+        barrier = threading.Barrier(2, timeout=10)
+
+        def fake_handler(step, task, servers):
+            barrier.wait()  # 两模块必须同时在跑才能都过闸
+            return 0, f'{step.name} done'
+
+        with mock.patch.dict(runner._STEP_HANDLERS, {'command': fake_handler}), \
+                mock.patch.object(runner, '_step_servers', return_value=[object()]), \
+                mock.patch.object(runner, '_guard', return_value=None), \
+                mock.patch.object(runner, '_persist_progress'):
+            rc, output, results = runner.run(self.task)
+        self.assertEqual(rc, 0)
+        self.assertEqual([r['status'] for r in results], ['success', 'success'])
+        self.assertTrue(all(r['parallel'] for r in results))
+        # 输出按模块顺序拼接
+        self.assertLess(output.index('并A done'), output.index('并B done'))
+
+    def test_parallel_group_failure_aborts_next_stage(self):
+        self._step(1, '并A', parallel=True)
+        self._step(2, '并B', parallel=True)
+        self._step(3, '串尾')
+
+        def fake_handler(step, task, servers):
+            return (1, 'boom') if step.name == '并B' else (0, 'ok')
+
+        with mock.patch.dict(runner._STEP_HANDLERS, {'command': fake_handler}), \
+                mock.patch.object(runner, '_step_servers', return_value=[object()]), \
+                mock.patch.object(runner, '_guard', return_value=None), \
+                mock.patch.object(runner, '_persist_progress'):
+            rc, output, results = runner.run(self.task)
+        self.assertEqual(rc, 1)
+        self.assertEqual([r['status'] for r in results], ['success', 'failed', 'skipped'])
+        self.assertIn('中止后续 1 个模块', output)
+
+    def test_pause_step_rejects_run_parallel(self):
+        from apps.asset_mgr.models import Channel, Environment, ProjectGroup
+
+        pg = ProjectGroup.objects.create(name='并行项目', code='pl-proj')
+        ch = Channel.objects.create(name='并行渠道', code='pl-ch')
+        env = Environment.objects.create(name='并行环境', code='pl-env')
+        c = APIClient()
+        r = c.post('/api/auth/login/', {'username': 'admin_pl', 'password': 'Pass!2345xyz'}, format='json')
+        c.credentials(HTTP_AUTHORIZATION='Bearer ' + r.json()['access'])
+        r = c.post('/api/exec/tasks/', {
+            'name': '非法流',
+            'project_group': pg.id, 'channel': ch.id, 'environment': env.id,
+            'steps': [{'order': 1, 'name': '确认', 'task_type': 'pause', 'run_parallel': True}],
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('不允许标记并行', r.json()['msg'])

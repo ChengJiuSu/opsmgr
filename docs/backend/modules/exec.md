@@ -129,6 +129,16 @@ Ansible 项目目录内执行剧本：
 
 ---
 
+## 模块间并行（run_parallel）
+
+- 模块默认按序串行；`TaskStep.run_parallel=True` 且相邻的模块合并为一个
+  **并行组**（`runner._build_stages`），组内模块线程并发执行、互不打断，
+  全部完成后按模块顺序拼接输出，任一失败则后续阶段整体 skipped。
+- pause 模块禁止标记并行（序列化器校验），强制独立成阶段。
+- 与任务级 `exec_mode` 正交：exec_mode 管模块内主机并发（--forks），
+  run_parallel 管模块之间并发。
+- steps_result 每项新增 `parallel` 布尔，前端日志树以 ∥ 标记。
+
 ## 暂停确认（pause 模块）
 
 - 执行到 pause 模块：任务状态置 `paused`，把已完成模块输出实时落库

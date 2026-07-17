@@ -20,6 +20,7 @@
         <span class="node-dot" :class="`dot-${mod.status || 'pending'}`" />
         <span class="node-order">{{ mod.index }}</span>
         <span class="node-title" :title="mod.fullTitle">{{ mod.title }}</span>
+        <span v-if="mod.parallel" class="node-parallel" title="并行组模块">∥</span>
         <el-icon v-if="mod.status === 'running'" class="is-loading node-loading"><Loading /></el-icon>
         <el-tag v-else-if="mod.status" size="small" :type="STATUS_TAG[mod.status] || 'info'" class="node-tag">
           {{ STATUS_LABEL[mod.status] || mod.status }}
@@ -96,6 +97,7 @@ const modules = computed(() => {
       status: r.status,
       duration: r.duration,
       return_code: r.return_code,
+      parallel: !!r.parallel,
       section: secs.get(i + 1) || null,
     }))
   }
@@ -197,6 +199,7 @@ watch(() => props.stepsResult, () => {
 .node-title { overflow: hidden; text-overflow: ellipsis; flex: 1; }
 .node-tag { flex-shrink: 0; }
 .node-loading { color: #e6a23c; }
+.node-parallel { color: #e5c07b; font-weight: 700; flex-shrink: 0; }
 
 /* ── 右侧日志区 ── */
 .log-pane { flex: 1; min-width: 0; display: flex; flex-direction: column; }

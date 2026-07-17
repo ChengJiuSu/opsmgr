@@ -166,6 +166,7 @@ class TaskStepSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'order', 'name', 'task_type', 'task_type_display',
             'command', 'playbook', 'method', 'method_name', 'tags', 'extra_vars', 'params', 'timeout',
+            'run_parallel',
             'use_custom_scope', 'project_group', 'project_group_name',
             'channel', 'channel_name', 'environment', 'environment_name', 'environment_is_prod',
         ]
@@ -191,6 +192,9 @@ class TaskStepSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({'tags': f'{label}必须选择一个 tags（不支持留空执行全部）'})
         if task_type == 'method' and attrs.get('method') is None:
             raise serializers.ValidationError({'method': f'{label}为平台方法类型，必须选择一个方法'})
+        # 暂停确认必须独立成阶段：并行组内暂停会让组内其他模块空等，语义不成立
+        if task_type == 'pause' and attrs.get('run_parallel'):
+            raise serializers.ValidationError({'run_parallel': f'{label}为暂停确认类型，不允许标记并行'})
         # 自定义主机范围时三维度必选（与任务全局范围同策略，不支持留空=不限）
         if attrs.get('use_custom_scope'):
             for field, dim in (('project_group', '项目组'), ('channel', '渠道'), ('environment', '环境')):
@@ -220,7 +224,7 @@ class ExecutionTaskSerializer(serializers.ModelSerializer):
             'id', 'name', 'steps',
             'project_group', 'project_group_name', 'channel', 'channel_name',
             'environment', 'environment_name', 'environment_is_prod',
-            'exec_mode', 'exec_mode_display', 'servers',
+            'exec_mode', 'exec_mode_display', 'forks', 'servers',
             'credential', 'credential_name',
             'status', 'status_display', 'return_code', 'output',
             'created_by_name', 'created_at', 'started_at', 'finished_at', 'duration',
@@ -237,6 +241,11 @@ class ExecutionTaskSerializer(serializers.ModelSerializer):
     def validate_steps(self, value):
         if not value:
             raise serializers.ValidationError('任务流至少需要一个任务模块')
+        return value
+
+    def validate_forks(self, value):
+        if not 1 <= value <= 200:
+            raise serializers.ValidationError('主机并发数须在 1-200 之间')
         return value
 
     def validate(self, attrs):

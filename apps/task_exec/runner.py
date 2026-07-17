@@ -121,8 +121,10 @@ def _write_inventory(servers, credential, workdir):
 
 
 def _forks_args(task):
-    """执行方式参数：串行 = --forks 1 逐台执行；并发用 ansible 默认并发数。"""
-    return ['--forks', '1'] if task.exec_mode == 'serial' else []
+    """主机并发参数：串行 --forks 1 逐台；并发按任务并发数分批（默认 10）。"""
+    if task.exec_mode == 'serial':
+        return ['--forks', '1']
+    return ['--forks', str(getattr(task, 'forks', None) or 10)]
 
 
 class ArtifactLookupError(Exception):
@@ -334,49 +336,111 @@ def run(task):
     outputs, results = [], []
     total = len(steps)
     failed_rc = None
-    for idx, step in enumerate(steps, 1):
+    pos = 0  # 已消费的模块数（模块序号 = pos + 组内偏移）
+    for stage in _build_stages(steps):
         if failed_rc is not None:
-            results.append({
-                'order': step.order, 'name': step.name, 'task_type': step.task_type,
-                'status': 'skipped', 'return_code': None, 'duration': None, 'server_count': None,
-            })
+            for step in stage:
+                results.append({
+                    'order': step.order, 'name': step.name, 'task_type': step.task_type,
+                    'status': 'skipped', 'return_code': None, 'duration': None,
+                    'server_count': None, 'parallel': len(stage) > 1,
+                })
+            pos += len(stage)
             continue
 
-        started = time.monotonic()
-        if step.task_type == 'pause':
-            # 暂停确认模块：不涉及目标主机，等待人工继续/中止
-            servers = []
-            header = f'═══ 模块 {idx}/{total}：{step.name}（暂停确认 · 等待人工处理）═══'
-            prompt = f'⏸ 任务流已暂停，等待人工确认…（超过 {step.timeout or 300}s 未确认将自动中止）'
-            _persist_progress(task, outputs + [f'{header}\n{prompt}'])
-            rc, out = _wait_confirmation(step, task)
+        if len(stage) == 1:
+            step = stage[0]
+            entries = [_exec_step(step, task, pos + 1, total, outputs, parallel=False)]
         else:
-            servers = _step_servers(step, task)
-            scope = '自定义范围' if step.use_custom_scope else '全局范围'
-            header = f'═══ 模块 {idx}/{total}：{step.name}（{step.get_task_type_display()} · {scope} {len(servers)} 台）═══'
-            error = _guard(servers)
-            if error:
-                rc, out = 1, error
-            else:
-                try:
-                    rc, out = _STEP_HANDLERS[step.task_type](step, task, servers)
-                except ArtifactLookupError as exc:
-                    rc, out = 1, str(exc)
-        duration = round(time.monotonic() - started, 2)
+            entries = _exec_parallel_stage(stage, task, pos, total)
 
-        outputs.append(f'{header}\n{out}')
-        results.append({
-            'order': step.order, 'name': step.name, 'task_type': step.task_type,
-            'status': 'success' if rc == 0 else 'failed', 'return_code': rc,
-            'duration': duration,
-            'server_count': None if step.task_type == 'pause' else len(servers),
-        })
-        if rc != 0:
-            failed_rc = rc
-            remaining = total - idx
+        for step, header, rc, out, duration, server_count in entries:
+            outputs.append(f'{header}\n{out}')
+            results.append({
+                'order': step.order, 'name': step.name, 'task_type': step.task_type,
+                'status': 'success' if rc == 0 else 'failed', 'return_code': rc,
+                'duration': duration, 'server_count': server_count,
+                'parallel': len(stage) > 1,
+            })
+            if rc != 0 and failed_rc is None:
+                failed_rc = rc
+        pos += len(stage)
+        if failed_rc is not None:
+            remaining = total - pos
             if remaining:
-                outputs.append(f'✖ 模块「{step.name}」执行失败，中止后续 {remaining} 个模块。')
-        # 每个模块结束即持久化进度，前端轮询可见已完成模块的输出
+                failed_names = '、'.join(
+                    e[0].name for e in entries if e[2] != 0
+                )
+                outputs.append(f'✖ 模块「{failed_names}」执行失败，中止后续 {remaining} 个模块。')
+        # 每个阶段结束即持久化进度，前端轮询可见已完成模块的输出
         _persist_progress(task, outputs)
 
     return (failed_rc if failed_rc is not None else 0), '\n\n'.join(outputs), results
+
+
+def _build_stages(steps):
+    """把模块序列切成执行阶段：相邻的 run_parallel 模块合并为一个并行组，
+    其余各自成单模块阶段（pause 模块强制独立阶段）。阶段间严格按序。"""
+    stages, buf = [], []
+    for step in steps:
+        if getattr(step, 'run_parallel', False) and step.task_type != 'pause':
+            buf.append(step)
+            continue
+        if buf:
+            stages.append(buf)
+            buf = []
+        stages.append([step])
+    if buf:
+        stages.append(buf)
+    return stages
+
+
+def _exec_step(step, task, idx, total, outputs, parallel):
+    """执行单个模块，返回 (step, header, rc, out, duration, server_count)。
+
+    outputs 仅暂停确认模块用于持久化暂停提示（pause 不会出现在并行组内）。
+    """
+    started = time.monotonic()
+    if step.task_type == 'pause':
+        # 暂停确认模块：不涉及目标主机，等待人工继续/中止
+        header = f'═══ 模块 {idx}/{total}：{step.name}（暂停确认 · 等待人工处理）═══'
+        prompt = f'⏸ 任务流已暂停，等待人工确认…（超过 {step.timeout or 300}s 未确认将自动中止）'
+        _persist_progress(task, outputs + [f'{header}\n{prompt}'])
+        rc, out = _wait_confirmation(step, task)
+        server_count = None
+    else:
+        servers = _step_servers(step, task)
+        scope = '自定义范围' if step.use_custom_scope else '全局范围'
+        mark = ' · 并行组' if parallel else ''
+        header = f'═══ 模块 {idx}/{total}：{step.name}（{step.get_task_type_display()} · {scope} {len(servers)} 台{mark}）═══'
+        error = _guard(servers)
+        if error:
+            rc, out = 1, error
+        else:
+            try:
+                rc, out = _STEP_HANDLERS[step.task_type](step, task, servers)
+            except ArtifactLookupError as exc:
+                rc, out = 1, str(exc)
+        server_count = len(servers)
+    duration = round(time.monotonic() - started, 2)
+    return step, header, rc, out, duration, server_count
+
+
+def _exec_parallel_stage(stage, task, pos, total):
+    """并行组：组内模块并发执行，等待全部完成后按模块顺序返回结果。
+
+    任一模块失败不打断组内其他模块（各自跑完），失败由调用方汇总中止后续阶段。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from django.db import connection as dj_connection
+
+    def _worker(step, idx):
+        try:
+            return _exec_step(step, task, idx, total, [], parallel=True)
+        finally:
+            dj_connection.close()  # 线程私有连接，退出前释放
+
+    with ThreadPoolExecutor(max_workers=len(stage)) as pool:
+        futures = [pool.submit(_worker, step, pos + offset) for offset, step in enumerate(stage, 1)]
+        return [f.result() for f in futures]

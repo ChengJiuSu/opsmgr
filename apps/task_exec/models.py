@@ -197,7 +197,11 @@ class ExecutionTask(models.Model):
         'asset_mgr.Environment', verbose_name='环境', on_delete=models.PROTECT,
         null=True, blank=True, related_name='exec_tasks',
     )
-    exec_mode = models.CharField('执行方式', max_length=20, choices=EXEC_MODE_CHOICES, default='parallel')
+    # 模块内主机的执行方式：并发（默认，按 forks 分批）/ 串行（--forks 1 逐台）；
+    # 模块之间的并发见 TaskStep.run_parallel
+    exec_mode = models.CharField('主机执行方式', max_length=20, choices=EXEC_MODE_CHOICES, default='parallel')
+    # 并发模式下的主机并发数（ansible --forks）：默认 10 台一批
+    forks = models.PositiveIntegerField('主机并发数', default=10)
 
     # ── 目标主机与连接：servers 为「最近一次执行的全局范围主机」快照 ──
     servers = models.ManyToManyField(
@@ -274,6 +278,9 @@ class TaskStep(models.Model):
     # 平台方法模块的参数（JSON 对象，预留给 provider 消费，如云主机管理）
     params = models.JSONField('方法参数', default=dict, blank=True)
     timeout = models.PositiveIntegerField('超时(秒)', default=300)
+    # 模块间并行：相邻的 run_parallel=True 模块合并为一个并行组同时执行，
+    # 组内全部成功才进入下一阶段；默认 False=按序串行（pause 模块禁止并行）
+    run_parallel = models.BooleanField('与相邻并行模块并发', default=False)
 
     # ── 主机范围：默认跟随任务全局，自定义时按模块维度独立匹配 ──
     use_custom_scope = models.BooleanField('自定义主机范围', default=False)
@@ -303,6 +310,11 @@ class TaskStep(models.Model):
     def exec_mode(self):
         """执行方式任务级统一（方法执行器按 step 读取时透传）。"""
         return self.task.exec_mode
+
+    @property
+    def forks(self):
+        """主机并发数任务级统一（方法执行器按 step 读取时透传）。"""
+        return self.task.forks
 
     def matched_servers(self):
         """自定义范围：按模块维度实时匹配可执行主机（仅 use_custom_scope 时使用）。"""

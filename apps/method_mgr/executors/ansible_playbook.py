@@ -37,14 +37,13 @@ class AnsiblePlaybookExecutor(BaseExecutor):
             return 1, f'剧本文件不存在：{config["playbook"]}'
 
         # 模块级覆盖方法默认值（task 为 TaskStep，tags/extra_vars/timeout 均模块级）
-        from apps.task_exec.runner import extra_vars_args
+        from apps.task_exec.runner import _forks_args, extra_vars_args
 
         tags = (task.tags or config.get('tags') or '').strip()
         limit = (config.get('limit') or '').strip()
 
-        cmd = ['ansible-playbook', playbook_path, '-i', inventory_path]
-        if getattr(task, 'exec_mode', '') == 'serial':
-            cmd += ['--forks', '1']  # 串行：逐台执行
+        # 主机并发与命令/playbook 模块同口径：串行逐台，并发按任务并发数分批
+        cmd = ['ansible-playbook', playbook_path, '-i', inventory_path] + _forks_args(task)
         if tags:
             cmd += ['--tags', tags]
         if limit:
