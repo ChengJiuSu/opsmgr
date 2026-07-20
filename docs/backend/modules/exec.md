@@ -179,7 +179,6 @@ GET                 /api/exec/variables/{id}/versions/  历史版本列表（默
 POST                /api/exec/variables/{id}/rollback/  回滚到指定版本 body {version}（仅管理员，回滚亦落新版本）
 GET                 /api/exec/playbooks/          剧本列表（仅管理员；ANSIBLE_PROJECT_DIR 内相对路径）
 GET/POST/PUT/PATCH/DELETE /api/exec/tasks/        任务流 CRUD（steps 嵌套整体读写；保存不执行；执行中禁止编辑）
-POST                /api/exec/tasks/{id}/copy/    复制任务流：整体克隆定义（含全部模块），body 可选覆盖 {name, project_group, channel, environment}（不传则沿用源任务，name 默认追加"副本"）；状态/输出/历史日志不继承，新任务为 pending
 GET                 /api/exec/tasks/{id}/matched_servers/  执行表单数据源：{global: {...}, steps: [{order,name,custom,total,servers?}]}
 POST                /api/exec/tasks/{id}/execute/ 发起执行，body {server_ids:[...]} 仅作用于全局范围模块（缺省=全部全局匹配主机）
 POST                /api/exec/tasks/{id}/confirm/ 人工处理暂停：确认模块 continue/abort；失败等待 retry/skip/abort（仅管理员）

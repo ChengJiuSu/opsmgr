@@ -212,7 +212,7 @@
   </el-dialog>
 
   <!-- 新建 / 编辑任务弹窗（任务流定义，仅保存不执行） -->
-  <el-dialog v-model="formVisible" :title="form.id ? '编辑任务' : '新建任务'" width="760px" top="4vh">
+  <el-dialog v-model="formVisible" :title="form.id ? '编辑任务' : (copySourceName ? `复制任务（源：${copySourceName}）` : '新建任务')" width="760px" top="4vh">
     <el-form ref="formRef" :model="form" :rules="rules" label-width="90px">
       <el-row :gutter="16">
         <el-col :span="12">
@@ -498,7 +498,7 @@ import {
   getServers, fetchDictOptions, projectGroupApi, channelApi, environmentApi,
 } from '../../api/assets'
 import {
-  getTasks, createTask, updateTask, deleteTask, copyTask, getMatchedServers, executeTask,
+  getTasks, createTask, updateTask, deleteTask, getMatchedServers, executeTask,
   getTaskOutput, getTaskLogs, getTaskLogDetail, getCredentials, getMethods, confirmTask,
 } from '../../api/tasks'
 
@@ -585,6 +585,7 @@ async function fetchMatchedCount({ project_group, channel, environment }) {
 const formVisible = ref(false)
 const formRef = ref()
 const matchedCount = ref(null)
+const copySourceName = ref('') // 复制来源任务名（仅弹窗标题提示，未保存前不落库）
 const emptyStep = () => ({
   name: '', task_type: 'command', command: '', playbook: '', pbMethod: null, method: null,
   tag: '', extra_vars: '', paramsText: '', timeout: 300, run_parallel: false,
@@ -654,6 +655,9 @@ function moveStep(i, delta) {
 }
 
 async function openForm(row) {
+  // row.id 为空表示「复制」预填（尚未落库），保留调用方设置的 copySourceName；
+  // 真正编辑（row.id 存在）或全新新建（无 row）都清空复制提示
+  if (!row || row.id) copySourceName.value = ''
   Object.assign(form, emptyForm(), { steps: [emptyStep()] })
   if (row) {
     Object.assign(form, {
@@ -776,12 +780,10 @@ async function handleSave() {
   }
 }
 
-// 复制任务流：克隆定义（含全部模块），复制后直接打开编辑弹窗，方便改到其他项目/渠道/环境
-async function handleCopy(row) {
-  const res = await copyTask(row.id, {})
-  ElMessage.success(res.msg || '已复制')
-  fetchData()
-  openForm(res.data)
+// 复制任务流：仅本地预填表单（不调用后端，未点「保存」不落库），方便改到其他项目/渠道/环境后再保存
+function handleCopy(row) {
+  copySourceName.value = row.name
+  openForm({ ...row, id: null, name: `${row.name} 副本` })
 }
 
 async function handleDelete(row) {
