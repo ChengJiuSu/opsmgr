@@ -65,10 +65,11 @@
       <el-table-column prop="created_at" label="创建时间" width="160">
         <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
       </el-table-column>
-      <el-table-column label="操作" width="280" fixed="right">
+      <el-table-column label="操作" width="330" fixed="right">
         <template #default="{ row }">
           <el-button v-if="authStore.isStaff" size="small" type="primary" :icon="CaretRight" :disabled="['running', 'paused'].includes(row.status)" @click="openExec(row)">执行</el-button>
           <el-button v-if="authStore.isStaff" size="small" :icon="EditPen" :disabled="['running', 'paused'].includes(row.status)" @click="openForm(row)">编辑</el-button>
+          <el-button v-if="authStore.isStaff" size="small" :icon="CopyDocument" @click="handleCopy(row)">复制</el-button>
           <el-button size="small" :icon="View" @click="openLogs(row)">日志</el-button>
           <el-button v-if="authStore.isStaff" size="small" type="danger" :icon="Delete" @click="handleDelete(row)" />
         </template>
@@ -488,7 +489,7 @@
 import { ref, reactive, computed, nextTick, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import {
-  Plus, Delete, Search, Refresh, View, Loading, CaretRight, EditPen, Close, Top, Bottom, FullScreen, TopRight,
+  Plus, Delete, Search, Refresh, View, Loading, CaretRight, EditPen, CopyDocument, Close, Top, Bottom, FullScreen, TopRight,
 } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../../stores/auth'
@@ -497,7 +498,7 @@ import {
   getServers, fetchDictOptions, projectGroupApi, channelApi, environmentApi,
 } from '../../api/assets'
 import {
-  getTasks, createTask, updateTask, deleteTask, getMatchedServers, executeTask,
+  getTasks, createTask, updateTask, deleteTask, copyTask, getMatchedServers, executeTask,
   getTaskOutput, getTaskLogs, getTaskLogDetail, getCredentials, getMethods, confirmTask,
 } from '../../api/tasks'
 
@@ -773,6 +774,14 @@ async function handleSave() {
   } finally {
     submitting.value = false
   }
+}
+
+// 复制任务流：克隆定义（含全部模块），复制后直接打开编辑弹窗，方便改到其他项目/渠道/环境
+async function handleCopy(row) {
+  const res = await copyTask(row.id, {})
+  ElMessage.success(res.msg || '已复制')
+  fetchData()
+  openForm(res.data)
 }
 
 async function handleDelete(row) {

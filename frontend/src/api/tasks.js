@@ -6,6 +6,8 @@ export const getTask = (id) => request.get(`/api/exec/tasks/${id}/`)
 export const createTask = (data) => request.post('/api/exec/tasks/', data)
 export const updateTask = (id, data) => request.patch(`/api/exec/tasks/${id}/`, data)
 export const deleteTask = (id) => request.delete(`/api/exec/tasks/${id}/`)
+// 复制任务流：克隆定义（含全部模块），data 可选覆盖 name/project_group/channel/environment
+export const copyTask = (id, data) => request.post(`/api/exec/tasks/${id}/copy/`, data)
 export const getMatchedServers = (id) => request.get(`/api/exec/tasks/${id}/matched_servers/`)
 export const executeTask = (id, data) => request.post(`/api/exec/tasks/${id}/execute/`, data)
 export const getTaskOutput = (id) => request.get(`/api/exec/tasks/${id}/output/`)

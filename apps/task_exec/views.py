@@ -1,6 +1,7 @@
 import os
 
 from django.conf import settings
+from django.db import transaction
 from django.shortcuts import get_object_or_404
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema
@@ -11,7 +12,7 @@ from rest_framework.views import APIView
 from common.permissions import IsAdmin, IsAdminOrReadOnly
 from common.response import fail, ok
 
-from .models import Credential, ExecutionTask, ExecVariable
+from .models import Credential, ExecutionTask, ExecVariable, TaskStep
 from .serializers import (
     CredentialSerializer,
     ExecutionTaskSerializer,
@@ -166,6 +167,67 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
         if self.get_object().status in ('running', 'paused'):
             return fail('任务正在执行中，无法编辑')
         return super().update(request, *args, **kwargs)
+
+    @action(detail=True, methods=['post'])
+    def copy(self, request, pk=None):
+        """复制任务流：整体克隆定义（含全部模块），便于其他项目复用已有流程。
+
+        body 可选覆盖 name/project_group/channel/environment（不传则沿用源任务，
+        name 默认追加"副本"）；执行状态、最近输出、历史主机快照均不继承，
+        新任务为 pending，需重新执行。
+        """
+        from apps.asset_mgr.models import Channel, Environment, ProjectGroup
+
+        source = self.get_object()
+        data = request.data or {}
+        overrides = {}
+        for field, label, model in (
+            ('project_group', '项目组', ProjectGroup),
+            ('channel', '渠道', Channel),
+            ('environment', '环境', Environment),
+        ):
+            if field in data:
+                value = data.get(field)
+                if value is None:
+                    return fail(f'{label}不允许留空（主机范围三维度必选）')
+                if not model.objects.filter(pk=value).exists():
+                    return fail(f'{label} id={value} 不存在')
+                overrides[f'{field}_id'] = value
+            else:
+                overrides[f'{field}_id'] = getattr(source, f'{field}_id')
+
+        with transaction.atomic():
+            new_task = ExecutionTask.objects.create(
+                name=data.get('name') or f'{source.name} 副本',
+                exec_mode=source.exec_mode,
+                forks=source.forks,
+                credential_id=source.credential_id,
+                created_by=request.user,
+                **overrides,
+            )
+            for step in source.steps.all():
+                TaskStep.objects.create(
+                    task=new_task,
+                    order=step.order,
+                    name=step.name,
+                    task_type=step.task_type,
+                    command=step.command,
+                    playbook=step.playbook,
+                    method_id=step.method_id,
+                    tags=step.tags,
+                    extra_vars=step.extra_vars,
+                    params=step.params,
+                    timeout=step.timeout,
+                    run_parallel=step.run_parallel,
+                    use_custom_scope=step.use_custom_scope,
+                    project_group_id=step.project_group_id,
+                    channel_id=step.channel_id,
+                    environment_id=step.environment_id,
+                )
+        return ok(
+            ExecutionTaskSerializer(new_task).data,
+            msg=f'已复制为「{new_task.name}」，请检查主机范围后执行',
+        )
 
     @action(detail=True, methods=['get'])
     def matched_servers(self, request, pk=None):
