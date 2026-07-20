@@ -127,9 +127,12 @@ class MethodModelTests(TestCase):
 
 
 
-@override_settings(TASK_EXEC_BACKEND='sync')
+@override_settings(TASK_EXEC_BACKEND='sync', TASK_FAILURE_WAIT_TIMEOUT=0)
 class ExecutionAPITests(TestCase):
-    """任务流 API 测试：任务=模块序列，新建/编辑仅保存，执行走 execute 动作。"""
+    """任务流 API 测试：任务=模块序列，新建/编辑仅保存，执行走 execute 动作。
+
+    失败等待超时置 0（失败即中止），失败处理交互见 FailureHandlingTests。
+    """
 
     def setUp(self):
         from apps.asset_mgr.models import Channel, Environment, ProjectGroup, ServerService, ServiceType
@@ -787,7 +790,7 @@ class ExecutionAPITests(TestCase):
         self.assertEqual(cmd[idxs[1] + 1], 'override=1')  # 模块变量在后，ansible 同名覆盖
 
 
-@override_settings(TASK_EXEC_BACKEND='sync')
+@override_settings(TASK_EXEC_BACKEND='sync', TASK_FAILURE_WAIT_TIMEOUT=0)
 class ArtifactInjectTests(TestCase):
     """CD 制品变量注入：按模块有效维度取最新制品，params.artifact_version 可锁定版本。"""
 
@@ -943,7 +946,7 @@ class PauseStepTests(TestCase):
         c = self._client()
         r = c.post(f'/api/exec/tasks/{self.task.id}/confirm/', {'action': 'continue'}, format='json')
         self.assertEqual(r.status_code, 400)
-        self.assertIn('等待确认', r.json()['msg'])
+        self.assertIn('等待处理', r.json()['msg'])
 
         ExecutionTask.objects.filter(pk=self.task.pk).update(status='paused')
         r = c.post(f'/api/exec/tasks/{self.task.id}/confirm/', {'action': 'bad'}, format='json')
@@ -980,6 +983,7 @@ class PauseStepTests(TestCase):
         self.assertEqual(r.status_code, 201, r.content)
 
 
+@override_settings(TASK_FAILURE_WAIT_TIMEOUT=0)
 class ParallelStageTests(TestCase):
     """模块间并行组：分组规则、并发执行、组内失败中止后续阶段。"""
 
@@ -1060,3 +1064,145 @@ class ParallelStageTests(TestCase):
         }, format='json')
         self.assertEqual(r.status_code, 400)
         self.assertIn('不允许标记并行', r.json()['msg'])
+
+
+class FailureHandlingTests(TestCase):
+    """模块失败处理：暂停等待人工重试/跳过/中止，超时中止，confirm 接口按暂停类型校验动作。"""
+
+    def setUp(self):
+        self.user = User.objects.create(username='admin_f', is_staff=True, is_superuser=True)
+        self.user.set_password('Pass!2345xyz')
+        self.user.save()
+        self.task = ExecutionTask.objects.create(name='失败流', created_by=self.user)
+
+    def _client(self, username='admin_f'):
+        c = APIClient()
+        r = c.post('/api/auth/login/', {'username': username, 'password': 'Pass!2345xyz'}, format='json')
+        c.credentials(HTTP_AUTHORIZATION='Bearer ' + r.json()['access'])
+        return c
+
+    def _step(self, order, name, parallel=False):
+        return TaskStep.objects.create(
+            task=self.task, order=order, name=name, task_type='command',
+            command='echo hi', run_parallel=parallel, timeout=30,
+        )
+
+    def _run(self, handler, actions):
+        """执行任务流：handler 为命令模块假执行器；actions 为失败等待期间
+        依次注入的处理动作（借 mock 的 sleep 单线程写入，规避 SQLite 跨线程锁）。"""
+        queue = list(actions)
+        task_pk = self.task.pk
+
+        def _inject(_seconds=None):
+            if queue:
+                ExecutionTask.objects.filter(pk=task_pk).update(pause_action=queue.pop(0))
+
+        with mock.patch.dict(runner._STEP_HANDLERS, {'command': handler}), \
+                mock.patch.object(runner, '_step_servers', return_value=[object()]), \
+                mock.patch.object(runner, '_guard', return_value=None), \
+                mock.patch.object(runner.time, 'sleep', side_effect=_inject):
+            return runner.run(self.task)
+
+    def test_retry_until_success(self):
+        """失败后人工重试：当前模块重跑成功，任务流继续且最终成功。"""
+        self._step(1, '会失败')
+        self._step(2, '后续')
+        calls = {'n': 0}
+
+        def handler(step, task, servers):
+            if step.name == '会失败':
+                calls['n'] += 1
+                return (1, 'boom') if calls['n'] == 1 else (0, 'ok after retry')
+            return 0, 'tail ok'
+
+        rc, output, results = self._run(handler, ['retry'])
+        self.assertEqual(rc, 0)
+        self.assertEqual([r['status'] for r in results], ['success', 'success'])
+        self.assertEqual(results[0]['attempts'], 2)
+        self.assertEqual(results[1]['attempts'], 1)
+        self.assertIn('重试#1', output)
+        self.assertIn('ok after retry', output)
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.pause_action, '')
+        self.assertEqual(self.task.pause_type, '')
+
+    def test_skip_continues_following_steps(self):
+        """失败后人工跳过：后续模块继续执行，失败模块标记 skipped_over，任务最终记失败。"""
+        self._step(1, '会失败')
+        self._step(2, '后续')
+
+        def handler(step, task, servers):
+            return (1, 'boom') if step.name == '会失败' else (0, 'tail ok')
+
+        rc, output, results = self._run(handler, ['skip'])
+        self.assertEqual(rc, 1)
+        self.assertEqual([r['status'] for r in results], ['failed', 'success'])
+        self.assertTrue(results[0].get('skipped_over'))
+        self.assertIn('跳过失败模块', output)
+        self.assertIn('tail ok', output)
+
+    def test_abort_marks_rest_skipped(self):
+        """失败后人工中止：后续模块标记 skipped。"""
+        self._step(1, '会失败')
+        self._step(2, '后续')
+
+        def handler(step, task, servers):
+            return (1, 'boom') if step.name == '会失败' else (0, 'tail ok')
+
+        rc, output, results = self._run(handler, ['abort'])
+        self.assertEqual(rc, 1)
+        self.assertEqual([r['status'] for r in results], ['failed', 'skipped'])
+        self.assertIn('人工确认中止', output)
+        self.assertNotIn('tail ok', output)
+
+    def test_wait_timeout_aborts(self):
+        """失败等待超时：按中止处理。"""
+        self._step(1, '会失败')
+        self._step(2, '后续')
+
+        def handler(step, task, servers):
+            return (1, 'boom') if step.name == '会失败' else (0, 'tail ok')
+
+        with override_settings(TASK_FAILURE_WAIT_TIMEOUT=1):
+            rc, output, results = self._run(handler, [])  # 不注入动作，sleep 空转到超时
+        self.assertEqual(rc, 1)
+        self.assertEqual([r['status'] for r in results], ['failed', 'skipped'])
+        self.assertIn('等待人工处理超时', output)
+
+    def test_retry_parallel_group_only_failed_members(self):
+        """并行组失败重试：仅重跑失败模块，成功模块不重复执行。"""
+        self._step(1, '并A', parallel=True)
+        self._step(2, '并B', parallel=True)
+        calls = {'A': 0, 'B': 0}
+
+        def handler(step, task, servers):
+            key = 'A' if step.name == '并A' else 'B'
+            calls[key] += 1
+            if key == 'B' and calls['B'] == 1:
+                return 1, 'B boom'
+            return 0, f'{step.name} ok'
+
+        rc, output, results = self._run(handler, ['retry'])
+        self.assertEqual(rc, 0)
+        self.assertEqual([r['status'] for r in results], ['success', 'success'])
+        self.assertEqual(calls, {'A': 1, 'B': 2})
+        self.assertEqual(results[0]['attempts'], 1)
+        self.assertEqual(results[1]['attempts'], 2)
+
+    def test_confirm_api_validates_pause_type(self):
+        """confirm 接口：失败等待仅接受 retry/skip/abort，暂停确认仅接受 continue/abort。"""
+        c = self._client()
+        ExecutionTask.objects.filter(pk=self.task.pk).update(status='paused', pause_type='failed')
+        r = c.post(f'/api/exec/tasks/{self.task.id}/confirm/', {'action': 'continue'}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('retry/skip/abort', r.json()['msg'])
+        r = c.post(f'/api/exec/tasks/{self.task.id}/confirm/', {'action': 'retry'}, format='json')
+        self.assertEqual(r.status_code, 200)
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.pause_action, 'retry')
+
+        ExecutionTask.objects.filter(pk=self.task.pk).update(
+            status='paused', pause_type='confirm', pause_action='')
+        r = c.post(f'/api/exec/tasks/{self.task.id}/confirm/', {'action': 'skip'}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('continue/abort', r.json()['msg'])

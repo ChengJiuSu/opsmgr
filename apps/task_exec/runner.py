@@ -1,7 +1,8 @@
 """任务执行分派（任务流）。
 
-任务 = 任务流：模块（TaskStep）按 order 顺序执行，任一模块失败即中止
-后续模块；模块内主机按任务 exec_mode 并发/串行（串行 = --forks 1）。
+任务 = 任务流：模块（TaskStep）按 order 顺序执行，模块失败后暂停等待
+人工处理（重试当前模块 / 跳过继续 / 中止，超时=中止）；模块内主机按任务
+exec_mode 并发/串行（串行 = --forks 1）。
 
 每个模块执行前解析主机并生成临时动态 inventory：
   - 全局范围模块：任务 servers 快照（执行时勾选的全局范围主机）；
@@ -283,6 +284,19 @@ _STEP_HANDLERS = {
 # 执行进度预览上限（与 tasks.OUTPUT_PREVIEW_LIMIT 一致）；暂停确认轮询间隔（秒）
 PROGRESS_PREVIEW_LIMIT = 60000
 PAUSE_POLL_INTERVAL = 2
+# 模块失败后等待人工处理（重试/跳过/中止）的默认超时（秒），超时按中止处理
+FAILURE_WAIT_TIMEOUT_DEFAULT = 600
+
+
+def _failure_wait_timeout():
+    """失败等待超时（秒）：系统配置 task.failure_wait_timeout 优先，其次
+    settings.TASK_FAILURE_WAIT_TIMEOUT，默认 600；0 = 不等待（失败即中止）。"""
+    from apps.system_cfg.services import get_config
+
+    raw = get_config('task.failure_wait_timeout')
+    if str(raw).strip().isdigit():
+        return int(raw)
+    return getattr(settings, 'TASK_FAILURE_WAIT_TIMEOUT', FAILURE_WAIT_TIMEOUT_DEFAULT)
 
 
 def _persist_progress(task, outputs):
@@ -305,7 +319,8 @@ def _wait_confirmation(step, task):
     from .models import ExecutionTask
 
     timeout = step.timeout or 300
-    ExecutionTask.objects.filter(pk=task.pk).update(status='paused', pause_action='')
+    ExecutionTask.objects.filter(pk=task.pk).update(
+        status='paused', pause_action='', pause_type='confirm')
     deadline = time.monotonic() + timeout
     try:
         while time.monotonic() < deadline:
@@ -321,13 +336,44 @@ def _wait_confirmation(step, task):
             time.sleep(PAUSE_POLL_INTERVAL)
         return 124, f'等待人工确认超时（>{timeout}s），任务流中止。'
     finally:
-        ExecutionTask.objects.filter(pk=task.pk).update(status='running', pause_action='')
+        ExecutionTask.objects.filter(pk=task.pk).update(
+            status='running', pause_action='', pause_type='')
+
+
+def _wait_failure_action(task, timeout):
+    """模块失败等待人工处理：置任务 paused（pause_type=failed），轮询动作。
+
+    确认接口（views.confirm）向 pause_action 写 retry/skip/abort，本函数
+    消费后清空并把状态恢复为 running；等待超时返回 'timeout'（按中止处理）。
+    """
+    from .models import ExecutionTask
+
+    ExecutionTask.objects.filter(pk=task.pk).update(
+        status='paused', pause_action='', pause_type='failed')
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() < deadline:
+            action = (
+                ExecutionTask.objects.filter(pk=task.pk)
+                .values_list('pause_action', flat=True)
+                .first()
+            )
+            if action in ('retry', 'skip', 'abort'):
+                return action
+            time.sleep(PAUSE_POLL_INTERVAL)
+        return 'timeout'
+    finally:
+        ExecutionTask.objects.filter(pk=task.pk).update(
+            status='running', pause_action='', pause_type='')
 
 
 def run(task):
     """按 order 顺序执行任务流的全部模块，返回 (return_code, output, steps_result)。
 
-    任一模块失败（rc != 0）即中止，后续模块标记 skipped。
+    模块失败（rc != 0）后任务流暂停，等待人工处理：重试（重跑当前阶段失败
+    模块，可反复）/ 跳过（继续后续模块，任务最终仍记失败）/ 中止（后续模块
+    标记 skipped）；等待超时按中止处理。暂停确认模块的中止/超时直接终止
+    任务流，不进入失败处理。
     """
     steps = list(task.steps.all())
     if not steps:
@@ -335,47 +381,101 @@ def run(task):
 
     outputs, results = [], []
     total = len(steps)
-    failed_rc = None
+    flow_rc = None  # 首个失败模块的 rc（含被跳过的失败），决定任务流最终状态
+    aborted = False
+    abort_note = ''
     pos = 0  # 已消费的模块数（模块序号 = pos + 组内偏移）
     for stage in _build_stages(steps):
-        if failed_rc is not None:
+        parallel = len(stage) > 1
+        if aborted:
             for step in stage:
                 results.append({
                     'order': step.order, 'name': step.name, 'task_type': step.task_type,
                     'status': 'skipped', 'return_code': None, 'duration': None,
-                    'server_count': None, 'parallel': len(stage) > 1,
+                    'server_count': None, 'parallel': parallel,
                 })
             pos += len(stage)
             continue
 
-        if len(stage) == 1:
-            step = stage[0]
-            entries = [_exec_step(step, task, pos + 1, total, outputs, parallel=False)]
-        else:
-            entries = _exec_parallel_stage(stage, task, pos, total)
+        pairs = [(step, pos + offset) for offset, step in enumerate(stage, 1)]
+        entries = _exec_stage(pairs, task, total, outputs, parallel)
 
+        result_by_id = {}
         for step, header, rc, out, duration, server_count in entries:
             outputs.append(f'{header}\n{out}')
-            results.append({
+            item = {
                 'order': step.order, 'name': step.name, 'task_type': step.task_type,
                 'status': 'success' if rc == 0 else 'failed', 'return_code': rc,
                 'duration': duration, 'server_count': server_count,
-                'parallel': len(stage) > 1,
-            })
-            if rc != 0 and failed_rc is None:
-                failed_rc = rc
+                'parallel': parallel, 'attempts': 1,
+            }
+            results.append(item)
+            result_by_id[step.id] = item
+
+        idx_by_id = {step.id: idx for step, idx in pairs}
+        failed_entries = [e for e in entries if e[2] != 0]
+
+        # 暂停确认模块的中止/超时：直接终止任务流，不提供重试/跳过
+        if failed_entries and stage[0].task_type == 'pause':
+            flow_rc = failed_entries[0][2]
+            aborted = True
+            abort_note = f'模块「{stage[0].name}」暂停确认未通过'
+            failed_entries = []
+
+        # 失败处理循环：暂停等待人工选择重试/跳过/中止（超时=中止；
+        # 等待超时配置为 0 时不等待，保持「失败即中止」）
+        while failed_entries:
+            names = '、'.join(e[0].name for e in failed_entries)
+            timeout = _failure_wait_timeout()
+            if timeout > 0:
+                prompt = (f'✖ 模块「{names}」执行失败，任务流已暂停，等待人工处理：'
+                          f'重试失败模块 / 跳过并继续 / 中止（超过 {timeout}s 未处理将自动中止）。')
+                _persist_progress(task, outputs + [prompt])
+                action = _wait_failure_action(task, timeout)
+            else:
+                action = 'abort_now'
+            if action == 'retry':
+                attempt = result_by_id[failed_entries[0][0].id]['attempts'] + 1
+                outputs.append(f'↻ 已人工确认重试，第 {attempt} 次执行失败模块：{names}。')
+                _persist_progress(task, outputs)
+                retry_pairs = [(e[0], idx_by_id[e[0].id]) for e in failed_entries]
+                entries = _exec_stage(retry_pairs, task, total, outputs, parallel, attempt=attempt)
+                for step, header, rc, out, duration, server_count in entries:
+                    outputs.append(f'{header}\n{out}')
+                    item = result_by_id[step.id]
+                    item.update({
+                        'status': 'success' if rc == 0 else 'failed', 'return_code': rc,
+                        'duration': duration, 'server_count': server_count,
+                        'attempts': attempt,
+                    })
+                failed_entries = [e for e in entries if e[2] != 0]
+            elif action == 'skip':
+                if flow_rc is None:
+                    flow_rc = failed_entries[0][2]
+                for e in failed_entries:
+                    result_by_id[e[0].id]['skipped_over'] = True
+                outputs.append(f'⤼ 已人工确认跳过失败模块「{names}」，继续执行后续模块（本次执行仍记失败）。')
+                failed_entries = []
+            else:  # abort / timeout / abort_now（未开启失败等待）
+                if flow_rc is None:
+                    flow_rc = failed_entries[0][2]
+                aborted = True
+                if action == 'abort_now':
+                    abort_note = f'模块「{names}」执行失败'
+                else:
+                    reason = '等待人工处理超时' if action == 'timeout' else '人工确认中止'
+                    abort_note = f'模块「{names}」执行失败（{reason}）'
+                failed_entries = []
+
         pos += len(stage)
-        if failed_rc is not None:
+        if aborted:
             remaining = total - pos
             if remaining:
-                failed_names = '、'.join(
-                    e[0].name for e in entries if e[2] != 0
-                )
-                outputs.append(f'✖ 模块「{failed_names}」执行失败，中止后续 {remaining} 个模块。')
+                outputs.append(f'✖ {abort_note}，中止后续 {remaining} 个模块。')
         # 每个阶段结束即持久化进度，前端轮询可见已完成模块的输出
         _persist_progress(task, outputs)
 
-    return (failed_rc if failed_rc is not None else 0), '\n\n'.join(outputs), results
+    return (flow_rc if flow_rc is not None else 0), '\n\n'.join(outputs), results
 
 
 def _build_stages(steps):
@@ -395,12 +495,24 @@ def _build_stages(steps):
     return stages
 
 
-def _exec_step(step, task, idx, total, outputs, parallel):
+def _exec_stage(pairs, task, total, outputs, parallel, attempt=1):
+    """执行一个阶段（或阶段内失败模块的重试子集），按传入顺序返回 entries。
+
+    pairs 为 (step, 模块序号) 列表；attempt > 1 表示重试轮次（体现在模块头）。
+    """
+    if not parallel:
+        step, idx = pairs[0]
+        return [_exec_step(step, task, idx, total, outputs, parallel=False, attempt=attempt)]
+    return _exec_parallel_stage(pairs, task, total, attempt)
+
+
+def _exec_step(step, task, idx, total, outputs, parallel, attempt=1):
     """执行单个模块，返回 (step, header, rc, out, duration, server_count)。
 
     outputs 仅暂停确认模块用于持久化暂停提示（pause 不会出现在并行组内）。
     """
     started = time.monotonic()
+    retry_mark = f' · 重试#{attempt - 1}' if attempt > 1 else ''
     if step.task_type == 'pause':
         # 暂停确认模块：不涉及目标主机，等待人工继续/中止
         header = f'═══ 模块 {idx}/{total}：{step.name}（暂停确认 · 等待人工处理）═══'
@@ -412,7 +524,8 @@ def _exec_step(step, task, idx, total, outputs, parallel):
         servers = _step_servers(step, task)
         scope = '自定义范围' if step.use_custom_scope else '全局范围'
         mark = ' · 并行组' if parallel else ''
-        header = f'═══ 模块 {idx}/{total}：{step.name}（{step.get_task_type_display()} · {scope} {len(servers)} 台{mark}）═══'
+        header = (f'═══ 模块 {idx}/{total}：{step.name}'
+                  f'（{step.get_task_type_display()} · {scope} {len(servers)} 台{mark}{retry_mark}）═══')
         error = _guard(servers)
         if error:
             rc, out = 1, error
@@ -426,10 +539,11 @@ def _exec_step(step, task, idx, total, outputs, parallel):
     return step, header, rc, out, duration, server_count
 
 
-def _exec_parallel_stage(stage, task, pos, total):
+def _exec_parallel_stage(pairs, task, total, attempt=1):
     """并行组：组内模块并发执行，等待全部完成后按模块顺序返回结果。
 
-    任一模块失败不打断组内其他模块（各自跑完），失败由调用方汇总中止后续阶段。
+    任一模块失败不打断组内其他模块（各自跑完），失败由调用方汇总处理
+    （暂停等待人工重试/跳过/中止）。重试时 pairs 仅含失败模块（序号沿用）。
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -437,10 +551,10 @@ def _exec_parallel_stage(stage, task, pos, total):
 
     def _worker(step, idx):
         try:
-            return _exec_step(step, task, idx, total, [], parallel=True)
+            return _exec_step(step, task, idx, total, [], parallel=True, attempt=attempt)
         finally:
             dj_connection.close()  # 线程私有连接，退出前释放
 
-    with ThreadPoolExecutor(max_workers=len(stage)) as pool:
-        futures = [pool.submit(_worker, step, pos + offset) for offset, step in enumerate(stage, 1)]
+    with ThreadPoolExecutor(max_workers=len(pairs)) as pool:
+        futures = [pool.submit(_worker, step, idx) for step, idx in pairs]
         return [f.result() for f in futures]

@@ -54,13 +54,17 @@
           <span v-if="current">返回码：{{ current.return_code ?? '-' }}</span>
           <span v-if="currentServers" class="muted">{{ currentServers }}</span>
         </div>
-        <!-- 暂停确认操作条：任务流停在「暂停确认」模块时展示 -->
-        <el-alert v-if="task?.status === 'paused'" type="warning" :closable="false" show-icon class="pause-bar">
+        <!-- 暂停处理操作条：暂停确认模块（继续/中止）或模块失败等待（重试/跳过/中止） -->
+        <el-alert v-if="task?.status === 'paused'" :type="pausedFailed ? 'error' : 'warning'" :closable="false" show-icon class="pause-bar">
           <template #title>
             <span class="pause-line">
-              任务流已暂停，等待人工确认后继续
+              {{ pausedFailed ? '模块执行失败，任务流已暂停，等待人工处理' : '任务流已暂停，等待人工确认后继续' }}
               <span v-if="authStore.isStaff" class="pause-actions">
-                <el-button size="small" type="primary" :loading="confirming" @click="handleConfirm('continue')">继续执行</el-button>
+                <template v-if="pausedFailed">
+                  <el-button size="small" type="primary" :loading="confirming" @click="handleConfirm('retry')">重试失败模块</el-button>
+                  <el-button size="small" type="warning" :loading="confirming" @click="handleConfirm('skip')">跳过并继续</el-button>
+                </template>
+                <el-button v-else size="small" type="primary" :loading="confirming" @click="handleConfirm('continue')">继续执行</el-button>
                 <el-button size="small" type="danger" :loading="confirming" @click="handleConfirm('abort')">中止任务流</el-button>
               </span>
             </span>
@@ -182,16 +186,25 @@ function stopPolling() {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
 }
 
-// 暂停确认：继续 / 中止（中止需二次确认），状态由轮询自动刷新
+// 暂停处理：确认模块（继续/中止）或失败等待（重试/跳过/中止），状态由轮询自动刷新
 const confirming = ref(false)
+const pausedFailed = computed(() => task.value?.pause_type === 'failed')
+const CONFIRM_DONE_MSG = {
+  continue: '已确认，任务流继续执行',
+  abort: '已发送中止指令',
+  retry: '已发送重试指令，失败模块将重新执行',
+  skip: '已发送跳过指令，任务流继续执行后续模块',
+}
 async function handleConfirm(action) {
   if (action === 'abort') {
     await ElMessageBox.confirm('确定中止任务流吗？后续模块将不再执行。', '警告', { type: 'warning' })
+  } else if (action === 'skip') {
+    await ElMessageBox.confirm('确定跳过失败模块吗？任务流将继续执行后续模块（本次执行仍记为失败）。', '提示', { type: 'warning' })
   }
   confirming.value = true
   try {
     await confirmTask(taskId, action)
-    ElMessage.success(action === 'continue' ? '已确认，任务流继续执行' : '已发送中止指令')
+    ElMessage.success(CONFIRM_DONE_MSG[action])
   } finally {
     confirming.value = false
   }

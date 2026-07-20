@@ -229,6 +229,9 @@ CELERY_TIMEZONE = 'Asia/Shanghai'
 # ── 任务执行后端 ──────────────────────────────────────────
 # thread（默认，无需 Redis）/ celery（生产，需 worker）/ sync（同步，测试用）
 TASK_EXEC_BACKEND = config('TASK_EXEC_BACKEND', default='thread')
+# 模块失败后等待人工处理（重试/跳过/中止）的超时秒数，超时按中止处理；
+# 0 = 不等待（失败即中止）。系统配置 task.failure_wait_timeout 可运行时覆盖。
+TASK_FAILURE_WAIT_TIMEOUT = config('TASK_FAILURE_WAIT_TIMEOUT', default=600, cast=int)
 
 # ── 任务执行日志 ──────────────────────────────────────────
 # 输出超过预览上限时全量落盘的目录（输出可能含敏感回显，禁止暴露到静态文件路径）

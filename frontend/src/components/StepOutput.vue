@@ -23,7 +23,7 @@
         <span v-if="mod.parallel" class="node-parallel" title="并行组模块">∥</span>
         <el-icon v-if="mod.status === 'running'" class="is-loading node-loading"><Loading /></el-icon>
         <el-tag v-else-if="mod.status" size="small" :type="STATUS_TAG[mod.status] || 'info'" class="node-tag">
-          {{ STATUS_LABEL[mod.status] || mod.status }}
+          {{ statusLabel(mod) }}
         </el-tag>
       </div>
     </div>
@@ -33,6 +33,7 @@
         <span class="pane-title">{{ currentMeta.fullTitle }}</span>
         <span v-if="currentMeta.duration != null" class="pane-meta">耗时 {{ currentMeta.duration }}s</span>
         <span v-if="currentMeta.return_code != null" class="pane-meta">rc={{ currentMeta.return_code }}</span>
+        <span v-if="currentMeta.attempts > 1" class="pane-meta">已重试 {{ currentMeta.attempts - 1 }} 次</span>
       </div>
       <pre ref="paneRef" class="pane-body">{{ currentBody }}</pre>
     </div>
@@ -54,6 +55,9 @@ const props = defineProps({
 const ALL = '__all__'
 const STATUS_TAG = { success: 'success', failed: 'danger', skipped: 'info' }
 const STATUS_LABEL = { success: '成功', failed: '失败', skipped: '跳过' }
+// 失败后被人工跳过的模块（任务流继续但本次执行仍记失败）
+const statusLabel = (mod) =>
+  mod.status === 'failed' && mod.skippedOver ? '失败·已跳过' : STATUS_LABEL[mod.status] || mod.status
 
 // runner 输出的模块分隔头：═══ 模块 i/n：名称（类型 · 范围）═══
 const HEADER_RE = /^═══ 模块 (\d+)\/(\d+)：(.+?)═══\s*$/
@@ -98,6 +102,8 @@ const modules = computed(() => {
       duration: r.duration,
       return_code: r.return_code,
       parallel: !!r.parallel,
+      attempts: r.attempts || 1,
+      skippedOver: !!r.skipped_over,
       section: secs.get(i + 1) || null,
     }))
   }

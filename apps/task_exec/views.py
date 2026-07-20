@@ -239,30 +239,49 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
         task.status = 'pending'
         task.return_code = None
         task.output = ''
-        task.pause_action = ''  # 清残留确认信号，避免上次未消费的动作误触发
+        task.pause_action = ''  # 清残留处理信号，避免上次未消费的动作误触发
+        task.pause_type = ''
         task.started_at = None
         task.finished_at = None
-        task.save(update_fields=['status', 'return_code', 'output', 'pause_action', 'started_at', 'finished_at'])
+        task.save(update_fields=[
+            'status', 'return_code', 'output', 'pause_action', 'pause_type',
+            'started_at', 'finished_at',
+        ])
         log = dispatch(task, triggered_by=request.user, trigger_type='execute')
         return ok(
             {'task': ExecutionTaskSerializer(task).data, 'log_id': log.id, 'step_count': len(steps)},
             msg=f'已发起执行（{len(steps)} 个模块，{task.get_exec_mode_display()}）',
         )
 
+    # 暂停类型 -> 允许的处理动作（'' 兼容存量：视为暂停确认）
+    PAUSE_ACTIONS = {
+        'confirm': ('continue', 'abort'),
+        'failed': ('retry', 'skip', 'abort'),
+    }
+
     @action(detail=True, methods=['post'], permission_classes=[IsAdmin])
     def confirm(self, request, pk=None):
-        """暂停确认：任务流停在「暂停确认」模块时，continue 继续 / abort 中止。
+        """人工处理暂停中的任务流。
 
-        仅 paused 状态可操作；动作写入 pause_action 由 runner 轮询消费。
+        暂停确认模块（pause_type=confirm）：continue 继续 / abort 中止；
+        模块失败等待（pause_type=failed）：retry 重试失败模块 / skip 跳过
+        继续后续模块 / abort 中止。仅 paused 状态可操作；动作写入
+        pause_action 由 runner 轮询消费。
         """
         action_value = request.data.get('action')
-        if action_value not in ('continue', 'abort'):
-            return fail('action 必须为 continue（继续）或 abort（中止）')
+        if action_value not in ('continue', 'abort', 'retry', 'skip'):
+            return fail('action 必须为 continue/abort（暂停确认）或 retry/skip/abort（失败处理）')
         from .models import ExecutionTask
 
+        row = ExecutionTask.objects.filter(pk=pk).values_list('status', 'pause_type').first()
+        if row is None or row[0] != 'paused':
+            return fail('任务当前不在「等待处理」状态，无法操作')
+        allowed = self.PAUSE_ACTIONS[row[1] or 'confirm']
+        if action_value not in allowed:
+            return fail(f'当前暂停类型仅支持动作：{"/".join(allowed)}')
         updated = ExecutionTask.objects.filter(pk=pk, status='paused').update(pause_action=action_value)
         if not updated:
-            return fail('任务当前不在「等待确认」状态，无法操作')
+            return fail('任务当前不在「等待处理」状态，无法操作')
         return ok({'action': action_value})
 
     @action(detail=True, methods=['get'])
@@ -272,6 +291,7 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
         return ok({
             'id': task.id,
             'status': task.status,
+            'pause_type': task.pause_type,
             'return_code': task.return_code,
             'output': task.output,
             'duration': task.duration,

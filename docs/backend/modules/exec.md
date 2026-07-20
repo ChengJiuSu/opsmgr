@@ -133,7 +133,7 @@ Ansible 项目目录内执行剧本：
 
 - 模块默认按序串行；`TaskStep.run_parallel=True` 且相邻的模块合并为一个
   **并行组**（`runner._build_stages`），组内模块线程并发执行、互不打断，
-  全部完成后按模块顺序拼接输出，任一失败则后续阶段整体 skipped。
+  全部完成后按模块顺序拼接输出，失败进入失败处理（重试仅重跑组内失败模块）。
 - pause 模块禁止标记并行（序列化器校验），强制独立成阶段。
 - 与任务级 `exec_mode` 正交：exec_mode 管模块内主机并发（--forks），
   run_parallel 管模块之间并发。
@@ -141,13 +141,34 @@ Ansible 项目目录内执行剧本：
 
 ## 暂停确认（pause 模块）
 
-- 执行到 pause 模块：任务状态置 `paused`，把已完成模块输出实时落库
-  （runner 每模块结束也会持久化进度），前端轮询可见暂停提示。
+- 执行到 pause 模块：任务状态置 `paused`（`pause_type=confirm`），把已完成
+  模块输出实时落库（runner 每模块结束也会持久化进度），前端轮询可见暂停提示。
 - 确认：`POST /api/exec/tasks/{id}/confirm/` `{"action": "continue"|"abort"}`
   （仅管理员、仅 paused 状态可操作）；动作写入 `ExecutionTask.pause_action`，
   runner 每 2s 轮询消费后清空并恢复 `running`。
 - abort → 模块 rc=1，后续模块 skipped；超时未确认 → rc=124 中止。
+  pause 模块的中止/超时直接终止任务流，**不进入失败处理**。
 - paused 状态下任务禁止编辑与重复发起。
+
+## 模块失败处理（重试 / 跳过 / 中止）
+
+- 模块失败（rc != 0）后任务流不再立即中止：任务状态置 `paused`
+  （`pause_type=failed`），等待人工经 confirm 接口处理
+  `{"action": "retry"|"skip"|"abort"}`（仅管理员）：
+  - `retry`：重跑当前阶段的失败模块（并行组只重跑失败成员，序号沿用），
+    可反复重试；模块头追加 ` · 重试#N` 标记，steps_result 该模块
+    `attempts` 递增（日志树右侧显示已重试次数）。
+  - `skip`：跳过失败模块继续后续阶段；该模块 steps_result 标记
+    `skipped_over: true`（前端显示「失败·已跳过」），任务最终仍记失败
+    （return_code = 首个失败模块 rc）。
+  - `abort`：中止，后续模块标记 skipped。
+- 等待超时按中止处理。超时时长：系统配置 `task.failure_wait_timeout` 优先，
+  其次 settings `TASK_FAILURE_WAIT_TIMEOUT`（环境变量，默认 600s）；
+  **配置为 0 = 不等待，恢复「失败即中止」旧行为**。
+- confirm 接口按 `pause_type` 校验动作：confirm 态仅收 continue/abort，
+  failed 态仅收 retry/skip/abort（`pause_type` 空值兼容存量，视为 confirm）。
+- `output` 轮询接口与任务序列化器均返回 `pause_type`，前端据此切换
+  暂停操作条（继续/中止 vs 重试/跳过/中止）。
 
 ## 接口
 
@@ -160,6 +181,7 @@ GET                 /api/exec/playbooks/          剧本列表（仅管理员；
 GET/POST/PUT/PATCH/DELETE /api/exec/tasks/        任务流 CRUD（steps 嵌套整体读写；保存不执行；执行中禁止编辑）
 GET                 /api/exec/tasks/{id}/matched_servers/  执行表单数据源：{global: {...}, steps: [{order,name,custom,total,servers?}]}
 POST                /api/exec/tasks/{id}/execute/ 发起执行，body {server_ids:[...]} 仅作用于全局范围模块（缺省=全部全局匹配主机）
+POST                /api/exec/tasks/{id}/confirm/ 人工处理暂停：确认模块 continue/abort；失败等待 retry/skip/abort（仅管理员）
 GET                 /api/exec/tasks/{id}/output/  轻量轮询：状态与输出
 GET                 /api/exec/tasks/{id}/logs/    执行历史列表（含主机数/执行方式/逐模块结果 steps_result）
 GET                 /api/exec/tasks/{id}/logs/{log_id}/  单条日志详情（完整输出 + 主机快照）

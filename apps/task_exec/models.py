@@ -173,9 +173,13 @@ class ExecutionTask(models.Model):
     STATUS_CHOICES = [
         ('pending', '等待中'),
         ('running', '执行中'),
-        ('paused', '等待确认'),  # 任务流执行到「暂停确认」模块，等待人工继续/中止
+        ('paused', '等待处理'),  # 暂停确认模块等待继续/中止，或模块失败等待重试/跳过/中止
         ('success', '成功'),
         ('failed', '失败'),
+    ]
+    PAUSE_TYPE_CHOICES = [
+        ('confirm', '暂停确认'),   # 暂停确认模块：可 continue/abort
+        ('failed', '失败待处理'),  # 模块执行失败：可 retry/skip/abort
     ]
     EXEC_MODE_CHOICES = [
         ('parallel', '并发'),
@@ -215,8 +219,12 @@ class ExecutionTask(models.Model):
     status = models.CharField('状态', max_length=20, choices=STATUS_CHOICES, default='pending')
     return_code = models.IntegerField('返回码', null=True, blank=True)
     output = models.TextField('执行输出', blank=True)
-    # 暂停确认信号：paused 时由确认接口写 continue/abort，runner 轮询消费后清空
-    pause_action = models.CharField('暂停确认动作', max_length=20, blank=True, default='')
+    # 暂停信号：paused 时由确认接口按 pause_type 写动作（continue/abort 或
+    # retry/skip/abort），runner 轮询消费后清空
+    pause_action = models.CharField('暂停处理动作', max_length=20, blank=True, default='')
+    pause_type = models.CharField(
+        '暂停类型', max_length=20, choices=PAUSE_TYPE_CHOICES, blank=True, default='',
+    )
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
         related_name='exec_tasks', verbose_name='发起人',
@@ -343,7 +351,9 @@ class TaskExecutionLog(models.Model):
     # 本次执行的范围快照：全局范围主机 [{id,name,ip}] 与执行方式（历史可追溯，不随任务编辑变化）
     servers_snapshot = models.JSONField('执行主机快照', default=list, blank=True)
     exec_mode = models.CharField('执行方式', max_length=20, blank=True)
-    # 逐模块执行结果：[{order,name,task_type,status,return_code,duration,server_count}]，skipped=被失败中止
+    # 逐模块执行结果：[{order,name,task_type,status,return_code,duration,server_count,
+    # attempts,skipped_over}]，skipped=被失败中止；attempts=执行次数（含重试）；
+    # skipped_over=失败后被人工跳过（任务流继续但最终仍记失败）
     steps_result = models.JSONField('模块执行结果', default=list, blank=True)
     triggered_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
