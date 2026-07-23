@@ -64,8 +64,9 @@ apps/task_exec/
 
 - **主机名作 inventory 别名**：ansible 日志按主机名（而非 IP）显示各主机执行结果；
   名称中的非法字符净化为 `_`，空名回退 IP，别名撞车（不同名净化后同名）追加 IP 保证唯一
-- **连接地址公网优先**（`runner._conn_ip`）：`ansible_host` 有公网 IP 用公网，
-  NAT 出局主机（无公网 IP）回退私网；与 JumpServer 注册地址规则一致
+- **连接地址公网优先**（`Server.conn_ip` 模型属性）：`ansible_host` 有公网 IP 用公网，
+  NAT 出局主机（无公网 IP）回退私网；JumpServer 注册地址、执行日志主机快照、
+  前端主机选择/分配页展示均走同一口径
 - **服务类型注入**（数据源：主机服务规划 `asset_mgr.ServerService`，取
   planned/deployed 记录，offline 不算）：
   - 主机变量 `service_types="<code1>,<code2>"`，剧本/命令中可引用

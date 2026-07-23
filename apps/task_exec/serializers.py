@@ -142,7 +142,7 @@ def validate_service_planned(method, servers):
     )
     missing = [s for s in servers if s.id not in planned_ids]
     if missing:
-        names = '、'.join(f'{s.name}({s.private_ip})' for s in missing[:5])
+        names = '、'.join(f'{s.name}({s.conn_ip})' for s in missing[:5])
         more = f' 等 {len(missing)} 台' if len(missing) > 5 else ''
         return (
             f'主机 {names}{more}未规划服务「{method.service_type.name}」，'
@@ -236,7 +236,7 @@ class ExecutionTaskSerializer(serializers.ModelSerializer):
 
     @extend_schema_field(OpenApiTypes.OBJECT)
     def get_servers(self, obj):
-        return [{'id': s.id, 'name': s.name, 'ip': s.private_ip} for s in obj.servers.all()]
+        return [{'id': s.id, 'name': s.name, 'ip': s.conn_ip} for s in obj.servers.all()]
 
     def validate_steps(self, value):
         if not value:

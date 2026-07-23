@@ -141,8 +141,16 @@ class Server(models.Model):
             ),
         ]
 
+    @property
+    def conn_ip(self):
+        """连接地址：公网优先，NAT 出局主机（无公网 IP）回退私网。
+
+        ansible 连接、JumpServer 注册、执行日志快照与前端展示统一走该口径。
+        """
+        return self.public_ip or self.private_ip
+
     def __str__(self):
-        return f'{self.name} ({self.private_ip})'
+        return f'{self.name} ({self.conn_ip})'
 
 
 class ServerService(models.Model):

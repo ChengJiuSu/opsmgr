@@ -104,7 +104,7 @@ def dispatch(task, triggered_by=None, trigger_type='execute'):
         trigger_type=trigger_type,
         triggered_by=triggered_by or task.created_by,
         exec_mode=task.exec_mode,
-        servers_snapshot=[{'id': s.id, 'name': s.name, 'ip': s.private_ip} for s in task.servers.all()],
+        servers_snapshot=[{'id': s.id, 'name': s.name, 'ip': s.conn_ip} for s in task.servers.all()],
     )
     backend = getattr(settings, 'TASK_EXEC_BACKEND', 'thread')
     if backend == 'sync':

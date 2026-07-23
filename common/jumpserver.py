@@ -53,14 +53,9 @@ def register_servers(servers):
         )
     session = _session(cfg)
     return [
-        {'id': s.id, 'name': s.name, 'ip': _address(s), **_register_one(session, cfg, s)}
+        {'id': s.id, 'name': s.name, 'ip': s.conn_ip, **_register_one(session, cfg, s)}
         for s in servers
     ]
-
-
-def _address(server):
-    """资产连接地址：公网优先，NAT 出局主机（无公网）回退私网。"""
-    return server.public_ip or server.private_ip
 
 
 def _register_one(session, cfg, server):
@@ -82,7 +77,7 @@ def _register_one(session, cfg, server):
 
         payload = {
             'name': server.name,
-            'address': _address(server),
+            'address': server.conn_ip,
             'platform': {'pk': int(cfg['platform_id'])},
             'protocols': [{'name': 'ssh', 'port': server.ssh_port or 22}],
             'is_active': True,
@@ -94,7 +89,7 @@ def _register_one(session, cfg, server):
         if resp.status_code == 400 and 'name' in (resp.text or ''):
             # 兜底：查重与创建之间的并发窗口，或查重接口异常时命中资产名唯一约束
             raise ValueError(
-                f'主机「{server.name}」（{_address(server)}）与 JumpServer 已有资产重名，'
+                f'主机「{server.name}」（{server.conn_ip}）与 JumpServer 已有资产重名，'
                 '禁止同步，请先修改名称保证唯一。'
             )
         if resp.status_code in (200, 201):

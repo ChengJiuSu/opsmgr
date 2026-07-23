@@ -38,11 +38,6 @@ LOCAL_HOSTS = {'127.0.0.1', 'localhost', '::1'}
 PLANNED_STATUSES = ('planned', 'deployed')
 
 
-def _conn_ip(srv):
-    """ansible 连接地址：公网优先，NAT 出局主机（无公网 IP）回退私网。"""
-    return srv.public_ip or srv.private_ip
-
-
 def _host_alias(name, ip, used):
     """主机名转 inventory 别名：替换非法字符，空名回退 IP，重名追加 IP 保证唯一。"""
     alias = re.sub(r'[^\w.-]', '_', (name or '').strip()) or ip
@@ -89,7 +84,8 @@ def _inventory_content(servers, credential, workdir):
     groups = {}  # 服务类型 code -> [主机别名]
     used_aliases = set()
     for srv in servers:
-        conn_ip = _conn_ip(srv)
+        # 连接地址公网优先（Server.conn_ip），与 JumpServer 注册、前端展示同口径
+        conn_ip = srv.conn_ip
         alias = _host_alias(srv.name, conn_ip, used_aliases)
         parts = [alias, f'ansible_host={conn_ip}']
         if conn_ip in LOCAL_HOSTS:
@@ -215,7 +211,7 @@ def _guard(servers):
         return '未匹配到可执行主机（自定义范围维度无主机，或全局范围未勾选）。'
     unplanned = _unplanned_servers(servers)
     if unplanned:
-        names = '、'.join(f'{s.name}({s.private_ip})' for s in unplanned)
+        names = '、'.join(f'{s.name}({s.conn_ip})' for s in unplanned)
         return f'主机 {names} 未规划任何服务类型，不允许执行，请先在「配置管理 → 服务器分配」完成服务规划。'
     return None
 

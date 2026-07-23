@@ -431,7 +431,10 @@
       >
         <el-table-column type="selection" width="42" />
         <el-table-column prop="name" label="主机名" min-width="120" show-overflow-tooltip />
-        <el-table-column prop="private_ip" label="私网 IP" width="130" />
+        <!-- 连接地址口径：公网优先，NAT 主机回退私网，与实际 ansible 连接一致 -->
+        <el-table-column label="IP" width="130">
+          <template #default="{ row }">{{ row.public_ip || row.private_ip }}</template>
+        </el-table-column>
         <el-table-column label="环境" width="100">
           <template #default="{ row }">
             <span :class="{ prod: row.environment_is_prod, unset: !row.environment_name }">{{ row.environment_name || '未分配' }}</span>
