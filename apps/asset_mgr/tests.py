@@ -412,3 +412,42 @@ class ServerJumpServerTests(BaseApiTest):
         data = r.json()['data']
         self.assertEqual((data['total'], data['succeeded'], data['failed']), (1, 1, 0))
         self.assertEqual(data['results'][0]['msg'], '注册成功')
+
+    def test_duplicate_names_in_selection_rejected(self):
+        from apps.system_cfg.models import SystemConfig
+        SystemConfig.objects.create(key='jumpserver.url', value='http://js.local')
+        SystemConfig.objects.create(key='jumpserver.token', value='tkn')
+        s2 = Server.objects.create(name='js-01', ip='10.7.0.2')
+        r = self.admin.post('/api/assets/servers/register-jumpserver/', {
+            'server_ids': [self.s1.id, s2.id],
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('重名', r.json()['msg'])
+        self.assertIn('js-01', r.json()['msg'])
+
+    def test_name_conflict_on_jumpserver_rejected(self):
+        from unittest import mock
+        from apps.system_cfg.models import SystemConfig
+        SystemConfig.objects.create(key='jumpserver.url', value='http://js.local')
+        SystemConfig.objects.create(key='jumpserver.token', value='tkn')
+
+        def fake_response(status=200, payload=None, text=''):
+            resp = mock.Mock()
+            resp.status_code = status
+            resp.ok = 200 <= status < 300
+            resp.json.return_value = payload if payload is not None else {}
+            resp.text = text
+            return resp
+
+        with mock.patch('common.jumpserver.requests.Session') as session_cls:
+            session = session_cls.return_value
+            session.headers = {}
+            # IP 查重为空，但创建时名称与 JumpServer 已有资产冲突
+            session.get.return_value = fake_response(200, {'results': []})
+            session.post.return_value = fake_response(
+                400, text='{"name":["This field must be unique."]}')
+            r = self.admin.post('/api/assets/servers/register-jumpserver/', {
+                'server_ids': [self.s1.id],
+            }, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('重名', r.json()['msg'])

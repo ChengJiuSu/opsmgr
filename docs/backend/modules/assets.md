@@ -162,7 +162,15 @@ region         = CharField(max_length=50, blank=True)
 ## JumpServer 注册
 
 `common/jumpserver.py` 为公共实现（asset_mgr 接口与 method_mgr `jumpserver` 执行器共用）：
-按 IP 查重幂等，逐台返回 `{id, name, ip, ok, msg}`。连接信息读系统配置：
+按 IP 查重幂等，逐台返回 `{id, name, ip, ok, msg}`。行为约束：
+
+- **重名硬拒绝**：JumpServer 资产名唯一。选中主机之间重名，或与 JumpServer 已有资产重名，
+  均抛 `ValueError` 中止整批同步（接口转 400 友好报错），不做自动改名，需先改名保证唯一。
+- 请求忽略 `http_proxy` 等环境代理（`session.trust_env = False`），JumpServer 走内网直连。
+- token 用 JumpServer 私有令牌；v4 无页面入口，需在 jms_core 容器
+  `python manage.py shell` 里 `User.objects.get(username=...).create_private_token()` 生成。
+
+连接信息读系统配置：
 
 | key | 说明 |
 |-----|------|

@@ -29,6 +29,8 @@ def _settings():
 
 def _session(cfg):
     session = requests.Session()
+    # JumpServer 一般在内网，忽略 http_proxy 等环境代理，避免开发机代理劫持导致 502
+    session.trust_env = False
     session.headers['Authorization'] = f'Token {cfg["token"]}'
     if cfg['org_id']:
         session.headers['X-JMS-ORG'] = cfg['org_id']
@@ -47,11 +49,23 @@ def register_servers(servers):
         raise ValueError(
             'JumpServer 连接信息不完整，请在「系统配置」维护 jumpserver.url / jumpserver.token。'
         )
+    _check_duplicate_names(servers)
     session = _session(cfg)
     return [
         {'id': s.id, 'name': s.name, 'ip': s.ip, **_register_one(session, cfg, s)}
         for s in servers
     ]
+
+
+def _check_duplicate_names(servers):
+    """JumpServer 资产名唯一，选中主机重名时直接拒绝同步。"""
+    by_name = {}
+    for s in servers:
+        by_name.setdefault(s.name, []).append(s.ip)
+    dups = {name: ips for name, ips in by_name.items() if len(ips) > 1}
+    if dups:
+        detail = '；'.join(f'{name}（{"、".join(ips)}）' for name, ips in dups.items())
+        raise ValueError(f'存在重名主机，禁止同步：{detail}。请先修改主机名称保证唯一。')
 
 
 def _register_one(session, cfg, server):
@@ -82,6 +96,12 @@ def _register_one(session, cfg, server):
         if cfg['node_id']:
             payload['nodes'] = [{'pk': cfg['node_id']}]
         resp = session.post(f'{base}/api/v1/assets/hosts/', json=payload, timeout=REQUEST_TIMEOUT)
+        if resp.status_code == 400 and 'name' in (resp.text or ''):
+            # JumpServer 资产名唯一，与已有资产重名直接中止本次同步
+            raise ValueError(
+                f'主机「{server.name}」（{server.ip}）与 JumpServer 已有资产重名，'
+                '禁止同步，请先修改名称保证唯一。'
+            )
         if resp.status_code in (200, 201):
             return {'ok': True, 'msg': '注册成功'}
         return {'ok': False, 'msg': f'注册失败：HTTP {resp.status_code} {(resp.text or "")[:200]}'}
