@@ -83,7 +83,10 @@
     >
       <el-table-column v-if="authStore.isStaff" type="selection" width="46" reserve-selection />
       <el-table-column prop="name" label="名称" min-width="120" />
-      <el-table-column prop="ip" label="IP 地址" width="130" />
+      <!-- 有公网 IP 显示公网，否则显示私网（NAT 出局主机） -->
+      <el-table-column label="IP 地址" width="130">
+        <template #default="{ row }">{{ row.public_ip || row.private_ip }}</template>
+      </el-table-column>
       <el-table-column label="项目组" min-width="110">
         <template #default="{ row }">
           <span :class="{ unset: !row.project_group_name }">{{ row.project_group_name || '未分配' }}</span>
@@ -556,7 +559,7 @@ const allocateOptions = computed(() => {
 // 已选但被筛掉的主机在标签中标注归属，便于确认跨项目/环境勾选无误
 function serverOptionLabel(s) {
   const dims = [s.project_group_name, s.environment_name].filter(Boolean).join('/')
-  return `${s.name} (${s.ip})${dims ? ` - ${dims}` : ''}`
+  return `${s.name} (${s.public_ip || s.private_ip})${dims ? ` - ${dims}` : ''}`
 }
 
 async function loadUnplannedServers() {

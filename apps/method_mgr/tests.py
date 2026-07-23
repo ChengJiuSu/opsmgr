@@ -203,7 +203,7 @@ class JumpServerExecutorTests(TestCase):
     def test_missing_config(self):
         from apps.asset_mgr.models import Server
         from .executors import get_executor
-        srv = Server.objects.create(name='js-x', ip='10.6.0.1')
+        srv = Server.objects.create(name='js-x', private_ip='10.6.0.1')
         rc, out = get_executor('jumpserver').execute(self.step, self.method, servers=[srv])
         self.assertEqual(rc, 1)
         self.assertIn('jumpserver.url', out)
@@ -212,11 +212,11 @@ class JumpServerExecutorTests(TestCase):
         from unittest import mock
         from apps.asset_mgr.models import Server
         from .executors import get_executor
-        s1 = Server.objects.create(name='js-1', ip='10.6.0.2')
-        s2 = Server.objects.create(name='js-2', ip='10.6.0.3')
+        s1 = Server.objects.create(name='js-1', private_ip='10.6.0.2')
+        s2 = Server.objects.create(name='js-2', private_ip='10.6.0.3')
         results = [
-            {'id': s1.id, 'name': s1.name, 'ip': s1.ip, 'ok': True, 'msg': '注册成功'},
-            {'id': s2.id, 'name': s2.name, 'ip': s2.ip, 'ok': False, 'msg': '注册失败：HTTP 400'},
+            {'id': s1.id, 'name': s1.name, 'ip': s1.private_ip, 'ok': True, 'msg': '注册成功'},
+            {'id': s2.id, 'name': s2.name, 'ip': s2.private_ip, 'ok': False, 'msg': '注册失败：HTTP 400'},
         ]
         with mock.patch('apps.method_mgr.executors.jumpserver.register_servers', return_value=results):
             rc, out = get_executor('jumpserver').execute(self.step, self.method, servers=[s1, s2])

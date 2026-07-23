@@ -50,7 +50,10 @@
     >
       <el-table-column v-if="authStore.isStaff" type="selection" width="46" reserve-selection />
       <el-table-column prop="name" label="名称" min-width="120" />
-      <el-table-column prop="ip" label="IP 地址" width="130" />
+      <el-table-column prop="private_ip" label="私网 IP" width="130" />
+      <el-table-column label="公网 IP" width="130">
+        <template #default="{ row }">{{ row.public_ip || '-' }}</template>
+      </el-table-column>
       <el-table-column label="配置" width="110">
         <template #default="{ row }">
           {{ row.cpu }}核 / {{ (row.memory / 1024).toFixed(0) }}GB
@@ -110,8 +113,13 @@
           </el-form-item>
         </el-col>
         <el-col :span="12">
-          <el-form-item label="IP 地址" prop="ip">
-            <el-input v-model="form.ip" />
+          <el-form-item label="私网 IP" prop="private_ip">
+            <el-input v-model="form.private_ip" />
+          </el-form-item>
+        </el-col>
+        <el-col :span="12">
+          <el-form-item label="公网 IP" prop="public_ip">
+            <el-input v-model="form.public_ip" placeholder="NAT 出局主机留空" />
           </el-form-item>
         </el-col>
         <!-- 操作系统名称较长（如 Windows Server 2019），独占整行；CPU/内存用标准半行，避免下拉框过窄看不见选中值 -->
@@ -254,8 +262,8 @@
     <div class="import-toolbar">
       <el-button size="small" :icon="Download" @click="handleTemplateDownload">下载 CSV 模板</el-button>
       <el-radio-group v-model="importMode" size="small">
-        <el-radio-button value="skip">IP 已存在时跳过</el-radio-button>
-        <el-radio-button value="update">IP 已存在时更新</el-radio-button>
+        <el-radio-button value="skip">主机名已存在时跳过</el-radio-button>
+        <el-radio-button value="update">主机名已存在时更新</el-radio-button>
       </el-radio-group>
     </div>
     <el-upload
@@ -272,7 +280,7 @@
     </el-upload>
     <el-table v-if="importErrors.length" :data="importErrors" size="small" max-height="220" style="margin-top:12px">
       <el-table-column prop="line" label="行号" width="70" />
-      <el-table-column prop="ip" label="IP" width="130" />
+      <el-table-column prop="name" label="主机名" width="140" />
       <el-table-column label="错误">
         <template #default="{ row }">{{ row.errors.join('；') }}</template>
       </el-table-column>
@@ -292,7 +300,7 @@
     </el-alert>
     <el-table :data="jsResult.results" size="small" max-height="320">
       <el-table-column prop="name" label="主机名" min-width="120" />
-      <el-table-column prop="ip" label="IP" width="130" />
+      <el-table-column prop="ip" label="私网 IP" width="130" />
       <el-table-column label="结果" width="80">
         <template #default="{ row }">
           <el-tag size="small" :type="row.ok ? 'success' : 'danger'">{{ row.ok ? '成功' : '失败' }}</el-tag>
@@ -347,14 +355,14 @@ const CPU_OPTIONS = [1, 2, 4, 8, 16, 32, 64, 128]
 const MEMORY_OPTIONS = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
 
 const emptyForm = () => ({
-  name: '', ip: '', os: '', cpu: null, memory: null, status: 'running',
+  name: '', private_ip: '', public_ip: '', os: '', cpu: null, memory: null, status: 'running',
   environment: null, project_group: null, channel: null, cloud_provider: null,
   region: '', ssh_user: 'root', ssh_port: 22, remark: '', service_type_ids: [],
 })
 const form = reactive(emptyForm())
 const rules = {
   name: [{ required: true, message: '请输入名称' }],
-  ip: [{ required: true, message: '请输入 IP 地址' }],
+  private_ip: [{ required: true, message: '请输入私网 IP' }],
 }
 
 const statusType = (s) => ({ running: 'success', stopped: 'danger', maintenance: 'warning' }[s] || 'info')

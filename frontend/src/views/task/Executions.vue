@@ -431,7 +431,7 @@
       >
         <el-table-column type="selection" width="42" />
         <el-table-column prop="name" label="主机名" min-width="120" show-overflow-tooltip />
-        <el-table-column prop="ip" label="IP" width="130" />
+        <el-table-column prop="private_ip" label="私网 IP" width="130" />
         <el-table-column label="环境" width="100">
           <template #default="{ row }">
             <span :class="{ prod: row.environment_is_prod, unset: !row.environment_name }">{{ row.environment_name || '未分配' }}</span>

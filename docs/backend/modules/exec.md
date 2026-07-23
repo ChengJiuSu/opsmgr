@@ -63,7 +63,9 @@ apps/task_exec/
 （方法任务由 runner 生成后以 `inventory_path` 传给 provider 执行器，同时传 `servers`（模块匹配到的 Server 列表）供不走 Ansible 的 provider——如 `jumpserver` 注册——直接消费主机对象）：
 
 - **主机名作 inventory 别名**：ansible 日志按主机名（而非 IP）显示各主机执行结果；
-  名称中的非法字符净化为 `_`，空名回退 IP，重名主机追加 IP 保证别名唯一
+  名称中的非法字符净化为 `_`，空名回退 IP，别名撞车（不同名净化后同名）追加 IP 保证唯一
+- **连接地址公网优先**（`runner._conn_ip`）：`ansible_host` 有公网 IP 用公网，
+  NAT 出局主机（无公网 IP）回退私网；与 JumpServer 注册地址规则一致
 - **服务类型注入**（数据源：主机服务规划 `asset_mgr.ServerService`，取
   planned/deployed 记录，offline 不算）：
   - 主机变量 `service_types="<code1>,<code2>"`，剧本/命令中可引用

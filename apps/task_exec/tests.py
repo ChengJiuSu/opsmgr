@@ -48,11 +48,19 @@ def _make_ansible_project():
 
 class InventoryTests(TestCase):
     def test_local_host_uses_local_connection(self):
-        srv = Server.objects.create(name='local', ip='127.0.0.1')
+        srv = Server.objects.create(name='local', private_ip='127.0.0.1')
         self.assertIn('ansible_connection=local', _inventory_content([srv], None, '/tmp'))
 
+    def test_public_ip_preferred_for_connection(self):
+        pub = Server.objects.create(name='pub-01', private_ip='10.0.0.20', public_ip='42.8.8.8')
+        nat = Server.objects.create(name='nat-01', private_ip='10.0.0.21')
+        content = _inventory_content([pub, nat], None, '/tmp')
+        self.assertIn('ansible_host=42.8.8.8', content)
+        self.assertNotIn('ansible_host=10.0.0.20', content)
+        self.assertIn('ansible_host=10.0.0.21', content)
+
     def test_credential_password_injected(self):
-        srv = Server.objects.create(name='web', ip='10.0.0.6')
+        srv = Server.objects.create(name='web', private_ip='10.0.0.6')
         cred = Credential.objects.create(name='c1', username='ops', auth_type='password', password='secret', become=True)
         content = _inventory_content([srv], cred, '/tmp')
         self.assertIn('ansible_user=ops', content)
@@ -66,7 +74,7 @@ class InventoryTests(TestCase):
         game = ServiceType.objects.create(name='游戏服', code='game-server')
         redis = ServiceType.objects.create(name='Redis', code='redis')
         offline_svc = ServiceType.objects.create(name='网关', code='gateway')
-        srv = Server.objects.create(name='game-01', ip='10.0.0.8')
+        srv = Server.objects.create(name='game-01', private_ip='10.0.0.8')
         ServerService.objects.create(server=srv, service_type=game, status='planned')
         ServerService.objects.create(server=srv, service_type=redis, status='deployed')
         # offline 状态不进 inventory
@@ -81,9 +89,12 @@ class InventoryTests(TestCase):
         self.assertNotIn('gateway', content)
 
     def test_alias_sanitized_and_deduplicated(self):
-        """主机名含非法字符时净化为下划线；重名主机追加 IP 保证别名唯一。"""
-        s1 = Server.objects.create(name='web 01', ip='10.0.0.11')
-        s2 = Server.objects.create(name='web 01', ip='10.0.0.12')
+        """主机名含非法字符时净化为下划线；净化后别名撞车追加 IP 保证唯一。
+
+        主机名 DB 层已全局唯一，但不同主机名净化后仍可能同名（如 web 01 / web+01）。
+        """
+        s1 = Server.objects.create(name='web 01', private_ip='10.0.0.11')
+        s2 = Server.objects.create(name='web+01', private_ip='10.0.0.12')
         content = _inventory_content([s1, s2], None, '/tmp')
         self.assertIn('web_01 ansible_host=10.0.0.11', content)
         self.assertIn('web_01_10.0.0.12 ansible_host=10.0.0.12', content)
@@ -145,7 +156,7 @@ class ExecutionAPITests(TestCase):
         self.ch = Channel.objects.create(name='官服渠道', code='ut-official')
         self.env = Environment.objects.create(name='单测环境', code='ut-env')
         self.server = Server.objects.create(
-            name='local', ip='127.0.0.1',
+            name='local', private_ip='127.0.0.1',
             project_group=self.pg, channel=self.ch, environment=self.env,
         )
         # 执行权限前提：主机需在服务概要中已规划服务
@@ -250,11 +261,11 @@ class ExecutionAPITests(TestCase):
         c = self._client()
         pg_b = ProjectGroup.objects.create(name='项目B', code='proj-b')
         in_b = Server.objects.create(
-            name='dim-01', ip='10.0.1.1', project_group=pg_b, channel=self.ch, environment=self.env,
+            name='dim-01', private_ip='10.0.1.1', project_group=pg_b, channel=self.ch, environment=self.env,
         )
         ServerService.objects.create(server=in_b, service_type=self.base_service, status='deployed')
         # 未规划服务的主机即使维度匹配也不出现
-        Server.objects.create(name='raw-01', ip='10.0.1.2', project_group=self.pg, channel=self.ch, environment=self.env)
+        Server.objects.create(name='raw-01', private_ip='10.0.1.2', project_group=self.pg, channel=self.ch, environment=self.env)
 
         task_id = self._create_task(c, steps=[
             self._step(name='全局步骤'),
@@ -279,7 +290,7 @@ class ExecutionAPITests(TestCase):
         c = self._client()
         pg_b = ProjectGroup.objects.create(name='项目B', code='proj-b')
         custom_srv = Server.objects.create(
-            name='dim-01', ip='10.0.1.1', project_group=pg_b, channel=self.ch, environment=self.env,
+            name='dim-01', private_ip='10.0.1.1', project_group=pg_b, channel=self.ch, environment=self.env,
         )
         ServerService.objects.create(server=custom_srv, service_type=self.base_service, status='planned')
 
@@ -297,7 +308,7 @@ class ExecutionAPITests(TestCase):
 
     def test_execute_rejects_out_of_scope_and_empty_step(self):
         c = self._client()
-        raw = Server.objects.create(name='raw-02', ip='10.0.2.9')  # 未规划
+        raw = Server.objects.create(name='raw-02', private_ip='10.0.2.9')  # 未规划
         task_id = self._create_task(c)
 
         r = c.post(f'/api/exec/tasks/{task_id}/execute/', {'server_ids': [raw.id]}, format='json')
@@ -862,7 +873,7 @@ class ArtifactInjectTests(TestCase):
 
         other_env = Environment.objects.create(name='预发', code='ut-staging')
         other_srv = Server.objects.create(
-            name='stage', ip='127.0.0.1',
+            name='stage', private_ip='127.0.0.1',
             project_group=self.pg, channel=self.ch, environment=other_env,
         )
         ServerService.objects.create(server=other_srv, service_type=self.base_service, status='planned')

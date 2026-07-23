@@ -81,7 +81,7 @@ class ProtectedDeleteTests(BaseApiTest):
     def test_referenced_dict_cannot_be_deleted(self):
         admin = self._client()
         env = Environment.objects.get(code='prod')
-        Server.objects.create(name='web1', ip='10.0.0.1', environment=env)
+        Server.objects.create(name='web1', private_ip='10.0.0.1', environment=env)
 
         r = admin.delete(f'/api/assets/environments/{env.id}/')
         self.assertEqual(r.status_code, 400)
@@ -105,7 +105,7 @@ class ServerApiTests(BaseApiTest):
 
     def test_create_with_fk_and_display_fields(self):
         r = self.admin.post('/api/assets/servers/', {
-            'name': 'game-01', 'ip': '10.1.0.1',
+            'name': 'game-01', 'private_ip': '10.1.0.1',
             'environment': self.envProd.id, 'project_group': self.group.id,
             'channel': self.channel.id, 'cloud_provider': self.provider.id,
             'region': 'cn-hangzhou',
@@ -118,23 +118,51 @@ class ServerApiTests(BaseApiTest):
         self.assertEqual(data['cloud_provider_name'], '阿里云')
 
         # 外键全部留空也允许创建
-        r = self.admin.post('/api/assets/servers/', {'name': 'tmp-01', 'ip': '10.1.0.9'}, format='json')
+        r = self.admin.post('/api/assets/servers/', {'name': 'tmp-01', 'private_ip': '10.1.0.9'}, format='json')
         self.assertEqual(r.status_code, 201)
+
+    def test_name_unique_and_public_ip_rules(self):
+        # 主机名全局唯一
+        self.admin.post('/api/assets/servers/', {'name': 'uniq-01', 'private_ip': '10.3.0.1'}, format='json')
+        r = self.admin.post('/api/assets/servers/', {'name': 'uniq-01', 'private_ip': '10.3.0.2'}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('主机名', str(r.content.decode('utf-8')))
+        # 私网 IP 允许重复（NAT 场景跨网段复用），靠主机名区分
+        r = self.admin.post('/api/assets/servers/', {'name': 'uniq-02', 'private_ip': '10.3.0.1'}, format='json')
+        self.assertEqual(r.status_code, 201)
+        # 公网 IP 留空（空串转 null）可多台并存
+        r = self.admin.post('/api/assets/servers/', {
+            'name': 'nat-01', 'private_ip': '10.3.1.1', 'public_ip': '',
+        }, format='json')
+        self.assertEqual(r.status_code, 201)
+        r = self.admin.post('/api/assets/servers/', {
+            'name': 'nat-02', 'private_ip': '10.3.1.2', 'public_ip': '',
+        }, format='json')
+        self.assertEqual(r.status_code, 201)
+        # 公网 IP 有值时唯一
+        self.admin.post('/api/assets/servers/', {
+            'name': 'pub-01', 'private_ip': '10.3.2.1', 'public_ip': '1.2.3.4',
+        }, format='json')
+        r = self.admin.post('/api/assets/servers/', {
+            'name': 'pub-02', 'private_ip': '10.3.2.2', 'public_ip': '1.2.3.4',
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('公网 IP', r.content.decode('utf-8'))
 
     def test_normal_user_can_create_but_not_modify(self):
         normal = self._client(is_staff=False)
-        r = normal.post('/api/assets/servers/', {'name': 'user-01', 'ip': '10.2.0.1'}, format='json')
+        r = normal.post('/api/assets/servers/', {'name': 'user-01', 'private_ip': '10.2.0.1'}, format='json')
         self.assertEqual(r.status_code, 201)
         sid = r.json()['data']['id'] if 'data' in r.json() else r.json()['id']
 
-        r = normal.put(f'/api/assets/servers/{sid}/', {'name': 'user-01x', 'ip': '10.2.0.1'}, format='json')
+        r = normal.put(f'/api/assets/servers/{sid}/', {'name': 'user-01x', 'private_ip': '10.2.0.1'}, format='json')
         self.assertEqual(r.status_code, 403)
         r = normal.delete(f'/api/assets/servers/{sid}/')
         self.assertEqual(r.status_code, 403)
 
     def test_filter_by_code_and_id(self):
-        Server.objects.create(name='p1', ip='10.1.0.2', environment=self.envProd, project_group=self.group)
-        Server.objects.create(name='t1', ip='10.1.0.3', environment=self.envTest)
+        Server.objects.create(name='p1', private_ip='10.1.0.2', environment=self.envProd, project_group=self.group)
+        Server.objects.create(name='t1', private_ip='10.1.0.3', environment=self.envTest)
 
         r = self.admin.get('/api/assets/servers/', {'env': 'prod'})
         self.assertEqual([i['name'] for i in r.json()['data']['results']], ['p1'])
@@ -151,7 +179,7 @@ class ServerApiTests(BaseApiTest):
 
         nginx = ServiceType.objects.create(name='Nginx', code='nginx')
         payload = {
-            'name': 'idc-cn-cd-develop-nginx-01', 'ip': '10.1.1.1',
+            'name': 'idc-cn-cd-develop-nginx-01', 'private_ip': '10.1.1.1',
             'environment': self.envProd.id, 'project_group': self.group.id,
             'channel': self.channel.id, 'cloud_provider': self.provider.id,
             'service_type_ids': [nginx.id],
@@ -169,21 +197,21 @@ class ServerApiTests(BaseApiTest):
 
         # 相同云厂商+项目组+环境+渠道的第二台 nginx → nginx-02（与主机名序号无关）
         r = self.admin.post('/api/assets/servers/', {
-            **payload, 'name': 'idc-cn-cd-develop-web-09', 'ip': '10.1.1.2',
+            **payload, 'name': 'idc-cn-cd-develop-web-09', 'private_ip': '10.1.1.2',
         }, format='json')
         self.assertEqual(_services(r)[0]['process_name'], 'nginx-02')
 
         # 分组维度不同（换云厂商）→ 序号独立，从 01 重新开始
         other = CloudProvider.objects.get(code='tencent')
         r = self.admin.post('/api/assets/servers/', {
-            **payload, 'name': 'tx-nginx', 'ip': '10.1.1.3', 'cloud_provider': other.id,
+            **payload, 'name': 'tx-nginx', 'private_ip': '10.1.1.3', 'cloud_provider': other.id,
         }, format='json')
         self.assertEqual(_services(r)[0]['process_name'], 'nginx-01')
 
         # 停用的服务类型拒绝分配
         disabled = ServiceType.objects.create(name='停用', code='disabled-x', enabled=False)
         r = self.admin.post('/api/assets/servers/', {
-            **payload, 'name': 'bad', 'ip': '10.1.1.4', 'service_type_ids': [disabled.id],
+            **payload, 'name': 'bad', 'private_ip': '10.1.1.4', 'service_type_ids': [disabled.id],
         }, format='json')
         self.assertEqual(r.status_code, 400)
         self.assertEqual(ServerService.objects.count(), 3)
@@ -193,8 +221,8 @@ class ServerApiTests(BaseApiTest):
         from .models import ServerService, ServiceType
 
         nginx = ServiceType.objects.create(name='Nginx', code='nginx')
-        planned = Server.objects.create(name='planned-01', ip='10.1.2.1')
-        Server.objects.create(name='raw-01', ip='10.1.2.2')
+        planned = Server.objects.create(name='planned-01', private_ip='10.1.2.1')
+        Server.objects.create(name='raw-01', private_ip='10.1.2.2')
         ServerService.objects.create(server=planned, service_type=nginx, status='planned')
 
         r = self.admin.get('/api/assets/servers/', {'assigned': 'service_type'})
@@ -205,10 +233,10 @@ class ServerApiTests(BaseApiTest):
         from .models import ServerService, ServiceType
 
         nginx = ServiceType.objects.create(name='Nginx', code='nginx')
-        planned = Server.objects.create(name='planned-01', ip='10.1.3.1')
-        deployed = Server.objects.create(name='deployed-01', ip='10.1.3.2')
-        offline = Server.objects.create(name='offline-01', ip='10.1.3.3')
-        Server.objects.create(name='raw-01', ip='10.1.3.4')
+        planned = Server.objects.create(name='planned-01', private_ip='10.1.3.1')
+        deployed = Server.objects.create(name='deployed-01', private_ip='10.1.3.2')
+        offline = Server.objects.create(name='offline-01', private_ip='10.1.3.3')
+        Server.objects.create(name='raw-01', private_ip='10.1.3.4')
         ServerService.objects.create(server=planned, service_type=nginx, status='planned')
         ServerService.objects.create(server=deployed, service_type=nginx, status='deployed')
         link = ServerService.objects.create(server=offline, service_type=nginx, status='planned')
@@ -221,7 +249,7 @@ class ServerApiTests(BaseApiTest):
     def test_page_size_zero_returns_all(self):
         """page_size=0 跳过分页一次性返回全量，响应结构与分页时一致。"""
         for i in range(25):  # 超过默认页大小 20
-            Server.objects.create(name=f'bulk-{i:02d}', ip=f'10.9.0.{i + 1}')
+            Server.objects.create(name=f'bulk-{i:02d}', private_ip=f'10.9.0.{i + 1}')
 
         r = self.admin.get('/api/assets/servers/', {'page_size': 0})
         data = r.json()['data']
@@ -237,8 +265,8 @@ class ServerApiTests(BaseApiTest):
         self.assertEqual(data['page'], 2)
 
     def test_stats_by_env_and_project(self):
-        Server.objects.create(name='p1', ip='10.1.0.2', environment=self.envProd, project_group=self.group)
-        Server.objects.create(name='p2', ip='10.1.0.4', environment=self.envProd)
+        Server.objects.create(name='p1', private_ip='10.1.0.2', environment=self.envProd, project_group=self.group)
+        Server.objects.create(name='p2', private_ip='10.1.0.4', environment=self.envProd)
         r = self.admin.get('/api/assets/servers/stats/')
         data = r.json()['data']
         self.assertEqual(data['by_env'].get('生产'), 2)
@@ -251,8 +279,8 @@ class ServerBatchApiTests(BaseApiTest):
 
     def setUp(self):
         self.admin = self._client()
-        self.s1 = Server.objects.create(name='b-01', ip='10.9.0.1')
-        self.s2 = Server.objects.create(name='b-02', ip='10.9.0.2')
+        self.s1 = Server.objects.create(name='b-01', private_ip='10.9.0.1')
+        self.s2 = Server.objects.create(name='b-02', private_ip='10.9.0.2')
 
     def test_batch_update_fields(self):
         r = self.admin.post('/api/assets/servers/batch/update/', {
@@ -266,7 +294,7 @@ class ServerBatchApiTests(BaseApiTest):
 
     def test_batch_update_rejects_unknown_field_and_bad_values(self):
         r = self.admin.post('/api/assets/servers/batch/update/', {
-            'server_ids': [self.s1.id], 'update': {'ip': '1.1.1.1'},
+            'server_ids': [self.s1.id], 'update': {'private_ip': '1.1.1.1'},
         }, format='json')
         self.assertEqual(r.status_code, 400)
         r = self.admin.post('/api/assets/servers/batch/update/', {
@@ -319,36 +347,39 @@ class ServerImportExportTests(BaseApiTest):
         self.assertEqual(r.status_code, 200)
         self.assertIn('text/csv', r['Content-Type'])
         body = r.content.decode('utf-8-sig')
-        self.assertTrue(body.startswith('name,ip,'))
+        self.assertTrue(body.startswith('name,private_ip,public_ip,'))
 
     def test_import_create_and_skip_update(self):
         csv_text = (
-            'name,ip,os,cpu,memory,status,project_group,channel,environment,cloud_provider,region,ssh_port,ssh_user,remark\n'
-            'imp-01,10.8.0.1,Ubuntu,4,8192,running,legend,,prod,aliyun,cn-hz,22,root,首次导入\n'
-            'imp-02,10.8.0.2,,,,,,,,,,,,\n'
+            'name,private_ip,public_ip,os,cpu,memory,status,project_group,channel,environment,cloud_provider,region,ssh_port,ssh_user,remark\n'
+            'imp-01,10.8.0.1,8.8.8.1,Ubuntu,4,8192,running,legend,,prod,aliyun,cn-hz,22,root,首次导入\n'
+            'imp-02,10.8.0.2,,,,,,,,,,,,,\n'
         )
         r = self._import(csv_text)
         self.assertEqual(r.status_code, 200, r.content)
         self.assertEqual(r.json()['data'], {'created': 2, 'updated': 0, 'skipped': 0})
-        srv = Server.objects.get(ip='10.8.0.1')
+        srv = Server.objects.get(name='imp-01')
         self.assertEqual(srv.project_group.code, 'legend')
         self.assertEqual(srv.environment.code, 'prod')
-        self.assertEqual(Server.objects.get(ip='10.8.0.2').ssh_user, 'root')
+        self.assertEqual(srv.public_ip, '8.8.8.1')
+        # 公网 IP 留空存 null
+        self.assertIsNone(Server.objects.get(name='imp-02').public_ip)
+        self.assertEqual(Server.objects.get(name='imp-02').ssh_user, 'root')
 
-        # skip 模式重复导入全部跳过
+        # skip 模式重复导入（主机名已存在）全部跳过
         r = self._import(csv_text)
         self.assertEqual(r.json()['data'], {'created': 0, 'updated': 0, 'skipped': 2})
 
-        # update 模式按 IP 更新
+        # update 模式按主机名匹配更新其余字段
         r = self._import(
-            'name,ip,status\nimp-01-renamed,10.8.0.1,maintenance\n', mode='update')
+            'name,private_ip,status\nimp-01,10.8.0.99,maintenance\n', mode='update')
         self.assertEqual(r.json()['data'], {'created': 0, 'updated': 1, 'skipped': 0})
         srv.refresh_from_db()
-        self.assertEqual((srv.name, srv.status), ('imp-01-renamed', 'maintenance'))
+        self.assertEqual((srv.private_ip, srv.status), ('10.8.0.99', 'maintenance'))
 
     def test_import_validation_errors_abort_all(self):
         csv_text = (
-            'name,ip,status,project_group\n'
+            'name,private_ip,status,project_group\n'
             'ok-01,10.8.1.1,running,legend\n'
             ',bad-ip,flying,nope\n'
         )
@@ -358,12 +389,26 @@ class ServerImportExportTests(BaseApiTest):
         self.assertEqual(errors[0]['line'], 3)
         joined = ' '.join(errors[0]['errors'])
         self.assertIn('name 不能为空', joined)
-        self.assertIn('ip 格式非法', joined)
+        self.assertIn('private_ip 格式非法', joined)
         # 任一行有错则整体不写库
-        self.assertFalse(Server.objects.filter(ip='10.8.1.1').exists())
+        self.assertFalse(Server.objects.filter(private_ip='10.8.1.1').exists())
+
+    def test_import_rejects_duplicate_names_and_taken_public_ip(self):
+        Server.objects.create(name='occupied', private_ip='10.8.3.1', public_ip='9.9.9.9')
+        csv_text = (
+            'name,private_ip,public_ip\n'
+            'dup-01,10.8.3.2,\n'
+            'dup-01,10.8.3.3,\n'
+            'new-01,10.8.3.4,9.9.9.9\n'
+        )
+        r = self._import(csv_text)
+        self.assertEqual(r.status_code, 400)
+        joined = ' '.join(e for row in r.json()['data']['errors'] for e in row['errors'])
+        self.assertIn('文件内主机名重复', joined)
+        self.assertIn('已被主机「occupied」使用', joined)
 
     def test_export_roundtrip(self):
-        Server.objects.create(name='exp-01', ip='10.8.2.1', project_group=self.group, ssh_port=2222)
+        Server.objects.create(name='exp-01', private_ip='10.8.2.1', project_group=self.group, ssh_port=2222)
         r = self.admin.get('/api/assets/servers/export/')
         self.assertEqual(r.status_code, 200)
         body = r.content.decode('utf-8-sig')
@@ -376,7 +421,7 @@ class ServerJumpServerTests(BaseApiTest):
 
     def setUp(self):
         self.admin = self._client()
-        self.s1 = Server.objects.create(name='js-01', ip='10.7.0.1')
+        self.s1 = Server.objects.create(name='js-01', private_ip='10.7.0.1')
 
     def test_missing_config_returns_friendly_error(self):
         r = self.admin.post('/api/assets/servers/register-jumpserver/', {
@@ -412,18 +457,36 @@ class ServerJumpServerTests(BaseApiTest):
         data = r.json()['data']
         self.assertEqual((data['total'], data['succeeded'], data['failed']), (1, 1, 0))
         self.assertEqual(data['results'][0]['msg'], '注册成功')
+        # 无公网 IP：address 用私网 IP
+        self.assertEqual(session.post.call_args.kwargs['json']['address'], self.s1.private_ip)
 
-    def test_duplicate_names_in_selection_rejected(self):
+    def test_register_prefers_public_ip(self):
+        from unittest import mock
         from apps.system_cfg.models import SystemConfig
         SystemConfig.objects.create(key='jumpserver.url', value='http://js.local')
         SystemConfig.objects.create(key='jumpserver.token', value='tkn')
-        s2 = Server.objects.create(name='js-01', ip='10.7.0.2')
-        r = self.admin.post('/api/assets/servers/register-jumpserver/', {
-            'server_ids': [self.s1.id, s2.id],
-        }, format='json')
-        self.assertEqual(r.status_code, 400)
-        self.assertIn('重名', r.json()['msg'])
-        self.assertIn('js-01', r.json()['msg'])
+        pub = Server.objects.create(name='pub-js-01', private_ip='10.7.0.8', public_ip='42.1.2.3')
+
+        def fake_response(status=200, payload=None):
+            resp = mock.Mock()
+            resp.status_code = status
+            resp.ok = 200 <= status < 300
+            resp.json.return_value = payload if payload is not None else {}
+            resp.text = ''
+            return resp
+
+        with mock.patch('common.jumpserver.requests.Session') as session_cls:
+            session = session_cls.return_value
+            session.headers = {}
+            session.get.return_value = fake_response(200, {'results': []})
+            session.post.return_value = fake_response(201, {'id': 'x'})
+            r = self.admin.post('/api/assets/servers/register-jumpserver/', {
+                'server_ids': [pub.id],
+            }, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        # 有公网 IP：address 与结果 ip 均用公网
+        self.assertEqual(session.post.call_args.kwargs['json']['address'], '42.1.2.3')
+        self.assertEqual(r.json()['data']['results'][0]['ip'], '42.1.2.3')
 
     def test_name_conflict_on_jumpserver_rejected(self):
         from unittest import mock

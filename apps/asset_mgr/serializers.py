@@ -1,5 +1,6 @@
 from django.db import transaction
 from rest_framework import serializers
+from rest_framework.validators import UniqueValidator
 
 from .models import Channel, CloudProvider, Environment, ProjectGroup, Server, ServerService, ServiceType
 
@@ -49,10 +50,33 @@ class ServerSerializer(serializers.ModelSerializer):
         queryset=ServiceType.objects.filter(enabled=True), many=True,
         write_only=True, required=False,
     )
+    # 覆盖默认 UniqueValidator 报错文案
+    name = serializers.CharField(
+        max_length=100,
+        validators=[UniqueValidator(
+            queryset=Server.objects.all(), message='主机名已存在，主机名必须全局唯一',
+        )],
+    )
 
     class Meta:
         model = Server
         fields = '__all__'
+
+    def to_internal_value(self, data):
+        # 前端公网 IP 留空提交空串，统一转 null（NAT 出局主机无公网 IP）
+        if isinstance(data, dict) and data.get('public_ip') == '':
+            data = {**data, 'public_ip': None}
+        return super().to_internal_value(data)
+
+    def validate_public_ip(self, value):
+        # 部分唯一约束（有值时唯一）DRF 不会自动校验，手动查重转友好报错
+        if value:
+            qs = Server.objects.filter(public_ip=value)
+            if self.instance:
+                qs = qs.exclude(pk=self.instance.pk)
+            if qs.exists():
+                raise serializers.ValidationError('该公网 IP 已被其他主机使用')
+        return value
 
     def get_services(self, obj):
         return [

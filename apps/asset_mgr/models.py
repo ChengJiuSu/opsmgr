@@ -94,8 +94,11 @@ class Server(models.Model):
         ('maintenance', '维护中'),
     ]
 
-    name = models.CharField('服务器名称', max_length=100)
-    ip = models.GenericIPAddressField('IP 地址')
+    # 主机名全局唯一：作为导入更新、JumpServer 注册查重的匹配键
+    name = models.CharField('服务器名称', max_length=100, unique=True)
+    # 私网 IP 必填（ansible/JumpServer 连接地址），跨网段可重复；公网 IP 可空（NAT 出局主机留空）
+    private_ip = models.GenericIPAddressField('私网 IP')
+    public_ip = models.GenericIPAddressField('公网 IP', null=True, blank=True)
     os = models.CharField('操作系统', max_length=50, blank=True)
     cpu = models.PositiveSmallIntegerField('CPU 核数', default=0)
     memory = models.PositiveIntegerField('内存 MB', default=0)
@@ -129,9 +132,17 @@ class Server(models.Model):
         verbose_name = '服务器'
         verbose_name_plural = '服务器'
         db_table = 'asset_server'
+        constraints = [
+            # 公网 IP 有值时全局唯一（NAT 主机留空不受限）
+            models.UniqueConstraint(
+                fields=['public_ip'],
+                condition=models.Q(public_ip__isnull=False),
+                name='uniq_server_public_ip',
+            ),
+        ]
 
     def __str__(self):
-        return f'{self.name} ({self.ip})'
+        return f'{self.name} ({self.private_ip})'
 
 
 class ServerService(models.Model):

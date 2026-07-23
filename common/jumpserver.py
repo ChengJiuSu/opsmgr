@@ -40,8 +40,10 @@ def _session(cfg):
 def register_servers(servers):
     """把平台服务器逐台注册为 JumpServer 主机资产，返回逐台结果列表。
 
-    幂等：按 IP（address）查到已存在资产则跳过不重复创建。
-    返回 [{'id', 'name', 'ip', 'ok', 'msg'}, ...]。
+    幂等：按主机名查到已存在资产则跳过不重复创建（平台主机名全局唯一，
+    私网 IP 跨网段可重复，故查重以 name 为准）。
+    连接地址（address）公网优先：有公网 IP 用公网，无则用私网（NAT 出局主机）。
+    返回 [{'id', 'name', 'ip', 'ok', 'msg'}, ...]（ip 为实际注册地址）。
     连接信息未配置时抛 ValueError（调用方转为友好报错）。
     """
     cfg = _settings()
@@ -49,33 +51,26 @@ def register_servers(servers):
         raise ValueError(
             'JumpServer 连接信息不完整，请在「系统配置」维护 jumpserver.url / jumpserver.token。'
         )
-    _check_duplicate_names(servers)
     session = _session(cfg)
     return [
-        {'id': s.id, 'name': s.name, 'ip': s.ip, **_register_one(session, cfg, s)}
+        {'id': s.id, 'name': s.name, 'ip': _address(s), **_register_one(session, cfg, s)}
         for s in servers
     ]
 
 
-def _check_duplicate_names(servers):
-    """JumpServer 资产名唯一，选中主机重名时直接拒绝同步。"""
-    by_name = {}
-    for s in servers:
-        by_name.setdefault(s.name, []).append(s.ip)
-    dups = {name: ips for name, ips in by_name.items() if len(ips) > 1}
-    if dups:
-        detail = '；'.join(f'{name}（{"、".join(ips)}）' for name, ips in dups.items())
-        raise ValueError(f'存在重名主机，禁止同步：{detail}。请先修改主机名称保证唯一。')
+def _address(server):
+    """资产连接地址：公网优先，NAT 出局主机（无公网）回退私网。"""
+    return server.public_ip or server.private_ip
 
 
 def _register_one(session, cfg, server):
     """注册单台主机，返回 {'ok': bool, 'msg': str}。"""
     base = cfg['url']
     try:
-        # 先按 address 查重，保证重复执行幂等
+        # 先按主机名查重，保证重复执行幂等
         resp = session.get(
             f'{base}/api/v1/assets/hosts/',
-            params={'address': server.ip}, timeout=REQUEST_TIMEOUT,
+            params={'name': server.name}, timeout=REQUEST_TIMEOUT,
         )
         if resp.status_code == 401:
             return {'ok': False, 'msg': 'JumpServer 认证失败（token 无效或已过期）'}
@@ -87,7 +82,7 @@ def _register_one(session, cfg, server):
 
         payload = {
             'name': server.name,
-            'address': server.ip,
+            'address': _address(server),
             'platform': {'pk': int(cfg['platform_id'])},
             'protocols': [{'name': 'ssh', 'port': server.ssh_port or 22}],
             'is_active': True,
@@ -97,9 +92,9 @@ def _register_one(session, cfg, server):
             payload['nodes'] = [{'pk': cfg['node_id']}]
         resp = session.post(f'{base}/api/v1/assets/hosts/', json=payload, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 400 and 'name' in (resp.text or ''):
-            # JumpServer 资产名唯一，与已有资产重名直接中止本次同步
+            # 兜底：查重与创建之间的并发窗口，或查重接口异常时命中资产名唯一约束
             raise ValueError(
-                f'主机「{server.name}」（{server.ip}）与 JumpServer 已有资产重名，'
+                f'主机「{server.name}」（{_address(server)}）与 JumpServer 已有资产重名，'
                 '禁止同步，请先修改名称保证唯一。'
             )
         if resp.status_code in (200, 201):

@@ -27,9 +27,9 @@ from .serializers import (
     ServiceTypeSerializer,
 )
 
-# CSV 导入导出列（顺序即模板列顺序）：字典外键列填字典编码（code），name/ip 必填
+# CSV 导入导出列（顺序即模板列顺序）：字典外键列填字典编码（code），name/private_ip 必填
 CSV_COLUMNS = [
-    'name', 'ip', 'os', 'cpu', 'memory', 'status',
+    'name', 'private_ip', 'public_ip', 'os', 'cpu', 'memory', 'status',
     'project_group', 'channel', 'environment', 'cloud_provider',
     'region', 'ssh_port', 'ssh_user', 'remark',
 ]
@@ -169,7 +169,11 @@ class ServerViewSet(viewsets.ModelViewSet):
         elif unassigned == 'service_type':
             qs = qs.filter(services__isnull=True)
         if keyword:
-            qs = qs.filter(Q(name__icontains=keyword) | Q(ip__icontains=keyword))
+            qs = qs.filter(
+                Q(name__icontains=keyword)
+                | Q(private_ip__icontains=keyword)
+                | Q(public_ip__icontains=keyword)
+            )
         return qs
 
     @action(detail=False, methods=['get'])
@@ -202,7 +206,7 @@ class ServerViewSet(viewsets.ModelViewSet):
         writer.writerow(CSV_COLUMNS)
         for s in self.get_queryset():
             writer.writerow([
-                s.name, s.ip, s.os, s.cpu, s.memory, s.status,
+                s.name, s.private_ip, s.public_ip or '', s.os, s.cpu, s.memory, s.status,
                 s.project_group.code if s.project_group else '',
                 s.channel.code if s.channel else '',
                 s.environment.code if s.environment else '',
@@ -225,7 +229,7 @@ class ServerImportTemplateView(APIView):
         writer = csv.writer(response)
         writer.writerow(CSV_COLUMNS)
         writer.writerow([
-            'web-server-01', '192.168.1.100', 'Ubuntu 22.04', '4', '8192', 'running',
+            'web-server-01', '192.168.1.100', '', 'Ubuntu 22.04', '4', '8192', 'running',
             'legend', 'official', 'prod', 'aliyun',
             'cn-hangzhou', '22', 'root', '示例行，导入前请删除',
         ])
@@ -320,7 +324,9 @@ class ServerImportView(APIView):
     multipart 表单::
 
         file: CSV 文件（模板见 servers/import-template/）
-        mode: skip（默认，IP 已存在跳过）| update（IP 已存在则更新其余字段）
+        mode: skip（默认，主机名已存在跳过）| update（主机名已存在则更新其余字段）
+
+    更新目标按主机名匹配（name 全局唯一）。
 
     全量校验通过才写库（原子），任一行有错则整体不导入并返回逐行错误。
     """
@@ -342,7 +348,7 @@ class ServerImportView(APIView):
 
         reader = csv.DictReader(io.StringIO(text))
         headers = [h.strip() for h in (reader.fieldnames or [])]
-        missing = {'name', 'ip'} - set(headers)
+        missing = {'name', 'private_ip'} - set(headers)
         if missing:
             return fail(f'CSV 缺少必需列：{", ".join(sorted(missing))}（请使用导入模板）')
 
@@ -352,30 +358,38 @@ class ServerImportView(APIView):
                   **{o.name: o for o in model.objects.all()}}
             for key, (model, _) in CSV_DICT_FIELDS.items()
         }
-        existing_by_ip = {}
-        for s in Server.objects.all():
-            existing_by_ip.setdefault(s.ip, []).append(s)
+        # 主机名全局唯一，导入按 name 匹配更新目标
+        existing_by_name = {s.name: s for s in Server.objects.all()}
+        existing_public_ips = {
+            s.public_ip: s.name for s in Server.objects.exclude(public_ip=None)
+        }
 
         errors, to_create, to_update, skipped = [], [], [], 0
-        seen_ips = set()
+        seen_names, seen_public_ips = set(), set()
         for lineno, row in enumerate(reader, start=2):  # 第 1 行为表头
             parsed, row_errors = self._parse_row(row, dict_cache)
             if parsed is None and row_errors is None:
                 continue  # 空行
-            ip = parsed.get('ip')
-            if ip and ip in seen_ips:
-                row_errors.append('文件内 IP 重复')
-            if ip:
-                seen_ips.add(ip)
+            name = parsed.get('name')
+            public_ip = parsed.get('public_ip')
+            if name and name in seen_names:
+                row_errors.append('文件内主机名重复')
+            if name:
+                seen_names.add(name)
+            matched = existing_by_name.get(name)
+            if public_ip:
+                if public_ip in seen_public_ips:
+                    row_errors.append(f'文件内公网 IP 重复：{public_ip}')
+                seen_public_ips.add(public_ip)
+                owner = existing_public_ips.get(public_ip)
+                if owner and owner != name:
+                    row_errors.append(f'公网 IP {public_ip} 已被主机「{owner}」使用')
             if row_errors:
-                errors.append({'line': lineno, 'ip': ip or '', 'errors': row_errors})
+                errors.append({'line': lineno, 'name': name or '', 'errors': row_errors})
                 continue
-            matched = existing_by_ip.get(ip, [])
-            if len(matched) > 1:
-                errors.append({'line': lineno, 'ip': ip, 'errors': ['平台已存在多台同 IP 主机，无法确定更新目标']})
-            elif matched:
+            if matched:
                 if mode == 'update':
-                    to_update.append((matched[0], parsed))
+                    to_update.append((matched, parsed))
                 else:
                     skipped += 1
             else:
@@ -398,16 +412,25 @@ class ServerImportView(APIView):
         if not any(get(key) for key in CSV_COLUMNS):
             return None, None
         errors = []
-        parsed = {'name': get('name'), 'ip': get('ip')}
+        parsed = {
+            'name': get('name'),
+            'private_ip': get('private_ip'),
+            'public_ip': get('public_ip') or None,
+        }
         if not parsed['name']:
             errors.append('name 不能为空')
-        if not parsed['ip']:
-            errors.append('ip 不能为空')
+        if not parsed['private_ip']:
+            errors.append('private_ip 不能为空')
         else:
             try:
-                validate_ipv46_address(parsed['ip'])
+                validate_ipv46_address(parsed['private_ip'])
             except ValidationError:
-                errors.append(f'ip 格式非法：{parsed["ip"]}')
+                errors.append(f'private_ip 格式非法：{parsed["private_ip"]}')
+        if parsed['public_ip']:
+            try:
+                validate_ipv46_address(parsed['public_ip'])
+            except ValidationError:
+                errors.append(f'public_ip 格式非法：{parsed["public_ip"]}')
 
         status = get('status') or 'running'
         valid_status = {key for key, _ in Server.STATUS_CHOICES}

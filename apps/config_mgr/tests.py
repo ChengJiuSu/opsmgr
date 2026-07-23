@@ -31,8 +31,8 @@ class BaseApiTest(TestCase):
         self.envProd = Environment.objects.get(code='prod')
         self.group = ProjectGroup.objects.create(name='仙侠项目组', code='xianxia')
         self.channel = Channel.objects.get(code='qixia')
-        self.s1 = Server.objects.create(name='s1', ip='10.2.0.1')
-        self.s2 = Server.objects.create(name='s2', ip='10.2.0.2', region='cn-shanghai')
+        self.s1 = Server.objects.create(name='s1', private_ip='10.2.0.1')
+        self.s2 = Server.objects.create(name='s2', private_ip='10.2.0.2', region='cn-shanghai')
 
 
 class BatchAssignTests(BaseApiTest):
@@ -151,7 +151,7 @@ class ServicePlanTests(BaseApiTest):
         self.admin.post(UNPLAN_URL, {
             'server_ids': [first.server_id], 'service_type_id': self.nginx.id,
         }, format='json')
-        s3 = Server.objects.create(name='s3', ip='10.2.0.3')
+        s3 = Server.objects.create(name='s3', private_ip='10.2.0.3')
         self._plan([s3.id], [self.nginx.id])
         self.assertEqual(
             ServerService.objects.get(server=s3).process_name, 'nginx-01',

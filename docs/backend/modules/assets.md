@@ -151,21 +151,30 @@ region         = CharField(max_length=50, blank=True)
 
 ---
 
+## 主机名与 IP 约束
+
+- **主机名全局唯一**（DB unique）：是导入更新、JumpServer 注册查重的匹配键。
+- **私网 IP（`private_ip`）必填**：ansible / JumpServer 的连接地址；跨网段可重复（NAT 场景），靠主机名区分。
+- **公网 IP（`public_ip`）可空**：NAT 出局主机留空（存 null，前端空串自动转换）；有值时全局唯一（部分唯一约束
+  `uniq_server_public_ip`，DRF 不校验部分约束，序列化器手动查重转友好报错）。
+
 ## CSV 导入导出
 
-- 列：`name,ip,os,cpu,memory,status,project_group,channel,environment,cloud_provider,region,ssh_port,ssh_user,remark`，
-  字典外键列填字典**编码**（兼容名称），`name`/`ip` 必填。
+- 列：`name,private_ip,public_ip,os,cpu,memory,status,project_group,channel,environment,cloud_provider,region,ssh_port,ssh_user,remark`，
+  字典外键列填字典**编码**（兼容名称），`name`/`private_ip` 必填。
 - 导入全量校验通过才写库（原子）；任一行有错返回 400，`data.errors` 携带
-  `[{line, ip, errors[]}]` 逐行明细。`mode=skip`（默认）IP 已存在跳过，`mode=update` 按 IP 更新。
+  `[{line, name, errors[]}]` 逐行明细。`mode=skip`（默认）主机名已存在跳过，`mode=update` **按主机名**匹配更新；
+  文件内主机名/公网 IP 重复、公网 IP 已被其他主机占用均校验拦截。
 - 导出应用与列表页一致的筛选参数，带 BOM，Excel 可直接打开，可回导。
 
 ## JumpServer 注册
 
 `common/jumpserver.py` 为公共实现（asset_mgr 接口与 method_mgr `jumpserver` 执行器共用）：
-按 IP 查重幂等，逐台返回 `{id, name, ip, ok, msg}`。行为约束：
+**按主机名查重幂等**（JumpServer `?name=` 为精确匹配，v4.0.2 实测），address **公网优先**
+（有公网 IP 用公网，NAT 出局主机回退私网），逐台返回 `{id, name, ip, ok, msg}`（ip 为实际注册地址）。行为约束：
 
-- **重名硬拒绝**：JumpServer 资产名唯一。选中主机之间重名，或与 JumpServer 已有资产重名，
-  均抛 `ValueError` 中止整批同步（接口转 400 友好报错），不做自动改名，需先改名保证唯一。
+- **重名硬拒绝**：JumpServer 资产名唯一。与 JumpServer 已有资产重名（查重/创建间并发窗口兜底）
+  抛 `ValueError` 中止整批同步（接口转 400 友好报错），不做自动改名；平台侧主机名 DB 已唯一。
 - 请求忽略 `http_proxy` 等环境代理（`session.trust_env = False`），JumpServer 走内网直连。
 - token 用 JumpServer 私有令牌；v4 无页面入口，需在 jms_core 容器
   `python manage.py shell` 里 `User.objects.get(username=...).create_private_token()` 生成。
