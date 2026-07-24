@@ -490,7 +490,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, nextTick, watch, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, nextTick, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   Plus, Delete, Search, Refresh, View, Loading, CaretRight, EditPen, CopyDocument, Close, Top, Bottom, FullScreen, TopRight,
@@ -877,7 +877,8 @@ const outputFullVisible = ref(false)
 let pollTimer = null
 let listTimer = null
 
-// 面板工作区高度随页面滚动动态计算：顶部到视口底部铺满（下拉页面时逐渐占满整屏），小屏保底 360px。
+// 面板工作区高度：按「面板滚动到屏幕顶部时正好铺满一屏」一次性计算的固定值（与当前滚动位置无关，
+// 滚动过程中不重算，避免页面高度随滚动变化产生漂移感），仅窗口尺寸变化时更新，小屏保底 360px。
 // 左侧记录表限 max-height 内部滚动，右侧输出框 flex 填满剩余高度，两栏恒等高，不受记录条数影响
 const logBodyRef = ref()
 const logBodyHeight = ref(420)
@@ -887,16 +888,16 @@ function updateOutputHeight() {
   if (heightRaf) return
   heightRaf = requestAnimationFrame(() => {
     heightRaf = null
-    const el = logBodyRef.value
-    if (!el || !logPanel.task) return
-    const { top } = el.getBoundingClientRect()
+    const card = logPanelRef.value?.$el
+    const body = logBodyRef.value
+    if (!card || !body || !logPanel.task) return
+    // 工作区相对卡片顶部的偏移（卡片头+内边距）是常量；滚动容器顶部位置也是常量 → 结果与滚动无关
+    const containerTop = card.closest('.main-content')?.getBoundingClientRect().top ?? 0
+    const delta = body.getBoundingClientRect().top - card.getBoundingClientRect().top
     // 40 = 卡片内边距 + 页面底部留白
-    logBodyHeight.value = Math.max(360, Math.round(window.innerHeight - top - 40))
+    logBodyHeight.value = Math.max(360, Math.round(window.innerHeight - containerTop - delta - 40))
   })
 }
-
-// 暂停操作条出现/消失、切换执行记录都可能改变面板顶部位置，需要重算
-watch(() => [logPanel.task?.status, logPanel.current?.id], () => nextTick(updateOutputHeight))
 
 const stepsSummary = (log) => {
   const steps = log.steps_result || []
@@ -1025,15 +1026,12 @@ onMounted(() => {
       fetchData()
     }
   }, 5000)
-  // 页面在 .main-content 内滚动（非 window），用捕获态监听覆盖任意滚动容器
-  window.addEventListener('scroll', updateOutputHeight, true)
   window.addEventListener('resize', updateOutputHeight)
 })
 
 onUnmounted(() => {
   stopPolling()
   if (listTimer) clearInterval(listTimer)
-  window.removeEventListener('scroll', updateOutputHeight, true)
   window.removeEventListener('resize', updateOutputHeight)
   if (heightRaf) cancelAnimationFrame(heightRaf)
 })
