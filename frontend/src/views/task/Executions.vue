@@ -101,10 +101,11 @@
         <el-button size="small" text :icon="Close" @click="closeLogs">关闭</el-button>
       </div>
     </template>
-    <div class="log-body">
+    <div ref="logBodyRef" class="log-body" :style="{ height: logBodyHeight + 'px' }">
       <div class="log-list">
         <el-table
           :data="logPanel.logs" size="small" highlight-current-row
+          :max-height="logBodyHeight"
           :row-class-name="() => 'log-row'"
           @current-change="selectLog"
           ref="logTableRef"
@@ -489,7 +490,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, nextTick, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, nextTick, watch, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   Plus, Delete, Search, Refresh, View, Loading, CaretRight, EditPen, CopyDocument, Close, Top, Bottom, FullScreen, TopRight,
@@ -876,6 +877,27 @@ const outputFullVisible = ref(false)
 let pollTimer = null
 let listTimer = null
 
+// 面板工作区高度随页面滚动动态计算：顶部到视口底部铺满（下拉页面时逐渐占满整屏），小屏保底 360px。
+// 左侧记录表限 max-height 内部滚动，右侧输出框 flex 填满剩余高度，两栏恒等高，不受记录条数影响
+const logBodyRef = ref()
+const logBodyHeight = ref(420)
+let heightRaf = null
+
+function updateOutputHeight() {
+  if (heightRaf) return
+  heightRaf = requestAnimationFrame(() => {
+    heightRaf = null
+    const el = logBodyRef.value
+    if (!el || !logPanel.task) return
+    const { top } = el.getBoundingClientRect()
+    // 40 = 卡片内边距 + 页面底部留白
+    logBodyHeight.value = Math.max(360, Math.round(window.innerHeight - top - 40))
+  })
+}
+
+// 暂停操作条出现/消失、切换执行记录都可能改变面板顶部位置，需要重算
+watch(() => [logPanel.task?.status, logPanel.current?.id], () => nextTick(updateOutputHeight))
+
 const stepsSummary = (log) => {
   const steps = log.steps_result || []
   if (!steps.length) return '-'
@@ -897,6 +919,7 @@ async function openLogs(row, { live = false } = {}) {
   logPanel.output = ''
   await refreshLogs()
   await nextTick()
+  updateOutputHeight()
   logPanelRef.value?.$el?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   if (live || ['running', 'pending', 'paused'].includes(row.status)) startPolling()
 }
@@ -1002,11 +1025,17 @@ onMounted(() => {
       fetchData()
     }
   }, 5000)
+  // 页面在 .main-content 内滚动（非 window），用捕获态监听覆盖任意滚动容器
+  window.addEventListener('scroll', updateOutputHeight, true)
+  window.addEventListener('resize', updateOutputHeight)
 })
 
 onUnmounted(() => {
   stopPolling()
   if (listTimer) clearInterval(listTimer)
+  window.removeEventListener('scroll', updateOutputHeight, true)
+  window.removeEventListener('resize', updateOutputHeight)
+  if (heightRaf) cancelAnimationFrame(heightRaf)
 })
 </script>
 
@@ -1051,11 +1080,11 @@ code { background: #f5f7fa; padding: 1px 6px; border-radius: 3px; font-size: 12p
 /* 执行记录列表占 1/3，详细日志占 2/3 */
 .log-list { width: 33.33%; min-width: 300px; flex-shrink: 0; }
 .log-list :deep(.log-row) { cursor: pointer; }
-.log-output { flex: 1; min-width: 0; }
+.log-output { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .output-meta { display: flex; gap: 16px; align-items: center; margin-bottom: 8px; color: #606266; font-size: 13px; }
 .output-expand { margin-left: auto; }
-/* 输出区高度：面板内随视口拉高（小屏保底 420px），全屏占满剩余高度 */
-.output-host { height: max(420px, calc(100vh - 400px)); }
+/* 输出区高度：填满面板剩余高度（面板整体定高、内部滚动），全屏浮层占满剩余高度 */
+.output-host { flex: 1; min-height: 0; }
 .output-host-full { height: calc(100vh - 90px); border-radius: 0; }
 .output-full-header {
   display: flex; justify-content: space-between; align-items: center;
