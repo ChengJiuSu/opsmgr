@@ -145,16 +145,16 @@
           </el-form-item>
         </el-col>
         <el-col :span="12">
-          <el-form-item label="环境">
-            <el-select v-model="form.environment" clearable style="width:100%">
-              <el-option v-for="o in dicts.environments" :key="o.id" :label="o.name" :value="o.id" />
+          <el-form-item label="项目组">
+            <el-select v-model="form.project_group" clearable style="width:100%">
+              <el-option v-for="o in dicts.projectGroups" :key="o.id" :label="o.name" :value="o.id" />
             </el-select>
           </el-form-item>
         </el-col>
         <el-col :span="12">
-          <el-form-item label="项目组">
-            <el-select v-model="form.project_group" clearable style="width:100%">
-              <el-option v-for="o in dicts.projectGroups" :key="o.id" :label="o.name" :value="o.id" />
+          <el-form-item label="环境">
+            <el-select v-model="form.environment" clearable style="width:100%">
+              <el-option v-for="o in dicts.environments" :key="o.id" :label="o.name" :value="o.id" />
             </el-select>
           </el-form-item>
         </el-col>
