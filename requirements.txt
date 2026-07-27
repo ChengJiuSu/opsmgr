@@ -18,6 +18,11 @@ django-celery-results>=2.5.0
 # 任务执行（命令 / 剧本均通过 Ansible 下发）
 ansible-core>=2.16
 
+# ops-agent WebSocket 接入（NAT 出口执行代理）
+channels>=4.0
+channels-redis>=4.2
+daphne>=4.1
+
 # Jenkins 集成（平台方法 jenkins provider 直连 Jenkins REST API）
 requests>=2.32.0
 
