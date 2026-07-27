@@ -66,15 +66,18 @@ def _unplanned_servers(servers):
     return [s for s in servers if s.id not in planned]
 
 
-def _inventory_content(servers, credential, workdir):
+def _inventory_content(servers, credential, workdir, include_secrets=True):
     """生成 INI 格式动态 inventory。
 
     以主机名为 inventory 别名（ansible 日志按主机名显示执行结果），并从服务概要
     注入 service_types 主机变量，同时按服务类型 code 生成分组，供剧本圈选。
+
+    include_secrets=False 用于 agent 通道下发：密码/私钥不出通道，仅保留
+    用户/端口/become 标志；SSH 免密凭据驻留 agent 主机（设计文档 3.4）。
     """
     lines = []
     key_file = None
-    if credential and credential.auth_type == 'key' and credential.private_key:
+    if include_secrets and credential and credential.auth_type == 'key' and credential.private_key:
         key_file = os.path.join(workdir, 'id_key')
         with open(key_file, 'w', encoding='utf-8') as f:
             f.write(credential.private_key.strip() + '\n')
@@ -94,13 +97,13 @@ def _inventory_content(servers, credential, workdir):
             parts.append(f'ansible_port={srv.ssh_port or 22}')
             user = (credential.username if credential else '') or srv.ssh_user or 'root'
             parts.append(f'ansible_user={user}')
-            if credential and credential.auth_type == 'password' and credential.password:
+            if include_secrets and credential and credential.auth_type == 'password' and credential.password:
                 parts.append(f'ansible_ssh_pass={credential.password}')
             if key_file:
                 parts.append(f'ansible_ssh_private_key_file={key_file}')
         if credential and credential.become:
             parts.append('ansible_become=true')
-            if credential.become_password:
+            if include_secrets and credential.become_password:
                 parts.append(f'ansible_become_pass={credential.become_password}')
         codes = service_map.get(srv.id, [])
         parts.append('service_types="{}"'.format(','.join(codes)))
@@ -216,17 +219,65 @@ def _guard(servers):
     return None
 
 
+def _split_by_agent(servers):
+    """按执行通道拆分主机：返回 (直连主机列表, [(agent, 该 agent 主机列表)])。
+
+    agent 组按 agent id 排序，保证输出顺序稳定。
+    """
+    direct, groups = [], {}
+    for srv in servers:
+        if srv.agent_id:
+            groups.setdefault(srv.agent, []).append(srv)
+        else:
+            direct.append(srv)
+    return direct, sorted(groups.items(), key=lambda item: item[0].pk)
+
+
+def _run_channels(step, task, servers, run_direct, agent_payload):
+    """通道分组执行：直连组本地执行，agent 组经 dispatch 下发，输出拼接。
+
+    run_direct(直连主机列表) → (rc, out)；agent_payload(该组主机列表) →
+    下发 payload 字典。全部为直连（现状主流）时输出不加通道标头，与旧行为
+    完全一致；rc 取首个非零（保留 124 等语义）。
+    """
+    from apps.agent_mgr.dispatch import run_via_agent
+
+    direct, agent_groups = _split_by_agent(servers)
+    if not agent_groups:
+        return run_direct(direct)
+
+    parts, final_rc = [], 0
+    if direct:
+        rc, out = run_direct(direct)
+        parts.append(f'───── [直连 · {len(direct)} 台] ─────\n{out}')
+        final_rc = final_rc or rc
+    for agent, group in agent_groups:
+        rc, out = run_via_agent(
+            agent, agent_payload(group), timeout=step.timeout or 300,
+            task_id=task.pk, step_order=step.order)
+        parts.append(f'───── [经 Agent {agent.name} · {len(group)} 台] ─────\n{out}')
+        final_rc = final_rc or rc
+    return final_rc, '\n\n'.join(parts)
+
+
 def _run_command_step(step, task, servers):
     if not step.command.strip():
         return 1, '命令内容为空。'
-    workdir = tempfile.mkdtemp(prefix='ops_cmd_')
-    try:
-        inventory_path = _write_inventory(servers, task.credential, workdir)
-        cmd = ['ansible', 'all', '-i', inventory_path] + _forks_args(task) \
-            + extra_vars_args(step) + ['-m', 'shell', '-a', step.command]
-        return run_subprocess(cmd, timeout=step.timeout or 300)
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+
+    def run_direct(direct_servers):
+        workdir = tempfile.mkdtemp(prefix='ops_cmd_')
+        try:
+            inventory_path = _write_inventory(direct_servers, task.credential, workdir)
+            cmd = ['ansible', 'all', '-i', inventory_path] + _forks_args(task) \
+                + extra_vars_args(step) + ['-m', 'shell', '-a', step.command]
+            return run_subprocess(cmd, timeout=step.timeout or 300)
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    def agent_payload(group):
+        return _agent_payload_base(step, task, group) | {'command': step.command}
+
+    return _run_channels(step, task, servers, run_direct, agent_payload)
 
 
 def _run_playbook_step(step, task, servers):
@@ -242,16 +293,42 @@ def _run_playbook_step(step, task, servers):
     if not os.path.isfile(playbook_path):
         return 1, f'剧本文件不存在：{step.playbook}'
 
-    workdir = tempfile.mkdtemp(prefix='ops_pb_')
-    try:
-        inventory_path = _write_inventory(servers, task.credential, workdir)
-        cmd = ['ansible-playbook', playbook_path, '-i', inventory_path] + _forks_args(task)
-        if (step.tags or '').strip():
-            cmd += ['--tags', step.tags.strip()]
-        cmd += extra_vars_args(step)
-        return run_subprocess(cmd, timeout=step.timeout or 300, cwd=project_dir)
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+    def run_direct(direct_servers):
+        workdir = tempfile.mkdtemp(prefix='ops_pb_')
+        try:
+            inventory_path = _write_inventory(direct_servers, task.credential, workdir)
+            cmd = ['ansible-playbook', playbook_path, '-i', inventory_path] + _forks_args(task)
+            if (step.tags or '').strip():
+                cmd += ['--tags', step.tags.strip()]
+            cmd += extra_vars_args(step)
+            return run_subprocess(cmd, timeout=step.timeout or 300, cwd=project_dir)
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    def agent_payload(group):
+        # 剧本按 agent 侧项目目录内相对路径执行（agent 与 manager 同步同一 git 仓库）
+        return _agent_payload_base(step, task, group) | {
+            'playbook': step.playbook.strip(),
+            'tags': (step.tags or '').strip(),
+            'project_sync': True,
+        }
+
+    return _run_channels(step, task, servers, run_direct, agent_payload)
+
+
+def _agent_payload_base(step, task, group):
+    """agent 下发 payload 公共部分：无密钥 inventory + 变量 + 并发/超时。
+
+    extra_vars 为按注入顺序排列的 --extra-vars 值列表（变量管理 → 制品
+    变量 → 模块额外变量，后者覆盖前者），agent 侧逐个以 -e 传入。
+    """
+    return {
+        'step_type': step.task_type,
+        'inventory': _inventory_content(group, task.credential, None, include_secrets=False),
+        'extra_vars': extra_vars_args(step)[1::2],
+        'forks': 1 if task.exec_mode == 'serial' else (getattr(task, 'forks', None) or 10),
+        'timeout': step.timeout or 300,
+    }
 
 
 def _run_method_step(step, task, servers):
@@ -266,6 +343,14 @@ def _run_method_step(step, task, servers):
         executor = get_executor(method.provider)
     except KeyError:
         return 1, f'未知 provider：{method.provider}'
+    # v1 限制：方法模块不走 agent 通道。剧本类方法从 manager 直连 SSH，
+    # agent 通道主机（NAT 内网）不可达，提前失败给出明确指引。
+    if method.provider == 'ansible_playbook':
+        agent_hosts = [s for s in servers if s.agent_id]
+        if agent_hosts:
+            names = '、'.join(f'{s.name}({s.conn_ip})' for s in agent_hosts[:5])
+            return 1, (f'方法模块暂不支持经 Agent 通道执行，主机 {names} 已配置执行通道。'
+                       '请改用命令/剧本模块，或将主机切回直连通道。')
 
     workdir = tempfile.mkdtemp(prefix='ops_mtd_')
     try:

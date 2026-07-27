@@ -17,4 +17,5 @@ urlpatterns = [
     path('api/exec/', include('apps.task_exec.urls')),
     path('api/exec/', include('apps.method_mgr.urls')),
     path('api/artifacts/', include('apps.artifact_mgr.urls')),
+    path('api/', include('apps.agent_mgr.urls')),
 ]

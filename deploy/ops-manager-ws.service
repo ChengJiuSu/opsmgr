@@ -1,0 +1,22 @@
+# OpsManager WebSocket 服务（daphne，承载 /ws/ ops-agent 接入）
+# 安装：
+#   sudo cp deploy/ops-manager-ws.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now ops-manager-ws
+# 仅当启用 ops-agent（NAT 出口执行代理）时需要部署本服务；
+# 依赖 Redis（channel layer 与 runner 跨进程通信），路径按实际部署修改。
+[Unit]
+Description=OpsManager WebSocket backend (daphne, ops-agent)
+After=network.target redis.service
+
+[Service]
+User=ops
+Group=ops
+WorkingDirectory=/opt/devops-manager
+Environment=DJANGO_SETTINGS_MODULE=ops_manager.settings.prod
+Environment=PATH=/opt/devops-manager/venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/devops-manager/venv/bin/daphne -b 127.0.0.1 -p 8001 ops_manager.asgi:application
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

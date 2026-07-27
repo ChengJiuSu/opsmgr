@@ -41,7 +41,7 @@ CSV_DICT_FIELDS = {
     'cloud_provider': (CloudProvider, '云厂商'),
 }
 # 批量编辑允许的普通字段（字典外键分配走「配置管理 → 服务器分配」的批量分配）
-BATCH_UPDATE_FIELDS = ('status', 'os', 'region', 'ssh_user', 'ssh_port', 'remark')
+BATCH_UPDATE_FIELDS = ('status', 'os', 'region', 'ssh_user', 'ssh_port', 'remark', 'agent')
 
 
 class BaseDictViewSet(viewsets.ModelViewSet):
@@ -278,6 +278,18 @@ class ServerBatchUpdateView(APIView):
         for key in ('os', 'region', 'ssh_user', 'remark'):
             if key in update:
                 fields[key] = str(update[key] or '')
+        if 'agent' in update:
+            # 执行通道批量切换：null = 回退直连
+            agent_id = update['agent']
+            if agent_id is None:
+                fields['agent'] = None
+            else:
+                from apps.agent_mgr.models import AgentNode
+
+                agent = AgentNode.objects.filter(pk=agent_id).first()
+                if agent is None:
+                    return fail('指定的 Agent 不存在')
+                fields['agent'] = agent
 
         with transaction.atomic():
             updated = servers.update(**fields, updated_at=timezone.now())

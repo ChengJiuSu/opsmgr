@@ -122,6 +122,12 @@ class Server(models.Model):
         null=True, blank=True, related_name='servers',
     )
     region = models.CharField('地域/机房', max_length=50, blank=True)
+    # 执行通道：空 = 直连（manager 本机跑 ansible）；有值 = 经该 agent 下发
+    # （NAT 内网主机场景）。agent 删除时回退直连而非删主机。
+    agent = models.ForeignKey(
+        'agent_mgr.AgentNode', verbose_name='执行通道 Agent', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='servers',
+    )
     ssh_port = models.PositiveIntegerField('SSH 端口', default=22)
     ssh_user = models.CharField('SSH 用户', max_length=50, default='root')
     remark = models.TextField('备注', blank=True)

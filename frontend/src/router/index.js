@@ -118,6 +118,12 @@ const router = createRouter({
           meta: { title: '用户管理', staff: true },
         },
         {
+          path: 'system/agents',
+          name: 'SystemAgents',
+          component: () => import('../views/system/Agents.vue'),
+          meta: { title: 'Agent 管理', staff: true },
+        },
+        {
           path: 'system/configs',
           name: 'SystemConfigs',
           component: () => import('../views/system/Configs.vue'),

@@ -93,6 +93,7 @@ DJANGO_APPS = [
 
 # 第三方应用
 THIRD_PARTY_APPS = [
+    'channels',
     'rest_framework',
     'rest_framework_simplejwt',
     'rest_framework_simplejwt.token_blacklist',
@@ -111,9 +112,11 @@ LOCAL_APPS = [
     'apps.method_mgr',
     'apps.task_exec',
     'apps.artifact_mgr',
+    'apps.agent_mgr',
 ]
 
-INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
+# daphne 必须排在 staticfiles 之前：接管 runserver 为 ASGI（含 WebSocket）
+INSTALLED_APPS = ['daphne'] + DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
@@ -147,6 +150,7 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'ops_manager.wsgi.application'
+ASGI_APPLICATION = 'ops_manager.asgi.application'
 
 # 使用自定义用户模型
 AUTH_USER_MODEL = 'auth_mgr.User'
@@ -225,6 +229,16 @@ CELERY_RESULT_BACKEND = REDIS_URL
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_TIMEZONE = 'Asia/Shanghai'
+
+# ── Channels（ops-agent WebSocket 接入）──────────────────
+# Redis channel layer：AgentConsumer（ASGI 进程）与 runner（WSGI/celery 进程）
+# 跨进程通信必需；复用 celery 同一 Redis 实例。
+CHANNEL_LAYERS = {
+    'default': {
+        'BACKEND': 'channels_redis.core.RedisChannelLayer',
+        'CONFIG': {'hosts': [REDIS_URL]},
+    },
+}
 
 # ── 任务执行后端 ──────────────────────────────────────────
 # thread（默认，无需 Redis）/ celery（生产，需 worker）/ sync（同步，测试用）

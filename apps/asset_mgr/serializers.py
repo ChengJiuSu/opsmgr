@@ -43,6 +43,8 @@ class ServerSerializer(serializers.ModelSerializer):
     environment_code = serializers.CharField(source='environment.code', read_only=True, default=None)
     environment_is_prod = serializers.BooleanField(source='environment.is_prod', read_only=True, default=None)
     cloud_provider_name = serializers.CharField(source='cloud_provider.name', read_only=True, default=None)
+    # 执行通道展示：空 = 直连
+    agent_name = serializers.CharField(source='agent.name', read_only=True, default=None)
     # 主机服务摘要：已规划/已部署/已下线记录列表（视图层需 prefetch services__service_type）
     services = serializers.SerializerMethodField()
     # 新增主机时可选分配服务类型：直接创建 planned 记录并自动生成进程名（仅创建时生效）

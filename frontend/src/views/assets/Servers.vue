@@ -83,6 +83,12 @@
           <el-tag size="small" :type="statusType(row.status)">{{ statusLabel(row.status) }}</el-tag>
         </template>
       </el-table-column>
+      <el-table-column label="执行通道" width="110">
+        <template #default="{ row }">
+          <el-tag v-if="row.agent_name" size="small" type="warning">{{ row.agent_name }}</el-tag>
+          <span v-else class="muted">直连</span>
+        </template>
+      </el-table-column>
       <el-table-column v-if="authStore.isStaff" label="操作" width="140" fixed="right">
         <template #default="{ row }">
           <el-button size="small" :icon="Edit" @click="openDialog(row)">编辑</el-button>
@@ -196,6 +202,14 @@
             <el-input-number v-model="form.ssh_port" :min="1" :max="65535" style="width:100%" />
           </el-form-item>
         </el-col>
+        <!-- 执行通道选项来自 Agent 管理（仅管理员接口），普通用户不展示 -->
+        <el-col v-if="authStore.isStaff" :span="12">
+          <el-form-item label="执行通道">
+            <el-select v-model="form.agent" clearable placeholder="直连（默认）" style="width:100%">
+              <el-option v-for="o in agents" :key="o.id" :label="`Agent：${o.name}`" :value="o.id" />
+            </el-select>
+          </el-form-item>
+        </el-col>
         <!-- 分配服务仅在新增时提供；已有主机的服务调整走「配置管理 → 服务器分配」 -->
         <el-col v-if="!editRow" :span="24">
           <el-form-item label="分配服务">
@@ -240,6 +254,13 @@
             v-model="batchForm.ssh_port.value" :disabled="!batchForm.ssh_port.on"
             :min="1" :max="65535" style="flex:1"
           />
+          <el-select
+            v-else-if="field.key === 'agent'"
+            v-model="batchForm.agent.value" :disabled="!batchForm.agent.on"
+            clearable placeholder="直连" style="flex:1"
+          >
+            <el-option v-for="o in agents" :key="o.id" :label="`Agent：${o.name}`" :value="o.id" />
+          </el-select>
           <el-input
             v-else
             v-model="batchForm[field.key].value" :disabled="!batchForm[field.key].on"
@@ -324,6 +345,7 @@ import {
   exportServers, getServerImportTemplate, importServers,
   projectGroupApi, channelApi, environmentApi, cloudProviderApi, serviceTypeApi, fetchDictOptions,
 } from '../../api/assets'
+import { getAgents } from '../../api/agents'
 import { useAuthStore } from '../../stores/auth'
 
 const authStore = useAuthStore()
@@ -343,7 +365,10 @@ const formRef = ref()
 const dicts = reactive({ environments: [], projectGroups: [], channels: [], cloudProviders: [], serviceTypes: [] })
 
 // 字典外键字段：提交前把清空的下拉值归一为 null
-const FK_FIELDS = ['environment', 'project_group', 'channel', 'cloud_provider']
+const FK_FIELDS = ['environment', 'project_group', 'channel', 'cloud_provider', 'agent']
+
+// 执行通道候选（Agent 管理接口仅管理员可访问，普通用户不加载）
+const agents = ref([])
 
 // 操作系统/CPU/内存 下拉候选项（操作系统支持手动输入自定义值）
 const OS_OPTIONS = [
@@ -357,7 +382,7 @@ const MEMORY_OPTIONS = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262
 const emptyForm = () => ({
   name: '', private_ip: '', public_ip: '', os: '', cpu: null, memory: null, status: 'running',
   environment: null, project_group: null, channel: null, cloud_provider: null,
-  region: '', ssh_user: 'root', ssh_port: 22, remark: '', service_type_ids: [],
+  region: '', ssh_user: 'root', ssh_port: 22, remark: '', service_type_ids: [], agent: null,
 })
 const form = reactive(emptyForm())
 const rules = {
@@ -381,6 +406,10 @@ async function loadDicts() {
   dicts.channels = channels.data?.results || []
   dicts.cloudProviders = providers.data?.results || []
   dicts.serviceTypes = serviceTypes.data?.results || []
+  if (authStore.isStaff) {
+    const res = await getAgents()
+    agents.value = Array.isArray(res) ? res : res.data || []
+  }
 }
 
 async function fetchData() {
@@ -453,6 +482,7 @@ const batchFields = [
   { key: 'region', label: '地域/机房', placeholder: '如 cn-hangzhou（留空表示清空）' },
   { key: 'ssh_user', label: 'SSH 用户', placeholder: '如 root' },
   { key: 'ssh_port', label: 'SSH 端口' },
+  { key: 'agent', label: '执行通道' },
   { key: 'remark', label: '备注', placeholder: '留空表示清空' },
 ]
 const batchForm = reactive({
@@ -461,6 +491,7 @@ const batchForm = reactive({
   region: { on: false, value: '' },
   ssh_user: { on: false, value: 'root' },
   ssh_port: { on: false, value: 22 },
+  agent: { on: false, value: null },
   remark: { on: false, value: '' },
 })
 
@@ -591,6 +622,7 @@ onMounted(() => {
 .toolbar-right { display: flex; gap: 8px; align-items: center; flex-shrink: 0; flex-wrap: wrap; }
 .form-tip { color: #909399; font-size: 12px; line-height: 1.5; margin-top: 4px; }
 .batch-line { display: flex; gap: 10px; align-items: center; width: 100%; }
+.muted { color: #c0c4cc; }
 .batch-line > :last-child { flex: 1; }
 .import-toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
 </style>

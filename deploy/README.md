@@ -12,6 +12,7 @@
 | `update.sh` | 日常更新：拉代码、迁移、构建、重启服务 |
 | `ops-manager.conf` | gunicorn supervisor 配置（默认托管方式） |
 | `ops-manager.service` | gunicorn systemd 单元（备选托管方式） |
+| `ops-manager-ws.service` | daphne systemd 单元（/ws/ ops-agent 接入，启用 agent 时部署） |
 | `docker/` | 后端容器化：Dockerfile + entrypoint（compose 文件在仓库根） |
 | `nginx.conf` | nginx 站点配置 |
 
@@ -40,6 +41,19 @@ sudo nginx -t && sudo systemctl reload nginx
 sudo cp deploy/ops-manager.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now ops-manager
 ```
+
+### 启用 ops-agent（NAT 出口执行代理，可选）
+
+agent 经 WebSocket（`/ws/agent/`）接入，需额外起 daphne（ASGI）并确保
+Redis 可用（channel layer；与 celery 共用同一 `REDIS_URL`）：
+
+```bash
+sudo cp deploy/ops-manager-ws.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now ops-manager-ws
+```
+
+nginx.conf 已内置 `/ws/` → `127.0.0.1:8001` 分流；agent 侧部署见
+独立仓库 ops-agent 的 README 与 `docs/ops-agent-design.md`。
 
 部署路径与配置内路径不一致时，同步修改 `ops-manager.conf`（或 `ops-manager.service`）与 `nginx.conf`。
 supervisor 程序名改动时，`update.sh` 重启用 `SUPERVISOR_PROGRAM=<程序名>` 覆盖（默认 `ops-manager-01`）。
