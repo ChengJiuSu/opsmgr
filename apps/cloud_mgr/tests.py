@@ -414,3 +414,148 @@ class CertificateApiTests(BaseApiTest):
         mock_issue.assert_called_once()
         # 强制重签口径
         self.assertTrue(mock_issue.call_args.kwargs.get('force'))
+
+
+class CertDeploymentApiTests(BaseApiTest):
+    """证书分发：mock ansible 子进程，覆盖登记校验、推送、续签自动分发、桩类型。"""
+
+    def setUp(self):
+        super().setUp()
+        from apps.cloud_mgr.models import Certificate
+        self.cert = Certificate.objects.create(
+            name='web-cert', domains=['example.com'], cloud_account=self.account,
+            status='issued', cert_pem='CERT', private_key_pem='KEY', chain_pem='CHAIN',
+        )
+        self.server = Server.objects.create(name='web-01', private_ip='10.0.0.8', public_ip='8.8.8.8')
+
+    def _create_deployment(self, **kwargs):
+        from apps.cloud_mgr.models import CertDeployment
+        defaults = {
+            'certificate': self.cert, 'target_type': 'server', 'server': self.server,
+            'deploy_path': '/etc/nginx/ssl', 'reload_cmd': 'nginx -s reload',
+        }
+        defaults.update(kwargs)
+        return CertDeployment.objects.create(**defaults)
+
+    def test_create_requires_server_for_server_type(self):
+        admin = self._client()
+        r = admin.post('/api/cloud/cert-deployments/', {
+            'certificate': self.cert.id, 'target_type': 'server', 'deploy_path': '/etc/nginx/ssl',
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+
+    def test_deploy_path_validation(self):
+        admin = self._client()
+        for bad in ('etc/nginx/ssl', '/etc', '/'):
+            r = admin.post('/api/cloud/cert-deployments/', {
+                'certificate': self.cert.id, 'target_type': 'server',
+                'server': self.server.id, 'deploy_path': bad,
+            }, format='json')
+            self.assertEqual(r.status_code, 400, bad)
+        # 绝对路径正常，尾部斜杠被规范化
+        r = admin.post('/api/cloud/cert-deployments/', {
+            'certificate': self.cert.id, 'target_type': 'server',
+            'server': self.server.id, 'deploy_path': '/etc/nginx/ssl/',
+        }, format='json')
+        self.assertEqual(r.status_code, 201)
+        self.assertEqual(r.json()['deploy_path'], '/etc/nginx/ssl')
+
+    @patch('apps.cloud_mgr.deploy.run_subprocess')
+    def test_deploy_success_pushes_files_and_reload(self, mock_run):
+        mock_run.return_value = (0, 'ok changed=4')
+        dep = self._create_deployment()
+        admin = self._client()
+        with self.settings(TASK_EXEC_BACKEND='sync'):
+            r = admin.post(f'/api/cloud/cert-deployments/{dep.id}/deploy/')
+        self.assertEqual(r.status_code, 200)
+        dep.refresh_from_db()
+        self.assertEqual(dep.status, 'success')
+        self.assertIsNotNone(dep.last_deployed_at)
+        self.assertIn('changed=4', dep.last_output)
+        # 剧本内容：三个文件 + 目录 + reload，私钥 0600
+        playbook_path = mock_run.call_args.args[0][1]
+        self.assertTrue(playbook_path.endswith('deploy_cert.yml'))
+
+    @patch('apps.cloud_mgr.deploy.run_subprocess')
+    def test_deploy_failure_records_error(self, mock_run):
+        mock_run.return_value = (2, 'UNREACHABLE! ssh timeout')
+        dep = self._create_deployment()
+        admin = self._client()
+        with self.settings(TASK_EXEC_BACKEND='sync'):
+            admin.post(f'/api/cloud/cert-deployments/{dep.id}/deploy/')
+        dep.refresh_from_db()
+        self.assertEqual(dep.status, 'failed')
+        self.assertIn('UNREACHABLE', dep.last_error)
+
+    def test_deploy_rejects_agent_channel_host(self):
+        from apps.agent_mgr.models import AgentNode
+        agent = AgentNode.objects.create(name='nat-gw', token_hash='x' * 64)
+        self.server.agent = agent
+        self.server.save(update_fields=['agent'])
+        dep = self._create_deployment()
+        admin = self._client()
+        with self.settings(TASK_EXEC_BACKEND='sync'):
+            admin.post(f'/api/cloud/cert-deployments/{dep.id}/deploy/')
+        dep.refresh_from_db()
+        self.assertEqual(dep.status, 'failed')
+        self.assertIn('agent', dep.last_error)
+
+    def test_deploy_stub_target_types_rejected(self):
+        admin = self._client()
+        for target in ('lb', 'ga', 'cdn'):
+            dep = self._create_deployment(target_type=target, server=None,
+                                          deploy_path=f'/opt/{target}')
+            r = admin.post(f'/api/cloud/cert-deployments/{dep.id}/deploy/')
+            self.assertEqual(r.status_code, 400, target)
+            self.assertIn('暂未接入', r.json()['msg'])
+
+    def test_deploy_requires_issued_certificate(self):
+        self.cert.status = 'pending'
+        self.cert.save(update_fields=['status'])
+        dep = self._create_deployment()
+        admin = self._client()
+        r = admin.post(f'/api/cloud/cert-deployments/{dep.id}/deploy/')
+        self.assertEqual(r.status_code, 400)
+
+    @patch('apps.cloud_mgr.deploy.run_subprocess')
+    def test_deploy_all_skips_stub_and_deploying(self, mock_run):
+        mock_run.return_value = (0, 'ok')
+        good = self._create_deployment()
+        self._create_deployment(target_type='cdn', server=None, deploy_path='/opt/cdn')
+        admin = self._client()
+        with self.settings(TASK_EXEC_BACKEND='sync'):
+            r = admin.post(f'/api/cloud/certificates/{self.cert.id}/deploy_all/')
+        self.assertEqual(r.status_code, 200)
+        data = r.json()['data']
+        self.assertEqual(data['dispatched'], [good.id])
+        self.assertEqual(len(data['skipped']), 1)
+
+    @patch('apps.cloud_mgr.deploy.run_subprocess')
+    @patch('apps.cloud_mgr.tasks.issue_certificate')
+    def test_renew_triggers_auto_deploy(self, mock_issue, mock_run):
+        from datetime import timedelta
+        from django.utils import timezone as tz
+        mock_issue.return_value = ('C2', 'K2', 'CH2', tz.now() + timedelta(days=90))
+        mock_run.return_value = (0, 'ok')
+        auto = self._create_deployment(auto_deploy=True)
+        manual = self._create_deployment(auto_deploy=False, deploy_path='/etc/haproxy/ssl')
+        admin = self._client()
+        with self.settings(TASK_EXEC_BACKEND='sync'):
+            r = admin.post(f'/api/cloud/certificates/{self.cert.id}/renew/')
+        self.assertEqual(r.status_code, 200)
+        auto.refresh_from_db()
+        manual.refresh_from_db()
+        self.assertEqual(auto.status, 'success')
+        self.assertEqual(manual.status, 'pending')  # 未开自动分发不动
+
+    def test_destroy_blocked_while_deploying(self):
+        dep = self._create_deployment(status='deploying')
+        admin = self._client()
+        self.assertEqual(admin.delete(f'/api/cloud/cert-deployments/{dep.id}/').status_code, 400)
+        self.assertEqual(admin.post(f'/api/cloud/cert-deployments/{dep.id}/deploy/').status_code, 400)
+
+    def test_normal_user_read_only(self):
+        dep = self._create_deployment()
+        normal = self._client(is_staff=False)
+        self.assertEqual(normal.get('/api/cloud/cert-deployments/').status_code, 200)
+        self.assertEqual(normal.post(f'/api/cloud/cert-deployments/{dep.id}/deploy/').status_code, 403)

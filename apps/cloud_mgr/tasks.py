@@ -1,8 +1,10 @@
-"""证书签发/续签调度。
+"""证书签发/续签/分发调度。
 
-- run_issue：同步执行完整签发流程并落库（状态 issuing → issued/failed）；
-- dispatch_issue：按 TASK_EXEC_BACKEND 调度（thread 默认 / celery / sync），
-  与 task_exec 同口径；
+- run_issue：同步执行完整签发流程并落库（状态 issuing → issued/failed），
+  成功后自动分发 auto_deploy 的分发目标（续签即自动推送）；
+- run_deploy：同步执行一个分发目标并落库（deploying → success/failed）；
+- dispatch_issue / dispatch_deploy：按 TASK_EXEC_BACKEND 调度
+  （thread 默认 / celery / sync），与 task_exec 同口径；
 - renew_expiring_certificates：celery beat 每日任务，auto_renew 且
   距过期不足 CERT_RENEW_BEFORE_DAYS 天的已签发证书强制重签。
 """
@@ -14,6 +16,7 @@ from django.db import connection
 from django.utils import timezone
 
 from .acme import AcmeError, issue_certificate
+from .deploy import CertDeployError, run_deployment
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +46,9 @@ def run_issue(certificate_id, force=False):
         'issued_at', 'expires_at', 'status', 'last_error', 'updated_at',
     ])
     logger.info('证书 %s 签发成功，过期时间 %s', cert.name, expires_at)
+    # 续签后自动推送到已登记目标（同线程顺序执行，避免并发抢同一主机）
+    for deployment in cert.deployments.filter(auto_deploy=True):
+        run_deploy(deployment.id)
 
 
 def _run_in_thread(certificate_id, force):
@@ -71,6 +77,66 @@ def dispatch_issue(certificate, force=False):
         _run_in_thread(certificate.id, force)
 
 
+def run_deploy(deployment_id):
+    """执行一个分发目标并落库。同步阻塞（ansible 子进程）。"""
+    from .models import CertDeployment
+
+    deployment = CertDeployment.objects.select_related('certificate', 'server', 'credential').get(
+        pk=deployment_id,
+    )
+    cert = deployment.certificate
+    if cert.status != 'issued' or not cert.cert_pem:
+        deployment.status = 'failed'
+        deployment.last_error = '证书尚未签发，无法分发。'
+        deployment.save(update_fields=['status', 'last_error', 'updated_at'])
+        return
+    deployment.status = 'deploying'
+    deployment.last_error = ''
+    deployment.save(update_fields=['status', 'last_error', 'updated_at'])
+    try:
+        output = run_deployment(cert, deployment)
+    except CertDeployError as e:
+        deployment.status = 'failed'
+        deployment.last_error = str(e)
+        deployment.save(update_fields=['status', 'last_error', 'updated_at'])
+        logger.error('证书 %s 分发到 %s 失败：%s', cert.name, deployment, e)
+        return
+    deployment.status = 'success'
+    deployment.last_error = ''
+    deployment.last_output = output[-4000:]
+    deployment.last_deployed_at = timezone.now()
+    deployment.save(update_fields=[
+        'status', 'last_error', 'last_output', 'last_deployed_at', 'updated_at',
+    ])
+    logger.info('证书 %s 分发到 %s 成功', cert.name, deployment)
+
+
+def _deploy_in_thread(deployment_id):
+    import threading
+
+    def _worker():
+        try:
+            run_deploy(deployment_id)
+        finally:
+            connection.close()
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def dispatch_deploy(deployment):
+    """置 deploying 状态并按配置后端调度分发。"""
+    deployment.status = 'deploying'
+    deployment.last_error = ''
+    deployment.save(update_fields=['status', 'last_error', 'updated_at'])
+    backend = getattr(settings, 'TASK_EXEC_BACKEND', 'thread')
+    if backend == 'sync':
+        run_deploy(deployment.id)
+    elif backend == 'celery':
+        run_deploy_certificate.delay(deployment.id)
+    else:
+        _deploy_in_thread(deployment.id)
+
+
 def renew_expiring(now=None):
     """续签扫描：返回本次触发续签的证书 id 列表（beat 任务与测试共用）。"""
     from .models import Certificate
@@ -96,6 +162,10 @@ try:
     def run_issue_certificate(certificate_id, force=False):
         run_issue(certificate_id, force=force)
 
+    @shared_task(name='cloud_mgr.run_deploy_certificate')
+    def run_deploy_certificate(deployment_id):
+        run_deploy(deployment_id)
+
     @shared_task(name='cloud_mgr.renew_expiring_certificates')
     def renew_expiring_certificates():
         """beat 每日调度：见 settings CELERY_BEAT_SCHEDULE。"""
@@ -103,4 +173,7 @@ try:
 
 except ImportError:  # celery 未安装时提供占位
     def run_issue_certificate(certificate_id, force=False):  # type: ignore
+        raise RuntimeError('Celery 未安装，无法使用 celery 后端。请改用 thread/sync。')
+
+    def run_deploy_certificate(deployment_id):  # type: ignore
         raise RuntimeError('Celery 未安装，无法使用 celery 后端。请改用 thread/sync。')

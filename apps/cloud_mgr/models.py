@@ -195,7 +195,13 @@ class Certificate(models.Model):
 
 
 class CertDeployment(models.Model):
-    """证书分发目标：P3 实现服务器分发（task_exec 通道），LB/GA/CDN 接口预留。"""
+    """证书分发目标。
+
+    - server：经 ansible 推送 crt/key/fullchain 到 deploy_path 并执行 reload_cmd；
+      文件名与下载包一致（<证书名>.crt/.key/.fullchain.pem）；
+    - lb/ga/cdn：接口预留（deploy.py 中各自 deployer 桩），资源模块接入后实现；
+    - auto_deploy：证书签发/续签成功后自动重新分发（续签后无需人工推送）。
+    """
 
     TARGET_CHOICES = [
         ('server', '服务器'),
@@ -220,11 +226,17 @@ class CertDeployment(models.Model):
         Server, verbose_name='目标服务器', on_delete=models.SET_NULL,
         null=True, blank=True, related_name='cert_deployments',
     )
-    deploy_path = models.CharField('部署路径', max_length=255, blank=True)
+    credential = models.ForeignKey(
+        'task_exec.Credential', verbose_name='连接凭据', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='cert_deployments',
+    )
+    deploy_path = models.CharField('部署目录', max_length=255, default='/etc/nginx/ssl')
     reload_cmd = models.CharField('重载命令', max_length=255, blank=True)
+    auto_deploy = models.BooleanField('签发后自动分发', default=True)
     status = models.CharField('状态', max_length=20, choices=STATUS_CHOICES, default='pending')
     last_deployed_at = models.DateTimeField('最近部署时间', null=True, blank=True)
     last_error = models.TextField('最近错误', blank=True)
+    last_output = models.TextField('最近执行输出', blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -233,6 +245,13 @@ class CertDeployment(models.Model):
         verbose_name_plural = '证书分发'
         db_table = 'cloud_cert_deployment'
         ordering = ['-id']
+        constraints = [
+            # 同证书对同一目标（同路径）不重复登记
+            models.UniqueConstraint(
+                fields=['certificate', 'target_type', 'server', 'deploy_path'],
+                name='uniq_cert_deployment_target',
+            ),
+        ]
 
     def __str__(self):
         return f'{self.certificate.name} -> {self.get_target_type_display()}'

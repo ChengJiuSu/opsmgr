@@ -6,7 +6,7 @@ from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
-from .models import Certificate, CloudAccount, DnsRecord, Domain
+from .models import CertDeployment, Certificate, CloudAccount, DnsRecord, Domain
 
 # 域名整体校验（简化 RFC 1035：小写字母/数字/连字符，点分，末级 ≥2 位字母）
 DOMAIN_RE = re.compile(r'^(?!-)[a-z0-9-]{1,63}(?<!-)(\.(?!-)[a-z0-9-]{1,63}(?<!-))+$')
@@ -153,13 +153,14 @@ class CertificateSerializer(serializers.ModelSerializer):
     provider_code = serializers.CharField(source='cloud_account.provider.code', read_only=True)
     has_private_key = serializers.SerializerMethodField()
     days_left = serializers.SerializerMethodField()
+    deployment_count = serializers.IntegerField(source='deployments.count', read_only=True)
 
     class Meta:
         model = Certificate
         fields = [
             'id', 'name', 'domains', 'cloud_account', 'cloud_account_name', 'provider_code',
             'status', 'has_private_key', 'issued_at', 'expires_at', 'days_left',
-            'auto_renew', 'last_error', 'remark', 'created_at', 'updated_at',
+            'auto_renew', 'deployment_count', 'last_error', 'remark', 'created_at', 'updated_at',
         ]
         read_only_fields = ['status', 'issued_at', 'expires_at', 'last_error']
 
@@ -194,4 +195,48 @@ class CertificateSerializer(serializers.ModelSerializer):
             for field in ('domains', 'cloud_account'):
                 if field in attrs and attrs[field] != getattr(self.instance, field):
                     raise serializers.ValidationError('已签发证书不能修改域名列表 / 验证账号，请新建证书')
+        return attrs
+
+
+class CertDeploymentSerializer(serializers.ModelSerializer):
+    """证书分发目标序列化器。
+
+    - target_type=server 时 server 必填；其他类型为预留（deploy.py 桩），
+      仅允许登记不允许执行（视图层拦截并给出中文提示）；
+    - 部署目录必须为绝对路径，禁止根目录等危险路径。
+    """
+
+    certificate_name = serializers.CharField(source='certificate.name', read_only=True)
+    server_name = serializers.CharField(source='server.name', read_only=True, default=None)
+    server_ip = serializers.CharField(source='server.conn_ip', read_only=True, default=None)
+    credential_name = serializers.CharField(source='credential.name', read_only=True, default=None)
+    target_type_display = serializers.CharField(source='get_target_type_display', read_only=True)
+
+    class Meta:
+        model = CertDeployment
+        fields = [
+            'id', 'certificate', 'certificate_name', 'target_type', 'target_type_display',
+            'server', 'server_name', 'server_ip', 'credential', 'credential_name',
+            'deploy_path', 'reload_cmd', 'auto_deploy',
+            'status', 'last_deployed_at', 'last_error', 'last_output',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = ['status', 'last_deployed_at', 'last_error', 'last_output']
+
+    def validate_deploy_path(self, value):
+        value = (value or '').strip().rstrip('/')
+        if not value.startswith('/'):
+            raise serializers.ValidationError('部署目录须为绝对路径，如 /etc/nginx/ssl')
+        if value in ('', '/bin', '/sbin', '/usr', '/etc', '/boot', '/dev', '/proc', '/sys'):
+            raise serializers.ValidationError(f'禁止部署到系统关键目录：{value or "/"}')
+        return value
+
+    def validate(self, attrs):
+        target_type = attrs.get('target_type', getattr(self.instance, 'target_type', 'server'))
+        server = attrs.get('server', getattr(self.instance, 'server', None))
+        if target_type == 'server':
+            if server is None:
+                raise serializers.ValidationError('目标类型为服务器时必须选择服务器')
+        else:
+            attrs['server'] = None
         return attrs

@@ -65,8 +65,15 @@
           </el-tag>
         </template>
       </el-table-column>
+      <el-table-column label="分发目标" width="90">
+        <template #default="{ row }">
+          <el-link type="primary" :underline="false" @click="openDeployments(row)">
+            {{ row.deployment_count }} 个
+          </el-link>
+        </template>
+      </el-table-column>
       <el-table-column prop="remark" label="备注" min-width="100" show-overflow-tooltip />
-      <el-table-column v-if="authStore.isStaff" label="操作" width="310" fixed="right">
+      <el-table-column v-if="authStore.isStaff" label="操作" width="380" fixed="right">
         <template #default="{ row }">
           <el-button
             v-if="['pending', 'failed'].includes(row.status)"
@@ -80,6 +87,7 @@
             type="warning"
             @click="handleRenew(row)"
           >续签</el-button>
+          <el-button size="small" @click="openDeployments(row)">分发</el-button>
           <el-button
             v-if="row.status === 'issued'"
             size="small"
@@ -154,6 +162,151 @@
       <el-button type="primary" :loading="submitting" @click="handleSubmit">确定</el-button>
     </template>
   </el-dialog>
+
+  <!-- 分发目标抽屉 -->
+  <el-drawer v-model="deployVisible" :title="`证书分发 — ${deployCert?.name || ''}`" size="70%">
+    <div class="toolbar">
+      <div class="tip">
+        分发到服务器：推送 <code>{{ safeName(deployCert?.name) }}.crt / .key / .fullchain.pem</code>
+        到部署目录（私钥 0600、覆盖前自动备份），随后执行重载命令。
+        开启「自动分发」的目标在证书续签成功后自动重新推送。
+      </div>
+      <div v-if="authStore.isStaff" style="white-space:nowrap">
+        <el-button
+          :disabled="!deployRows.length || deployCert?.status !== 'issued'"
+          :loading="deployingAll"
+          @click="handleDeployAll"
+        >全部分发</el-button>
+        <el-button type="primary" :icon="Plus" @click="openDeployDialog()">新增目标</el-button>
+      </div>
+    </div>
+
+    <el-table v-loading="deployLoading" :data="deployRows" stripe>
+      <el-table-column label="目标" min-width="200">
+        <template #default="{ row }">
+          <template v-if="row.target_type === 'server'">
+            <el-tag size="small" type="success">服务器</el-tag>
+            <span style="margin-left:6px">{{ row.server_name }}（{{ row.server_ip }}）</span>
+          </template>
+          <template v-else>
+            <el-tag size="small" type="warning">{{ row.target_type_display }}</el-tag>
+            <span class="muted" style="margin-left:6px">暂未接入</span>
+          </template>
+        </template>
+      </el-table-column>
+      <el-table-column prop="deploy_path" label="部署目录" min-width="160" show-overflow-tooltip />
+      <el-table-column prop="reload_cmd" label="重载命令" min-width="150" show-overflow-tooltip>
+        <template #default="{ row }">
+          <span v-if="row.reload_cmd">{{ row.reload_cmd }}</span>
+          <span v-else class="muted">不执行</span>
+        </template>
+      </el-table-column>
+      <el-table-column prop="credential_name" label="凭据" min-width="110">
+        <template #default="{ row }">
+          <span v-if="row.credential_name">{{ row.credential_name }}</span>
+          <span v-else class="muted">主机默认</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="自动分发" width="90">
+        <template #default="{ row }">
+          <el-switch
+            v-if="authStore.isStaff"
+            :model-value="row.auto_deploy"
+            @change="(v) => toggleAutoDeploy(row, v)"
+          />
+          <el-tag v-else size="small" :type="row.auto_deploy ? 'success' : 'info'">
+            {{ row.auto_deploy ? '开' : '关' }}
+          </el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="状态" width="100">
+        <template #default="{ row }">
+          <el-tooltip v-if="row.status === 'failed'" :content="row.last_error" placement="top">
+            <el-tag size="small" type="danger">失败</el-tag>
+          </el-tooltip>
+          <el-tag v-else size="small" :type="DEPLOY_TAG[row.status]">
+            {{ DEPLOY_LABELS[row.status] }}
+            <el-icon v-if="row.status === 'deploying'" class="is-loading" style="margin-left:2px"><Loading /></el-icon>
+          </el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="最近部署" width="160">
+        <template #default="{ row }">
+          <span v-if="row.last_deployed_at">{{ row.last_deployed_at.replace('T', ' ').slice(0, 19) }}</span>
+          <span v-else class="muted">—</span>
+        </template>
+      </el-table-column>
+      <el-table-column v-if="authStore.isStaff" label="操作" width="250" fixed="right">
+        <template #default="{ row }">
+          <el-button
+            size="small"
+            type="primary"
+            :disabled="deployCert?.status !== 'issued' || row.target_type !== 'server'"
+            :loading="deployingId === row.id"
+            @click="handleDeploy(row)"
+          >分发</el-button>
+          <el-button v-if="row.last_output" size="small" @click="showOutput(row)">日志</el-button>
+          <el-button size="small" :icon="Edit" @click="openDeployDialog(row)">编辑</el-button>
+          <el-button size="small" type="danger" :icon="Delete" @click="handleDeployDelete(row)">删除</el-button>
+        </template>
+      </el-table-column>
+    </el-table>
+  </el-drawer>
+
+  <!-- 新增/编辑分发目标弹窗 -->
+  <el-dialog v-model="deployDialogVisible" :title="editDeploy ? '编辑分发目标' : '新增分发目标'" width="560px">
+    <el-form ref="deployFormRef" :model="deployForm" :rules="deployRules" label-width="100px">
+      <el-form-item label="目标类型" prop="target_type">
+        <el-select v-model="deployForm.target_type" style="width:100%">
+          <el-option
+            v-for="(label, key) in DEPLOY_TARGETS"
+            :key="key"
+            :label="key === 'server' ? label : `${label}（暂未接入）`"
+            :value="key"
+          />
+        </el-select>
+      </el-form-item>
+      <el-form-item v-if="deployForm.target_type === 'server'" label="服务器" prop="server">
+        <el-select v-model="deployForm.server" filterable style="width:100%">
+          <el-option
+            v-for="s in serverOptions"
+            :key="s.id"
+            :label="`${s.name}（${s.public_ip || s.private_ip}）`"
+            :value="s.id"
+          />
+        </el-select>
+        <div class="tip">agent 执行通道主机暂不支持分发（证书内容不出通道）</div>
+      </el-form-item>
+      <el-form-item label="部署目录" prop="deploy_path">
+        <el-input v-model="deployForm.deploy_path" placeholder="/etc/nginx/ssl" />
+        <div class="tip">
+          绝对路径；文件将落为
+          <code>{{ deployForm.deploy_path || '/etc/nginx/ssl' }}/{{ safeName(deployCert?.name) }}.crt</code> 等
+        </div>
+      </el-form-item>
+      <el-form-item label="重载命令">
+        <el-input v-model="deployForm.reload_cmd" placeholder="如 nginx -t && nginx -s reload（留空不执行）" />
+      </el-form-item>
+      <el-form-item label="连接凭据">
+        <el-select v-model="deployForm.credential" clearable placeholder="留空用主机默认 SSH 用户" style="width:100%">
+          <el-option v-for="c in credentialOptions" :key="c.id" :label="c.name" :value="c.id" />
+        </el-select>
+      </el-form-item>
+      <el-form-item label="自动分发">
+        <el-switch v-model="deployForm.auto_deploy" />
+        <span class="tip" style="margin-left:8px">证书续签成功后自动重新推送</span>
+      </el-form-item>
+    </el-form>
+    <template #footer>
+      <el-button @click="deployDialogVisible = false">取消</el-button>
+      <el-button type="primary" :loading="deploySubmitting" @click="handleDeploySubmit">确定</el-button>
+    </template>
+  </el-dialog>
+
+  <!-- 分发执行日志 -->
+  <el-dialog v-model="outputVisible" title="最近分发输出" width="70%">
+    <pre class="output">{{ outputText }}</pre>
+  </el-dialog>
 </template>
 
 <script setup>
@@ -161,10 +314,14 @@ import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { Plus, Edit, Delete, Download, Loading } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../../stores/auth'
+import { getServers } from '../../api/assets'
+import { getCredentials } from '../../api/tasks'
 import {
   getCloudAccounts, getDomains, getDnsRecords,
   getCertificates, createCertificate, updateCertificate, deleteCertificate,
   issueCertificate, renewCertificate, downloadCertificate,
+  getCertDeployments, createCertDeployment, updateCertDeployment,
+  deleteCertDeployment, deployCertDeployment, deployCertificateAll,
 } from '../../api/cloud'
 
 const authStore = useAuthStore()
@@ -173,6 +330,15 @@ const STATUS_LABELS = { pending: '待申请', issuing: '申请中', issued: '已
 const STATUS_TAG = { pending: 'info', issuing: 'warning', issued: 'success', failed: 'danger', expired: 'danger' }
 // DNS 验证支持的厂商（与后端 ACME_DNS_HOOKS 对应）
 const ACME_PROVIDERS = ['aliyun', 'tencent']
+// 分发目标类型与状态（server 已实现，其余为后端预留桩）
+const DEPLOY_TARGETS = { server: '服务器', lb: '负载均衡', ga: '全球加速', cdn: 'CDN' }
+const DEPLOY_LABELS = { pending: '待部署', deploying: '部署中', success: '成功', failed: '失败' }
+const DEPLOY_TAG = { pending: 'info', deploying: 'warning', success: 'success', failed: 'danger' }
+
+// 证书文件名前缀：与后端 deploy.safe_cert_name / 下载包同口径
+function safeName(name) {
+  return (name || '').replace(/[^\w.*-]/g, '_')
+}
 
 const loading = ref(false)
 const submitting = ref(false)
@@ -308,14 +474,159 @@ async function handleDelete(row) {
   fetchData()
 }
 
+// ── 分发目标 ──────────────────────────────────────────────
+const deployVisible = ref(false)
+const deployLoading = ref(false)
+const deployCert = ref(null)
+const deployRows = ref([])
+const deployingId = ref(null)
+const deployingAll = ref(false)
+const serverOptions = ref([])
+const credentialOptions = ref([])
+
+const deployDialogVisible = ref(false)
+const deploySubmitting = ref(false)
+const editDeploy = ref(null)
+const deployFormRef = ref()
+const outputVisible = ref(false)
+const outputText = ref('')
+
+const emptyDeployForm = () => ({
+  target_type: 'server', server: null, deploy_path: '/etc/nginx/ssl',
+  reload_cmd: '', credential: null, auto_deploy: true,
+})
+const deployForm = reactive(emptyDeployForm())
+const deployRules = {
+  target_type: [{ required: true, message: '请选择目标类型' }],
+  server: [{ required: true, message: '请选择服务器' }],
+  deploy_path: [{ required: true, message: '请输入部署目录' }],
+}
+
+function openDeployments(row) {
+  deployCert.value = row
+  deployVisible.value = true
+  fetchDeployments()
+}
+
+async function fetchDeployments() {
+  deployLoading.value = true
+  try {
+    const res = await getCertDeployments({ certificate: deployCert.value.id, page_size: 0 })
+    deployRows.value = res.data?.results || []
+  } finally {
+    deployLoading.value = false
+  }
+  scheduleDeployPoll()
+}
+
+// 存在部署中的目标时 5s 轮询
+let deployTimer = null
+function scheduleDeployPoll() {
+  clearTimeout(deployTimer)
+  if (deployVisible.value && deployRows.value.some((r) => r.status === 'deploying')) {
+    deployTimer = setTimeout(fetchDeployments, 5000)
+  }
+}
+onUnmounted(() => clearTimeout(deployTimer))
+
+function openDeployDialog(row = null) {
+  editDeploy.value = row
+  Object.assign(deployForm, row ? { ...row } : emptyDeployForm())
+  deployDialogVisible.value = true
+  deployFormRef.value?.clearValidate()
+}
+
+async function handleDeploySubmit() {
+  await deployFormRef.value.validate()
+  deploySubmitting.value = true
+  try {
+    const payload = { ...deployForm, certificate: deployCert.value.id }
+    if (editDeploy.value) {
+      await updateCertDeployment(editDeploy.value.id, payload)
+      ElMessage.success('更新成功')
+    } else {
+      await createCertDeployment(payload)
+      ElMessage.success('已登记分发目标，点击「分发」推送证书')
+    }
+    deployDialogVisible.value = false
+    fetchDeployments()
+    fetchData()
+  } finally {
+    deploySubmitting.value = false
+  }
+}
+
+async function handleDeploy(row) {
+  await ElMessageBox.confirm(
+    `确定将证书推送到 ${row.server_name}（${row.deploy_path}）吗？`
+    + (row.reload_cmd ? `推送后执行：${row.reload_cmd}` : '推送后不执行重载命令。'),
+    '分发证书',
+    { type: 'warning' },
+  )
+  deployingId.value = row.id
+  try {
+    const res = await deployCertDeployment(row.id)
+    ElMessage.success(res.msg || '已提交分发')
+    fetchDeployments()
+  } finally {
+    deployingId.value = null
+  }
+}
+
+async function handleDeployAll() {
+  await ElMessageBox.confirm(
+    `确定分发到全部 ${deployRows.value.length} 个目标吗？未接入的目标类型将跳过。`,
+    '全部分发',
+    { type: 'warning' },
+  )
+  deployingAll.value = true
+  try {
+    const res = await deployCertificateAll(deployCert.value.id)
+    ElMessage.success(res.msg || '已提交分发')
+    fetchDeployments()
+  } finally {
+    deployingAll.value = false
+  }
+}
+
+async function toggleAutoDeploy(row, value) {
+  try {
+    await updateCertDeployment(row.id, { auto_deploy: value })
+    row.auto_deploy = value
+  } catch {
+    fetchDeployments()
+  }
+}
+
+function showOutput(row) {
+  outputText.value = row.last_output || ''
+  outputVisible.value = true
+}
+
+async function handleDeployDelete(row) {
+  await ElMessageBox.confirm(
+    '确定删除该分发目标吗？目标机上已部署的证书文件不受影响。',
+    '警告',
+    { type: 'warning' },
+  )
+  await deleteCertDeployment(row.id)
+  ElMessage.success('删除成功')
+  fetchDeployments()
+  fetchData()
+}
+
 onMounted(async () => {
   fetchData()
   if (authStore.isStaff) {
-    const [accRes, domRes, recRes] = await Promise.all([
+    const [accRes, domRes, recRes, svrRes, credRes] = await Promise.all([
       getCloudAccounts({ page_size: 0, enabled: 'true' }),
       getDomains({ page_size: 0 }),
       getDnsRecords({ page_size: 0 }),
+      getServers({ page_size: 0 }),
+      getCredentials({ page_size: 0 }),
     ])
+    serverOptions.value = svrRes.data?.results || []
+    credentialOptions.value = credRes.data?.results || []
     accountOptions.value = accRes.data?.results || []
     // 建议项按主域名分组：主域名 + *.通配 + 该域名下子域名 FQDN（A/AAAA/CNAME），可自由输入
     const records = recRes.data?.results || []
@@ -334,4 +645,10 @@ onMounted(async () => {
 .toolbar-left { display: flex; gap: 8px; }
 .muted { color: #909399; }
 .tip { font-size: 12px; color: #909399; line-height: 1.6; }
+.tip code { background: #f4f4f5; padding: 0 4px; border-radius: 3px; }
+.output {
+  margin: 0; padding: 12px; background: #1e1e1e; color: #d4d4d4;
+  font-size: 12px; line-height: 1.6; border-radius: 4px;
+  max-height: 60vh; overflow: auto; white-space: pre-wrap; word-break: break-all;
+}
 </style>

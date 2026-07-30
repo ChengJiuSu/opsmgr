@@ -38,3 +38,12 @@ export const renewCertificate = (id) => request.post(`/api/cloud/certificates/${
 // 证书材料 zip 包（blob 响应由调用方触发下载）
 export const downloadCertificate = (id) =>
   request.get(`/api/cloud/certificates/${id}/download/`, { responseType: 'blob' })
+
+// 证书分发目标
+export const getCertDeployments = (params) => request.get('/api/cloud/cert-deployments/', { params })
+export const createCertDeployment = (data) => request.post('/api/cloud/cert-deployments/', data)
+export const updateCertDeployment = (id, data) => request.patch(`/api/cloud/cert-deployments/${id}/`, data)
+export const deleteCertDeployment = (id) => request.delete(`/api/cloud/cert-deployments/${id}/`)
+// 分发为后台异步任务（ansible 推送 + 重载），提交即返回
+export const deployCertDeployment = (id) => request.post(`/api/cloud/cert-deployments/${id}/deploy/`)
+export const deployCertificateAll = (id) => request.post(`/api/cloud/certificates/${id}/deploy_all/`)

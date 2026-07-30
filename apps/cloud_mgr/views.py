@@ -4,7 +4,8 @@
 - 主域名/解析记录：管理员可写、登录用户只读；
 - 解析记录以本地库为准，增删改即时推送厂商 DNS；推送失败保留本地记录并
   标记 sync_status=failed，可重试；
-- 域名 sync_records 从厂商侧全量拉取镜像到本地（忽略 _acme-challenge 记录）。
+- 域名 sync_records 从厂商侧全量拉取镜像到本地（忽略 _acme-challenge 记录）；
+- 证书：acme.sh DNS 验证签发/续签（后台异步）、zip 下载、分发目标管理与推送。
 """
 import io
 import logging
@@ -24,15 +25,17 @@ from common.permissions import IsAdmin, IsAdminOrReadOnly
 from common.response import fail, ok
 
 from .acme import supported_provider_codes
-from .models import Certificate, CloudAccount, DnsRecord, Domain
+from .deploy import supported_target_types
+from .models import CertDeployment, Certificate, CloudAccount, DnsRecord, Domain
 from .providers import DnsProviderError, DnsRecordData, get_dns_provider
 from .serializers import (
+    CertDeploymentSerializer,
     CertificateSerializer,
     CloudAccountSerializer,
     DnsRecordSerializer,
     DomainSerializer,
 )
-from .tasks import dispatch_issue
+from .tasks import dispatch_deploy, dispatch_issue
 
 logger = logging.getLogger(__name__)
 
@@ -371,9 +374,93 @@ class CertificateViewSet(viewsets.ModelViewSet):
         response['Cache-Control'] = 'no-store'
         return response
 
+    @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
+    @action(detail=True, methods=['post'])
+    def deploy_all(self, request, pk=None):
+        """分发到该证书全部已登记目标（跳过分发中与未接入类型）。"""
+        cert = self.get_object()
+        if cert.status != 'issued' or not cert.cert_pem:
+            return fail('证书尚未签发，请先申请证书。')
+        dispatched, skipped = [], []
+        for deployment in cert.deployments.all():
+            if deployment.status == 'deploying':
+                skipped.append(f'{deployment} 正在分发中')
+                continue
+            if deployment.target_type not in supported_target_types():
+                skipped.append(f'{deployment.get_target_type_display()} 暂未接入')
+                continue
+            dispatch_deploy(deployment)
+            dispatched.append(deployment.id)
+        if not dispatched:
+            return fail('没有可分发的目标。' + ('跳过：' + '；'.join(skipped) if skipped else ''))
+        return ok(
+            {'dispatched': dispatched, 'skipped': skipped},
+            msg=f'已提交 {len(dispatched)} 个目标的分发'
+                + (f'，跳过 {len(skipped)} 个。' if skipped else '。'),
+        )
+
     def destroy(self, request, *args, **kwargs):
         cert = self.get_object()
         if cert.status == 'issuing':
             return fail('证书正在申请中，禁止删除。')
         cert.delete()
         return ok(msg='已删除（acme 侧续签记录一并失效，不影响已部署副本）。')
+
+
+class CertDeploymentViewSet(viewsets.ModelViewSet):
+    """证书分发目标：登记目标 + 触发分发（后台异步）。
+
+    - deploy：单目标分发；deploying 状态防重入；未接入的目标类型明确拒绝；
+    - 证书签发/续签成功后 auto_deploy 目标由 tasks.run_issue 自动触发；
+    - 分发前置校验：证书已签发、服务器为直连通道（agent 通道 v1 不支持）。
+    """
+
+    queryset = CertDeployment.objects.select_related(
+        'certificate', 'server', 'credential',
+    ).all()
+    serializer_class = CertDeploymentSerializer
+    permission_classes = [IsAdminOrReadOnly]
+    pagination_class = StandardPagination
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        certificate = self.request.query_params.get('certificate')
+        if certificate and certificate.isdigit():
+            qs = qs.filter(certificate_id=certificate)
+        status_param = self.request.query_params.get('status')
+        if status_param:
+            qs = qs.filter(status=status_param)
+        target_type = self.request.query_params.get('target_type')
+        if target_type:
+            qs = qs.filter(target_type=target_type)
+        return qs
+
+    def _validate_deployable(self, deployment):
+        """分发前置校验，返回错误信息或 None。"""
+        if deployment.status == 'deploying':
+            return '该目标正在分发中，请等待完成。'
+        if deployment.target_type not in supported_target_types():
+            return (f'{deployment.get_target_type_display()}证书分发暂未接入'
+                    f'（接口已预留），当前仅支持服务器。')
+        cert = deployment.certificate
+        if cert.status != 'issued' or not cert.cert_pem:
+            return '证书尚未签发，请先申请证书。'
+        return None
+
+    @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
+    @action(detail=True, methods=['post'])
+    def deploy(self, request, pk=None):
+        """分发证书到该目标（后台异步执行 ansible 推送 + 重载）。"""
+        deployment = self.get_object()
+        err = self._validate_deployable(deployment)
+        if err:
+            return fail(err)
+        dispatch_deploy(deployment)
+        return ok(self.get_serializer(deployment).data, msg='已提交分发，请稍后刷新查看结果。')
+
+    def destroy(self, request, *args, **kwargs):
+        deployment = self.get_object()
+        if deployment.status == 'deploying':
+            return fail('该目标正在分发中，禁止删除。')
+        deployment.delete()
+        return ok(msg='已删除分发目标（目标机上已部署的证书文件不受影响）。')
