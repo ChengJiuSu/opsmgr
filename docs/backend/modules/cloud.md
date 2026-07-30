@@ -54,7 +54,7 @@ apps/cloud_mgr/
 | `/api/cloud/certificates/` | CRUD | 管理员写/登录读 | 已签发锁定域名与验证账号；issuing 禁止删除 |
 | `/api/cloud/certificates/{id}/issue/` | POST | 管理员 | 后台异步签发（thread/celery，同 TASK_EXEC_BACKEND）；已签发等价强制重签 |
 | `/api/cloud/certificates/{id}/renew/` | POST | 管理员 | 强制重签（--force），仅 issued 状态 |
-| `/api/cloud/certificates/{id}/download/` | GET | 仅管理员 | 完整 PEM（cert/key/fullchain），前端组装文件下载 |
+| `/api/cloud/certificates/{id}/download/` | GET | 仅管理员 | zip 包（`<名称>.crt` / `.key` / `.fullchain.pem` + README.txt），`Cache-Control: no-store` |
 
 筛选参数：accounts `provider`（数字 id / code）、`enabled`；domains
 `cloud_account`、`keyword`；dns-records `domain`、`type`、`keyword`、`sync_status`。

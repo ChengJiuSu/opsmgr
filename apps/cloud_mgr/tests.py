@@ -361,16 +361,32 @@ class CertificateApiTests(BaseApiTest):
         r = admin.patch(f'/api/cloud/certificates/{cert.id}/', {'auto_renew': False}, format='json')
         self.assertEqual(r.status_code, 200)
 
-    def test_download_admin_only_and_full_pem(self):
+    def test_download_admin_only_returns_zip(self):
+        import io
+        import zipfile
+
         cert = self._create_cert(status='issued', cert_pem='CERT', private_key_pem='KEY', chain_pem='CHAIN')
         normal = self._client(is_staff=False)
         self.assertEqual(normal.get(f'/api/cloud/certificates/{cert.id}/download/').status_code, 403)
         admin = self._client()
         r = admin.get(f'/api/cloud/certificates/{cert.id}/download/')
         self.assertEqual(r.status_code, 200)
-        data = r.json()['data']
-        self.assertEqual(data['key_pem'], 'KEY')
-        self.assertEqual(data['fullchain_pem'], 'CHAIN')
+        self.assertEqual(r['Content-Type'], 'application/zip')
+        self.assertIn('web-cert.zip', r['Content-Disposition'])
+        self.assertEqual(r['Cache-Control'], 'no-store')
+        with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+            self.assertEqual(
+                sorted(zf.namelist()),
+                ['README.txt', 'web-cert.crt', 'web-cert.fullchain.pem', 'web-cert.key'],
+            )
+            self.assertEqual(zf.read('web-cert.key').decode(), 'KEY')
+            self.assertEqual(zf.read('web-cert.fullchain.pem').decode(), 'CHAIN')
+
+    def test_download_before_issued_rejected(self):
+        cert = self._create_cert(status='pending')
+        admin = self._client()
+        r = admin.get(f'/api/cloud/certificates/{cert.id}/download/')
+        self.assertEqual(r.status_code, 400)
 
     @patch('apps.cloud_mgr.tasks.issue_certificate')
     def test_renew_expiring_scan(self, mock_issue):

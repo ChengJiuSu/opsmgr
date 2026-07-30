@@ -6,9 +6,13 @@
   标记 sync_status=failed，可重试；
 - 域名 sync_records 从厂商侧全量拉取镜像到本地（忽略 _acme-challenge 记录）。
 """
+import io
 import logging
+import re
+import zipfile
 
 from django.db import transaction
+from django.http import HttpResponse
 from django.utils import timezone
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema
@@ -272,7 +276,7 @@ class CertificateViewSet(viewsets.ModelViewSet):
 
     - issue：pending/failed 首次申请；issued 也可手动触发（等价强制重签）；
     - renew：已签发证书强制重签（--force）；
-    - download：完整 PEM（含私钥），仅管理员；
+    - download：证书/私钥/完整链打包 zip（含私钥，no-store），仅管理员；
     - issuing 状态禁止重复触发与删除。
     """
 
@@ -328,21 +332,44 @@ class CertificateViewSet(viewsets.ModelViewSet):
         dispatch_issue(cert, force=True)
         return ok(self.get_serializer(cert).data, msg='已提交续签，请稍后刷新查看。')
 
-    @extend_schema(responses=OpenApiTypes.OBJECT)
+    @extend_schema(responses={200: OpenApiTypes.BINARY})
     @action(detail=True, methods=['get'], permission_classes=[IsAdmin])
     def download(self, request, pk=None):
-        """完整证书材料（含私钥），仅管理员，前端组装文件下载。"""
+        """完整证书材料打包 zip 下载（含私钥），仅管理员。
+
+        包内：<名称>.crt（证书）/ <名称>.key（私钥）/ <名称>.fullchain.pem（完整链）
+        + README.txt（域名与有效期信息）。
+        """
         cert = self.get_object()
         if cert.status != 'issued' or not cert.cert_pem:
             return fail('证书尚未签发，无可下载内容。')
-        return ok({
-            'name': cert.name,
-            'domains': cert.domains,
-            'cert_pem': cert.cert_pem,
-            'key_pem': cert.private_key_pem,
-            'fullchain_pem': cert.chain_pem,
-            'expires_at': cert.expires_at,
-        })
+
+        # 文件名取证书名称，去掉路径分隔符等不安全字符
+        safe_name = re.sub(r'[^\w.*-]', '_', cert.name) or f'cert-{cert.pk}'
+        readme = (
+            f'证书名称：{cert.name}\n'
+            f'域名：{", ".join(cert.domains)}\n'
+            f'签发时间：{cert.issued_at.strftime("%Y-%m-%d %H:%M:%S") if cert.issued_at else "-"}\n'
+            f'过期时间：{cert.expires_at.strftime("%Y-%m-%d %H:%M:%S") if cert.expires_at else "-"}\n'
+            f'\n文件说明：\n'
+            f'  {safe_name}.crt            证书（server_certificate）\n'
+            f'  {safe_name}.key            私钥（请妥善保管，勿外传）\n'
+            f'  {safe_name}.fullchain.pem  证书 + 中间链（Nginx ssl_certificate 用此文件）\n'
+        )
+
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(f'{safe_name}.crt', cert.cert_pem)
+            zf.writestr(f'{safe_name}.key', cert.private_key_pem)
+            if cert.chain_pem:
+                zf.writestr(f'{safe_name}.fullchain.pem', cert.chain_pem)
+            zf.writestr('README.txt', readme)
+
+        response = HttpResponse(buffer.getvalue(), content_type='application/zip')
+        response['Content-Disposition'] = f'attachment; filename="{safe_name}.zip"'
+        # 含私钥，禁止任何中间层缓存
+        response['Cache-Control'] = 'no-store'
+        return response
 
     def destroy(self, request, *args, **kwargs):
         cert = self.get_object()

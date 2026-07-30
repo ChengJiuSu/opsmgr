@@ -35,4 +35,6 @@ export const deleteCertificate = (id) => request.delete(`/api/cloud/certificates
 // 申请/续签为后台异步任务，提交即返回
 export const issueCertificate = (id) => request.post(`/api/cloud/certificates/${id}/issue/`)
 export const renewCertificate = (id) => request.post(`/api/cloud/certificates/${id}/renew/`)
-export const downloadCertificate = (id) => request.get(`/api/cloud/certificates/${id}/download/`)
+// 证书材料 zip 包（blob 响应由调用方触发下载）
+export const downloadCertificate = (id) =>
+  request.get(`/api/cloud/certificates/${id}/download/`, { responseType: 'blob' })

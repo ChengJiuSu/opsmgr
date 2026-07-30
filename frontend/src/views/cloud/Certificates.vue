@@ -275,26 +275,17 @@ async function handleRenew(row) {
   fetchData()
 }
 
-// 下载证书材料：cert / key / fullchain 三个文件打包为浏览器逐个下载
+// 下载证书 zip 包（后端打包 crt/key/fullchain + README）
 async function handleDownload(row) {
-  const res = await downloadCertificate(row.id)
-  const data = res.data
-  const files = [
-    [`${data.name}.crt`, data.cert_pem],
-    [`${data.name}.key`, data.key_pem],
-    [`${data.name}.fullchain.pem`, data.fullchain_pem],
-  ]
-  for (const [filename, content] of files) {
-    if (!content) continue
-    const blob = new Blob([content], { type: 'application/x-pem-file' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = filename
-    a.click()
-    URL.revokeObjectURL(url)
-  }
-  ElMessage.success('已下载证书、私钥与完整链')
+  const blob = await downloadCertificate(row.id)
+  const filename = `${row.name.replace(/[^\w.*-]/g, '_')}.zip`
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(url)
+  ElMessage.success('已下载证书压缩包')
 }
 
 async function toggleAutoRenew(row, value) {
