@@ -8,10 +8,11 @@
           placeholder="搜索主域名 / 子域名 / 记录值"
           clearable
           style="width:260px"
-          @keyup.enter="fetchData"
-          @clear="fetchData"
+          @input="searchDebounced"
+          @keyup.enter="handleSearch"
+          @clear="handleSearch"
         />
-        <el-select v-model="filter.cloudAccount" placeholder="云账号" clearable style="width:180px" @change="fetchData">
+        <el-select v-model="filter.cloudAccount" placeholder="云账号" clearable style="width:180px" @change="handleSearch">
           <el-option v-for="a in accountOptions" :key="a.id" :label="a.name" :value="a.id" />
         </el-select>
       </div>
@@ -257,10 +258,11 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, onMounted, onUnmounted } from 'vue'
 import { Plus, Edit, Delete, Download } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../../stores/auth'
+import { debounce } from '../../utils/debounce'
 import { getServers } from '../../api/assets'
 import {
   getCloudAccounts, getDomains, createDomain, updateDomain, deleteDomain,
@@ -335,9 +337,20 @@ async function loadRecords(domainId, force = false) {
   recordsMap[domainId] = res.data?.results || []
 }
 
+// 搜索：回到第一页再查，避免停留在越界页码上
+function handleSearch() {
+  searchDebounced.cancel()
+  page.value = 1
+  fetchData()
+}
+
+// 边输边查（300ms 防抖），无需回车
+const searchDebounced = debounce(handleSearch)
+onUnmounted(() => searchDebounced.cancel())
+
 function clearKeyword() {
   filter.keyword = ''
-  fetchData()
+  handleSearch()
 }
 
 function handleExpandChange(row, expandedRows) {

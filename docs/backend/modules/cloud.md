@@ -60,7 +60,7 @@ apps/cloud_mgr/
 | `/api/cloud/cert-deployments/?certificate=` | CRUD | 管理员写/登录读 | 分发目标登记；deploying 禁止删除 |
 | `/api/cloud/cert-deployments/{id}/deploy/` | POST | 管理员 | 单目标分发（后台异步）；证书未签发 / agent 通道主机 / 未接入类型均拒绝 |
 
-筛选参数：accounts `provider`（数字 id / code）、`enabled`；domains
+筛选参数：accounts `provider`（数字 id / code）、`enabled`、`keyword`（名称 / AK）；domains
 `cloud_account`、`keyword`；dns-records `domain`、`type`、`keyword`、`sync_status`；
 cert-deployments `certificate`、`target_type`、`status`。
 

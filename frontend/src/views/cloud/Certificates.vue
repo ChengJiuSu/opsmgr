@@ -8,10 +8,11 @@
           placeholder="搜索证书名称"
           clearable
           style="width:200px"
-          @keyup.enter="fetchData"
-          @clear="fetchData"
+          @input="searchDebounced"
+          @keyup.enter="handleSearch"
+          @clear="handleSearch"
         />
-        <el-select v-model="filter.status" placeholder="状态" clearable style="width:130px" @change="fetchData">
+        <el-select v-model="filter.status" placeholder="状态" clearable style="width:130px" @change="handleSearch">
           <el-option v-for="(label, key) in STATUS_LABELS" :key="key" :label="label" :value="key" />
         </el-select>
       </div>
@@ -314,6 +315,7 @@ import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { Plus, Edit, Delete, Download, Loading } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../../stores/auth'
+import { debounce } from '../../utils/debounce'
 import { getServers } from '../../api/assets'
 import { getCredentials } from '../../api/tasks'
 import {
@@ -383,6 +385,17 @@ async function fetchData() {
   }
   schedulePoll()
 }
+
+// 搜索：回到第一页再查
+function handleSearch() {
+  searchDebounced.cancel()
+  page.value = 1
+  fetchData()
+}
+
+// 边输边查（300ms 防抖），无需回车
+const searchDebounced = debounce(handleSearch)
+onUnmounted(() => searchDebounced.cancel())
 
 // 存在申请中的证书时 5s 轮询刷新
 let pollTimer = null

@@ -100,6 +100,20 @@ class CloudAccountApiTests(BaseApiTest):
         self.assertEqual(r.status_code, 400)
         self.assertIn('主域名', r.json()['msg'])
 
+    def test_keyword_matches_name_and_access_key(self):
+        CloudAccount.objects.create(
+            name='tx-backup', provider=self.provider, access_key='AKID-TX', secret_key='S',
+        )
+        admin = self._client()
+
+        def names(keyword):
+            r = admin.get('/api/cloud/accounts/', {'keyword': keyword})
+            return sorted(a['name'] for a in r.json()['data']['results'])
+
+        self.assertEqual(names('backup'), ['tx-backup'])
+        self.assertEqual(names('AKID'), ['tx-backup'])
+        self.assertEqual(names('ali'), ['ali-main'])
+
     def test_non_admin_forbidden(self):
         normal = self._client(is_staff=False)
         self.assertEqual(normal.get('/api/cloud/accounts/').status_code, 403)

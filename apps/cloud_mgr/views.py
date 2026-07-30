@@ -87,6 +87,9 @@ class CloudAccountViewSet(viewsets.ModelViewSet):
         enabled = self.request.query_params.get('enabled')
         if enabled in ('true', 'false'):
             qs = qs.filter(enabled=enabled == 'true')
+        keyword = self.request.query_params.get('keyword')
+        if keyword:
+            qs = qs.filter(Q(name__icontains=keyword) | Q(access_key__icontains=keyword))
         return qs
 
     def destroy(self, request, *args, **kwargs):

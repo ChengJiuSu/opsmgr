@@ -3,10 +3,19 @@
     <!-- 工具栏 -->
     <div class="toolbar">
       <div class="toolbar-left">
-        <el-select v-model="filter.provider" placeholder="云厂商" clearable style="width:160px" @change="fetchData">
+        <el-input
+          v-model="filter.keyword"
+          placeholder="搜索账号名称 / AK"
+          clearable
+          style="width:200px"
+          @input="searchDebounced"
+          @keyup.enter="handleSearch"
+          @clear="handleSearch"
+        />
+        <el-select v-model="filter.provider" placeholder="云厂商" clearable style="width:160px" @change="handleSearch">
           <el-option v-for="p in providerOptions" :key="p.id" :label="p.name" :value="p.code" />
         </el-select>
-        <el-select v-model="filter.enabled" placeholder="启用状态" clearable style="width:120px" @change="fetchData">
+        <el-select v-model="filter.enabled" placeholder="启用状态" clearable style="width:120px" @change="handleSearch">
           <el-option label="启用" value="true" />
           <el-option label="停用" value="false" />
         </el-select>
@@ -100,9 +109,10 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, onMounted, onUnmounted } from 'vue'
 import { Plus, Edit, Delete } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { debounce } from '../../utils/debounce'
 import { cloudProviderApi, fetchDictOptions } from '../../api/assets'
 import {
   getCloudAccounts, createCloudAccount, updateCloudAccount,
@@ -116,7 +126,7 @@ const tableData = ref([])
 const total = ref(0)
 const page = ref(1)
 const pageSize = ref(20)
-const filter = reactive({ provider: '', enabled: '' })
+const filter = reactive({ keyword: '', provider: '', enabled: '' })
 const providerOptions = ref([])
 const dialogVisible = ref(false)
 const editRow = ref(null)
@@ -133,6 +143,17 @@ const rules = {
   secret_key: [{ required: true, message: '请输入 AccessKey Secret' }],
 }
 
+// 搜索：回到第一页再查
+function handleSearch() {
+  searchDebounced.cancel()
+  page.value = 1
+  fetchData()
+}
+
+// 边输边查（300ms 防抖），无需回车
+const searchDebounced = debounce(handleSearch)
+onUnmounted(() => searchDebounced.cancel())
+
 // AK 掩码展示：保留前 4 后 4
 function maskKey(key) {
   if (!key || key.length <= 8) return key
@@ -143,6 +164,7 @@ async function fetchData() {
   loading.value = true
   try {
     const params = { page: page.value, page_size: pageSize.value }
+    if (filter.keyword) params.keyword = filter.keyword
     if (filter.provider) params.provider = filter.provider
     if (filter.enabled) params.enabled = filter.enabled
     const res = await getCloudAccounts(params)
