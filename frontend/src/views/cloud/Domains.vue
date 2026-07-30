@@ -21,14 +21,97 @@
       </div>
     </div>
 
-    <!-- 域名表格 -->
-    <el-table v-loading="loading" :data="tableData" stripe>
-      <el-table-column prop="name" label="域名" min-width="180">
+    <!-- 域名表格：展开行内嵌子域名解析记录，默认全部展开 -->
+    <el-table
+      v-loading="loading"
+      :data="tableData"
+      stripe
+      :row-key="(row) => String(row.id)"
+      :expand-row-keys="expandedKeys"
+      @expand-change="handleExpandChange"
+    >
+      <el-table-column type="expand" width="40">
         <template #default="{ row }">
-          <el-link type="primary" :underline="false" @click="openRecords(row)">{{ row.name }}</el-link>
+          <div class="records-panel">
+            <div class="records-head">
+              <span class="records-title">子域名解析（{{ recordsMap[row.id]?.length ?? '…' }}）</span>
+              <el-button
+                v-if="authStore.isStaff"
+                size="small"
+                type="primary"
+                :icon="Plus"
+                @click="openRecordDialog(row)"
+              >新增记录</el-button>
+            </div>
+            <el-table
+              v-loading="!recordsMap[row.id]"
+              :data="recordsMap[row.id] || []"
+              size="small"
+              :show-header="true"
+            >
+              <el-table-column label="子域名" min-width="200">
+                <template #default="{ row: rec }">
+                  <span class="fqdn">{{ rec.fqdn }}</span>
+                </template>
+              </el-table-column>
+              <el-table-column prop="type" label="类型" width="80">
+                <template #default="{ row: rec }">
+                  <el-tag size="small" type="info">{{ rec.type }}</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column prop="value" label="记录值" min-width="180" show-overflow-tooltip />
+              <el-table-column prop="ttl" label="TTL" width="70" />
+              <el-table-column label="绑定" min-width="110">
+                <template #default="{ row: rec }">
+                  <template v-if="rec.target_type === 'server'">
+                    <el-tag size="small" type="success">服务器</el-tag>
+                    <span style="margin-left:4px">{{ rec.server_name }}</span>
+                  </template>
+                  <el-tag v-else-if="rec.target_type !== 'none'" size="small" type="warning">
+                    {{ TARGET_LABELS[rec.target_type] }}
+                  </el-tag>
+                  <span v-else class="muted">—</span>
+                </template>
+              </el-table-column>
+              <el-table-column label="启用" width="70">
+                <template #default="{ row: rec }">
+                  <el-tag size="small" :type="rec.enabled ? 'success' : 'info'">
+                    {{ rec.enabled ? '启用' : '暂停' }}
+                  </el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="同步" width="100">
+                <template #default="{ row: rec }">
+                  <el-tooltip v-if="rec.sync_status === 'failed'" :content="rec.sync_error" placement="top">
+                    <el-tag size="small" type="danger">推送失败</el-tag>
+                  </el-tooltip>
+                  <el-tag v-else-if="rec.sync_status === 'pending'" size="small" type="warning">待推送</el-tag>
+                  <el-tag v-else size="small" type="success">已同步</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column v-if="authStore.isStaff" label="操作" width="220">
+                <template #default="{ row: rec }">
+                  <el-button
+                    v-if="rec.sync_status !== 'synced'"
+                    size="small"
+                    type="warning"
+                    :loading="retryingId === rec.id"
+                    @click="handleRetry(row, rec)"
+                  >重推</el-button>
+                  <el-button size="small" :icon="Edit" @click="openRecordDialog(row, rec)">编辑</el-button>
+                  <el-button size="small" type="danger" :icon="Delete" @click="handleRecordDelete(row, rec)">删除</el-button>
+                </template>
+              </el-table-column>
+            </el-table>
+          </div>
         </template>
       </el-table-column>
-      <el-table-column prop="cloud_account_name" label="云账号" min-width="130" />
+      <el-table-column prop="name" label="域名" min-width="180">
+        <template #default="{ row }">
+          <span class="fqdn">{{ row.name }}</span>
+        </template>
+      </el-table-column>
+      <el-table-column prop="cloud_account_name" label="云账号" min-width="120" />
       <el-table-column prop="provider_name" label="云厂商" width="100">
         <template #default="{ row }">
           <el-tag size="small" type="info">{{ row.provider_name }}</el-tag>
@@ -48,15 +131,12 @@
           <span v-else class="muted">未同步</span>
         </template>
       </el-table-column>
-      <el-table-column prop="remark" label="备注" min-width="120" show-overflow-tooltip />
-      <el-table-column label="操作" :width="authStore.isStaff ? 300 : 110" fixed="right">
+      <el-table-column prop="remark" label="备注" min-width="100" show-overflow-tooltip />
+      <el-table-column v-if="authStore.isStaff" label="操作" width="230" fixed="right">
         <template #default="{ row }">
-          <el-button size="small" @click="openRecords(row)">解析记录</el-button>
-          <template v-if="authStore.isStaff">
-            <el-button size="small" :loading="syncingId === row.id" @click="handleSync(row)">同步</el-button>
-            <el-button size="small" :icon="Edit" @click="openDialog(row)">编辑</el-button>
-            <el-button size="small" type="danger" :icon="Delete" @click="handleDelete(row)">删除</el-button>
-          </template>
+          <el-button size="small" :loading="syncingId === row.id" @click="handleSync(row)">同步</el-button>
+          <el-button size="small" :icon="Edit" @click="openDialog(row)">编辑</el-button>
+          <el-button size="small" type="danger" :icon="Delete" @click="handleDelete(row)">删除</el-button>
         </template>
       </el-table-column>
     </el-table>
@@ -110,97 +190,12 @@
     </template>
   </el-dialog>
 
-  <!-- 解析记录抽屉 -->
-  <el-drawer v-model="recordsVisible" :title="`解析记录 — ${currentDomain?.name || ''}`" size="72%">
-    <div class="toolbar">
-      <div class="toolbar-left">
-        <el-input
-          v-model="recordFilter.keyword"
-          placeholder="搜索主机记录"
-          clearable
-          style="width:180px"
-          @keyup.enter="fetchRecords"
-          @clear="fetchRecords"
-        />
-        <el-select v-model="recordFilter.type" placeholder="类型" clearable style="width:110px" @change="fetchRecords">
-          <el-option v-for="t in RECORD_TYPES" :key="t" :label="t" :value="t" />
-        </el-select>
-        <el-select v-model="recordFilter.syncStatus" placeholder="同步状态" clearable style="width:120px" @change="fetchRecords">
-          <el-option label="已同步" value="synced" />
-          <el-option label="待推送" value="pending" />
-          <el-option label="推送失败" value="failed" />
-        </el-select>
-      </div>
-      <el-button v-if="authStore.isStaff" type="primary" :icon="Plus" @click="openRecordDialog()">新增记录</el-button>
-    </div>
-
-    <el-table v-loading="recordsLoading" :data="recordRows" stripe>
-      <el-table-column prop="rr" label="主机记录" min-width="120" />
-      <el-table-column prop="type" label="类型" width="80">
-        <template #default="{ row }">
-          <el-tag size="small" type="info">{{ row.type }}</el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column prop="value" label="记录值" min-width="180" show-overflow-tooltip />
-      <el-table-column prop="ttl" label="TTL" width="70" />
-      <el-table-column label="绑定" min-width="120">
-        <template #default="{ row }">
-          <template v-if="row.target_type === 'server'">
-            <el-tag size="small" type="success">服务器</el-tag>
-            <span style="margin-left:4px">{{ row.server_name }}</span>
-          </template>
-          <el-tag v-else-if="row.target_type !== 'none'" size="small" type="warning">
-            {{ TARGET_LABELS[row.target_type] }}
-          </el-tag>
-          <span v-else class="muted">—</span>
-        </template>
-      </el-table-column>
-      <el-table-column label="启用" width="70">
-        <template #default="{ row }">
-          <el-tag size="small" :type="row.enabled ? 'success' : 'info'">{{ row.enabled ? '启用' : '暂停' }}</el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column label="同步" width="110">
-        <template #default="{ row }">
-          <el-tooltip v-if="row.sync_status === 'failed'" :content="row.sync_error" placement="top">
-            <el-tag size="small" type="danger">推送失败</el-tag>
-          </el-tooltip>
-          <el-tag v-else-if="row.sync_status === 'pending'" size="small" type="warning">待推送</el-tag>
-          <el-tag v-else size="small" type="success">已同步</el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column v-if="authStore.isStaff" label="操作" width="220" fixed="right">
-        <template #default="{ row }">
-          <el-button
-            v-if="row.sync_status !== 'synced'"
-            size="small"
-            type="warning"
-            :loading="retryingId === row.id"
-            @click="handleRetry(row)"
-          >重推</el-button>
-          <el-button size="small" :icon="Edit" @click="openRecordDialog(row)">编辑</el-button>
-          <el-button size="small" type="danger" :icon="Delete" @click="handleRecordDelete(row)">删除</el-button>
-        </template>
-      </el-table-column>
-    </el-table>
-
-    <el-pagination
-      v-model:current-page="recordPage"
-      v-model:page-size="recordPageSize"
-      :total="recordTotal"
-      :page-sizes="[20, 50, 100]"
-      layout="total, sizes, prev, pager, next"
-      style="margin-top: 16px; justify-content: flex-end"
-      @change="fetchRecords"
-    />
-  </el-drawer>
-
   <!-- 新增/编辑解析记录弹窗 -->
   <el-dialog v-model="recordDialogVisible" :title="editRecord ? '编辑解析记录' : '新增解析记录'" width="540px">
     <el-form ref="recordFormRef" :model="recordForm" :rules="recordRules" label-width="90px">
       <el-form-item label="主机记录" prop="rr">
         <el-input v-model="recordForm.rr" placeholder="如 www、@、*">
-          <template #append>.{{ currentDomain?.name }}</template>
+          <template #append>.{{ recordDomain?.name }}</template>
         </el-input>
       </el-form-item>
       <el-form-item label="类型" prop="type">
@@ -284,6 +279,10 @@ const dialogVisible = ref(false)
 const editRow = ref(null)
 const formRef = ref()
 
+// 展开行：默认全部展开（可收放）；子域名记录按域名 id 缓存
+const expandedKeys = ref([])
+const recordsMap = reactive({})
+
 const form = reactive({ name: '', cloud_account: null, remark: '' })
 const rules = {
   name: [{ required: true, message: '请输入域名' }],
@@ -303,9 +302,24 @@ async function fetchData() {
     const res = await getDomains(params)
     tableData.value = res.data?.results || []
     total.value = res.data?.total || 0
+    // 默认展开当前页全部域名并加载各自记录
+    expandedKeys.value = tableData.value.map((d) => String(d.id))
+    tableData.value.forEach((d) => loadRecords(d.id))
   } finally {
     loading.value = false
   }
+}
+
+// 加载某域名的全部解析记录（page_size=0 全量，force 强制刷新缓存）
+async function loadRecords(domainId, force = false) {
+  if (!force && recordsMap[domainId]) return
+  const res = await getDnsRecords({ domain: domainId, page_size: 0 })
+  recordsMap[domainId] = res.data?.results || []
+}
+
+function handleExpandChange(row, expandedRows) {
+  expandedKeys.value = expandedRows.map((r) => String(r.id))
+  if (expandedRows.includes(row)) loadRecords(row.id)
 }
 
 function openDialog(row = null) {
@@ -350,8 +364,8 @@ async function handleSync(row) {
   try {
     const res = await syncDomainRecords(row.id)
     ElMessage.success(res.msg || '同步完成')
+    await loadRecords(row.id, true)
     fetchData()
-    if (recordsVisible.value && currentDomain.value?.id === row.id) fetchRecords()
   } finally {
     syncingId.value = null
   }
@@ -379,22 +393,14 @@ async function handleImport() {
   }
 }
 
-// ---------- 解析记录 ----------
-const recordsVisible = ref(false)
-const recordsLoading = ref(false)
-const currentDomain = ref(null)
-const recordRows = ref([])
-const recordTotal = ref(0)
-const recordPage = ref(1)
-const recordPageSize = ref(20)
-const recordFilter = reactive({ keyword: '', type: '', syncStatus: '' })
-const retryingId = ref(null)
-
+// ---------- 解析记录增删改 ----------
 const recordDialogVisible = ref(false)
 const recordSubmitting = ref(false)
+const recordDomain = ref(null)
 const editRecord = ref(null)
 const recordFormRef = ref()
 const serverOptions = ref([])
+const retryingId = ref(null)
 
 const emptyRecordForm = () => ({
   rr: '', type: 'A', value: '', ttl: 600, line: 'default',
@@ -408,38 +414,10 @@ const recordRules = {
   value: [{ required: true, message: '请输入记录值' }],
 }
 
-function openRecords(row) {
-  currentDomain.value = row
-  recordPage.value = 1
-  recordFilter.keyword = ''
-  recordFilter.type = ''
-  recordFilter.syncStatus = ''
-  recordsVisible.value = true
-  fetchRecords()
-}
-
-async function fetchRecords() {
-  recordsLoading.value = true
-  try {
-    const params = {
-      domain: currentDomain.value.id,
-      page: recordPage.value,
-      page_size: recordPageSize.value,
-    }
-    if (recordFilter.keyword) params.keyword = recordFilter.keyword
-    if (recordFilter.type) params.type = recordFilter.type
-    if (recordFilter.syncStatus) params.sync_status = recordFilter.syncStatus
-    const res = await getDnsRecords(params)
-    recordRows.value = res.data?.results || []
-    recordTotal.value = res.data?.total || 0
-  } finally {
-    recordsLoading.value = false
-  }
-}
-
-function openRecordDialog(row = null) {
-  editRecord.value = row
-  Object.assign(recordForm, row ? { ...row } : emptyRecordForm())
+function openRecordDialog(domainRow, rec = null) {
+  recordDomain.value = domainRow
+  editRecord.value = rec
+  Object.assign(recordForm, rec ? { ...rec } : emptyRecordForm())
   recordDialogVisible.value = true
   recordFormRef.value?.clearValidate()
 }
@@ -448,7 +426,7 @@ async function handleRecordSubmit() {
   await recordFormRef.value.validate()
   recordSubmitting.value = true
   try {
-    const payload = { ...recordForm, domain: currentDomain.value.id }
+    const payload = { ...recordForm, domain: recordDomain.value.id }
     if (editRecord.value) {
       await updateDnsRecord(editRecord.value.id, payload)
       ElMessage.success('更新成功')
@@ -457,29 +435,31 @@ async function handleRecordSubmit() {
       ElMessage.success('新增成功')
     }
     recordDialogVisible.value = false
-    fetchRecords()
+    await loadRecords(recordDomain.value.id, true)
+    fetchData()
   } finally {
     recordSubmitting.value = false
   }
 }
 
-async function handleRecordDelete(row) {
+async function handleRecordDelete(domainRow, rec) {
   await ElMessageBox.confirm(
-    `确定删除解析记录「${row.rr}.${currentDomain.value.name} ${row.type}」吗？将同步删除厂商侧解析，立即生效。`,
+    `确定删除解析记录「${rec.fqdn} ${rec.type}」吗？将同步删除厂商侧解析，立即生效。`,
     '警告',
     { type: 'warning' },
   )
-  await deleteDnsRecord(row.id)
+  await deleteDnsRecord(rec.id)
   ElMessage.success('删除成功')
-  fetchRecords()
+  await loadRecords(domainRow.id, true)
+  fetchData()
 }
 
-async function handleRetry(row) {
-  retryingId.value = row.id
+async function handleRetry(domainRow, rec) {
+  retryingId.value = rec.id
   try {
-    const res = await retrySyncDnsRecord(row.id)
+    const res = await retrySyncDnsRecord(rec.id)
     ElMessage.success(res.msg || '重推成功')
-    fetchRecords()
+    await loadRecords(domainRow.id, true)
   } finally {
     retryingId.value = null
   }
@@ -504,4 +484,8 @@ onMounted(async () => {
 .toolbar-left { display: flex; gap: 8px; }
 .muted { color: #909399; }
 .tip { font-size: 12px; color: #909399; line-height: 1.6; }
+.fqdn { font-weight: 600; }
+.records-panel { padding: 4px 16px 12px 48px; background: #fafafa; }
+.records-head { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; }
+.records-title { font-size: 13px; color: #606266; font-weight: 600; }
 </style>

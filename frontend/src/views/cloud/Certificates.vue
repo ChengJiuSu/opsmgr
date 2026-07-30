@@ -121,7 +121,9 @@
           placeholder="输入后回车添加，支持通配符 *.example.com"
           style="width:100%"
         >
-          <el-option v-for="d in domainSuggestions" :key="d" :label="d" :value="d" />
+          <el-option-group v-for="g in domainSuggestions" :key="g.label" :label="g.label">
+            <el-option v-for="d in g.options" :key="d" :label="d" :value="d" />
+          </el-option-group>
         </el-select>
         <div class="tip">
           首个域名为证书主域名（不能是通配符）；同一证书可含多个域名（SAN）。
@@ -160,7 +162,7 @@ import { Plus, Edit, Delete, Download, Loading } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../../stores/auth'
 import {
-  getCloudAccounts, getDomains,
+  getCloudAccounts, getDomains, getDnsRecords,
   getCertificates, createCertificate, updateCertificate, deleteCertificate,
   issueCertificate, renewCertificate, downloadCertificate,
 } from '../../api/cloud'
@@ -318,13 +320,20 @@ async function handleDelete(row) {
 onMounted(async () => {
   fetchData()
   if (authStore.isStaff) {
-    const [accRes, domRes] = await Promise.all([
+    const [accRes, domRes, recRes] = await Promise.all([
       getCloudAccounts({ page_size: 0, enabled: 'true' }),
       getDomains({ page_size: 0 }),
+      getDnsRecords({ page_size: 0 }),
     ])
     accountOptions.value = accRes.data?.results || []
-    // 已管理域名作为下拉建议（可自由输入其他域名/通配符）
-    domainSuggestions.value = (domRes.data?.results || []).flatMap((d) => [d.name, `*.${d.name}`])
+    // 建议项按主域名分组：主域名 + *.通配 + 该域名下子域名 FQDN（A/AAAA/CNAME），可自由输入
+    const records = recRes.data?.results || []
+    domainSuggestions.value = (domRes.data?.results || []).map((d) => {
+      const subs = records
+        .filter((r) => r.domain === d.id && ['A', 'AAAA', 'CNAME'].includes(r.type) && r.rr !== '@')
+        .map((r) => r.fqdn)
+      return { label: d.name, options: [...new Set([d.name, `*.${d.name}`, ...subs])] }
+    })
   }
 })
 </script>
