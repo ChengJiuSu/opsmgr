@@ -13,6 +13,8 @@ import re
 import zipfile
 
 from django.db import transaction
+from django.db.models import Q, Value
+from django.db.models.functions import Concat
 from django.http import HttpResponse
 from django.utils import timezone
 from drf_spectacular.types import OpenApiTypes
@@ -45,6 +47,21 @@ ACME_CHALLENGE_PREFIX = '_acme-challenge'
 
 def _is_acme_challenge(rr):
     return rr == ACME_CHALLENGE_PREFIX or rr.startswith(ACME_CHALLENGE_PREFIX + '.')
+
+
+def _record_keyword_qs(keyword):
+    """按关键字匹配解析记录：主机记录 / 完整子域名(FQDN) / 记录值 任一命中。
+
+    FQDN 在库中不存物理列（DnsRecord.fqdn 为属性），用 Concat 注解参与匹配，
+    这样搜 `test.linuxlab.space` 也能命中 rr=test 的记录。
+    """
+    return DnsRecord.objects.annotate(
+        fqdn_calc=Concat('rr', Value('.'), 'domain__name'),
+    ).filter(
+        Q(rr__icontains=keyword)
+        | Q(fqdn_calc__icontains=keyword)
+        | Q(value__icontains=keyword)
+    )
 
 
 def _to_provider_data(record):
@@ -103,7 +120,11 @@ class DomainViewSet(viewsets.ModelViewSet):
             qs = qs.filter(cloud_account_id=account)
         keyword = self.request.query_params.get('keyword')
         if keyword:
-            qs = qs.filter(name__icontains=keyword)
+            # 主域名名称命中，或名下任一解析记录（子域名/FQDN/记录值）命中
+            qs = qs.filter(
+                Q(name__icontains=keyword)
+                | Q(pk__in=_record_keyword_qs(keyword).values('domain_id'))
+            )
         return qs
 
     def destroy(self, request, *args, **kwargs):
@@ -213,7 +234,8 @@ class DnsRecordViewSet(viewsets.ModelViewSet):
             qs = qs.filter(type=rtype)
         keyword = self.request.query_params.get('keyword')
         if keyword:
-            qs = qs.filter(rr__icontains=keyword)
+            # 主机记录 / 完整子域名 / 记录值（按 IP 反查）任一命中
+            qs = qs.filter(pk__in=_record_keyword_qs(keyword).values('pk'))
         sync_status = self.request.query_params.get('sync_status')
         if sync_status:
             qs = qs.filter(sync_status=sync_status)

@@ -5,9 +5,9 @@
       <div class="toolbar-left">
         <el-input
           v-model="filter.keyword"
-          placeholder="搜索域名"
+          placeholder="搜索主域名 / 子域名 / 记录值"
           clearable
-          style="width:220px"
+          style="width:260px"
           @keyup.enter="fetchData"
           @clear="fetchData"
         />
@@ -34,7 +34,16 @@
         <template #default="{ row }">
           <div class="records-panel">
             <div class="records-head">
-              <span class="records-title">子域名解析（{{ recordsMap[row.id]?.length ?? '…' }}）</span>
+              <span class="records-title">
+                {{ appliedKeyword ? '匹配的子域名解析' : '子域名解析' }}（{{ recordsMap[row.id]?.length ?? '…' }}）
+                <el-button
+                  v-if="appliedKeyword"
+                  link
+                  type="primary"
+                  size="small"
+                  @click="clearKeyword"
+                >显示全部</el-button>
+              </span>
               <el-button
                 v-if="authStore.isStaff"
                 size="small"
@@ -282,6 +291,8 @@ const formRef = ref()
 // 展开行：默认全部展开（可收放）；子域名记录按域名 id 缓存
 const expandedKeys = ref([])
 const recordsMap = reactive({})
+// 本次列表实际生效的搜索词（决定展开面板是全量还是仅匹配项）
+const appliedKeyword = ref('')
 
 const form = reactive({ name: '', cloud_account: null, remark: '' })
 const rules = {
@@ -302,6 +313,10 @@ async function fetchData() {
     const res = await getDomains(params)
     tableData.value = res.data?.results || []
     total.value = res.data?.total || 0
+    // 搜索词变化时记录缓存失效（面板内容随搜索在「全量/仅匹配」间切换）
+    const keywordChanged = appliedKeyword.value !== (filter.keyword || '')
+    appliedKeyword.value = filter.keyword || ''
+    if (keywordChanged) Object.keys(recordsMap).forEach((k) => delete recordsMap[k])
     // 默认展开当前页全部域名并加载各自记录
     expandedKeys.value = tableData.value.map((d) => String(d.id))
     tableData.value.forEach((d) => loadRecords(d.id))
@@ -310,11 +325,19 @@ async function fetchData() {
   }
 }
 
-// 加载某域名的全部解析记录（page_size=0 全量，force 强制刷新缓存）
+// 加载某域名的解析记录（page_size=0 全量，force 强制刷新缓存）
+// 有搜索词时只取命中的子域名，便于在大量记录中定位
 async function loadRecords(domainId, force = false) {
   if (!force && recordsMap[domainId]) return
-  const res = await getDnsRecords({ domain: domainId, page_size: 0 })
+  const params = { domain: domainId, page_size: 0 }
+  if (appliedKeyword.value) params.keyword = appliedKeyword.value
+  const res = await getDnsRecords(params)
   recordsMap[domainId] = res.data?.results || []
+}
+
+function clearKeyword() {
+  filter.keyword = ''
+  fetchData()
 }
 
 function handleExpandChange(row, expandedRows) {

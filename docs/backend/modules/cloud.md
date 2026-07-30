@@ -61,7 +61,14 @@ apps/cloud_mgr/
 | `/api/cloud/cert-deployments/{id}/deploy/` | POST | 管理员 | 单目标分发（后台异步）；证书未签发 / agent 通道主机 / 未接入类型均拒绝 |
 
 筛选参数：accounts `provider`（数字 id / code）、`enabled`；domains
-`cloud_account`、`keyword`；dns-records `domain`、`type`、`keyword`、`sync_status`。
+`cloud_account`、`keyword`；dns-records `domain`、`type`、`keyword`、`sync_status`；
+cert-deployments `certificate`、`target_type`、`status`。
+
+`keyword` 语义（`_record_keyword_qs`）：主机记录 / 完整子域名 FQDN / 记录值任一
+命中。FQDN 无物理列（`DnsRecord.fqdn` 是属性），用 `Concat('rr', '.', 'domain__name')`
+注解参与匹配，故搜 `test.example.com` 也能命中 `rr=test` 的记录；记录值参与匹配
+支持按 IP 反查。domains 的 `keyword` 额外并上「名下解析记录命中」，因此搜子域名
+能直接定位到其主域名行。
 
 ---
 

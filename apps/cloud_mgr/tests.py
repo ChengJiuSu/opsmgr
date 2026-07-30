@@ -137,6 +137,40 @@ class DomainApiTests(BaseApiTest):
         }, format='json')
         self.assertEqual(r.status_code, 403)
 
+    def test_keyword_matches_subdomain_and_value(self):
+        other = Domain.objects.create(name='other.cn', cloud_account=self.account)
+        DnsRecord.objects.create(domain=self.domain, rr='test', type='A', value='1.2.3.4')
+        DnsRecord.objects.create(domain=other, rr='api', type='A', value='9.9.9.9')
+        admin = self._client()
+
+        def domain_names(keyword):
+            r = admin.get('/api/cloud/domains/', {'keyword': keyword})
+            return [d['name'] for d in r.json()['data']['results']]
+
+        # 主域名命中（原有行为）
+        self.assertEqual(domain_names('example'), ['example.com'])
+        # 子域名主机记录命中
+        self.assertEqual(domain_names('test'), ['example.com'])
+        # 完整 FQDN 命中（rr 与域名跨列拼接）
+        self.assertEqual(domain_names('test.example.com'), ['example.com'])
+        # 记录值（IP）反查命中
+        self.assertEqual(domain_names('9.9.9.9'), ['other.cn'])
+        # 无命中
+        self.assertEqual(domain_names('nothing-here'), [])
+
+    def test_record_keyword_matches_fqdn_and_value(self):
+        DnsRecord.objects.create(domain=self.domain, rr='test', type='A', value='1.2.3.4')
+        DnsRecord.objects.create(domain=self.domain, rr='api', type='A', value='5.6.7.8')
+        admin = self._client()
+
+        def rrs(keyword):
+            r = admin.get('/api/cloud/dns-records/', {'domain': self.domain.id, 'keyword': keyword})
+            return sorted(rec['rr'] for rec in r.json()['data']['results'])
+
+        self.assertEqual(rrs('test'), ['test'])
+        self.assertEqual(rrs('test.example.com'), ['test'])
+        self.assertEqual(rrs('5.6.7.8'), ['api'])
+
     @patch('apps.cloud_mgr.views.get_dns_provider')
     def test_import_remote_skips_existing(self, mock_get):
         mock_get.return_value = FakeDnsProvider()
