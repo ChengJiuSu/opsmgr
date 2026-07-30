@@ -38,6 +38,20 @@ const collapsed = ref(false)
 
 ---
 
+## 菜单展开与滚动
+
+分组多了会超出视口，两条措施配合：
+
+- **手风琴**：`el-menu` 加 `unique-opened`，展开新分组自动收起旧分组，
+  同时只有一组展开。当前路由所属分组由 Element Plus `initMenu` 自动展开
+  （挂载时按 activeIndex 的 indexPath 逐级 open），无需手动传 `default-openeds`。
+- **可滚动**：`.sidebar` 改纵向 flex（logo `flex-shrink: 0` 固定），
+  `.sidebar-menu` `flex: 1 + overflow-y: auto` 自身滚动——原先 `.sidebar`
+  只有 `overflow: hidden`，菜单超长会被直接裁掉。深色侧栏配 6px 半透明
+  细滚动条（`::-webkit-scrollbar`）。
+
+---
+
 ## 退出登录
 
 ```javascript

@@ -9,6 +9,7 @@
       <el-menu
         :default-active="route.meta.activeMenu || route.path"
         :collapse="collapsed"
+        unique-opened
         router
         background-color="#001529"
         text-color="#a6adb4"
@@ -204,10 +205,14 @@ async function submitPassword() {
 .sidebar {
   background: #001529;
   transition: width 0.3s;
+  /* 纵向 flex：logo 固定，菜单区自身滚动（原 overflow:hidden 会裁掉超长菜单） */
+  display: flex;
+  flex-direction: column;
   overflow: hidden;
 }
 .logo {
   height: 60px;
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -215,7 +220,21 @@ async function submitPassword() {
   border-bottom: 1px solid #002040;
 }
 .logo-text { color: #fff; font-size: 16px; font-weight: 600; white-space: nowrap; }
-.sidebar-menu { border-right: none; }
+.sidebar-menu {
+  border-right: none;
+  flex: 1;
+  overflow-y: auto;
+  /* 折叠态弹出子菜单靠 popper 渲染在 body，不受此处滚动影响 */
+  overflow-x: hidden;
+}
+/* 暗色细滚动条：默认滚动条在深色侧栏上很突兀 */
+.sidebar-menu::-webkit-scrollbar { width: 6px; }
+.sidebar-menu::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 3px;
+}
+.sidebar-menu::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.3); }
+.sidebar-menu::-webkit-scrollbar-track { background: transparent; }
 .header {
   display: flex;
   align-items: center;
