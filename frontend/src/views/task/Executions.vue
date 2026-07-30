@@ -3,7 +3,7 @@
   <el-card shadow="never">
     <div class="toolbar">
       <div class="toolbar-left">
-        <el-input v-model="filter.keyword" placeholder="任务名称" clearable style="width:160px" @keyup.enter="handleSearch" @clear="handleSearch" />
+        <el-input v-model="filter.keyword" placeholder="任务名称" clearable style="width:160px" @input="searchDebounced" @keyup.enter="handleSearch" @clear="handleSearch" />
         <el-select v-model="filter.task_type" placeholder="包含模块类型" clearable style="width:140px" @change="handleSearch">
           <el-option label="命令" value="command" />
           <el-option label="Playbook" value="playbook" />
@@ -491,6 +491,7 @@
 
 <script setup>
 import { ref, reactive, computed, nextTick, onMounted, onUnmounted } from 'vue'
+import { debounce } from '../../utils/debounce'
 import { useRouter } from 'vue-router'
 import {
   Plus, Delete, Search, Refresh, View, Loading, CaretRight, EditPen, CopyDocument, Close, Top, Bottom, FullScreen, TopRight,
@@ -561,9 +562,14 @@ async function fetchData() {
 }
 
 function handleSearch() {
+  searchDebounced.cancel()
   page.value = 1
   fetchData()
 }
+
+// 边输边查（300ms 防抖），无需回车
+const searchDebounced = debounce(handleSearch)
+onUnmounted(() => searchDebounced.cancel())
 
 async function loadDictOptions() {
   if (dictOptions.projects.length) return

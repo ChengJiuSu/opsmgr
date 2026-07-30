@@ -2,8 +2,8 @@
   <el-card shadow="never">
     <div class="toolbar">
       <div class="toolbar-left">
-        <el-input v-model="filter.keyword" placeholder="方法名称" clearable style="width:160px" @keyup.enter="fetchData" @clear="fetchData" />
-        <el-select v-model="filter.provider" placeholder="Provider" clearable style="width:150px" @change="fetchData">
+        <el-input v-model="filter.keyword" placeholder="方法名称" clearable style="width:160px" @input="searchDebounced" @keyup.enter="handleSearch" @clear="handleSearch" />
+        <el-select v-model="filter.provider" placeholder="Provider" clearable style="width:150px" @change="handleSearch">
           <el-option label="Ansible 剧本" value="ansible_playbook" />
           <el-option label="Jenkins 构建" value="jenkins" />
           <el-option label="JumpServer 注册" value="jumpserver" />
@@ -145,7 +145,8 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, onMounted, onUnmounted } from 'vue'
+import { debounce } from '../../utils/debounce'
 import { Plus, Edit, Delete, Search } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { getMethods, createMethod, updateMethod, deleteMethod } from '../../api/tasks'
@@ -183,6 +184,16 @@ const rules = {
 function providerTagType(provider) {
   return { ansible_playbook: 'success', jenkins: 'primary', jumpserver: 'danger' }[provider] || 'warning'
 }
+
+// 本页不分页（一次取全量），搜索直接重查
+function handleSearch() {
+  searchDebounced.cancel()
+  fetchData()
+}
+
+// 边输边查（300ms 防抖），无需回车
+const searchDebounced = debounce(handleSearch)
+onUnmounted(() => searchDebounced.cancel())
 
 async function fetchData() {
   loading.value = true

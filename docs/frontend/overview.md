@@ -87,6 +87,25 @@ Django 后端 /api/...
 
 ---
 
+## 列表页筛选统一口径
+
+所有列表页搜索框**边输边查**，不需要回车：
+
+```
+搜索框  @input="searchDebounced"   → 300ms 防抖后查（utils/debounce.js）
+        @keyup.enter="handleSearch" → 立即查（取消挂起的防抖调用）
+        @clear="handleSearch"       → 清空立即查
+筛选下拉 @change="handleSearch"     → 即时生效
+分页    @change="fetchData"         → 保持当前页码，不可用 handleSearch
+```
+
+`handleSearch()` 固定三步：`searchDebounced.cancel()` → `page.value = 1` →
+`fetchData()`（重置页码避免筛选后停在越界页）；不分页的页面（如方法管理一次取
+全量）省略页码重置。`onUnmounted` 中 `searchDebounced.cancel()`，防止组件卸载
+后仍发请求。
+
+---
+
 ## 路由结构
 
 ```

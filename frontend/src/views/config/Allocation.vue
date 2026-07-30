@@ -19,26 +19,26 @@
     <div class="toolbar">
       <div class="toolbar-left">
         <!-- 本页仅展示已规划服务的主机，「未规划服务」筛选不再适用（未规划主机走「分配服务」表单纳管） -->
-        <el-select v-model="filter.unassigned" placeholder="未分配维度" clearable style="width:140px" @change="fetchData">
+        <el-select v-model="filter.unassigned" placeholder="未分配维度" clearable style="width:140px" @change="handleSearch">
           <el-option label="任一维度未分配" value="any" />
           <el-option label="未分配项目组" value="project_group" />
           <el-option label="未分配环境" value="environment" />
           <el-option label="未分配渠道" value="channel" />
           <el-option label="未分配云厂商" value="cloud_provider" />
         </el-select>
-        <el-select v-model="filter.project_group" placeholder="项目组" clearable style="width:130px" @change="fetchData">
+        <el-select v-model="filter.project_group" placeholder="项目组" clearable style="width:130px" @change="handleSearch">
           <el-option v-for="o in dicts.projectGroups" :key="o.id" :label="o.name" :value="o.code" />
         </el-select>
-        <el-select v-model="filter.env" placeholder="环境" clearable style="width:110px" @change="fetchData">
+        <el-select v-model="filter.env" placeholder="环境" clearable style="width:110px" @change="handleSearch">
           <el-option v-for="o in dicts.environments" :key="o.id" :label="o.name" :value="o.code" />
         </el-select>
-        <el-select v-model="filter.channel" placeholder="渠道" clearable style="width:120px" @change="fetchData">
+        <el-select v-model="filter.channel" placeholder="渠道" clearable style="width:120px" @change="handleSearch">
           <el-option v-for="o in dicts.channels" :key="o.id" :label="o.name" :value="o.code" />
         </el-select>
-        <el-select v-model="filter.service_type" placeholder="服务类型" clearable style="width:130px" @change="fetchData">
+        <el-select v-model="filter.service_type" placeholder="服务类型" clearable style="width:130px" @change="handleSearch">
           <el-option v-for="o in dicts.serviceTypes" :key="o.id" :label="o.name" :value="o.code" />
         </el-select>
-        <el-select v-model="filter.service_status" placeholder="服务状态" clearable style="width:110px" @change="fetchData">
+        <el-select v-model="filter.service_status" placeholder="服务状态" clearable style="width:110px" @change="handleSearch">
           <el-option v-for="(label, key) in SERVICE_STATUS_LABELS" :key="key" :label="label" :value="key" />
         </el-select>
         <el-input
@@ -46,8 +46,9 @@
           placeholder="名称/IP"
           clearable
           style="width:160px"
-          @keyup.enter="fetchData"
-          @clear="fetchData"
+          @input="searchDebounced"
+          @keyup.enter="handleSearch"
+          @clear="handleSearch"
         />
       </div>
       <!-- 批量分配/规划均为修改操作，仅管理员可见 -->
@@ -325,7 +326,8 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
+import { debounce } from '../../utils/debounce'
 import { Connection, Menu, Plus } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
@@ -439,6 +441,17 @@ async function loadOverview() {
   const res = await getAllocationOverview()
   overview.value = res.data || { total: 0, unassigned: {} }
 }
+
+// 搜索：回到第一页再查，避免停留在越界页码上
+function handleSearch() {
+  searchDebounced.cancel()
+  page.value = 1
+  fetchData()
+}
+
+// 边输边查（300ms 防抖），无需回车
+const searchDebounced = debounce(handleSearch)
+onUnmounted(() => searchDebounced.cancel())
 
 async function fetchData() {
   loading.value = true

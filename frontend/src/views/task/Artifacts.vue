@@ -2,7 +2,7 @@
   <el-card shadow="never">
     <div class="toolbar">
       <div class="toolbar-left">
-        <el-input v-model="filter.keyword" placeholder="版本 / 文件名 / Job" clearable style="width:180px" @keyup.enter="handleSearch" @clear="handleSearch" />
+        <el-input v-model="filter.keyword" placeholder="版本 / 文件名 / Job" clearable style="width:180px" @input="searchDebounced" @keyup.enter="handleSearch" @clear="handleSearch" />
         <el-select v-model="filter.project_group" placeholder="项目组" clearable filterable style="width:130px" @change="handleSearch">
           <el-option v-for="d in dictOptions.projects" :key="d.id" :label="d.name" :value="d.id" />
         </el-select>
@@ -74,7 +74,8 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, onMounted, onUnmounted } from 'vue'
+import { debounce } from '../../utils/debounce'
 import { Delete, Download, Refresh, Search } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../../stores/auth'
@@ -130,9 +131,14 @@ async function fetchData() {
 }
 
 function handleSearch() {
+  searchDebounced.cancel()
   page.value = 1
   fetchData()
 }
+
+// 边输边查（300ms 防抖），无需回车
+const searchDebounced = debounce(handleSearch)
+onUnmounted(() => searchDebounced.cancel())
 
 function handleDownload(row) {
   // download_url 自带 HMAC 签名参数，免登录直接下载

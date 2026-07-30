@@ -1,12 +1,12 @@
 <template>
   <el-card shadow="never">
     <div class="toolbar">
-      <el-input v-model="filter.username" placeholder="用户名" clearable style="width:130px" @keyup.enter="handleSearch" @clear="handleSearch" />
-      <el-input v-model="filter.keyword" placeholder="路径关键字" clearable style="width:160px" @keyup.enter="handleSearch" @clear="handleSearch" />
+      <el-input v-model="filter.username" placeholder="用户名" clearable style="width:130px" @input="searchDebounced" @keyup.enter="handleSearch" @clear="handleSearch" />
+      <el-input v-model="filter.keyword" placeholder="路径关键字" clearable style="width:160px" @input="searchDebounced" @keyup.enter="handleSearch" @clear="handleSearch" />
       <el-select v-model="filter.method" placeholder="HTTP 方法" clearable style="width:120px" @change="handleSearch">
         <el-option v-for="m in ['GET','POST','PUT','PATCH','DELETE']" :key="m" :label="m" :value="m" />
       </el-select>
-      <el-input v-model="filter.status_code" placeholder="状态码" clearable style="width:100px" @keyup.enter="handleSearch" @clear="handleSearch" />
+      <el-input v-model="filter.status_code" placeholder="状态码" clearable style="width:100px" @input="searchDebounced" @keyup.enter="handleSearch" @clear="handleSearch" />
       <el-date-picker
         v-model="dateRange"
         type="daterange"
@@ -53,7 +53,8 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, onMounted, onUnmounted } from 'vue'
+import { debounce } from '../../utils/debounce'
 import { Search } from '@element-plus/icons-vue'
 import { getAuditLogs } from '../../api/audit'
 
@@ -89,9 +90,14 @@ async function fetchData() {
 }
 
 function handleSearch() {
+  searchDebounced.cancel()
   page.value = 1
   fetchData()
 }
+
+// 边输边查（300ms 防抖），无需回车
+const searchDebounced = debounce(handleSearch)
+onUnmounted(() => searchDebounced.cancel())
 
 onMounted(fetchData)
 </script>

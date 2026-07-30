@@ -9,6 +9,7 @@
           clearable
           style="width: 220px"
           :prefix-icon="Search"
+          @input="searchDebounced"
           @keyup.enter="handleSearch"
           @clear="handleSearch"
         />
@@ -121,7 +122,8 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, onMounted, onUnmounted } from 'vue'
+import { debounce } from '../../utils/debounce'
 import { Plus, Edit, Delete, Search, Key } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
@@ -176,9 +178,14 @@ async function fetchData() {
 }
 
 function handleSearch() {
+  searchDebounced.cancel()
   page.value = 1
   fetchData()
 }
+
+// 边输边查（300ms 防抖），无需回车
+const searchDebounced = debounce(handleSearch)
+onUnmounted(() => searchDebounced.cancel())
 
 function openDialog(row = null) {
   editRow.value = row

@@ -3,21 +3,30 @@
     <!-- 工具栏 -->
     <div class="toolbar">
       <div class="toolbar-left">
-        <el-select v-model="filter.status" placeholder="状态" clearable style="width:110px" @change="fetchData">
+        <el-input
+          v-model="filter.keyword"
+          placeholder="搜索名称 / IP"
+          clearable
+          style="width:180px"
+          @input="searchDebounced"
+          @keyup.enter="handleSearch"
+          @clear="handleSearch"
+        />
+        <el-select v-model="filter.status" placeholder="状态" clearable style="width:110px" @change="handleSearch">
           <el-option label="运行中" value="running" />
           <el-option label="已停止" value="stopped" />
           <el-option label="维护中" value="maintenance" />
         </el-select>
-        <el-select v-model="filter.env" placeholder="环境" clearable style="width:110px" @change="fetchData">
+        <el-select v-model="filter.env" placeholder="环境" clearable style="width:110px" @change="handleSearch">
           <el-option v-for="o in dicts.environments" :key="o.id" :label="o.name" :value="o.code" />
         </el-select>
-        <el-select v-model="filter.project_group" placeholder="项目组" clearable style="width:130px" @change="fetchData">
+        <el-select v-model="filter.project_group" placeholder="项目组" clearable style="width:130px" @change="handleSearch">
           <el-option v-for="o in dicts.projectGroups" :key="o.id" :label="o.name" :value="o.code" />
         </el-select>
-        <el-select v-model="filter.channel" placeholder="渠道" clearable style="width:120px" @change="fetchData">
+        <el-select v-model="filter.channel" placeholder="渠道" clearable style="width:120px" @change="handleSearch">
           <el-option v-for="o in dicts.channels" :key="o.id" :label="o.name" :value="o.code" />
         </el-select>
-        <el-select v-model="filter.cloud_provider" placeholder="云厂商" clearable style="width:120px" @change="fetchData">
+        <el-select v-model="filter.cloud_provider" placeholder="云厂商" clearable style="width:120px" @change="handleSearch">
           <el-option v-for="o in dicts.cloudProviders" :key="o.id" :label="o.name" :value="o.code" />
         </el-select>
       </div>
@@ -336,7 +345,8 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, onMounted, onUnmounted } from 'vue'
+import { debounce } from '../../utils/debounce'
 import { Plus, Edit, Delete, EditPen, Connection, Upload, Download } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
@@ -356,7 +366,9 @@ const tableData = ref([])
 const total = ref(0)
 const page = ref(1)
 const pageSize = ref(20)
-const filter = reactive({ status: '', env: '', project_group: '', channel: '', cloud_provider: '' })
+const filter = reactive({
+  keyword: '', status: '', env: '', project_group: '', channel: '', cloud_provider: '',
+})
 const dialogVisible = ref(false)
 const editRow = ref(null)
 const formRef = ref()
@@ -411,6 +423,17 @@ async function loadDicts() {
     agents.value = Array.isArray(res) ? res : res.data || []
   }
 }
+
+// 搜索：回到第一页再查，避免停留在越界页码上
+function handleSearch() {
+  searchDebounced.cancel()
+  page.value = 1
+  fetchData()
+}
+
+// 边输边查（300ms 防抖），无需回车
+const searchDebounced = debounce(handleSearch)
+onUnmounted(() => searchDebounced.cancel())
 
 async function fetchData() {
   loading.value = true

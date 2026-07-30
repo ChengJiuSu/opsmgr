@@ -8,10 +8,11 @@
           :placeholder="`搜索${cfg.label}名称/编码`"
           clearable
           style="width:220px"
-          @keyup.enter="fetchData"
-          @clear="fetchData"
+          @input="searchDebounced"
+          @keyup.enter="handleSearch"
+          @clear="handleSearch"
         />
-        <el-select v-model="filter.enabled" placeholder="启用状态" clearable style="width:120px" @change="fetchData">
+        <el-select v-model="filter.enabled" placeholder="启用状态" clearable style="width:120px" @change="handleSearch">
           <el-option label="启用" value="true" />
           <el-option label="停用" value="false" />
         </el-select>
@@ -105,7 +106,8 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, watch, onMounted } from 'vue'
+import { ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue'
+import { debounce } from '../../utils/debounce'
 import { Plus, Edit, Delete } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { projectGroupApi, channelApi, environmentApi, cloudProviderApi, serviceTypeApi } from '../../api/assets'
@@ -198,6 +200,17 @@ const rules = {
     { pattern: /^[-a-zA-Z0-9_]+$/, message: '仅限字母、数字、中划线、下划线' },
   ],
 }
+
+// 搜索：回到第一页再查，避免停留在越界页码上
+function handleSearch() {
+  searchDebounced.cancel()
+  page.value = 1
+  fetchData()
+}
+
+// 边输边查（300ms 防抖），无需回车
+const searchDebounced = debounce(handleSearch)
+onUnmounted(() => searchDebounced.cancel())
 
 async function fetchData() {
   loading.value = true

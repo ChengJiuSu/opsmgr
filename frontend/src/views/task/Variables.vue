@@ -2,7 +2,7 @@
   <el-card shadow="never">
     <div class="toolbar">
       <div class="toolbar-left">
-        <el-input v-model="filter.keyword" placeholder="变量名 / 说明" clearable style="width:170px" @keyup.enter="handleSearch" @clear="handleSearch" />
+        <el-input v-model="filter.keyword" placeholder="变量名 / 说明" clearable style="width:170px" @input="searchDebounced" @keyup.enter="handleSearch" @clear="handleSearch" />
         <el-select v-model="filter.project_group" placeholder="项目组" clearable filterable style="width:130px" @change="handleSearch">
           <el-option v-for="d in dictOptions.projects" :key="d.id" :label="d.name" :value="d.id" />
         </el-select>
@@ -166,7 +166,8 @@ ports:
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, onMounted, onUnmounted } from 'vue'
+import { debounce } from '../../utils/debounce'
 import { Plus, Delete, Search, Refresh, EditPen, Clock } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../../stores/auth'
@@ -228,9 +229,14 @@ async function fetchData() {
 }
 
 function handleSearch() {
+  searchDebounced.cancel()
   page.value = 1
   fetchData()
 }
+
+// 边输边查（300ms 防抖），无需回车
+const searchDebounced = debounce(handleSearch)
+onUnmounted(() => searchDebounced.cancel())
 
 function openDialog(row) {
   Object.assign(form, emptyForm(), row ? {
