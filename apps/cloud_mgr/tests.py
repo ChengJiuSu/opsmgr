@@ -375,12 +375,18 @@ class CertificateApiTests(BaseApiTest):
         self.assertIn('web-cert.zip', r['Content-Disposition'])
         self.assertEqual(r['Cache-Control'], 'no-store')
         with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+            # 统一带一层以证书名命名的目录
             self.assertEqual(
                 sorted(zf.namelist()),
-                ['README.txt', 'web-cert.crt', 'web-cert.fullchain.pem', 'web-cert.key'],
+                [
+                    'web-cert/README.txt',
+                    'web-cert/web-cert.crt',
+                    'web-cert/web-cert.fullchain.pem',
+                    'web-cert/web-cert.key',
+                ],
             )
-            self.assertEqual(zf.read('web-cert.key').decode(), 'KEY')
-            self.assertEqual(zf.read('web-cert.fullchain.pem').decode(), 'CHAIN')
+            self.assertEqual(zf.read('web-cert/web-cert.key').decode(), 'KEY')
+            self.assertEqual(zf.read('web-cert/web-cert.fullchain.pem').decode(), 'CHAIN')
 
     def test_download_before_issued_rejected(self):
         cert = self._create_cert(status='pending')

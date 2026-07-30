@@ -337,14 +337,14 @@ class CertificateViewSet(viewsets.ModelViewSet):
     def download(self, request, pk=None):
         """完整证书材料打包 zip 下载（含私钥），仅管理员。
 
-        包内：<名称>.crt（证书）/ <名称>.key（私钥）/ <名称>.fullchain.pem（完整链）
-        + README.txt（域名与有效期信息）。
+        包内统一带一层以证书名称命名的目录（解压不散落、多证书可并存）：
+        <名称>/<名称>.crt（证书）、.key（私钥）、.fullchain.pem（完整链）、README.txt。
         """
         cert = self.get_object()
         if cert.status != 'issued' or not cert.cert_pem:
             return fail('证书尚未签发，无可下载内容。')
 
-        # 文件名取证书名称，去掉路径分隔符等不安全字符
+        # 目录名与文件名取证书名称，去掉路径分隔符等不安全字符
         safe_name = re.sub(r'[^\w.*-]', '_', cert.name) or f'cert-{cert.pk}'
         readme = (
             f'证书名称：{cert.name}\n'
@@ -359,11 +359,11 @@ class CertificateViewSet(viewsets.ModelViewSet):
 
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr(f'{safe_name}.crt', cert.cert_pem)
-            zf.writestr(f'{safe_name}.key', cert.private_key_pem)
+            zf.writestr(f'{safe_name}/{safe_name}.crt', cert.cert_pem)
+            zf.writestr(f'{safe_name}/{safe_name}.key', cert.private_key_pem)
             if cert.chain_pem:
-                zf.writestr(f'{safe_name}.fullchain.pem', cert.chain_pem)
-            zf.writestr('README.txt', readme)
+                zf.writestr(f'{safe_name}/{safe_name}.fullchain.pem', cert.chain_pem)
+            zf.writestr(f'{safe_name}/README.txt', readme)
 
         response = HttpResponse(buffer.getvalue(), content_type='application/zip')
         response['Content-Disposition'] = f'attachment; filename="{safe_name}.zip"'
