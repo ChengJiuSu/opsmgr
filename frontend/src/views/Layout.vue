@@ -33,6 +33,7 @@
           </template>
           <el-menu-item v-if="authStore.isStaff" index="/cloud/accounts">云账号</el-menu-item>
           <el-menu-item index="/cloud/domains">域名管理</el-menu-item>
+          <el-menu-item index="/cloud/certificates">证书管理</el-menu-item>
         </el-sub-menu>
         <el-sub-menu index="config">
           <template #title>

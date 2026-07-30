@@ -1,11 +1,12 @@
 """云控管理序列化器。"""
 import re
 
+from django.utils import timezone
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
-from .models import CloudAccount, DnsRecord, Domain
+from .models import Certificate, CloudAccount, DnsRecord, Domain
 
 # 域名整体校验（简化 RFC 1035：小写字母/数字/连字符，点分，末级 ≥2 位字母）
 DOMAIN_RE = re.compile(r'^(?!-)[a-z0-9-]{1,63}(?<!-)(\.(?!-)[a-z0-9-]{1,63}(?<!-))+$')
@@ -135,4 +136,62 @@ class DnsRecordSerializer(serializers.ModelSerializer):
             qs = qs.exclude(pk=self.instance.pk)
         if qs.exists():
             raise serializers.ValidationError('同域名下已存在相同的解析记录（主机记录+类型+值+线路重复）')
+        return attrs
+
+
+# 证书域名项：支持通配符（*.example.com）
+CERT_DOMAIN_RE = re.compile(r'^(\*\.)?(?!-)[a-z0-9-]{1,63}(?<!-)(\.(?!-)[a-z0-9-]{1,63}(?<!-))+$')
+
+
+class CertificateSerializer(serializers.ModelSerializer):
+    """证书序列化器。私钥不回显（has_private_key 标志）；PEM 仅 download 接口返回。
+
+    domains 为 SAN 列表，首项为主域名（acme.sh 证书目录按首项命名，签发后不可改）。
+    """
+
+    cloud_account_name = serializers.CharField(source='cloud_account.name', read_only=True)
+    provider_code = serializers.CharField(source='cloud_account.provider.code', read_only=True)
+    has_private_key = serializers.SerializerMethodField()
+    days_left = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Certificate
+        fields = [
+            'id', 'name', 'domains', 'cloud_account', 'cloud_account_name', 'provider_code',
+            'status', 'has_private_key', 'issued_at', 'expires_at', 'days_left',
+            'auto_renew', 'last_error', 'remark', 'created_at', 'updated_at',
+        ]
+        read_only_fields = ['status', 'issued_at', 'expires_at', 'last_error']
+
+    @extend_schema_field(OpenApiTypes.BOOL)
+    def get_has_private_key(self, obj):
+        return bool(obj.private_key_pem)
+
+    @extend_schema_field(OpenApiTypes.INT)
+    def get_days_left(self, obj):
+        if not obj.expires_at:
+            return None
+        return (obj.expires_at - timezone.now()).days
+
+    def validate_domains(self, value):
+        if not isinstance(value, list) or not value:
+            raise serializers.ValidationError('域名列表不能为空')
+        cleaned = []
+        for item in value:
+            d = str(item).strip().lower().rstrip('.')
+            if not CERT_DOMAIN_RE.match(d):
+                raise serializers.ValidationError(f'域名格式不正确：{item}')
+            if d in cleaned:
+                raise serializers.ValidationError(f'域名重复：{d}')
+            cleaned.append(d)
+        if cleaned[0].startswith('*.'):
+            raise serializers.ValidationError('首个域名为证书主域名，不能是通配符（可将通配符放后面）')
+        return cleaned
+
+    def validate(self, attrs):
+        # 签发后锁定域名与验证账号（acme home 目录按主域名组织，改列表须新建证书）
+        if self.instance is not None and self.instance.status not in ('pending', 'failed'):
+            for field in ('domains', 'cloud_account'):
+                if field in attrs and attrs[field] != getattr(self.instance, field):
+                    raise serializers.ValidationError('已签发证书不能修改域名列表 / 验证账号，请新建证书')
         return attrs

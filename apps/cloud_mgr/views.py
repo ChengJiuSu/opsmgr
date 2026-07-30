@@ -19,9 +19,16 @@ from common.pagination import StandardPagination
 from common.permissions import IsAdmin, IsAdminOrReadOnly
 from common.response import fail, ok
 
-from .models import CloudAccount, DnsRecord, Domain
+from .acme import supported_provider_codes
+from .models import Certificate, CloudAccount, DnsRecord, Domain
 from .providers import DnsProviderError, DnsRecordData, get_dns_provider
-from .serializers import CloudAccountSerializer, DnsRecordSerializer, DomainSerializer
+from .serializers import (
+    CertificateSerializer,
+    CloudAccountSerializer,
+    DnsRecordSerializer,
+    DomainSerializer,
+)
+from .tasks import dispatch_issue
 
 logger = logging.getLogger(__name__)
 
@@ -258,3 +265,88 @@ class DnsRecordViewSet(viewsets.ModelViewSet):
         if record.sync_status == 'failed':
             return fail(f'重推失败：{record.sync_error}')
         return ok(self.get_serializer(record).data, msg='重推成功。')
+
+
+class CertificateViewSet(viewsets.ModelViewSet):
+    """证书管理：申请/续签（acme.sh DNS 验证，后台异步）。
+
+    - issue：pending/failed 首次申请；issued 也可手动触发（等价强制重签）；
+    - renew：已签发证书强制重签（--force）；
+    - download：完整 PEM（含私钥），仅管理员；
+    - issuing 状态禁止重复触发与删除。
+    """
+
+    queryset = Certificate.objects.select_related('cloud_account', 'cloud_account__provider').all()
+    serializer_class = CertificateSerializer
+    permission_classes = [IsAdminOrReadOnly]
+    pagination_class = StandardPagination
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        status_param = self.request.query_params.get('status')
+        if status_param:
+            qs = qs.filter(status=status_param)
+        keyword = self.request.query_params.get('keyword')
+        if keyword:
+            qs = qs.filter(name__icontains=keyword)
+        return qs
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+    def _validate_issuable(self, cert):
+        """签发前置校验：厂商支持 + 非 issuing。返回错误信息或 None。"""
+        if cert.status == 'issuing':
+            return '证书正在申请中，请等待完成。'
+        code = cert.cloud_account.provider.code
+        if code not in supported_provider_codes():
+            return (f'云厂商 {cert.cloud_account.provider.name}({code}) 暂不支持证书 DNS 验证，'
+                    f'当前支持：{"、".join(supported_provider_codes())}')
+        return None
+
+    @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
+    @action(detail=True, methods=['post'])
+    def issue(self, request, pk=None):
+        """申请证书（后台异步，DNS 验证需数分钟）。已签发的等价强制重签。"""
+        cert = self.get_object()
+        err = self._validate_issuable(cert)
+        if err:
+            return fail(err)
+        dispatch_issue(cert, force=cert.status == 'issued')
+        return ok(self.get_serializer(cert).data, msg='已提交申请，DNS 验证需数分钟，请稍后刷新查看。')
+
+    @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
+    @action(detail=True, methods=['post'])
+    def renew(self, request, pk=None):
+        """强制续签（--force 重签，签发日期与过期时间刷新）。"""
+        cert = self.get_object()
+        if cert.status != 'issued':
+            return fail('仅已签发证书可续签，未签发请用「申请」。')
+        err = self._validate_issuable(cert)
+        if err:
+            return fail(err)
+        dispatch_issue(cert, force=True)
+        return ok(self.get_serializer(cert).data, msg='已提交续签，请稍后刷新查看。')
+
+    @extend_schema(responses=OpenApiTypes.OBJECT)
+    @action(detail=True, methods=['get'], permission_classes=[IsAdmin])
+    def download(self, request, pk=None):
+        """完整证书材料（含私钥），仅管理员，前端组装文件下载。"""
+        cert = self.get_object()
+        if cert.status != 'issued' or not cert.cert_pem:
+            return fail('证书尚未签发，无可下载内容。')
+        return ok({
+            'name': cert.name,
+            'domains': cert.domains,
+            'cert_pem': cert.cert_pem,
+            'key_pem': cert.private_key_pem,
+            'fullchain_pem': cert.chain_pem,
+            'expires_at': cert.expires_at,
+        })
+
+    def destroy(self, request, *args, **kwargs):
+        cert = self.get_object()
+        if cert.status == 'issuing':
+            return fail('证书正在申请中，禁止删除。')
+        cert.delete()
+        return ok(msg='已删除（acme 侧续签记录一并失效，不影响已部署副本）。')

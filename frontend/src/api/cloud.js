@@ -26,3 +26,13 @@ export const createDnsRecord = (data) => request.post('/api/cloud/dns-records/',
 export const updateDnsRecord = (id, data) => request.put(`/api/cloud/dns-records/${id}/`, data)
 export const deleteDnsRecord = (id) => request.delete(`/api/cloud/dns-records/${id}/`)
 export const retrySyncDnsRecord = (id) => request.post(`/api/cloud/dns-records/${id}/retry_sync/`)
+
+// 证书
+export const getCertificates = (params) => request.get('/api/cloud/certificates/', { params })
+export const createCertificate = (data) => request.post('/api/cloud/certificates/', data)
+export const updateCertificate = (id, data) => request.patch(`/api/cloud/certificates/${id}/`, data)
+export const deleteCertificate = (id) => request.delete(`/api/cloud/certificates/${id}/`)
+// 申请/续签为后台异步任务，提交即返回
+export const issueCertificate = (id) => request.post(`/api/cloud/certificates/${id}/issue/`)
+export const renewCertificate = (id) => request.post(`/api/cloud/certificates/${id}/renew/`)
+export const downloadCertificate = (id) => request.get(`/api/cloud/certificates/${id}/download/`)

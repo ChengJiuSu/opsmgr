@@ -1,6 +1,6 @@
-# 云控管理（views/cloud/CloudAccounts.vue · Domains.vue）
+# 云控管理（views/cloud/CloudAccounts.vue · Domains.vue · Certificates.vue）
 
-**路由：** `/cloud/accounts`（仅管理员，`meta.staff`）· `/cloud/domains`（登录可读）
+**路由：** `/cloud/accounts`（仅管理员，`meta.staff`）· `/cloud/domains` · `/cloud/certificates`（登录可读）
 **菜单：** 侧边栏「云控管理」子菜单，位于「资产管理」与「配置管理」之间
 **API：** `src/api/cloud.js`（`/api/cloud/`，后端模块见 `docs/backend/modules/cloud.md`）
 
@@ -31,3 +31,16 @@
   - lb/ga/cdn：提示模块未接入，记录值手工填写；
   - 解析线路：default/telecom/unicom/mobile/oversea（腾讯侧中英映射由后端适配层处理）。
 - 删除：二次确认，提示**同步删除厂商侧解析，立即生效**；厂商删除失败时本地保留并报错。
+
+## 证书管理（Certificates.vue）
+
+- 列表：名称 / 域名 SAN tags / 验证账号 / 状态（待申请 info · 申请中 warning
+  +loading 图标 · 已签发 success · 失败 danger+错误 tooltip）/ 有效期
+  （到期日 + 剩余天数 tag：≤14 danger · ≤30 warning）/ 自动续签开关。
+- 存在申请中证书时页面 5s 轮询刷新，全部终态自动停。
+- 新增：域名多选（可自由输入 + 已管理域名及其 `*.` 通配作为建议项），首项为
+  主域名（不能是通配符）；验证账号只列 aliyun/tencent 云账号。
+- 申请 / 续签：确认框说明 DNS 验证流程与耗时（验证记录自动删除）；已签发
+  证书域名与验证账号锁定（改域名需新建），备注/自动续签随时可改。
+- 下载（仅管理员）：一次拉取 `.crt` / `.key` / `.fullchain.pem` 三个文件逐个下载。
+- 删除：确认框说明本平台停止续签、已部署副本不受影响；申请中禁止删除。

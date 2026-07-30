@@ -265,3 +265,27 @@ SITE_BASE_URL = config('SITE_BASE_URL', default='http://127.0.0.1:8000')
 # 主机与 inventory 由该项目统一维护。ANSIBLE_INVENTORY 为默认 inventory（可留空用项目 ansible.cfg）。
 ANSIBLE_PROJECT_DIR = config('ANSIBLE_PROJECT_DIR', default=str(BASE_DIR / 'ansible'))
 ANSIBLE_INVENTORY = config('ANSIBLE_INVENTORY', default='')
+
+# ── 证书管理（cloud_mgr，acme.sh DNS 验证签发）─────────────
+# acme.sh 可执行文件路径（默认取 ~/.acme.sh/acme.sh，官方 curl 安装位置）
+ACME_BIN = config('ACME_BIN', default=str(Path.home() / '.acme.sh' / 'acme.sh'))
+# 证书与 acme 账号数据目录（含私钥，禁止暴露到静态文件路径）
+ACME_HOME = config('ACME_HOME', default=str(MEDIA_ROOT / 'acme'))
+# ACME 账号注册邮箱（Let's Encrypt 到期提醒），生产建议配置
+ACME_EMAIL = config('ACME_EMAIL', default='')
+# ACME CA：letsencrypt / zerossl / buypass 等 acme.sh --server 取值
+ACME_SERVER = config('ACME_SERVER', default='letsencrypt')
+# 签发/续签子进程超时秒数（DNS 验证含传播等待，耗时数分钟）
+ACME_TIMEOUT = config('ACME_TIMEOUT', default=900, cast=int)
+# 距过期不足 N 天时 beat 自动续签（renew_expiring_certificates）
+CERT_RENEW_BEFORE_DAYS = config('CERT_RENEW_BEFORE_DAYS', default=30, cast=int)
+
+# celery beat 静态调度（需 beat 进程：celery -A ops_manager beat）
+# 每 24h 扫描临期证书自动续签（interval 而非 crontab：settings 不依赖 celery 导入）；
+# 未跑 beat 时可手动点续签，功能不受影响
+CELERY_BEAT_SCHEDULE = {
+    'renew-expiring-certificates': {
+        'task': 'cloud_mgr.renew_expiring_certificates',
+        'schedule': 3600 * 24,
+    },
+}

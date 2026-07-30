@@ -39,6 +39,12 @@ const router = createRouter({
           component: () => import('../views/cloud/Domains.vue'),
           meta: { title: '域名管理' },
         },
+        {
+          path: 'cloud/certificates',
+          name: 'CloudCertificates',
+          component: () => import('../views/cloud/Certificates.vue'),
+          meta: { title: '证书管理' },
+        },
         // 配置管理：服务器分配（归属分配 + 服务规划，仅显示已规划主机）+ CMDB 基础数据字典
         {
           path: 'config/allocation',

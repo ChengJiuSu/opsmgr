@@ -269,3 +269,126 @@ class DnsRecordApiTests(BaseApiTest):
         self.assertEqual(r.status_code, 200)
         self.assertIn(('delete', 'r1'), fake.calls)
         self.assertFalse(DnsRecord.objects.filter(pk=rec.id).exists())
+
+
+class CertificateApiTests(BaseApiTest):
+    """证书 API：mock acme 签发（sync 后端跑通完整落库链路）。"""
+
+    def _create_cert(self, **kwargs):
+        from apps.cloud_mgr.models import Certificate
+        defaults = {
+            'name': 'web-cert', 'domains': ['example.com', '*.example.com'],
+            'cloud_account': self.account,
+        }
+        defaults.update(kwargs)
+        return Certificate.objects.create(**defaults)
+
+    def test_create_validates_domains(self):
+        admin = self._client()
+        r = admin.post('/api/cloud/certificates/', {
+            'name': 'c1', 'domains': ['Example.COM.', '*.example.com'],
+            'cloud_account': self.account.id,
+        }, format='json')
+        self.assertEqual(r.status_code, 201)
+        self.assertEqual(r.json()['domains'], ['example.com', '*.example.com'])
+        # 空列表 / 通配符开头 / 非法格式
+        for bad in ([], ['*.example.com'], ['not_a_domain']):
+            r = admin.post('/api/cloud/certificates/', {
+                'name': f'bad-{len(bad)}', 'domains': bad, 'cloud_account': self.account.id,
+            }, format='json')
+            self.assertEqual(r.status_code, 400, bad)
+
+    def test_key_not_echoed(self):
+        cert = self._create_cert(status='issued', private_key_pem='SECRET-KEY')
+        admin = self._client()
+        r = admin.get(f'/api/cloud/certificates/{cert.id}/')
+        body = r.json()
+        self.assertNotIn('private_key_pem', body)
+        self.assertNotIn('cert_pem', body)
+        self.assertTrue(body['has_private_key'])
+
+    @patch('apps.cloud_mgr.tasks.issue_certificate')
+    def test_issue_success_flow(self, mock_issue):
+        from datetime import timedelta
+        from django.utils import timezone as tz
+        expires = tz.now() + timedelta(days=90)
+        mock_issue.return_value = ('CERT', 'KEY', 'CHAIN', expires)
+        cert = self._create_cert()
+        admin = self._client()
+        with self.settings(TASK_EXEC_BACKEND='sync'):
+            r = admin.post(f'/api/cloud/certificates/{cert.id}/issue/')
+        self.assertEqual(r.status_code, 200)
+        cert.refresh_from_db()
+        self.assertEqual(cert.status, 'issued')
+        self.assertEqual(cert.cert_pem, 'CERT')
+        self.assertEqual(cert.private_key_pem, 'KEY')
+        self.assertIsNotNone(cert.expires_at)
+
+    @patch('apps.cloud_mgr.tasks.issue_certificate')
+    def test_issue_failure_records_error(self, mock_issue):
+        from apps.cloud_mgr.acme import AcmeError
+        mock_issue.side_effect = AcmeError('DNS 验证失败')
+        cert = self._create_cert()
+        admin = self._client()
+        with self.settings(TASK_EXEC_BACKEND='sync'):
+            admin.post(f'/api/cloud/certificates/{cert.id}/issue/')
+        cert.refresh_from_db()
+        self.assertEqual(cert.status, 'failed')
+        self.assertIn('DNS 验证失败', cert.last_error)
+
+    def test_issue_blocked_while_issuing(self):
+        cert = self._create_cert(status='issuing')
+        admin = self._client()
+        r = admin.post(f'/api/cloud/certificates/{cert.id}/issue/')
+        self.assertEqual(r.status_code, 400)
+        r = admin.delete(f'/api/cloud/certificates/{cert.id}/')
+        self.assertEqual(r.status_code, 400)
+
+    def test_renew_requires_issued(self):
+        cert = self._create_cert(status='pending')
+        admin = self._client()
+        r = admin.post(f'/api/cloud/certificates/{cert.id}/renew/')
+        self.assertEqual(r.status_code, 400)
+
+    def test_issued_cert_locks_domains(self):
+        cert = self._create_cert(status='issued')
+        admin = self._client()
+        r = admin.patch(f'/api/cloud/certificates/{cert.id}/', {
+            'domains': ['other.com'],
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        # remark / auto_renew 可改
+        r = admin.patch(f'/api/cloud/certificates/{cert.id}/', {'auto_renew': False}, format='json')
+        self.assertEqual(r.status_code, 200)
+
+    def test_download_admin_only_and_full_pem(self):
+        cert = self._create_cert(status='issued', cert_pem='CERT', private_key_pem='KEY', chain_pem='CHAIN')
+        normal = self._client(is_staff=False)
+        self.assertEqual(normal.get(f'/api/cloud/certificates/{cert.id}/download/').status_code, 403)
+        admin = self._client()
+        r = admin.get(f'/api/cloud/certificates/{cert.id}/download/')
+        self.assertEqual(r.status_code, 200)
+        data = r.json()['data']
+        self.assertEqual(data['key_pem'], 'KEY')
+        self.assertEqual(data['fullchain_pem'], 'CHAIN')
+
+    @patch('apps.cloud_mgr.tasks.issue_certificate')
+    def test_renew_expiring_scan(self, mock_issue):
+        from datetime import timedelta
+        from django.utils import timezone as tz
+        from apps.cloud_mgr.tasks import renew_expiring
+        mock_issue.return_value = ('C', 'K', 'CH', tz.now() + timedelta(days=90))
+        soon = self._create_cert(name='soon', status='issued',
+                                 expires_at=tz.now() + timedelta(days=10))
+        far = self._create_cert(name='far', status='issued',
+                                expires_at=tz.now() + timedelta(days=80))
+        no_renew = self._create_cert(name='no-renew', status='issued', auto_renew=False,
+                                     expires_at=tz.now() + timedelta(days=10))
+        with self.settings(TASK_EXEC_BACKEND='sync'):
+            triggered = renew_expiring()
+        self.assertEqual(triggered, [soon.id])
+        soon.refresh_from_db()
+        self.assertEqual(soon.status, 'issued')
+        mock_issue.assert_called_once()
+        # 强制重签口径
+        self.assertTrue(mock_issue.call_args.kwargs.get('force'))
