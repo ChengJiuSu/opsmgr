@@ -1,0 +1,260 @@
+"""云控管理 API。
+
+- 云账号：仅管理员（含凭据连通性测试）；
+- 主域名/解析记录：管理员可写、登录用户只读；
+- 解析记录以本地库为准，增删改即时推送厂商 DNS；推送失败保留本地记录并
+  标记 sync_status=failed，可重试；
+- 域名 sync_records 从厂商侧全量拉取镜像到本地（忽略 _acme-challenge 记录）。
+"""
+import logging
+
+from django.db import transaction
+from django.utils import timezone
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema
+from rest_framework import viewsets
+from rest_framework.decorators import action
+
+from common.pagination import StandardPagination
+from common.permissions import IsAdmin, IsAdminOrReadOnly
+from common.response import fail, ok
+
+from .models import CloudAccount, DnsRecord, Domain
+from .providers import DnsProviderError, DnsRecordData, get_dns_provider
+from .serializers import CloudAccountSerializer, DnsRecordSerializer, DomainSerializer
+
+logger = logging.getLogger(__name__)
+
+# 证书 DNS 验证记录前缀：同步时忽略（acme.sh 验证后自动删除，窗口期不入库）
+ACME_CHALLENGE_PREFIX = '_acme-challenge'
+
+
+def _is_acme_challenge(rr):
+    return rr == ACME_CHALLENGE_PREFIX or rr.startswith(ACME_CHALLENGE_PREFIX + '.')
+
+
+def _to_provider_data(record):
+    return DnsRecordData(
+        rr=record.rr, type=record.type, value=record.value,
+        ttl=record.ttl, line=record.line or 'default',
+        remote_record_id=record.remote_record_id,
+        enabled=record.enabled,
+    )
+
+
+class CloudAccountViewSet(viewsets.ModelViewSet):
+    queryset = CloudAccount.objects.select_related('provider').all()
+    serializer_class = CloudAccountSerializer
+    permission_classes = [IsAdmin]
+    pagination_class = StandardPagination
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        provider = self.request.query_params.get('provider')
+        if provider:
+            qs = qs.filter(provider_id=provider) if provider.isdigit() else qs.filter(provider__code=provider)
+        enabled = self.request.query_params.get('enabled')
+        if enabled in ('true', 'false'):
+            qs = qs.filter(enabled=enabled == 'true')
+        return qs
+
+    def destroy(self, request, *args, **kwargs):
+        account = self.get_object()
+        if account.domains.exists():
+            return fail('该云账号下存在主域名，禁止删除（请先迁移或删除域名）。')
+        account.delete()
+        return ok(msg='已删除。')
+
+    @action(detail=True, methods=['post'])
+    def test_connection(self, request, pk=None):
+        """凭据连通性测试：调厂商域名列表接口，返回账号下托管域名。"""
+        account = self.get_object()
+        try:
+            domains = get_dns_provider(account).list_domains()
+        except DnsProviderError as e:
+            return fail(str(e))
+        return ok({'domains': domains}, msg=f'连接成功，账号下共 {len(domains)} 个域名。')
+
+
+class DomainViewSet(viewsets.ModelViewSet):
+    queryset = Domain.objects.select_related('cloud_account', 'cloud_account__provider').all()
+    serializer_class = DomainSerializer
+    permission_classes = [IsAdminOrReadOnly]
+    pagination_class = StandardPagination
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        account = self.request.query_params.get('cloud_account')
+        if account and account.isdigit():
+            qs = qs.filter(cloud_account_id=account)
+        keyword = self.request.query_params.get('keyword')
+        if keyword:
+            qs = qs.filter(name__icontains=keyword)
+        return qs
+
+    def destroy(self, request, *args, **kwargs):
+        # 仅删本地管理数据，不动厂商侧解析（防误删线上解析）
+        domain = self.get_object()
+        count = domain.records.count()
+        domain.delete()
+        return ok(msg=f'已删除本地域名及 {count} 条本地解析记录（厂商侧解析未改动）。')
+
+    @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
+    @action(detail=False, methods=['post'])
+    def import_remote(self, request):
+        """从云账号导入托管域名：{"cloud_account": id}，已存在的跳过。"""
+        account_id = request.data.get('cloud_account')
+        if not account_id:
+            return fail('缺少参数 cloud_account')
+        account = CloudAccount.objects.filter(pk=account_id).first()
+        if account is None:
+            return fail('云账号不存在')
+        try:
+            names = get_dns_provider(account).list_domains()
+        except DnsProviderError as e:
+            return fail(str(e))
+        created = []
+        with transaction.atomic():
+            for name in names:
+                _, is_new = Domain.objects.get_or_create(
+                    name=name, defaults={'cloud_account': account},
+                )
+                if is_new:
+                    created.append(name)
+        return ok(
+            {'imported': created, 'total': len(names)},
+            msg=f'导入完成：新增 {len(created)} 个，账号下共 {len(names)} 个。',
+        )
+
+    @action(detail=True, methods=['post'])
+    def sync_records(self, request, pk=None):
+        """从厂商侧全量同步解析记录到本地（镜像）。
+
+        - 忽略 _acme-challenge 证书验证记录；
+        - 本地有 remote_record_id 但厂商侧已不存在的记录删除；
+        - 本地 pending/failed（尚未推送成功）的记录保留。
+        """
+        domain = self.get_object()
+        try:
+            remote_records = get_dns_provider(domain.cloud_account).list_records(domain.name)
+        except DnsProviderError as e:
+            domain.status = 'abnormal'
+            domain.save(update_fields=['status', 'updated_at'])
+            return fail(str(e))
+
+        stats = {'created': 0, 'updated': 0, 'deleted': 0, 'skipped_acme': 0}
+        with transaction.atomic():
+            remote_ids = set()
+            for r in remote_records:
+                if _is_acme_challenge(r.rr):
+                    stats['skipped_acme'] += 1
+                    continue
+                remote_ids.add(r.remote_record_id)
+                fields = {
+                    'rr': r.rr, 'type': r.type, 'value': r.value, 'ttl': r.ttl,
+                    'line': r.line, 'enabled': r.enabled,
+                    'sync_status': 'synced', 'sync_error': '',
+                }
+                obj = domain.records.filter(remote_record_id=r.remote_record_id).first()
+                if obj is None:
+                    # 本地手工建但尚未推送成功的同内容记录：认领厂商侧 ID
+                    obj = domain.records.filter(
+                        rr=r.rr, type=r.type, value=r.value, line=r.line,
+                        remote_record_id='',
+                    ).first()
+                if obj:
+                    for k, v in fields.items():
+                        setattr(obj, k, v)
+                    obj.remote_record_id = r.remote_record_id
+                    obj.save()
+                    stats['updated'] += 1
+                else:
+                    domain.records.create(remote_record_id=r.remote_record_id, **fields)
+                    stats['created'] += 1
+            deleted, _ = (
+                domain.records.exclude(remote_record_id='')
+                .exclude(remote_record_id__in=remote_ids)
+                .delete()
+            )
+            stats['deleted'] = deleted
+            domain.status = 'normal'
+            domain.last_synced_at = timezone.now()
+            domain.save(update_fields=['status', 'last_synced_at', 'updated_at'])
+        return ok(stats, msg='同步完成：新增 {created}、更新 {updated}、删除 {deleted}。'.format(**stats))
+
+
+class DnsRecordViewSet(viewsets.ModelViewSet):
+    queryset = DnsRecord.objects.select_related('domain', 'domain__cloud_account', 'server').all()
+    serializer_class = DnsRecordSerializer
+    permission_classes = [IsAdminOrReadOnly]
+    pagination_class = StandardPagination
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        domain = self.request.query_params.get('domain')
+        if domain and domain.isdigit():
+            qs = qs.filter(domain_id=domain)
+        rtype = self.request.query_params.get('type')
+        if rtype:
+            qs = qs.filter(type=rtype)
+        keyword = self.request.query_params.get('keyword')
+        if keyword:
+            qs = qs.filter(rr__icontains=keyword)
+        sync_status = self.request.query_params.get('sync_status')
+        if sync_status:
+            qs = qs.filter(sync_status=sync_status)
+        return qs
+
+    def _push(self, record, is_new):
+        """推送到厂商 DNS，就地更新 sync 状态（不抛异常）。"""
+        try:
+            provider = get_dns_provider(record.domain.cloud_account)
+            if is_new or not record.remote_record_id:
+                record.remote_record_id = provider.add_record(record.domain.name, _to_provider_data(record))
+            else:
+                provider.update_record(record.domain.name, _to_provider_data(record))
+            record.sync_status, record.sync_error = 'synced', ''
+        except DnsProviderError as e:
+            record.sync_status, record.sync_error = 'failed', str(e)
+        record.save(update_fields=['remote_record_id', 'sync_status', 'sync_error', 'updated_at'])
+
+    def perform_create(self, serializer):
+        record = serializer.save()
+        self._push(record, is_new=True)
+
+    def perform_update(self, serializer):
+        old_enabled = serializer.instance.enabled
+        record = serializer.save()
+        self._push(record, is_new=False)
+        # 启停状态单独接口（部分厂商更新记录不改状态）
+        if record.sync_status == 'synced' and record.enabled != old_enabled:
+            try:
+                get_dns_provider(record.domain.cloud_account).set_record_enabled(
+                    record.domain.name, record.remote_record_id, record.enabled,
+                )
+            except DnsProviderError as e:
+                record.sync_status, record.sync_error = 'failed', str(e)
+                record.save(update_fields=['sync_status', 'sync_error', 'updated_at'])
+
+    def destroy(self, request, *args, **kwargs):
+        record = self.get_object()
+        if record.remote_record_id:
+            try:
+                get_dns_provider(record.domain.cloud_account).delete_record(
+                    record.domain.name, record.remote_record_id,
+                )
+            except DnsProviderError as e:
+                return fail(f'厂商侧删除失败，本地记录保留：{e}')
+        record.delete()
+        return ok(msg='已删除。')
+
+    @action(detail=True, methods=['post'])
+    def retry_sync(self, request, pk=None):
+        """重推 pending/failed 记录。"""
+        record = self.get_object()
+        if record.sync_status == 'synced':
+            return fail('该记录已同步，无需重推。')
+        self._push(record, is_new=not record.remote_record_id)
+        if record.sync_status == 'failed':
+            return fail(f'重推失败：{record.sync_error}')
+        return ok(self.get_serializer(record).data, msg='重推成功。')

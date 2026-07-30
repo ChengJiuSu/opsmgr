@@ -26,6 +26,14 @@
           </template>
           <el-menu-item index="/assets/servers">服务器</el-menu-item>
         </el-sub-menu>
+        <el-sub-menu index="cloud">
+          <template #title>
+            <el-icon><Cloudy /></el-icon>
+            <span>云控管理</span>
+          </template>
+          <el-menu-item v-if="authStore.isStaff" index="/cloud/accounts">云账号</el-menu-item>
+          <el-menu-item index="/cloud/domains">域名管理</el-menu-item>
+        </el-sub-menu>
         <el-sub-menu index="config">
           <template #title>
             <el-icon><SetUp /></el-icon>
@@ -136,7 +144,7 @@ import { ref, reactive } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   Monitor, DataBoard, Box, Document, Setting, SetUp,
-  Fold, Expand, ArrowDown, SwitchButton, Lock, Promotion,
+  Fold, Expand, ArrowDown, SwitchButton, Lock, Promotion, Cloudy,
 } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../stores/auth'

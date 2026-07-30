@@ -26,6 +26,19 @@ const router = createRouter({
           component: () => import('../views/assets/Servers.vue'),
           meta: { title: '服务器管理' },
         },
+        // 云控管理：云账号（仅管理员）+ 域名管理（主域名/解析记录）
+        {
+          path: 'cloud/accounts',
+          name: 'CloudAccounts',
+          component: () => import('../views/cloud/CloudAccounts.vue'),
+          meta: { title: '云账号', staff: true },
+        },
+        {
+          path: 'cloud/domains',
+          name: 'CloudDomains',
+          component: () => import('../views/cloud/Domains.vue'),
+          meta: { title: '域名管理' },
+        },
         // 配置管理：服务器分配（归属分配 + 服务规划，仅显示已规划主机）+ CMDB 基础数据字典
         {
           path: 'config/allocation',

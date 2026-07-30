@@ -113,6 +113,7 @@ LOCAL_APPS = [
     'apps.task_exec',
     'apps.artifact_mgr',
     'apps.agent_mgr',
+    'apps.cloud_mgr',
 ]
 
 # daphne 必须排在 staticfiles 之前：接管 runserver 为 ASGI（含 WebSocket）
