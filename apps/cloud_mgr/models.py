@@ -108,7 +108,9 @@ class DnsRecord(models.Model):
         Domain, verbose_name='主域名', on_delete=models.CASCADE,
         related_name='records',
     )
-    rr = models.CharField('主机记录', max_length=253, help_text='如 www、@、*')
+    # 长度受 uniq_dns_record 联合唯一索引限制：InnoDB 单索引上限 3072 字节，
+    # utf8mb4 下 domain(8)+rr(512)+type(40)+value(2048)+line(200)=2808，不可再放宽
+    rr = models.CharField('主机记录', max_length=128, help_text='如 www、@、*')
     type = models.CharField('记录类型', max_length=10, choices=TYPE_CHOICES, default='A')
     value = models.CharField('记录值', max_length=512)
     ttl = models.PositiveIntegerField('TTL(秒)', default=600)

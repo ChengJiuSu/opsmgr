@@ -111,7 +111,7 @@ class Migration(migrations.Migration):
             name='DnsRecord',
             fields=[
                 ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
-                ('rr', models.CharField(help_text='如 www、@、*', max_length=253, verbose_name='主机记录')),
+                ('rr', models.CharField(help_text='如 www、@、*', max_length=128, verbose_name='主机记录')),
                 ('type', models.CharField(choices=[('A', 'A'), ('AAAA', 'AAAA'), ('CNAME', 'CNAME'), ('TXT', 'TXT'), ('MX', 'MX'), ('NS', 'NS'), ('SRV', 'SRV'), ('CAA', 'CAA')], default='A', max_length=10, verbose_name='记录类型')),
                 ('value', models.CharField(max_length=512, verbose_name='记录值')),
                 ('ttl', models.PositiveIntegerField(default=600, verbose_name='TTL(秒)')),

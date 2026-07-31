@@ -82,6 +82,10 @@ cert-deployments `certificate`、`target_type`、`status`。
 | target_type=server | server 必填、仅 A/AAAA；value 自动取 `Server.conn_ip`（公网优先） |
 | 唯一性 | 域名+主机记录+类型+值+线路；关闭自动 UniqueTogetherValidator（与 value 后端填充冲突），validate() 手动校验 + DB 约束兜底 |
 
+> `uniq_dns_record` 是 5 列联合唯一索引，受 InnoDB 单索引 3072 字节上限约束。utf8mb4 下当前占用
+> `domain(8) + rr(128×4) + type(10×4) + value(512×4) + line(50×4) = 2808` 字节。
+> 加宽 `rr`/`value`/`line` 或往该约束里加列前，先重算这个和；MySQL 无参数可放宽该上限（sqlite 不校验，本地开发不会暴露问题）。
+
 ## 同步语义
 
 - **推送（本地 → 厂商）**：写操作后 `_push`；失败不回滚本地，`sync_status=failed` + `sync_error`，可 retry_sync 重推。启停状态走独立厂商接口。
