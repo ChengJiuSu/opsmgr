@@ -8,7 +8,9 @@ export const updateTask = (id, data) => request.patch(`/api/exec/tasks/${id}/`, 
 export const deleteTask = (id) => request.delete(`/api/exec/tasks/${id}/`)
 export const getMatchedServers = (id) => request.get(`/api/exec/tasks/${id}/matched_servers/`)
 export const executeTask = (id, data) => request.post(`/api/exec/tasks/${id}/execute/`, data)
-export const getTaskOutput = (id) => request.get(`/api/exec/tasks/${id}/output/`)
+// 执行中日志轮询：带 offset 时后端只回传新增部分（delta=true 则前端追加）
+export const getTaskOutput = (id, offset = 0) =>
+  request.get(`/api/exec/tasks/${id}/output/`, { params: offset ? { offset } : {} })
 // 暂停确认：任务流停在「暂停确认」模块时继续（continue）或中止（abort）
 export const confirmTask = (id, action) => request.post(`/api/exec/tasks/${id}/confirm/`, { action })
 export const getTaskLogs = (id) => request.get(`/api/exec/tasks/${id}/logs/`)

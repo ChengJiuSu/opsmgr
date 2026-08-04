@@ -300,7 +300,7 @@ class TaskExecutionLogSerializer(serializers.ModelSerializer):
 
     @extend_schema_field(OpenApiTypes.BOOL)
     def get_has_full_log(self, obj):
-        # 输出超过预览上限时才落盘完整日志文件
+        # 执行时完整日志流式落盘；文件过保留期被清理后置空，此处即为 false
         return bool(obj.log_file)
 
     @extend_schema_field(OpenApiTypes.INT)

@@ -35,7 +35,8 @@
         <span v-if="currentMeta.return_code != null" class="pane-meta">rc={{ currentMeta.return_code }}</span>
         <span v-if="currentMeta.attempts > 1" class="pane-meta">已重试 {{ currentMeta.attempts - 1 }} 次</span>
       </div>
-      <pre ref="paneRef" class="pane-body">{{ currentBody }}</pre>
+      <!-- ansible 彩色输出：ANSI 转义已转为已转义的 span（见 utils/ansi.js） -->
+      <pre ref="paneRef" class="pane-body" v-html="currentHtml" />
     </div>
   </div>
 </template>
@@ -43,6 +44,7 @@
 <script setup>
 import { ref, computed, nextTick, watch } from 'vue'
 import { Loading } from '@element-plus/icons-vue'
+import { ansiToHtml, stripAnsi } from '../utils/ansi'
 
 const props = defineProps({
   output: { type: String, default: '' },
@@ -73,7 +75,8 @@ const parsed = computed(() => {
   const preamble = []
   let current = null
   for (const line of (props.output || '').split('\n')) {
-    const m = line.match(HEADER_RE)
+    // 模块头由平台生成（无颜色码），仍按去色后的文本匹配以防夹带转义
+    const m = stripAnsi(line).match(HEADER_RE)
     if (m) {
       if (current) sections.push(current)
       current = { index: Number(m[1]), header: m[3].trim(), lines: [] }
@@ -131,6 +134,8 @@ const currentBody = computed(() => {
   if (mod.status === 'skipped') return '（该模块因前序失败被跳过，未执行）'
   return '（等待执行…）'
 })
+
+const currentHtml = computed(() => ansiToHtml(currentBody.value))
 
 function select(key) {
   selected.value = key
@@ -231,4 +236,31 @@ watch(() => props.stepsResult, () => {
   white-space: pre-wrap;
   word-break: break-all;
 }
+
+/* ── ansible ANSI 颜色（v-html 生成的节点，需 :deep 穿透 scoped）── */
+.pane-body :deep(.ansi-bold) { font-weight: 700; }
+.pane-body :deep(.ansi-fg-black) { color: #6b6b6b; }
+.pane-body :deep(.ansi-fg-red) { color: #f07178; }
+.pane-body :deep(.ansi-fg-green) { color: #7ec699; }
+.pane-body :deep(.ansi-fg-yellow) { color: #e2c08d; }
+.pane-body :deep(.ansi-fg-blue) { color: #6fb3e0; }
+.pane-body :deep(.ansi-fg-magenta) { color: #d08fd0; }
+.pane-body :deep(.ansi-fg-cyan) { color: #6cc4c4; }
+.pane-body :deep(.ansi-fg-white) { color: #e6e6e6; }
+.pane-body :deep(.ansi-fg-bright-black) { color: #8a8a8a; }
+.pane-body :deep(.ansi-fg-bright-red) { color: #ff7b80; }
+.pane-body :deep(.ansi-fg-bright-green) { color: #93e6ac; }
+.pane-body :deep(.ansi-fg-bright-yellow) { color: #f2d18b; }
+.pane-body :deep(.ansi-fg-bright-blue) { color: #8ac6f2; }
+.pane-body :deep(.ansi-fg-bright-magenta) { color: #e6a3e6; }
+.pane-body :deep(.ansi-fg-bright-cyan) { color: #87dada; }
+.pane-body :deep(.ansi-fg-bright-white) { color: #ffffff; }
+.pane-body :deep(.ansi-bg-red) { background: #5a2226; }
+.pane-body :deep(.ansi-bg-green) { background: #24452f; }
+.pane-body :deep(.ansi-bg-yellow) { background: #4d3f22; }
+.pane-body :deep(.ansi-bg-blue) { background: #22364d; }
+.pane-body :deep(.ansi-bg-magenta) { background: #43264a; }
+.pane-body :deep(.ansi-bg-cyan) { background: #1f4444; }
+.pane-body :deep(.ansi-bg-white) { background: #4a4a4a; }
+.pane-body :deep(.ansi-bg-black) { background: #2a2a2a; }
 </style>

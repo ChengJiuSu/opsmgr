@@ -249,10 +249,14 @@ TASK_EXEC_BACKEND = config('TASK_EXEC_BACKEND', default='thread')
 TASK_FAILURE_WAIT_TIMEOUT = config('TASK_FAILURE_WAIT_TIMEOUT', default=600, cast=int)
 
 # ── 任务执行日志 ──────────────────────────────────────────
-# 输出超过预览上限时全量落盘的目录（输出可能含敏感回显，禁止暴露到静态文件路径）
+# 每次执行的完整日志流式落盘目录（输出可能含敏感回显，禁止暴露到静态文件路径）
 TASK_LOG_DIR = config('TASK_LOG_DIR', default=str(BASE_DIR / 'logs' / 'tasks'))
-# 执行日志保留天数，clean_task_logs 命令据此清理过期记录与文件
+# 执行日志记录保留天数，clean_task_logs 命令据此清理过期记录
 TASK_LOG_RETENTION_DAYS = config('TASK_LOG_RETENTION_DAYS', default=90, cast=int)
+# 落盘日志文件保留天数（文件体积大，比记录更早清理；含孤儿文件按 mtime 清）
+TASK_LOG_FILE_RETENTION_DAYS = config('TASK_LOG_FILE_RETENTION_DAYS', default=30, cast=int)
+# ansible 彩色输出：开启则日志内保留 ANSI 颜色码（前端渲染着色），关闭为纯文本
+TASK_LOG_COLOR = config('TASK_LOG_COLOR', default=True, cast=bool)
 
 # ── 构建制品（Jenkins CI 上报）───────────────────────────
 # CI 上报的代码压缩包落盘根目录，按 项目组/渠道/环境/版本 分层

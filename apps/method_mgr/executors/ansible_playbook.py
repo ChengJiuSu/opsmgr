@@ -8,7 +8,7 @@ import os
 
 from django.conf import settings
 
-from common.ansible import resolve_within, run_subprocess
+from common.ansible import resolve_within, run_stream
 
 from .base import BaseExecutor, register
 
@@ -20,7 +20,7 @@ class AnsiblePlaybookExecutor(BaseExecutor):
         if not (config or {}).get('playbook'):
             raise ValueError('ansible_playbook 方法必须在 config.playbook 指定剧本文件')
 
-    def execute(self, task, method, inventory_path=None, servers=None):
+    def execute(self, task, method, inventory_path=None, servers=None, on_data=None):
         project_dir = getattr(settings, 'ANSIBLE_PROJECT_DIR', '')
         if not project_dir or not os.path.isdir(project_dir):
             return 1, f'Ansible 项目目录不存在：{project_dir!r}（请配置 ANSIBLE_PROJECT_DIR）'
@@ -51,4 +51,4 @@ class AnsiblePlaybookExecutor(BaseExecutor):
         # 变量管理启用变量 + 模块额外变量（后者覆盖同名项）
         cmd += extra_vars_args(task)
 
-        return run_subprocess(cmd, timeout=task.timeout or 300, cwd=project_dir)
+        return run_stream(cmd, timeout=task.timeout or 300, cwd=project_dir, on_data=on_data)

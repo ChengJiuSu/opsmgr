@@ -30,11 +30,13 @@ def agent_offline_reason(agent):
     return None
 
 
-def run_via_agent(agent, payload, timeout, task_id=None, log_id=None, step_order=None):
+def run_via_agent(agent, payload, timeout, task_id=None, log_id=None,
+                  step_order=None, on_data=None):
     """经 agent 执行一个模块单元，阻塞等待终态，返回 (rc, output)。
 
     通道层失败（离线/拒收/等待超时）rc=1/124，输出为中文原因；
-    执行结果 rc 与 ansible 输出由 agent 上报原样透传。
+    执行结果 rc 与 ansible 输出由 agent 上报原样透传。on_data 为实时输出
+    回调：轮询到新分片即回调增量（agent 侧日志分片由 consumer 异步落库）。
     """
     reason = agent_offline_reason(agent)
     if reason:
@@ -61,10 +63,13 @@ def run_via_agent(agent, payload, timeout, task_id=None, log_id=None, step_order
         return 1, f'agent 下发失败：{exc}'
 
     deadline = time.monotonic() + timeout + DISPATCH_MARGIN
+    sent_len = 0
     while time.monotonic() < deadline:
         time.sleep(POLL_INTERVAL)
         current = AgentJob.objects.filter(pk=job.pk).values(
             'status', 'return_code', 'output', 'error').first()
+        if on_data:
+            sent_len = _emit_delta(on_data, current['output'] or '', sent_len)
         if current['status'] in AgentJob.TERMINAL_STATUSES:
             if current['status'] == 'failed':
                 return current['return_code'] or 1, current['error'] or 'agent 通道失败。'
@@ -79,6 +84,22 @@ def run_via_agent(agent, payload, timeout, task_id=None, log_id=None, step_order
         logger.exception('agent %s 取消指令下发失败：job=%s', agent.name, job.job_id)
     output = AgentJob.objects.filter(pk=job.pk).values_list('output', flat=True).first() or ''
     return 124, output + f'\n✖ 等待 agent 回传超时（>{timeout + DISPATCH_MARGIN}s），已通知 agent 终止。'
+
+
+def _emit_delta(on_data, output, sent_len):
+    """把 agent 已回传输出的新增部分喂给实时回调，返回新的已发送长度。
+
+    output 被 agent 侧截断/重置（长度回退）时整体重发，避免拼出错位日志。
+    """
+    if len(output) < sent_len:
+        sent_len = 0
+    if len(output) > sent_len:
+        try:
+            on_data(output[sent_len:])
+        except Exception:  # noqa: BLE001 - 回调失败不影响任务本体
+            logger.exception('agent 输出实时回调失败：job 输出长度 %s', len(output))
+        sent_len = len(output)
+    return sent_len
 
 
 def _mark_failed(job, error, return_code=1):

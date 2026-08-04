@@ -51,8 +51,44 @@ apps/task_exec/
 ├── serializers.py   # 变量 key 校验、凭据脱敏、嵌套模块整体读写与内容校验、方法 service_type 执行校验
 ├── views.py         # 变量/凭据/任务 ViewSet + matched_servers/execute/output/logs 动作 + 剧本列表
 ├── runner.py        # 任务流执行：逐模块解析主机 + 动态 inventory + 变量注入 + ansible 调用，失败中止
+├── live.py          # LiveSink：流式日志汇聚（节流写库预览 + 完整日志落盘）
 ├── tasks.py         # dispatch：thread/celery/sync 三种后端（日志落主机快照与模块结果）
 └── management/      # clean_task_logs 日志清理命令
+```
+
+---
+
+## 流式执行日志（边跑边出）
+
+ansible 输出不再等模块跑完才可见：`common.ansible.run_stream` 以
+**伪终端（pty）**启动 ansible（posix），子进程视输出为终端 → 行级 flush
+且 `force_color` 生效，读到的分片经 `on_data` 回调交给 `live.LiveSink`：
+
+- **实时预览**：分片节流（0.5s 或 2KB）写 `ExecutionTask.output` 与
+  `TaskExecutionLog.output`，存尾部 60000 字符（超出加截断标注），前端
+  1s 轮询增量拉取（`output?offset=`）即可看到实时刷新；
+- **完整落盘**：每次执行流式写 `TASK_LOG_DIR/<task_id>/<log_id>.log`
+  （0600，父目录 0700），**所有执行都落盘**（旧行为仅超长才落盘），执行
+  记录详情接口读该文件返回全量。落盘以「已完成模块」为粒度追加（前缀式 append，
+  天然去重，并行组不会交错），实时性由写库预览承担；
+- **超时**：`threading.Timer` 到点按**进程组**终止（SIGTERM → 3s → SIGKILL），
+  ansible 派生的 ssh 子进程一并回收，返回 rc=124；
+- **颜色**：日志内保留 ANSI 颜色码，前端 `utils/ansi.js` 转成 span 着色
+  （`TASK_LOG_COLOR=false` 可关，此时 ansible 输出纯文本）；
+- **agent 通道**：`agent_mgr.dispatch.run_via_agent` 轮询 `AgentJob.output`
+  时把新增分片喂给同一 sink，NAT 主机执行同样实时可见；
+- 方法执行器（`ansible_playbook` provider）透传 `on_data`；Jenkins/JumpServer
+  等非 ansible provider 忽略该参数，仍为整段输出。
+
+日志保留（`clean_task_logs`，建议 cron 每日）：落盘文件按 mtime 保留
+`TASK_LOG_FILE_RETENTION_DAYS`（默认 30 天，含记录已删的孤儿文件；清理后
+对应记录 `log_file` 置空，详情页退回数据库预览），执行日志记录保留
+`TASK_LOG_RETENTION_DAYS`（默认 90 天）。`--files-only` 只清文件、
+`--dry-run` 只统计。
+
+```bash
+# crontab：每日 03:10 清理
+10 3 * * * cd /opt/devops-manager && venv/bin/python manage.py clean_task_logs >> logs/clean_task_logs.log 2>&1
 ```
 
 ---
@@ -144,8 +180,8 @@ Ansible 项目目录内执行剧本：
 
 ## 暂停确认（pause 模块）
 
-- 执行到 pause 模块：任务状态置 `paused`（`pause_type=confirm`），把已完成
-  模块输出实时落库（runner 每模块结束也会持久化进度），前端轮询可见暂停提示。
+- 执行到 pause 模块：任务状态置 `paused`（`pause_type=confirm`），已完成模块
+  输出与暂停提示由 sink 强制落库（见「流式执行日志」），前端轮询可见提示。
 - 确认：`POST /api/exec/tasks/{id}/confirm/` `{"action": "continue"|"abort"}`
   （仅管理员、仅 paused 状态可操作）；动作写入 `ExecutionTask.pause_action`，
   runner 每 2s 轮询消费后清空并恢复 `running`。
@@ -185,7 +221,7 @@ GET/POST/PUT/PATCH/DELETE /api/exec/tasks/        任务流 CRUD（steps 嵌套�
 GET                 /api/exec/tasks/{id}/matched_servers/  执行表单数据源：{global: {...}, steps: [{order,name,custom,total,servers?}]}
 POST                /api/exec/tasks/{id}/execute/ 发起执行，body {server_ids:[...]} 仅作用于全局范围模块（缺省=全部全局匹配主机）
 POST                /api/exec/tasks/{id}/confirm/ 人工处理暂停：确认模块 continue/abort；失败等待 retry/skip/abort（仅管理员）
-GET                 /api/exec/tasks/{id}/output/  轻量轮询：状态与输出
+GET                 /api/exec/tasks/{id}/output/  轻量轮询：状态与输出；?offset=N 只回增量（delta=true 时前端追加，返回新 offset）
 GET                 /api/exec/tasks/{id}/logs/    执行历史列表（含主机数/执行方式/逐模块结果 steps_result）
 GET                 /api/exec/tasks/{id}/logs/{log_id}/  单条日志详情（完整输出 + 主机快照）
 ```

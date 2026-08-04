@@ -7,9 +7,11 @@
 
 每次执行（含重跑）在 TaskExecutionLog 落一条日志记录：dispatch 时创建（pending），
 执行结束回填结果；任务本体字段仅作为「最近一次执行」快照。
+
+执行期间输出由 live.LiveSink 边跑边写：数据库存尾部预览（前端轮询实时刷新），
+完整日志流式落盘到 TASK_LOG_DIR/<task_id>/<log_id>.log（按保留期定期清理）。
 """
 import logging
-import os
 from pathlib import Path
 
 from django.conf import settings
@@ -17,28 +19,12 @@ from django.db import connection
 from django.utils import timezone
 
 from . import runner
+from .live import PREVIEW_LIMIT, LiveSink, log_rel_path, preview_of
 
 logger = logging.getLogger('apps.task_exec')
 
-# 数据库内输出预览上限（字符），超出部分全量落盘到 TASK_LOG_DIR
-OUTPUT_PREVIEW_LIMIT = 60000
-
-
-def _persist_full_output(log, output):
-    """输出超过预览上限时全量落盘，返回相对 TASK_LOG_DIR 的路径。
-
-    落盘失败仅记录告警，不影响任务与日志状态入库。
-    """
-    rel_path = Path(str(log.task_id)) / f'{log.pk}.log'
-    abs_path = Path(settings.TASK_LOG_DIR) / rel_path
-    try:
-        abs_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        abs_path.write_text(output, encoding='utf-8')
-        os.chmod(abs_path, 0o600)  # 输出可能含敏感回显，仅属主可读
-        return str(rel_path)
-    except OSError:
-        logger.exception('任务日志 %s 落盘失败：%s', log.pk, abs_path)
-        return ''
+# 数据库内输出预览上限（字符），完整输出见落盘文件
+OUTPUT_PREVIEW_LIMIT = PREVIEW_LIMIT
 
 
 def execute_task(task_id, log_id=None):
@@ -61,25 +47,33 @@ def execute_task(task_id, log_id=None):
     task.save(update_fields=['status', 'started_at'])
     log.save(update_fields=['status', 'started_at'])
 
+    rel_path = log_rel_path(task.pk, log.pk)
+    abs_path = Path(settings.TASK_LOG_DIR) / rel_path
+    sink = LiveSink(task.pk, log.pk, log_path=str(abs_path))
+
     rc, output, status, steps_result = -1, '', 'failed', []
     try:
-        rc, output, steps_result = runner.run(task)
+        rc, output, steps_result = runner.run(task, sink=sink)
         output = output or ''
         status = 'success' if rc == 0 else 'failed'
+        sink.close(final_output=output)
     except Exception as exc:  # noqa: BLE001 - 兜底，保证状态落库
         logger.exception('任务 %s 执行异常', task_id)
-        rc, output, status = -1, f'执行异常：{exc}', 'failed'
+        note = f'执行异常：{exc}'
+        partial = sink.render()[0]
+        sink.close(final_output=partial, note=note)
+        rc, output, status = -1, (f'{partial}\n\n{note}' if partial else note), 'failed'
     finally:
         finished_at = timezone.now()
-        preview = output[:OUTPUT_PREVIEW_LIMIT]
+        preview = preview_of(output)
 
         task.return_code, task.output, task.status, task.finished_at = rc, preview, status, finished_at
         task.save(update_fields=['return_code', 'output', 'status', 'finished_at'])
 
         log.return_code, log.output, log.status, log.finished_at = rc, preview, status, finished_at
         log.steps_result = steps_result
-        if len(output) > OUTPUT_PREVIEW_LIMIT:
-            log.log_file = _persist_full_output(log, output)
+        # 流式落盘成功即回填路径（详情页/下载读全量日志），落盘失败退回预览
+        log.log_file = rel_path if abs_path.exists() else ''
         log.save(update_fields=['return_code', 'output', 'status', 'finished_at', 'log_file', 'steps_result'])
 
 

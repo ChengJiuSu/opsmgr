@@ -286,14 +286,29 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['get'])
     def output(self, request, pk=None):
-        """轻量轮询接口：仅返回状态与输出。"""
+        """轻量轮询接口：仅返回状态与输出（支持增量拉取）。
+
+        带 ?offset=N 时只回传 N 之后的新增字符（delta=true），避免执行中
+        每秒重传整段日志；输出已达预览上限（尾部截断，前缀会漂移）或 offset
+        越界时回退整段（delta=false），前端按 delta 决定追加还是替换。
+        """
+        from .live import PREVIEW_LIMIT
+
         task = self.get_object()
+        out = task.output or ''
+        try:
+            offset = max(0, int(request.query_params.get('offset') or 0))
+        except (TypeError, ValueError):
+            offset = 0
+        delta = 0 < offset <= len(out) and len(out) < PREVIEW_LIMIT
         return ok({
             'id': task.id,
             'status': task.status,
             'pause_type': task.pause_type,
             'return_code': task.return_code,
-            'output': task.output,
+            'output': out[offset:] if delta else out,
+            'offset': len(out),
+            'delta': delta,
             'duration': task.duration,
         })
 

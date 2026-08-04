@@ -163,22 +163,37 @@ async function selectLog(log) {
   output.value = res.data?.output || '（暂无输出）'
 }
 
+// 增量轮询状态：outOffset = 服务端已回传长度；hasRaw = 当前展示的是真实日志（非占位）
+let outOffset = 0
+let hasRaw = false
+
 function startPolling() {
   stopPolling()
   polling.value = true
+  outOffset = 0
+  hasRaw = false
   pollTimer = setInterval(async () => {
     try {
-      const res = await getTaskOutput(taskId)
-      task.value = { ...task.value, ...res.data }
-      output.value = res.data.output || '（执行中，等待输出…）'
-      if (res.data.status === 'success' || res.data.status === 'failed') {
+      const res = await getTaskOutput(taskId, hasRaw ? outOffset : 0)
+      const data = res.data || {}
+      // output/offset/delta 属于日志流，不能并进任务对象（否则增量片段会污染 task.output）
+      const { output: _o, offset: _f, delta: _d, ...taskFields } = data
+      task.value = { ...task.value, ...taskFields }
+      if (data.delta) {
+        if (data.output) output.value += data.output   // 只回传新增部分，追加
+      } else {
+        output.value = data.output || '（执行中，等待输出…）'
+      }
+      outOffset = data.offset || 0
+      hasRaw = hasRaw || !!data.output
+      if (data.status === 'success' || data.status === 'failed') {
         stopPolling()
         init() // 执行完成：刷新日志列表并定位最新记录
       }
     } catch {
       stopPolling()
     }
-  }, 2000)
+  }, 1000)
 }
 
 function stopPolling() {

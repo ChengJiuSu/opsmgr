@@ -5,7 +5,9 @@
 """
 import os
 import shutil
+import sys
 import tempfile
+import time
 from datetime import timedelta
 from unittest import mock
 
@@ -18,8 +20,11 @@ from rest_framework.test import APIClient
 from apps.asset_mgr.models import Server
 from apps.method_mgr.models import Method
 
+from common import ansible as common_ansible
+
 from .models import Credential, ExecutionTask, TaskExecutionLog, TaskStep
 from . import runner
+from .live import PREVIEW_LIMIT, LiveSink
 from .runner import _inventory_content
 from .tasks import OUTPUT_PREVIEW_LIMIT
 
@@ -419,7 +424,7 @@ class ExecutionAPITests(TestCase):
         """串行执行：命令模块的 ansible 命令行携带 --forks 1，并发不带。"""
         c = self._client()
         task_id = self._create_task(c, exec_mode='serial')
-        with mock.patch('apps.task_exec.runner.run_subprocess', return_value=(0, 'ok')) as m:
+        with mock.patch('apps.task_exec.runner.run_stream', return_value=(0, 'ok')) as m:
             c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
         cmd = m.call_args[0][0]
         self.assertIn('--forks', cmd)
@@ -427,14 +432,14 @@ class ExecutionAPITests(TestCase):
 
         # 并发（默认）：按任务并发数分批，默认 10
         task2 = self._create_task(c)
-        with mock.patch('apps.task_exec.runner.run_subprocess', return_value=(0, 'ok')) as m:
+        with mock.patch('apps.task_exec.runner.run_stream', return_value=(0, 'ok')) as m:
             c.post(f'/api/exec/tasks/{task2}/execute/', {}, format='json')
         cmd = m.call_args[0][0]
         self.assertEqual(cmd[cmd.index('--forks') + 1], '10')
 
         # 自定义并发数
         task3 = self._create_task(c, forks=25)
-        with mock.patch('apps.task_exec.runner.run_subprocess', return_value=(0, 'ok')) as m:
+        with mock.patch('apps.task_exec.runner.run_stream', return_value=(0, 'ok')) as m:
             c.post(f'/api/exec/tasks/{task3}/execute/', {}, format='json')
         cmd = m.call_args[0][0]
         self.assertEqual(cmd[cmd.index('--forks') + 1], '25')
@@ -455,7 +460,7 @@ class ExecutionAPITests(TestCase):
                     task=task, order=1, name='m', task_type='method', method=method, tags='redis',
                 )
                 with mock.patch(
-                    'apps.method_mgr.executors.ansible_playbook.run_subprocess', return_value=(0, 'ok'),
+                    'apps.method_mgr.executors.ansible_playbook.run_stream', return_value=(0, 'ok'),
                 ) as m:
                     get_executor('ansible_playbook').execute(step, method, inventory_path='/tmp/inv.ini')
                 cmd = m.call_args[0][0]
@@ -558,7 +563,9 @@ class ExecutionAPITests(TestCase):
         self.assertEqual(ExecutionTask.objects.get(pk=task_id).status, 'failed')
 
     def test_long_output_persisted_to_file(self):
-        """输出超过预览上限时全量落盘，数据库仅存截断预览。"""
+        """完整输出落盘，数据库仅存带标注的尾部预览。"""
+        from .live import TRUNCATE_NOTE
+
         long_output = 'x' * (OUTPUT_PREVIEW_LIMIT + 500)
         log_dir = tempfile.mkdtemp(prefix='task_logs_')
         try:
@@ -571,7 +578,8 @@ class ExecutionAPITests(TestCase):
                     log = dispatch(task, triggered_by=self.admin)
                     log.refresh_from_db()
 
-                self.assertEqual(len(log.output), OUTPUT_PREVIEW_LIMIT)
+                self.assertTrue(log.output.startswith(TRUNCATE_NOTE))
+                self.assertEqual(len(log.output), OUTPUT_PREVIEW_LIMIT + len(TRUNCATE_NOTE))
                 self.assertTrue(log.log_file)
                 full_path = os.path.join(log_dir, log.log_file)
                 with open(full_path, encoding='utf-8') as f:
@@ -787,7 +795,7 @@ class ExecutionAPITests(TestCase):
         )
         c = self._client()
         task_id = self._create_task(c, steps=[self._step(extra_vars='override=1')])
-        with mock.patch('apps.task_exec.runner.run_subprocess', return_value=(0, 'ok')) as m:
+        with mock.patch('apps.task_exec.runner.run_stream', return_value=(0, 'ok')) as m:
             c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
         cmd = m.call_args[0][0]
         idxs = [i for i, a in enumerate(cmd) if a == '--extra-vars']
@@ -824,7 +832,7 @@ class ArtifactInjectTests(TestCase):
 
     def _run_step_cmd(self, c, task_id):
         """mock 子进程执行一次任务，返回捕获到的 ansible 命令行。"""
-        with mock.patch('apps.task_exec.runner.run_subprocess', return_value=(0, 'ok')) as m:
+        with mock.patch('apps.task_exec.runner.run_stream', return_value=(0, 'ok')) as m:
             c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
         return m.call_args[0][0]
 
@@ -859,7 +867,7 @@ class ArtifactInjectTests(TestCase):
         self._make_artifact('1.0.0')
         c = self._client()
         task_id = self._create_task(c, steps=[self._step(params={'artifact_version': '9.9.9'})])
-        with mock.patch('apps.task_exec.runner.run_subprocess', return_value=(0, 'ok')):
+        with mock.patch('apps.task_exec.runner.run_stream', return_value=(0, 'ok')):
             c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
         task = ExecutionTask.objects.get(pk=task_id)
         self.assertEqual(task.status, 'failed')
@@ -1027,7 +1035,7 @@ class ParallelStageTests(TestCase):
         self._step(2, '并B', parallel=True)
         barrier = threading.Barrier(2, timeout=10)
 
-        def fake_handler(step, task, servers):
+        def fake_handler(step, task, servers, on_data=None):
             barrier.wait()  # 两模块必须同时在跑才能都过闸
             return 0, f'{step.name} done'
 
@@ -1047,7 +1055,7 @@ class ParallelStageTests(TestCase):
         self._step(2, '并B', parallel=True)
         self._step(3, '串尾')
 
-        def fake_handler(step, task, servers):
+        def fake_handler(step, task, servers, on_data=None):
             return (1, 'boom') if step.name == '并B' else (0, 'ok')
 
         with mock.patch.dict(runner._STEP_HANDLERS, {'command': fake_handler}), \
@@ -1120,7 +1128,7 @@ class FailureHandlingTests(TestCase):
         self._step(2, '后续')
         calls = {'n': 0}
 
-        def handler(step, task, servers):
+        def handler(step, task, servers, on_data=None):
             if step.name == '会失败':
                 calls['n'] += 1
                 return (1, 'boom') if calls['n'] == 1 else (0, 'ok after retry')
@@ -1142,7 +1150,7 @@ class FailureHandlingTests(TestCase):
         self._step(1, '会失败')
         self._step(2, '后续')
 
-        def handler(step, task, servers):
+        def handler(step, task, servers, on_data=None):
             return (1, 'boom') if step.name == '会失败' else (0, 'tail ok')
 
         rc, output, results = self._run(handler, ['skip'])
@@ -1157,7 +1165,7 @@ class FailureHandlingTests(TestCase):
         self._step(1, '会失败')
         self._step(2, '后续')
 
-        def handler(step, task, servers):
+        def handler(step, task, servers, on_data=None):
             return (1, 'boom') if step.name == '会失败' else (0, 'tail ok')
 
         rc, output, results = self._run(handler, ['abort'])
@@ -1171,7 +1179,7 @@ class FailureHandlingTests(TestCase):
         self._step(1, '会失败')
         self._step(2, '后续')
 
-        def handler(step, task, servers):
+        def handler(step, task, servers, on_data=None):
             return (1, 'boom') if step.name == '会失败' else (0, 'tail ok')
 
         with override_settings(TASK_FAILURE_WAIT_TIMEOUT=1):
@@ -1186,7 +1194,7 @@ class FailureHandlingTests(TestCase):
         self._step(2, '并B', parallel=True)
         calls = {'A': 0, 'B': 0}
 
-        def handler(step, task, servers):
+        def handler(step, task, servers, on_data=None):
             key = 'A' if step.name == '并A' else 'B'
             calls[key] += 1
             if key == 'B' and calls['B'] == 1:
@@ -1217,3 +1225,279 @@ class FailureHandlingTests(TestCase):
         r = c.post(f'/api/exec/tasks/{self.task.id}/confirm/', {'action': 'skip'}, format='json')
         self.assertEqual(r.status_code, 400)
         self.assertIn('continue/abort', r.json()['msg'])
+
+
+class RunStreamTests(TestCase):
+    """流式子进程执行：分片回调、超时按进程组终止。"""
+
+    def test_streams_chunks_and_returns_full_output(self):
+        chunks = []
+        rc, out = common_ansible.run_stream(
+            [sys.executable, '-c', 'print("first", flush=True); print("second")'],
+            timeout=30, on_data=chunks.append,
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn('first', out)
+        self.assertIn('second', out)
+        # 回调分片拼接后与返回值一致（前端实时视图与最终日志同源）
+        self.assertEqual(''.join(chunks), out)
+
+    def test_callback_failure_does_not_break_execution(self):
+        def boom(_chunk):
+            raise RuntimeError('sink down')
+
+        rc, out = common_ansible.run_stream(
+            [sys.executable, '-c', 'print("still ok")'], timeout=30, on_data=boom)
+        self.assertEqual(rc, 0)
+        self.assertIn('still ok', out)
+
+    def test_timeout_terminates_and_returns_124(self):
+        rc, out = common_ansible.run_stream(
+            [sys.executable, '-c', 'import time; print("go", flush=True); time.sleep(30)'],
+            timeout=1, on_data=lambda _c: None,
+        )
+        self.assertEqual(rc, 124)
+        self.assertIn('go', out)
+        self.assertIn('超时', out)
+
+
+class LiveSinkTests(TestCase):
+    """实时输出汇聚：边跑边写库预览，完整日志按模块落盘。"""
+
+    def setUp(self):
+        self.task = ExecutionTask.objects.create(name='live')
+        self.log = TaskExecutionLog.objects.create(task=self.task)
+        self.dir = tempfile.mkdtemp(prefix='live_logs_')
+        self.path = os.path.join(self.dir, 'x.log')
+        self.sink = LiveSink(self.task.pk, self.log.pk, log_path=self.path)
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _db_output(self):
+        return ExecutionTask.objects.values_list('output', flat=True).get(pk=self.task.pk)
+
+    def test_running_step_visible_before_finish(self):
+        """模块执行中：分片即写库预览（任务与执行日志同步），尚未落盘。"""
+        outputs = []
+        self.sink.bind(outputs)
+        self.sink.begin(('s', 1), '═══ 模块 1/1：跑着 ═══', order=1)
+        self.sink.feed(('s', 1), 'partial line\n')
+        self.sink.flush(force=True)
+
+        self.assertIn('模块 1/1：跑着', self._db_output())
+        self.assertIn('partial line', self._db_output())
+        self.assertIn('partial line', TaskExecutionLog.objects.get(pk=self.log.pk).output)
+        self.assertFalse(os.path.exists(self.path))  # 落盘按模块粒度，模块未结束
+
+    def test_finished_step_written_to_file_without_duplication(self):
+        outputs = []
+        self.sink.bind(outputs)
+        key = ('s', 1)
+        self.sink.begin(key, 'H1', order=1)
+        self.sink.feed(key, 'chunk-a\n')
+        self.sink.end(key)
+        outputs.append('H1\nchunk-a\n')     # runner 结束模块后追加完整块
+        self.sink.flush(force=True)
+        self.sink.close(final_output='\n\n'.join(outputs))
+
+        with open(self.path, encoding='utf-8') as f:
+            content = f.read()
+        self.assertEqual(content, 'H1\nchunk-a\n')  # 实时分片不重复落盘
+
+    def test_transient_extra_not_persisted_to_file(self):
+        """失败等待提示只进实时预览，不写入落盘日志。"""
+        outputs = ['H1\ndone']
+        self.sink.bind(outputs)
+        self.sink.flush(extra='✖ 等待人工处理…', force=True)
+        self.sink.close(final_output='\n\n'.join(outputs))
+
+        self.assertIn('等待人工处理', self._db_output())
+        with open(self.path, encoding='utf-8') as f:
+            self.assertEqual(f.read(), 'H1\ndone')
+
+    def test_parallel_blocks_ordered_by_step_index(self):
+        self.sink.bind([])
+        self.sink.begin(('b', 1), 'H2', order=2)
+        self.sink.begin(('a', 1), 'H1', order=1)
+        self.sink.feed(('b', 1), 'second')
+        self.sink.feed(('a', 1), 'first')
+        self.sink.flush(force=True)
+
+        out = self._db_output()
+        self.assertLess(out.index('first'), out.index('second'))
+
+    def test_file_failure_does_not_break_flush(self):
+        """落盘失败（目录不可写等）只告警，写库预览照常。"""
+        sink = LiveSink(self.task.pk, self.log.pk, log_path=os.path.join(self.dir, 'x.log', 'nope.log'))
+        sink.bind(['H1\ndone'])
+        sink.flush(force=True)
+        self.assertIn('done', self._db_output())
+
+
+@override_settings(TASK_EXEC_BACKEND='sync', TASK_FAILURE_WAIT_TIMEOUT=0)
+class StreamedTaskLogTests(TestCase):
+    """执行链路的流式日志：完整日志落盘 + output 接口增量拉取。"""
+
+    setUp = ExecutionAPITests.setUp
+    _client = ExecutionAPITests._client
+    _step = staticmethod(ExecutionAPITests._step)
+    _create_task = ExecutionAPITests._create_task
+
+    def test_full_log_always_persisted_to_file(self):
+        if not ANSIBLE:
+            self.skipTest('ansible 未安装')
+        log_dir = tempfile.mkdtemp(prefix='task_logs_')
+        try:
+            with override_settings(TASK_LOG_DIR=log_dir):
+                c = self._client()
+                task_id = self._create_task(c, steps=[self._step(command='echo stream_marker')])
+                c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
+                log = TaskExecutionLog.objects.get(task_id=task_id)
+                # 输出未超预览上限也落盘（历史行为仅超长才落盘）
+                self.assertTrue(log.log_file)
+                with open(os.path.join(log_dir, log.log_file), encoding='utf-8') as f:
+                    content = f.read()
+                self.assertIn('stream_marker', content)
+                self.assertIn('模块 1/1', content)
+                # 详情接口读落盘全量
+                r = c.get(f'/api/exec/tasks/{task_id}/logs/{log.id}/')
+                self.assertEqual(r.json()['data']['output'], content)
+        finally:
+            shutil.rmtree(log_dir, ignore_errors=True)
+
+    def test_playbook_output_visible_before_step_finishes(self):
+        """流式：剧本第一个 task 的输出在模块跑完前就已可见（写库预览）。"""
+        if not ANSIBLE:
+            self.skipTest('ansible 未安装')
+        proj = tempfile.mkdtemp(prefix='ansible_proj_')
+        with open(os.path.join(proj, 'slow.yml'), 'w') as f:
+            f.write(
+                '- hosts: all\n'
+                '  gather_facts: false\n'
+                '  tasks:\n'
+                '    - debug: {msg: "first_task_marker"}\n'
+                '    - command: sleep 2\n'
+                '    - debug: {msg: "second_task_marker"}\n'
+            )
+        snapshots = []
+        original = LiveSink._save_preview
+
+        def spy(sink_self, preview):
+            snapshots.append(preview)
+            original(sink_self, preview)
+
+        try:
+            with override_settings(ANSIBLE_PROJECT_DIR=proj, TASK_LOG_DIR=proj):
+                task = ExecutionTask.objects.create(name='slow', created_by=self.admin)
+                TaskStep.objects.create(
+                    task=task, order=1, name='慢剧本', task_type='playbook',
+                    playbook='slow.yml', timeout=60,
+                )
+                task.servers.add(self.server)
+                from .tasks import dispatch
+                with mock.patch.object(LiveSink, '_save_preview', spy):
+                    dispatch(task, triggered_by=self.admin)
+            task.refresh_from_db()
+            self.assertEqual(task.status, 'success')
+            self.assertIn('second_task_marker', task.output)
+            # 关键：存在「已见第一个 task、尚未见最后一个 task」的中间快照
+            self.assertTrue(any(
+                'first_task_marker' in s and 'second_task_marker' not in s for s in snapshots),
+                '未捕获到流式中间输出（日志仍是模块跑完才落库）')
+        finally:
+            shutil.rmtree(proj, ignore_errors=True)
+
+    def test_output_api_incremental(self):
+        c = self._client()
+        task = ExecutionTask.objects.create(name='inc', created_by=self.admin, status='running')
+        ExecutionTask.objects.filter(pk=task.pk).update(output='0123456789')
+
+        r = c.get(f'/api/exec/tasks/{task.id}/output/', {'offset': 4})
+        data = r.json()['data']
+        self.assertTrue(data['delta'])
+        self.assertEqual(data['output'], '456789')
+        self.assertEqual(data['offset'], 10)
+
+        # offset 越界（如日志被重置）回退整段
+        r = c.get(f'/api/exec/tasks/{task.id}/output/', {'offset': 99})
+        data = r.json()['data']
+        self.assertFalse(data['delta'])
+        self.assertEqual(data['output'], '0123456789')
+
+        # 无 offset 与非法 offset 均为整段
+        for params in ({}, {'offset': 'abc'}):
+            data = c.get(f'/api/exec/tasks/{task.id}/output/', params).json()['data']
+            self.assertFalse(data['delta'])
+            self.assertEqual(data['output'], '0123456789')
+
+    def test_output_api_full_when_preview_saturated(self):
+        """预览已达上限（尾部截断，前缀漂移）时禁用增量，回退整段。"""
+        c = self._client()
+        task = ExecutionTask.objects.create(name='sat', created_by=self.admin, status='running')
+        ExecutionTask.objects.filter(pk=task.pk).update(output='y' * (PREVIEW_LIMIT + 10))
+        data = c.get(f'/api/exec/tasks/{task.id}/output/', {'offset': 5}).json()['data']
+        self.assertFalse(data['delta'])
+        self.assertEqual(len(data['output']), PREVIEW_LIMIT + 10)
+
+
+class CleanTaskLogFilesTests(TestCase):
+    """落盘日志清理：按 mtime 清过期文件（含孤儿），记录按各自保留期清。"""
+
+    def setUp(self):
+        self.task = ExecutionTask.objects.create(name='cleanup')
+        self.dir = tempfile.mkdtemp(prefix='task_logs_')
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _write(self, rel, days_old):
+        path = os.path.join(self.dir, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('log body')
+        old = time.time() - days_old * 86400
+        os.utime(path, (old, old))
+        return path
+
+    def test_files_only_removes_expired_and_clears_reference(self):
+        fresh_log = TaskExecutionLog.objects.create(task=self.task, log_file='1/fresh.log', output='预览')
+        old_log = TaskExecutionLog.objects.create(task=self.task, log_file='1/old.log', output='预览')
+        fresh = self._write('1/fresh.log', 3)
+        old = self._write('1/old.log', 45)
+        orphan = self._write('1/orphan.log', 45)  # 记录已删、文件残留
+
+        with override_settings(TASK_LOG_DIR=self.dir, TASK_LOG_FILE_RETENTION_DAYS=30):
+            call_command('clean_task_logs', '--files-only')
+
+        self.assertTrue(os.path.exists(fresh))
+        self.assertFalse(os.path.exists(old))
+        self.assertFalse(os.path.exists(orphan))
+        # 文件已清的记录仍在，log_file 置空后详情页退回数据库预览
+        old_log.refresh_from_db()
+        fresh_log.refresh_from_db()
+        self.assertEqual(old_log.log_file, '')
+        self.assertEqual(fresh_log.log_file, '1/fresh.log')
+        self.assertEqual(TaskExecutionLog.objects.count(), 2)
+
+    def test_expired_records_deleted_with_their_files(self):
+        old_log = TaskExecutionLog.objects.create(task=self.task, log_file='1/rec.log')
+        TaskExecutionLog.objects.filter(pk=old_log.pk).update(
+            created_at=timezone.now() - timedelta(days=120))
+        path = self._write('1/rec.log', 1)  # 文件本身未过期，随记录一起清
+
+        with override_settings(TASK_LOG_DIR=self.dir, TASK_LOG_RETENTION_DAYS=90,
+                               TASK_LOG_FILE_RETENTION_DAYS=30):
+            call_command('clean_task_logs')
+
+        self.assertFalse(os.path.exists(path))
+        self.assertFalse(TaskExecutionLog.objects.filter(pk=old_log.pk).exists())
+
+    def test_dry_run_keeps_everything(self):
+        old_log = TaskExecutionLog.objects.create(task=self.task, log_file='1/old.log')
+        path = self._write('1/old.log', 45)
+        with override_settings(TASK_LOG_DIR=self.dir, TASK_LOG_FILE_RETENTION_DAYS=30):
+            call_command('clean_task_logs', '--dry-run')
+        self.assertTrue(os.path.exists(path))
+        old_log.refresh_from_db()
+        self.assertEqual(old_log.log_file, '1/old.log')

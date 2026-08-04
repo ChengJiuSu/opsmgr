@@ -333,8 +333,9 @@ class TaskExecutionLog(models.Model):
     """任务执行日志：任务每执行一次落一条记录，反复执行追加而不覆盖历史。
 
     任务本体（ExecutionTask）上的状态/输出字段仅作为「最近一次执行」快照；
-    完整执行历史以本表为准。输出超过预览上限时全量落盘（settings.TASK_LOG_DIR），
-    ``log_file`` 保存相对该目录的文件路径。
+    完整执行历史以本表为准。执行期间完整输出流式落盘（settings.TASK_LOG_DIR），
+    ``log_file`` 保存相对该目录的文件路径（文件过保留期被清理后置空），
+    ``output`` 仅存尾部预览。
     """
 
     TRIGGER_CHOICES = [

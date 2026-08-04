@@ -16,8 +16,8 @@ from .base import BaseExecutor, register
 @register('jumpserver')
 class JumpServerExecutor(BaseExecutor):
 
-    def execute(self, task, method, inventory_path=None, servers=None):
-        # task 为 TaskStep；注册走 JumpServer API，不使用 inventory_path
+    def execute(self, task, method, inventory_path=None, servers=None, on_data=None):
+        # task 为 TaskStep；注册走 JumpServer API，不使用 inventory_path/on_data
         servers = list(servers or [])
         if not servers:
             return 1, '没有可注册的目标主机。'

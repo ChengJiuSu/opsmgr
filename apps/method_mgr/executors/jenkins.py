@@ -66,9 +66,9 @@ class JenkinsExecutor(BaseExecutor):
         if default_params is not None and not isinstance(default_params, dict):
             raise ValueError('config.default_params 必须为 JSON 对象（键值对）')
 
-    def execute(self, task, method, inventory_path=None, servers=None):
+    def execute(self, task, method, inventory_path=None, servers=None, on_data=None):
         # task 为 TaskStep：params/timeout 为模块级入参；Jenkins 构建不涉及目标主机，
-        # 忽略 inventory_path。
+        # 忽略 inventory_path；构建日志按轮询整段同步，暂不走 on_data 流式回传。
         config = method.config or {}
         try:
             self.validate_config(config)

@@ -260,7 +260,7 @@ class RunnerChannelSplitTests(TestCase):
         from apps.task_exec import runner
 
         task, step = self._task_and_step()
-        with mock.patch.object(runner, 'run_subprocess', return_value=(0, '直连输出')) as m_local, \
+        with mock.patch.object(runner, 'run_stream', return_value=(0, '直连输出')) as m_local, \
                 mock.patch('apps.agent_mgr.dispatch.run_via_agent',
                            return_value=(0, 'agent 输出')) as m_agent:
             rc, out = runner._run_command_step(step, task, [self.direct, self.via_agent])
@@ -280,7 +280,7 @@ class RunnerChannelSplitTests(TestCase):
         from apps.task_exec import runner
 
         task, step = self._task_and_step()
-        with mock.patch.object(runner, 'run_subprocess', return_value=(0, '直连输出')):
+        with mock.patch.object(runner, 'run_stream', return_value=(0, '直连输出')):
             rc, out = runner._run_command_step(step, task, [self.direct])
         self.assertEqual(rc, 0)
         self.assertEqual(out, '直连输出')  # 无 agent 组时输出不加通道标头
@@ -289,7 +289,7 @@ class RunnerChannelSplitTests(TestCase):
         from apps.task_exec import runner
 
         task, step = self._task_and_step()
-        with mock.patch.object(runner, 'run_subprocess', return_value=(0, 'ok')), \
+        with mock.patch.object(runner, 'run_stream', return_value=(0, 'ok')), \
                 mock.patch('apps.agent_mgr.dispatch.run_via_agent', return_value=(2, '失败')):
             rc, out = runner._run_command_step(step, task, [self.direct, self.via_agent])
         self.assertEqual(rc, 2)

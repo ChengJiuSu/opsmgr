@@ -28,7 +28,9 @@ import yaml
 
 from django.conf import settings
 
-from common.ansible import resolve_within, run_subprocess
+from common.ansible import resolve_within, run_stream
+
+from .live import PREVIEW_LIMIT, LiveSink
 
 logger = logging.getLogger('apps.task_exec')
 
@@ -233,12 +235,13 @@ def _split_by_agent(servers):
     return direct, sorted(groups.items(), key=lambda item: item[0].pk)
 
 
-def _run_channels(step, task, servers, run_direct, agent_payload):
+def _run_channels(step, task, servers, run_direct, agent_payload, on_data=None):
     """通道分组执行：直连组本地执行，agent 组经 dispatch 下发，输出拼接。
 
     run_direct(直连主机列表) → (rc, out)；agent_payload(该组主机列表) →
     下发 payload 字典。全部为直连（现状主流）时输出不加通道标头，与旧行为
-    完全一致；rc 取首个非零（保留 124 等语义）。
+    完全一致；rc 取首个非零（保留 124 等语义）。on_data 为实时输出回调，
+    通道标头也经它喂给实时视图（最终返回文本仍由本函数拼装）。
     """
     from apps.agent_mgr.dispatch import run_via_agent
 
@@ -246,21 +249,29 @@ def _run_channels(step, task, servers, run_direct, agent_payload):
     if not agent_groups:
         return run_direct(direct)
 
+    def emit(text):
+        if on_data:
+            on_data(text)
+
     parts, final_rc = [], 0
     if direct:
+        header = f'───── [直连 · {len(direct)} 台] ─────'
+        emit(header + '\n')
         rc, out = run_direct(direct)
-        parts.append(f'───── [直连 · {len(direct)} 台] ─────\n{out}')
+        parts.append(f'{header}\n{out}')
         final_rc = final_rc or rc
     for agent, group in agent_groups:
+        header = f'───── [经 Agent {agent.name} · {len(group)} 台] ─────'
+        emit(('\n\n' if parts else '') + header + '\n')
         rc, out = run_via_agent(
             agent, agent_payload(group), timeout=step.timeout or 300,
-            task_id=task.pk, step_order=step.order)
-        parts.append(f'───── [经 Agent {agent.name} · {len(group)} 台] ─────\n{out}')
+            task_id=task.pk, step_order=step.order, on_data=on_data)
+        parts.append(f'{header}\n{out}')
         final_rc = final_rc or rc
     return final_rc, '\n\n'.join(parts)
 
 
-def _run_command_step(step, task, servers):
+def _run_command_step(step, task, servers, on_data=None):
     if not step.command.strip():
         return 1, '命令内容为空。'
 
@@ -270,17 +281,17 @@ def _run_command_step(step, task, servers):
             inventory_path = _write_inventory(direct_servers, task.credential, workdir)
             cmd = ['ansible', 'all', '-i', inventory_path] + _forks_args(task) \
                 + extra_vars_args(step) + ['-m', 'shell', '-a', step.command]
-            return run_subprocess(cmd, timeout=step.timeout or 300)
+            return run_stream(cmd, timeout=step.timeout or 300, on_data=on_data)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
     def agent_payload(group):
         return _agent_payload_base(step, task, group) | {'command': step.command}
 
-    return _run_channels(step, task, servers, run_direct, agent_payload)
+    return _run_channels(step, task, servers, run_direct, agent_payload, on_data=on_data)
 
 
-def _run_playbook_step(step, task, servers):
+def _run_playbook_step(step, task, servers, on_data=None):
     project_dir = getattr(settings, 'ANSIBLE_PROJECT_DIR', '')
     if not project_dir or not os.path.isdir(project_dir):
         return 1, f'Ansible 项目目录不存在：{project_dir!r}（请配置 ANSIBLE_PROJECT_DIR）'
@@ -301,7 +312,7 @@ def _run_playbook_step(step, task, servers):
             if (step.tags or '').strip():
                 cmd += ['--tags', step.tags.strip()]
             cmd += extra_vars_args(step)
-            return run_subprocess(cmd, timeout=step.timeout or 300, cwd=project_dir)
+            return run_stream(cmd, timeout=step.timeout or 300, cwd=project_dir, on_data=on_data)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
@@ -313,7 +324,7 @@ def _run_playbook_step(step, task, servers):
             'project_sync': True,
         }
 
-    return _run_channels(step, task, servers, run_direct, agent_payload)
+    return _run_channels(step, task, servers, run_direct, agent_payload, on_data=on_data)
 
 
 def _agent_payload_base(step, task, group):
@@ -331,7 +342,7 @@ def _agent_payload_base(step, task, group):
     }
 
 
-def _run_method_step(step, task, servers):
+def _run_method_step(step, task, servers, on_data=None):
     from apps.method_mgr.executors import get_executor
 
     method = step.method
@@ -356,8 +367,10 @@ def _run_method_step(step, task, servers):
     try:
         inventory_path = _write_inventory(servers, task.credential, workdir)
         # 执行器按 step 读取 tags/extra_vars/timeout（模块级）与 exec_mode（透传任务级）；
-        # servers 供不走 Ansible 的 provider（如 jumpserver）直接消费主机对象
-        return executor.execute(step, method, inventory_path=inventory_path, servers=servers)
+        # servers 供不走 Ansible 的 provider（如 jumpserver）直接消费主机对象；
+        # on_data 供走 ansible 的 provider 实时回传输出（其余 provider 忽略）
+        return executor.execute(
+            step, method, inventory_path=inventory_path, servers=servers, on_data=on_data)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -368,8 +381,8 @@ _STEP_HANDLERS = {
     'method': _run_method_step,
 }
 
-# 执行进度预览上限（与 tasks.OUTPUT_PREVIEW_LIMIT 一致）；暂停确认轮询间隔（秒）
-PROGRESS_PREVIEW_LIMIT = 60000
+# 执行进度预览上限（live.PREVIEW_LIMIT）；暂停确认轮询间隔（秒）
+PROGRESS_PREVIEW_LIMIT = PREVIEW_LIMIT
 PAUSE_POLL_INTERVAL = 2
 # 模块失败后等待人工处理（重试/跳过/中止）的默认超时（秒），超时按中止处理
 FAILURE_WAIT_TIMEOUT_DEFAULT = 600
@@ -386,15 +399,13 @@ def _failure_wait_timeout():
     return getattr(settings, 'TASK_FAILURE_WAIT_TIMEOUT', FAILURE_WAIT_TIMEOUT_DEFAULT)
 
 
-def _persist_progress(task, outputs):
-    """把已完成模块的输出实时写入任务快照，供前端轮询展示执行进度。
+def _persist_progress(sink, extra=None):
+    """强制把当前输出（含正在执行模块的实时分片）写入快照与落盘文件。
 
-    仅更新 output 字段；最终完整输出与状态由 tasks.execute_task 统一落库。
+    extra 为仅供实时查看的临时提示（如失败等待人工处理），不落盘；
+    最终完整输出与状态由 tasks.execute_task 统一落库。
     """
-    from .models import ExecutionTask
-
-    preview = '\n\n'.join(outputs)[-PROGRESS_PREVIEW_LIMIT:]
-    ExecutionTask.objects.filter(pk=task.pk).update(output=preview)
+    sink.flush(extra=extra, force=True)
 
 
 def _wait_confirmation(step, task):
@@ -454,19 +465,24 @@ def _wait_failure_action(task, timeout):
             status='running', pause_action='', pause_type='')
 
 
-def run(task):
+def run(task, sink=None):
     """按 order 顺序执行任务流的全部模块，返回 (return_code, output, steps_result)。
 
     模块失败（rc != 0）后任务流暂停，等待人工处理：重试（重跑当前阶段失败
     模块，可反复）/ 跳过（继续后续模块，任务最终仍记失败）/ 中止（后续模块
     标记 skipped）；等待超时按中止处理。暂停确认模块的中止/超时直接终止
     任务流，不进入失败处理。
+
+    sink 为实时输出汇聚器（LiveSink）：ansible 输出边跑边写库/落盘；未传时
+    自建一个仅写库的 sink（直接调用 runner.run 的场景，如测试）。
     """
     steps = list(task.steps.all())
     if not steps:
         return 1, '任务未配置任何模块，请编辑任务后重试。', []
 
+    sink = sink or LiveSink(task.pk)
     outputs, results = [], []
+    sink.bind(outputs)
     total = len(steps)
     flow_rc = None  # 首个失败模块的 rc（含被跳过的失败），决定任务流最终状态
     aborted = False
@@ -485,7 +501,7 @@ def run(task):
             continue
 
         pairs = [(step, pos + offset) for offset, step in enumerate(stage, 1)]
-        entries = _exec_stage(pairs, task, total, outputs, parallel)
+        entries = _exec_stage(pairs, task, total, sink, parallel)
 
         result_by_id = {}
         for step, header, rc, out, duration, server_count in entries:
@@ -517,16 +533,16 @@ def run(task):
             if timeout > 0:
                 prompt = (f'✖ 模块「{names}」执行失败，任务流已暂停，等待人工处理：'
                           f'重试失败模块 / 跳过并继续 / 中止（超过 {timeout}s 未处理将自动中止）。')
-                _persist_progress(task, outputs + [prompt])
+                _persist_progress(sink, extra=prompt)
                 action = _wait_failure_action(task, timeout)
             else:
                 action = 'abort_now'
             if action == 'retry':
                 attempt = result_by_id[failed_entries[0][0].id]['attempts'] + 1
                 outputs.append(f'↻ 已人工确认重试，第 {attempt} 次执行失败模块：{names}。')
-                _persist_progress(task, outputs)
+                _persist_progress(sink)
                 retry_pairs = [(e[0], idx_by_id[e[0].id]) for e in failed_entries]
-                entries = _exec_stage(retry_pairs, task, total, outputs, parallel, attempt=attempt)
+                entries = _exec_stage(retry_pairs, task, total, sink, parallel, attempt=attempt)
                 for step, header, rc, out, duration, server_count in entries:
                     outputs.append(f'{header}\n{out}')
                     item = result_by_id[step.id]
@@ -559,8 +575,8 @@ def run(task):
             remaining = total - pos
             if remaining:
                 outputs.append(f'✖ {abort_note}，中止后续 {remaining} 个模块。')
-        # 每个阶段结束即持久化进度，前端轮询可见已完成模块的输出
-        _persist_progress(task, outputs)
+        # 每个阶段结束即持久化进度（写库预览 + 补齐落盘）
+        _persist_progress(sink)
 
     return (flow_rc if flow_rc is not None else 0), '\n\n'.join(outputs), results
 
@@ -582,30 +598,37 @@ def _build_stages(steps):
     return stages
 
 
-def _exec_stage(pairs, task, total, outputs, parallel, attempt=1):
+def _exec_stage(pairs, task, total, sink, parallel, attempt=1):
     """执行一个阶段（或阶段内失败模块的重试子集），按传入顺序返回 entries。
 
     pairs 为 (step, 模块序号) 列表；attempt > 1 表示重试轮次（体现在模块头）。
     """
     if not parallel:
         step, idx = pairs[0]
-        return [_exec_step(step, task, idx, total, outputs, parallel=False, attempt=attempt)]
-    return _exec_parallel_stage(pairs, task, total, attempt)
+        return [_exec_step(step, task, idx, total, sink, parallel=False, attempt=attempt)]
+    return _exec_parallel_stage(pairs, task, total, sink, attempt)
 
 
-def _exec_step(step, task, idx, total, outputs, parallel, attempt=1):
+def _exec_step(step, task, idx, total, sink, parallel, attempt=1):
     """执行单个模块，返回 (step, header, rc, out, duration, server_count)。
 
-    outputs 仅暂停确认模块用于持久化暂停提示（pause 不会出现在并行组内）。
+    执行期间输出经 sink 实时写库/落盘（模块头先行登记，结束后由调用方把
+    完整输出追加进 outputs，sink 丢弃实时块，两者不会重复）。
     """
     started = time.monotonic()
     retry_mark = f' · 重试#{attempt - 1}' if attempt > 1 else ''
+    live_key = (step.id, attempt)
     if step.task_type == 'pause':
         # 暂停确认模块：不涉及目标主机，等待人工继续/中止
         header = f'═══ 模块 {idx}/{total}：{step.name}（暂停确认 · 等待人工处理）═══'
         prompt = f'⏸ 任务流已暂停，等待人工确认…（超过 {step.timeout or 300}s 未确认将自动中止）'
-        _persist_progress(task, outputs + [f'{header}\n{prompt}'])
-        rc, out = _wait_confirmation(step, task)
+        sink.begin(live_key, header, order=idx)
+        try:
+            sink.feed(live_key, prompt)
+            _persist_progress(sink)
+            rc, out = _wait_confirmation(step, task)
+        finally:
+            sink.end(live_key)
         server_count = None
     else:
         servers = _step_servers(step, task)
@@ -617,16 +640,20 @@ def _exec_step(step, task, idx, total, outputs, parallel, attempt=1):
         if error:
             rc, out = 1, error
         else:
+            sink.begin(live_key, header, order=idx)
             try:
-                rc, out = _STEP_HANDLERS[step.task_type](step, task, servers)
+                rc, out = _STEP_HANDLERS[step.task_type](
+                    step, task, servers, sink.writer(live_key))
             except ArtifactLookupError as exc:
                 rc, out = 1, str(exc)
+            finally:
+                sink.end(live_key)
         server_count = len(servers)
     duration = round(time.monotonic() - started, 2)
     return step, header, rc, out, duration, server_count
 
 
-def _exec_parallel_stage(pairs, task, total, attempt=1):
+def _exec_parallel_stage(pairs, task, total, sink, attempt=1):
     """并行组：组内模块并发执行，等待全部完成后按模块顺序返回结果。
 
     任一模块失败不打断组内其他模块（各自跑完），失败由调用方汇总处理
@@ -638,7 +665,7 @@ def _exec_parallel_stage(pairs, task, total, attempt=1):
 
     def _worker(step, idx):
         try:
-            return _exec_step(step, task, idx, total, [], parallel=True, attempt=attempt)
+            return _exec_step(step, task, idx, total, sink, parallel=True, attempt=attempt)
         finally:
             dj_connection.close()  # 线程私有连接，退出前释放
 
