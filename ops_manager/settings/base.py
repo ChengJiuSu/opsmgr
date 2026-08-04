@@ -7,6 +7,8 @@ from pathlib import Path
 
 from decouple import config
 
+from django.core.exceptions import ImproperlyConfigured
+
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
 # ── 日志配置 ──────────────────────────────────────────────
@@ -231,15 +233,34 @@ CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_TIMEZONE = 'Asia/Shanghai'
 
-# ── Channels（ops-agent WebSocket 接入）──────────────────
-# Redis channel layer：AgentConsumer（ASGI 进程）与 runner（WSGI/celery 进程）
-# 跨进程通信必需；复用 celery 同一 Redis 实例。
-CHANNEL_LAYERS = {
-    'default': {
-        'BACKEND': 'channels_redis.core.RedisChannelLayer',
-        'CONFIG': {'hosts': [REDIS_URL]},
-    },
-}
+# ── Channels（执行日志推送 / ops-agent WebSocket 接入）────
+# CHANNEL_LAYER_BACKEND 选层：
+#   redis  —— 跨进程组消息，复用 celery 同一 Redis 实例。以下任一情况必须用它：
+#             TASK_EXEC_BACKEND=celery、gunicorn/daphne 多进程或多实例、
+#             ops-agent 的 WebSocket 与 runner 不在同一进程。
+#   memory —— 进程内层，零外部依赖，仅「单个 ASGI 进程 + TASK_EXEC_BACKEND=thread」
+#             可用；此时跨进程推送静默失效（前端回退轮询、agent 下发会失败）。
+# dev.py 默认 memory（本地免装 Redis），prod.py 不覆盖即 redis。
+CHANNEL_LAYER_BACKENDS = ('redis', 'memory')
+
+
+def channel_layers_for(backend):
+    """按后端名构造 CHANNEL_LAYERS（名字非法直接报错，避免静默退回 Redis）。"""
+    if backend not in CHANNEL_LAYER_BACKENDS:
+        raise ImproperlyConfigured(
+            f'CHANNEL_LAYER_BACKEND 只能是 {"/".join(CHANNEL_LAYER_BACKENDS)}，收到 {backend!r}')
+    if backend == 'memory':
+        return {'default': {'BACKEND': 'channels.layers.InMemoryChannelLayer'}}
+    return {
+        'default': {
+            'BACKEND': 'channels_redis.core.RedisChannelLayer',
+            'CONFIG': {'hosts': [REDIS_URL]},
+        },
+    }
+
+
+CHANNEL_LAYER_BACKEND = config('CHANNEL_LAYER_BACKEND', default='redis')
+CHANNEL_LAYERS = channel_layers_for(CHANNEL_LAYER_BACKEND)
 
 # ── 任务执行后端 ──────────────────────────────────────────
 # thread（默认，无需 Redis）/ celery（生产，需 worker）/ sync（同步，测试用）

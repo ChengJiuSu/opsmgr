@@ -12,6 +12,7 @@
 | `JWT_ACCESS_TOKEN_LIFETIME_MINUTES` | `60` | Access Token 有效期（分钟）|
 | `JWT_REFRESH_TOKEN_LIFETIME_DAYS` | `7` | Refresh Token 有效期（天）|
 | `REDIS_URL` | `redis://127.0.0.1:6379/0` | Redis 连接地址 |
+| `CHANNEL_LAYER_BACKEND` | `redis`（dev 默认 `memory`）| channel layer 后端：`redis` 跨进程，`memory` 进程内免依赖 |
 
 ---
 
@@ -31,6 +32,18 @@ os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'ops_manager.settings.dev')
 | DEBUG | `True` |
 | CORS | 允许所有源 |
 | 日志 | 控制台输出，DEBUG 级别 |
+| channel layer | `InMemoryChannelLayer`（免装 Redis）|
+
+开发环境默认不需要 Redis：`TASK_EXEC_BACKEND=thread` + 单个 daphne 进程时，
+执行日志 WebSocket 推送走进程内 channel layer 即可。以下情况本地也要装 Redis 并设
+`CHANNEL_LAYER_BACKEND=redis`：
+
+- `TASK_EXEC_BACKEND=celery`（Redis 同时作为 broker/result backend）；
+- 多进程运行（gunicorn 多 worker、daphne 多进程）；
+- 调试 ops-agent 下发（`agent_mgr` 的 WebSocket 与 runner 不在同一进程时）。
+
+用 `memory` 层而跨了进程时不会报错，只会静默失效：日志推送收不到（前端自动回退
+轮询），agent 下发返回失败。
 
 ### 生产环境（prod）
 
