@@ -498,6 +498,7 @@ import {
 } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../../stores/auth'
+import { openTaskLogStream } from '../../utils/taskLogStream'
 import StepOutput from '../../components/StepOutput.vue'
 import {
   getServers, fetchDictOptions, projectGroupApi, channelApi, environmentApi,
@@ -882,6 +883,7 @@ const logTableRef = ref()
 const outputFullVisible = ref(false)
 let pollTimer = null
 let listTimer = null
+let stream = null   // WebSocket 日志流（不可用时为 null，走 pollTimer）
 
 // 面板工作区高度：按「面板滚动到屏幕顶部时正好铺满一屏」一次性计算的固定值（与当前滚动位置无关，
 // 滚动过程中不重算，避免页面高度随滚动变化产生漂移感），仅窗口尺寸变化时更新，小屏保底 360px。
@@ -928,13 +930,13 @@ async function openLogs(row, { live = false } = {}) {
   await nextTick()
   updateOutputHeight()
   logPanelRef.value?.$el?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-  if (live || ['running', 'pending', 'paused'].includes(row.status)) startPolling()
+  if (live || ['running', 'pending', 'paused'].includes(row.status)) startFollow()
 }
 
 function closeLogs() {
   logPanel.task = null
   outputFullVisible.value = false
-  stopPolling()
+  stopFollow()
 }
 
 // 暂停处理：确认模块（继续/中止）或失败等待（重试/跳过/中止），中止与跳过需二次确认
@@ -998,9 +1000,55 @@ async function selectLog(log) {
   logPanel.output = res.data?.output || '（暂无输出）'
 }
 
-// 增量轮询状态：outOffset = 服务端已回传长度；hasRaw = 当前展示的是真实日志（非占位）
+// 实时刷新状态：outOffset = 轮询已拉取长度；hasRaw = 当前展示的是真实日志（非占位）
 let outOffset = 0
 let hasRaw = false
+
+// ── 实时日志：WebSocket 优先，失败回退轮询 ────────────────
+function startFollow() {
+  stopFollow()
+  if (!logPanel.task) return
+  logPanel.polling = true
+  hasRaw = false
+  const taskId = logPanel.task.id
+  stream = openTaskLogStream(taskId, {
+    onFull: (text) => {
+      if (logPanel.task?.id !== taskId) return stopFollow()
+      logPanel.output = text || '（执行中，等待输出…）'
+      hasRaw = !!text
+    },
+    onDelta: (chunk) => {
+      if (logPanel.task?.id !== taskId) return stopFollow()
+      if (hasRaw) logPanel.output += chunk
+      else { logPanel.output = chunk; hasRaw = true }
+    },
+    onStatus: (data) => {
+      if (logPanel.task?.id !== taskId) return stopFollow()
+      logPanel.task = {
+        ...logPanel.task,
+        status: data.status,
+        pause_type: data.pause_type,
+        return_code: data.return_code,
+        duration: data.duration,
+      }
+      if (data.status === 'success' || data.status === 'failed') {
+        stopFollow()
+        fetchData()
+        refreshLogs() // 执行完成：刷新日志列表并选中最新记录
+      }
+    },
+    onFallback: () => {
+      stream = null
+      if (logPanel.polling) startPolling()  // 通道不可用：退回轮询接口
+    },
+  })
+}
+
+function stopFollow() {
+  stream?.close()
+  stream = null
+  stopPolling()
+}
 
 function startPolling() {
   stopPolling()
@@ -1051,7 +1099,7 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
-  stopPolling()
+  stopFollow()
   if (listTimer) clearInterval(listTimer)
   window.removeEventListener('resize', updateOutputHeight)
   if (heightRaf) cancelAnimationFrame(heightRaf)

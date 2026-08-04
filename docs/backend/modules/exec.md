@@ -1,6 +1,6 @@
 # 任务执行模块（task_exec）
 
-**路由前缀：** `/api/exec/`  
+**路由前缀：** `/api/exec/`（HTTP API）、`/ws/task-logs/<task_id>/`（执行日志实时推送）  
 **App Label：** `task_exec`
 
 ---
@@ -51,7 +51,9 @@ apps/task_exec/
 ├── serializers.py   # 变量 key 校验、凭据脱敏、嵌套模块整体读写与内容校验、方法 service_type 执行校验
 ├── views.py         # 变量/凭据/任务 ViewSet + matched_servers/execute/output/logs 动作 + 剧本列表
 ├── runner.py        # 任务流执行：逐模块解析主机 + 动态 inventory + 变量注入 + ansible 调用，失败中止
-├── live.py          # LiveSink：流式日志汇聚（节流写库预览 + 完整日志落盘）
+├── live.py          # LiveSink：流式日志汇聚（节流写库预览 + 落盘 + WebSocket 推送）
+├── consumers.py     # TaskLogConsumer：/ws/task-logs/<task_id>/ 日志推送（子协议 JWT 鉴权）
+├── routing.py       # WebSocket 路由（ops_manager/asgi.py 挂载）
 ├── tasks.py         # dispatch：thread/celery/sync 三种后端（日志落主机快照与模块结果）
 └── management/      # clean_task_logs 日志清理命令
 ```
@@ -65,8 +67,8 @@ ansible 输出不再等模块跑完才可见：`common.ansible.run_stream` 以
 且 `force_color` 生效，读到的分片经 `on_data` 回调交给 `live.LiveSink`：
 
 - **实时预览**：分片节流（0.5s 或 2KB）写 `ExecutionTask.output` 与
-  `TaskExecutionLog.output`，存尾部 60000 字符（超出加截断标注），前端
-  1s 轮询增量拉取（`output?offset=`）即可看到实时刷新；
+  `TaskExecutionLog.output`，存尾部 60000 字符（超出加截断标注）：既是
+  WebSocket 连接时的快照来源，也是轮询回退（`output?offset=`，1s）的数据源；
 - **完整落盘**：每次执行流式写 `TASK_LOG_DIR/<task_id>/<log_id>.log`
   （0600，父目录 0700），**所有执行都落盘**（旧行为仅超长才落盘），执行
   记录详情接口读该文件返回全量。落盘以「已完成模块」为粒度追加（前缀式 append，
@@ -79,6 +81,30 @@ ansible 输出不再等模块跑完才可见：`common.ansible.run_stream` 以
   时把新增分片喂给同一 sink，NAT 主机执行同样实时可见；
 - 方法执行器（`ansible_playbook` provider）透传 `on_data`；Jenkins/JumpServer
   等非 ansible provider 忽略该参数，仍为整段输出。
+
+### 实时通道：WebSocket 推送（轮询为回退）
+
+`/ws/task-logs/<task_id>/`（`consumers.TaskLogConsumer`，路由
+`task_exec/routing.py`，与 agent 通道一起挂在 `ops_manager/asgi.py`）：
+
+- **鉴权**：token 走 **子协议** `['jwt', <access_token>]`（不进 URL 与 nginx
+  访问日志），兼容 `?token=`；校验到有效启用用户即放行（任务详情登录可读）。
+  失败关 4401，任务不存在关 4404。
+- **消息**：连接先收 `{"kind":"full", output, offset, status, ...}` 快照，
+  之后收 `{"kind":"delta", output}` 增量与 `{"kind":"status", ...}` 状态变化
+  （running / paused / 终态，来自 `live.push_status`）。客户端可发
+  `{"type":"ping"}`，服务端回 `{"kind":"pong"}`。
+- **增量语义**：sink 以 render 全文长度为基准发增量；临时提示（失败等待）、
+  并行组多块交错、模块结束交还 outputs 时改发整段（`kind=full`，尾部预览），
+  客户端按 kind 决定追加还是替换。
+- **回退**：连接建立时先 `group_add` 探测 channel layer，未配/连不上 Redis
+  直接拒握手（4503）；`live.push` 失败只告警并停止后续推送。前端
+  `utils/taskLogStream.js` 在握手失败、连接中断、或 60s 收不到任何帧（含
+  pong）时回退到 `output?offset=` 轮询，功能等价。
+- **部署**：执行进程（WSGI/celery worker）与 WebSocket 进程（daphne）不同
+  进程，跨进程推送**依赖 Redis channel layer**（`CHANNEL_LAYERS`）；nginx
+  `/ws/` 已反代到 daphne 8001（见 `deploy/nginx.conf`）。dev 的 runserver
+  自带 ASGI，同端口即可，vite 已代理 `/ws`。
 
 日志保留（`clean_task_logs`，建议 cron 每日）：落盘文件按 mtime 保留
 `TASK_LOG_FILE_RETENTION_DAYS`（默认 30 天，含记录已删的孤儿文件；清理后
@@ -164,7 +190,8 @@ Ansible 项目目录内执行剧本：
 
 前端流程：新建/编辑（模块卡片编排，保存定义）→ 列表「执行」→ 执行表单
 （任务流预览 + 全局范围主机默认全选、可勾除）→ 确认框（任务名称/维度/
-逐模块流程，生产环境标红）→ 自动定位任务列表下方的执行日志面板，轮询至完成。
+逐模块流程，生产环境标红）→ 自动定位任务列表下方的执行日志面板，日志实时
+推送（WebSocket，不可用自动回退轮询）直至完成。
 
 ---
 
@@ -181,7 +208,7 @@ Ansible 项目目录内执行剧本：
 ## 暂停确认（pause 模块）
 
 - 执行到 pause 模块：任务状态置 `paused`（`pause_type=confirm`），已完成模块
-  输出与暂停提示由 sink 强制落库（见「流式执行日志」），前端轮询可见提示。
+  输出与暂停提示由 sink 强制落库并推送（见「流式执行日志」），前端即时可见。
 - 确认：`POST /api/exec/tasks/{id}/confirm/` `{"action": "continue"|"abort"}`
   （仅管理员、仅 paused 状态可操作）；动作写入 `ExecutionTask.pause_action`，
   runner 每 2s 轮询消费后清空并恢复 `running`。

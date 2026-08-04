@@ -11,9 +11,13 @@ import time
 from datetime import timedelta
 from unittest import mock
 
+from channels.db import database_sync_to_async
+from channels.routing import URLRouter
+from channels.testing import WebsocketCommunicator
+
 from django.contrib.auth import get_user_model
 from django.core.management import call_command
-from django.test import TestCase, override_settings
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -1501,3 +1505,162 @@ class CleanTaskLogFilesTests(TestCase):
         self.assertTrue(os.path.exists(path))
         old_log.refresh_from_db()
         self.assertEqual(old_log.log_file, '1/old.log')
+
+
+IN_MEMORY_LAYER = {'default': {'BACKEND': 'channels.layers.InMemoryChannelLayer'}}
+
+
+@override_settings(CHANNEL_LAYERS=IN_MEMORY_LAYER)
+class TaskLogConsumerTests(TransactionTestCase):
+    """日志推送 WebSocket：子协议鉴权、连接快照、组消息下行。
+
+    TransactionTestCase：consumer 的 database_sync_to_async 在其他线程读库，
+    TestCase 的事务隔离会挡住可见性。
+    """
+
+    def setUp(self):
+        from .routing import websocket_urlpatterns
+
+        self.user = User.objects.create(username='ws_user', is_active=True)
+        self.user.set_password('Pass!2345xyz')
+        self.user.save()
+        self.task = ExecutionTask.objects.create(name='ws-task', status='running', output='已有输出')
+        self.app = URLRouter(websocket_urlpatterns)
+
+    def _token(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        return str(AccessToken.for_user(self.user))
+
+    def _communicator(self, token=None, task_id=None, use_query=False):
+        task_id = task_id or self.task.pk
+        token = self._token() if token is None else token
+        path = f'/ws/task-logs/{task_id}/'
+        if use_query:
+            return WebsocketCommunicator(self.app, f'{path}?token={token}')
+        return WebsocketCommunicator(self.app, path, subprotocols=['jwt', token])
+
+    async def test_snapshot_then_delta_push(self):
+        from .live import push, push_status
+
+        comm = self._communicator()
+        connected, subprotocol = await comm.connect()
+        self.assertTrue(connected)
+        self.assertEqual(subprotocol, 'jwt')
+
+        snapshot = await comm.receive_json_from()
+        self.assertEqual(snapshot['kind'], 'full')
+        self.assertEqual(snapshot['output'], '已有输出')
+        self.assertEqual(snapshot['status'], 'running')
+
+        # LiveSink/tasks 侧的推送经组消息下行
+        await database_sync_to_async(push)(
+            self.task.pk, {'kind': 'delta', 'output': '新增一行\n', 'offset': 12})
+        delta = await comm.receive_json_from()
+        self.assertEqual(delta, {'kind': 'delta', 'output': '新增一行\n', 'offset': 12})
+
+        await database_sync_to_async(
+            lambda: ExecutionTask.objects.filter(pk=self.task.pk).update(
+                status='success', return_code=0))()
+        await database_sync_to_async(push_status)(self.task.pk)
+        status = await comm.receive_json_from()
+        self.assertEqual(status['kind'], 'status')
+        self.assertEqual(status['status'], 'success')
+        self.assertEqual(status['return_code'], 0)
+
+        await comm.disconnect()
+
+    async def test_token_via_query_param_also_accepted(self):
+        comm = self._communicator(use_query=True)
+        connected, _ = await comm.connect()
+        self.assertTrue(connected)
+        self.assertEqual((await comm.receive_json_from())['kind'], 'full')
+        await comm.disconnect()
+
+    async def test_reject_without_token(self):
+        comm = WebsocketCommunicator(self.app, f'/ws/task-logs/{self.task.pk}/')
+        connected, _ = await comm.connect()
+        if connected:
+            msg = await comm.receive_output()
+            self.assertEqual(msg['type'], 'websocket.close')
+            self.assertEqual(msg['code'], 4401)
+        await comm.disconnect()
+
+    async def test_reject_bad_token(self):
+        comm = self._communicator(token='not-a-jwt')
+        connected, _ = await comm.connect()
+        if connected:
+            msg = await comm.receive_output()
+            self.assertEqual(msg['code'], 4401)
+        await comm.disconnect()
+
+    async def test_missing_task_closed(self):
+        comm = self._communicator(task_id=999999)
+        connected, _ = await comm.connect()
+        if connected:
+            msg = await comm.receive_output()
+            self.assertEqual(msg['code'], 4404)
+        await comm.disconnect()
+
+    async def test_channel_layer_unavailable_rejects_handshake(self):
+        """通道不可用（未配/连不上 Redis）：直接拒握手，前端据此回退轮询。"""
+        comm = self._communicator()
+        with mock.patch('channels.layers.InMemoryChannelLayer.group_add',
+                        side_effect=RuntimeError('redis 不可达')):
+            connected, code = await comm.connect()
+        self.assertFalse(connected)
+        self.assertEqual(code, 4503)
+        await comm.disconnect()
+
+    async def test_ping_keepalive(self):
+        comm = self._communicator()
+        await comm.connect()
+        await comm.receive_json_from()  # 快照
+        await comm.send_json_to({'type': 'ping'})
+        self.assertEqual((await comm.receive_json_from())['kind'], 'pong')
+        await comm.disconnect()
+
+
+@override_settings(CHANNEL_LAYERS=IN_MEMORY_LAYER)
+class LiveSinkBroadcastTests(TestCase):
+    """LiveSink 推送语义：追加发 delta，前缀被破坏发整段。"""
+
+    def setUp(self):
+        self.task = ExecutionTask.objects.create(name='bc')
+        self.sink = LiveSink(self.task.pk)
+        self.sink.bind([])
+        self.pushes = []
+
+    def _patch_push(self):
+        return mock.patch('apps.task_exec.live.push',
+                          side_effect=lambda _tid, payload: self.pushes.append(payload) or True)
+
+    def test_append_pushes_delta(self):
+        with self._patch_push():
+            self.sink.begin(('s', 1), 'H1', order=1)
+            self.sink.feed(('s', 1), 'aaa')
+            self.sink.flush(force=True)
+            self.sink.feed(('s', 1), 'bbb')
+            self.sink.flush(force=True)
+        # 全程按追加推送（客户端连接时已拿到快照，delta 接在其后）
+        self.assertTrue(all(p['kind'] == 'delta' for p in self.pushes))
+        self.assertEqual([p['output'] for p in self.pushes], ['H1\n', 'aaa', 'bbb'])
+
+    def test_transient_extra_and_parallel_push_full(self):
+        with self._patch_push():
+            self.sink.begin(('a', 1), 'H1', order=1)
+            self.sink.flush(force=True)
+            self.sink.flush(extra='等待人工处理…', force=True)      # 临时提示 → 整段
+            self.sink.begin(('b', 1), 'H2', order=2)                # 并行组 → 整段
+            self.sink.feed(('b', 1), 'x')
+            self.sink.flush(force=True)
+        self.assertTrue(all(p['kind'] == 'full' for p in self.pushes[1:]))
+        self.assertIn('等待人工处理', self.pushes[1]['output'])
+
+    def test_broken_channel_stops_pushing(self):
+        with mock.patch('apps.task_exec.live.push', return_value=False) as m:
+            self.sink.begin(('s', 1), 'H1', order=1)
+            self.sink.feed(('s', 1), 'aaa')
+            self.sink.flush(force=True)
+            self.sink.flush(force=True)
+        self.assertEqual(m.call_count, 1)  # 首次失败后不再重试

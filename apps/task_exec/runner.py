@@ -30,7 +30,7 @@ from django.conf import settings
 
 from common.ansible import resolve_within, run_stream
 
-from .live import PREVIEW_LIMIT, LiveSink
+from .live import PREVIEW_LIMIT, LiveSink, push_status
 
 logger = logging.getLogger('apps.task_exec')
 
@@ -419,6 +419,7 @@ def _wait_confirmation(step, task):
     timeout = step.timeout or 300
     ExecutionTask.objects.filter(pk=task.pk).update(
         status='paused', pause_action='', pause_type='confirm')
+    push_status(task.pk)  # 推送暂停态，前端切出「继续/中止」操作条
     deadline = time.monotonic() + timeout
     try:
         while time.monotonic() < deadline:
@@ -436,6 +437,7 @@ def _wait_confirmation(step, task):
     finally:
         ExecutionTask.objects.filter(pk=task.pk).update(
             status='running', pause_action='', pause_type='')
+        push_status(task.pk)  # 恢复执行：推送状态收起操作条
 
 
 def _wait_failure_action(task, timeout):
@@ -463,6 +465,7 @@ def _wait_failure_action(task, timeout):
     finally:
         ExecutionTask.objects.filter(pk=task.pk).update(
             status='running', pause_action='', pause_type='')
+        push_status(task.pk)  # 恢复执行：推送状态收起操作条
 
 
 def run(task, sink=None):

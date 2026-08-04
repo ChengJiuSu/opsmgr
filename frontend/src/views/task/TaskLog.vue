@@ -88,6 +88,7 @@ import { Back, CopyDocument, Loading, Refresh } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { getTask, getTaskLogs, getTaskLogDetail, getTaskOutput, confirmTask } from '../../api/tasks'
 import { useAuthStore } from '../../stores/auth'
+import { openTaskLogStream } from '../../utils/taskLogStream'
 import StepOutput from '../../components/StepOutput.vue'
 
 const route = useRoute()
@@ -103,6 +104,7 @@ const output = ref('')
 const polling = ref(false)
 const logTableRef = ref()
 let pollTimer = null
+let stream = null   // WebSocket 日志流（不可用时为 null，走 pollTimer）
 
 const statusType = (s) => ({ pending: 'info', running: 'warning', paused: 'primary', success: 'success', failed: 'danger' }[s] || 'info')
 const formatTime = (t) => (t ? t.slice(0, 19).replace('T', ' ') : '')
@@ -124,7 +126,7 @@ const currentServers = computed(() => {
 
 async function init() {
   loading.value = true
-  stopPolling()
+  stopFollow()
   try {
     const [t, l] = await Promise.all([getTask(taskId), getTaskLogs(taskId)])
     task.value = t.data
@@ -152,20 +154,62 @@ async function selectLog(log) {
   const isLatest = logs.value[0]?.id === log.id
   const running = ['pending', 'running', 'paused'].includes(task.value?.status)
   if (isLatest && running) {
-    // 最新一次且执行中：输出走轻量轮询实时刷新
+    // 最新一次且执行中：优先 WebSocket 推送，不可用回退轮询
     output.value = task.value?.output || '（执行中，等待输出…）'
-    startPolling()
+    startFollow()
     return
   }
-  stopPolling()
+  stopFollow()
   const res = await getTaskLogDetail(taskId, log.id)
   current.value = res.data
   output.value = res.data?.output || '（暂无输出）'
 }
 
-// 增量轮询状态：outOffset = 服务端已回传长度；hasRaw = 当前展示的是真实日志（非占位）
+// 实时刷新状态：outOffset = 轮询已拉取长度；hasRaw = 当前展示的是真实日志（非占位）
 let outOffset = 0
 let hasRaw = false
+
+// ── 实时日志：WebSocket 优先，失败回退轮询 ────────────────
+function startFollow() {
+  stopFollow()
+  polling.value = true
+  hasRaw = false
+  stream = openTaskLogStream(taskId, {
+    onFull: (text) => {
+      output.value = text || '（执行中，等待输出…）'
+      hasRaw = !!text
+    },
+    onDelta: (chunk) => {
+      if (hasRaw) output.value += chunk
+      else { output.value = chunk; hasRaw = true }
+    },
+    onStatus: applyStatus,
+    onFallback: () => {
+      stream = null
+      if (polling.value) startPolling()  // 通道不可用：退回轮询接口
+    },
+  })
+}
+
+function applyStatus(data) {
+  task.value = {
+    ...task.value,
+    status: data.status,
+    pause_type: data.pause_type,
+    return_code: data.return_code,
+    duration: data.duration,
+  }
+  if (data.status === 'success' || data.status === 'failed') {
+    stopFollow()
+    init() // 执行完成：刷新日志列表并定位最新记录
+  }
+}
+
+function stopFollow() {
+  stream?.close()
+  stream = null
+  stopPolling()
+}
 
 function startPolling() {
   stopPolling()
@@ -237,7 +281,7 @@ async function copyLink() {
 }
 
 onMounted(init)
-onUnmounted(stopPolling)
+onUnmounted(stopFollow)
 </script>
 
 <style scoped>

@@ -2,7 +2,9 @@
 
 runner 每个模块把 ansible 子进程输出分片喂给 LiveSink，由它负责：
   - 节流写库：ExecutionTask.output / TaskExecutionLog.output 存尾部预览，
-    前端轮询即可看到「边跑边出」的日志；
+    前端（WebSocket 不可用时）轮询即可看到「边跑边出」的日志；
+  - 实时推送：经 channel layer 组消息把新增片段推给 WebSocket 客户端
+    （consumers.TaskLogConsumer），无需轮询；
   - 落盘留存：完整日志按执行记录写 TASK_LOG_DIR/<task_id>/<log_id>.log。
 
 落盘以「已完成模块」为粒度（append-only 前缀，天然去重且不会因并行组交错），
@@ -13,6 +15,10 @@ import os
 import threading
 import time
 from pathlib import Path
+
+from asgiref.sync import async_to_sync
+
+from channels.layers import get_channel_layer
 
 logger = logging.getLogger('apps.task_exec')
 
@@ -37,6 +43,42 @@ def log_rel_path(task_id, log_id):
     return str(Path(str(task_id)) / f'{log_id}.log')
 
 
+def push(task_id, payload):
+    """向任务日志组推送一条消息（channel layer 不可用时静默跳过）。
+
+    推送失败（未装/未连 Redis 等）只告警：前端在 WebSocket 不可用时自动
+    回退轮询，执行本体不受影响。
+    """
+    from .consumers import group_name
+
+    layer = get_channel_layer()
+    if layer is None:
+        return False
+    try:
+        async_to_sync(layer.group_send)(
+            group_name(task_id), {'type': 'task.log', 'payload': payload})
+        return True
+    except Exception as exc:  # noqa: BLE001 - 推送失败不影响执行与落库
+        logger.warning('任务 %s 日志推送失败：%s', task_id, exc)
+        return False
+
+
+def push_status(task_id):
+    """推送任务状态变化（执行中/暂停/终态），供前端切换操作条与收尾。"""
+    from .models import ExecutionTask
+
+    task = ExecutionTask.objects.filter(pk=task_id).first()
+    if task is None:
+        return
+    push(task_id, {
+        'kind': 'status',
+        'status': task.status,
+        'pause_type': task.pause_type,
+        'return_code': task.return_code,
+        'duration': task.duration,
+    })
+
+
 class LiveSink:
     """一次执行的输出汇聚器（线程安全，供并行组多线程共用）。
 
@@ -56,6 +98,9 @@ class LiveSink:
         self._file_broken = False
         self._last_flush = 0.0
         self._pending = 0
+        self._ws_len = 0        # 已推送的 render 文本长度（增量基准）
+        self._ws_reset = False  # 下次推送整段（模块切换后文本可能被重排）
+        self._ws_broken = False
 
     # ── 生命周期 ────────────────────────────────────────────
     def bind(self, outputs):
@@ -88,6 +133,9 @@ class LiveSink:
         """模块结束：丢弃实时块（完整输出由 runner 追加进 outputs）。"""
         with self._lock:
             self._live.pop(key, None)
+            # 实时块交还 outputs 时文本可能被重排（如 agent 通道标头），
+            # 下次推送整段以对齐客户端
+            self._ws_reset = True
 
     def close(self, final_output=None, note=''):
         """收尾：把 outputs 剩余部分与附加说明（如执行异常）落盘并关闭文件。"""
@@ -132,6 +180,24 @@ class LiveSink:
                 self._append_file(finished[self._file_len:])
                 self._file_len = len(finished)
         self._save_preview(preview_of(full))
+        self._broadcast(full, extra_used=bool(extra))
+
+    def _broadcast(self, full, extra_used):
+        """把新增片段推给 WebSocket 客户端（前缀被破坏时整段重发）。"""
+        if self._ws_broken:
+            return
+        with self._lock:
+            # 临时提示会消失、并行组多块交错插入、长度回退：都不再是 append，整段重发
+            reset = (self._ws_reset or extra_used or len(self._live) > 1
+                     or len(full) < self._ws_len)
+            chunk = '' if reset else full[self._ws_len:]
+            if not reset and not chunk:
+                return
+            self._ws_len, self._ws_reset = len(full), False
+        payload = ({'kind': 'full', 'output': preview_of(full), 'offset': len(full)}
+                   if reset else {'kind': 'delta', 'output': chunk, 'offset': len(full)})
+        if not push(self.task_id, payload):
+            self._ws_broken = True  # 通道不可用：不再重试，前端自行回退轮询
 
     def _save_preview(self, preview):
         from .models import ExecutionTask, TaskExecutionLog

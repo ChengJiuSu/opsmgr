@@ -19,7 +19,7 @@ from django.db import connection
 from django.utils import timezone
 
 from . import runner
-from .live import PREVIEW_LIMIT, LiveSink, log_rel_path, preview_of
+from .live import PREVIEW_LIMIT, LiveSink, log_rel_path, preview_of, push, push_status
 
 logger = logging.getLogger('apps.task_exec')
 
@@ -46,6 +46,7 @@ def execute_task(task_id, log_id=None):
     task.started_at = log.started_at = started_at
     task.save(update_fields=['status', 'started_at'])
     log.save(update_fields=['status', 'started_at'])
+    push_status(task.pk)  # 开跑：推送 running（WebSocket 客户端已在等）
 
     rel_path = log_rel_path(task.pk, log.pk)
     abs_path = Path(settings.TASK_LOG_DIR) / rel_path
@@ -75,6 +76,10 @@ def execute_task(task_id, log_id=None):
         # 流式落盘成功即回填路径（详情页/下载读全量日志），落盘失败退回预览
         log.log_file = rel_path if abs_path.exists() else ''
         log.save(update_fields=['return_code', 'output', 'status', 'finished_at', 'log_file', 'steps_result'])
+
+        # 收尾推送：整段最终输出 + 终态（客户端据此停连接并刷新执行记录）
+        push(task.pk, {'kind': 'full', 'output': preview, 'offset': len(preview)})
+        push_status(task.pk)
 
 
 def _run_in_thread(task_id, log_id):
