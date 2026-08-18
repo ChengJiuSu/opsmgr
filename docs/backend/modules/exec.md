@@ -76,6 +76,7 @@ apps/task_exec/
 │                    #   match_executable_servers：全局/模块维度匹配共用口径
 ├── serializers.py   # 变量 key 校验、凭据脱敏、嵌套模块整体读写与内容校验、方法 service_type 执行校验
 ├── views.py         # 变量/凭据/任务 ViewSet + matched_servers/execute/output/logs 动作 + 剧本列表
+├── log_files.py     # 日志文件浏览：TASK_LOG_DIR 只读目录树 / 文本分段读 / 原文件下载（仅管理员）
 ├── runner.py        # 任务流执行：逐模块解析主机 + 动态 inventory + 变量注入 + ansible 调用，失败中止
 ├── live.py          # LiveSink：流式日志汇聚（节流写库预览 + 落盘 + WebSocket 推送）
 ├── consumers.py     # TaskLogConsumer：/ws/task-logs/<task_id>/ 日志推送（子协议 JWT 鉴权）
@@ -153,6 +154,27 @@ TASK_LOG_DIR/<task_id>/<log_id>.d/step<order>[-retry<n>]/
 - 读取走 `logs/{log_id}/scene/`（**仅管理员**，归档含变量值），前端执行日志页
   `TaskLog.vue` 的「执行现场」按钮按文件浏览内容；`file` 参数经 `resolve_within`
   限制在本条执行记录的归档目录内，防路径穿越。
+
+### 日志文件浏览（按目录翻）
+
+`scene/` 接口按「某任务的某次执行」定向取归档；另有一组不依赖数据库记录的
+目录浏览接口（`log_files.py`），把 `TASK_LOG_DIR` 整棵树开放给前端页面
+「任务执行 → 日志文件」（`views/task/LogFiles.vue`，仅管理员）：
+
+- `GET /api/exec/log-files/?path=` 列目录，返回
+  `{path, parent, entries:[{name,path,type,size,modified_at,label}], root}`；
+  排序为目录优先、纯数字名（任务 id / 执行记录 id）按数值倒序（新的在前）；
+  `label` 是可读性标注——根层取任务名，任务目录内取该次执行的状态与开始时间，
+  记录已删则标注「记录已删除」，不影响浏览；
+- `GET /api/exec/log-files/content/?path=&offset=&limit=&tail=true` 读文本，
+  单次上限 512KB（`CONTENT_LIMIT`），`tail=true` 直接读末尾，返回 `eof` 供
+  前端「继续加载」翻页；二进制文件（含 `\x00`）拒绝，提示下载；
+- `GET /api/exec/log-files/download/?path=` 原文件流式下载（不受上限限制），
+  下载名把目录层级拼进文件名，避免多个 `vars.yml` 互相覆盖。
+
+三个接口的 `path` 均经 `resolve_within` 收敛到 `TASK_LOG_DIR` 内（realpath
+比较，`../` 与指向外部的软链接一并拒绝），**只读**，无写/删接口；权限
+`IsAdmin`（归档含变量值）。记录已被清理但文件仍在时同样能翻到。
 
 日志保留（`clean_task_logs`，建议 cron 每日）：落盘文件按 mtime 保留
 `TASK_LOG_FILE_RETENTION_DAYS`（默认 30 天，含记录已删的孤儿文件；清理后
@@ -306,6 +328,9 @@ GET                 /api/exec/tasks/{id}/logs/{log_id}/  单条日志详情（�
 GET                 /api/exec/tasks/{id}/logs/{log_id}/scene/  执行现场归档（仅管理员）：
                                                   缺省列清单 {files:[{path,size}],retained}；
                                                   ?file=step1/direct/vars.yml 返回 {path,content,truncated}
+GET                 /api/exec/log-files/          日志目录浏览（仅管理员）：?path= 相对 TASK_LOG_DIR，缺省为根
+GET                 /api/exec/log-files/content/  日志文本读取（仅管理员）：?path= 必填，?offset=&limit=&tail=true 分段读
+GET                 /api/exec/log-files/download/ 日志原文件下载（仅管理员）：?path= 必填
 ```
 
 任务读写权限：普通用户只读，管理员可保存/编辑/执行（`IsAdminOrReadOnly`）。

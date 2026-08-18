@@ -1982,3 +1982,145 @@ class LiveSinkBroadcastTests(TestCase):
             self.sink.flush(force=True)
             self.sink.flush(force=True)
         self.assertEqual(m.call_count, 1)  # 首次失败后不再重试
+
+
+class LogFileBrowserTests(TestCase):
+    """日志文件浏览接口：目录列表 / 文本读取 / 下载 / 路径穿越与权限。
+
+    不依赖真实执行：直接在临时 TASK_LOG_DIR 内造出与 runner 一致的目录结构。
+    """
+
+    def setUp(self):
+        self.admin = User.objects.create(username='logadmin', is_staff=True, is_superuser=True)
+        self.admin.set_password('Pass!2345xyz')
+        self.admin.save()
+        self.dir = tempfile.mkdtemp(prefix='task_logs_')
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.task = ExecutionTask.objects.create(name='部署任务')
+        self.log = TaskExecutionLog.objects.create(
+            task=self.task, status='success', started_at=timezone.now())
+        task_dir = os.path.join(self.dir, str(self.task.id))
+        scene = os.path.join(task_dir, f'{self.log.id}.d', 'step1', 'direct')
+        os.makedirs(scene)
+        self._write(os.path.join(task_dir, f'{self.log.id}.log'), 'ok: [local]\n' * 5)
+        self._write(os.path.join(scene, 'inventory.ini'), 'local ansible_host=127.0.0.1\n')
+        self._write(os.path.join(scene, 'vars.yml'), 'app_conf:\n  mode: prod\n')
+        self._write(os.path.join(scene, 'command.txt'), 'ansible all -m shell -a "echo hi"\n')
+
+    @staticmethod
+    def _write(path, text):
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text)
+
+    def _client(self, username='logadmin'):
+        c = APIClient()
+        r = c.post('/api/auth/login/',
+                   {'username': username, 'password': 'Pass!2345xyz'}, format='json')
+        c.credentials(HTTP_AUTHORIZATION='Bearer ' + r.json()['access'])
+        return c
+
+    def test_list_root_annotates_task_name(self):
+        with override_settings(TASK_LOG_DIR=self.dir):
+            r = self._client().get('/api/exec/log-files/')
+        self.assertEqual(r.status_code, 200)
+        data = r.json()['data']
+        self.assertIsNone(data['parent'])
+        entry = next(e for e in data['entries'] if e['name'] == str(self.task.id))
+        self.assertEqual(entry['type'], 'dir')
+        self.assertEqual(entry['label'], '部署任务')
+
+    def test_list_task_dir_annotates_log_status(self):
+        with override_settings(TASK_LOG_DIR=self.dir):
+            r = self._client().get('/api/exec/log-files/', {'path': str(self.task.id)})
+        data = r.json()['data']
+        self.assertEqual(data['parent'], '')
+        labels = {e['name']: e['label'] for e in data['entries']}
+        self.assertIn('执行现场', labels[f'{self.log.id}.d'])
+        self.assertIn('执行日志 · 成功', labels[f'{self.log.id}.log'])
+        # 同一执行记录的归档目录与日志文件相邻，目录在前
+        self.assertEqual([e['name'] for e in data['entries']],
+                         [f'{self.log.id}.d', f'{self.log.id}.log'])
+
+    def test_list_nested_scene_dir(self):
+        rel = f'{self.task.id}/{self.log.id}.d/step1/direct'
+        with override_settings(TASK_LOG_DIR=self.dir):
+            r = self._client().get('/api/exec/log-files/', {'path': rel})
+        data = r.json()['data']
+        self.assertEqual(data['parent'], f'{self.task.id}/{self.log.id}.d/step1')
+        names = {e['name'] for e in data['entries']}
+        self.assertEqual(names, {'inventory.ini', 'vars.yml', 'command.txt'})
+        self.assertTrue(all(e['size'] > 0 for e in data['entries']))
+
+    def test_read_file_content(self):
+        rel = f'{self.task.id}/{self.log.id}.d/step1/direct/vars.yml'
+        with override_settings(TASK_LOG_DIR=self.dir):
+            r = self._client().get('/api/exec/log-files/content/', {'path': rel})
+        data = r.json()['data']
+        self.assertEqual(yaml.safe_load(data['content']), {'app_conf': {'mode': 'prod'}})
+        self.assertTrue(data['eof'])
+
+    def test_read_tail_and_offset(self):
+        rel = f'{self.task.id}/{self.log.id}.log'
+        with override_settings(TASK_LOG_DIR=self.dir):
+            c = self._client()
+            r = c.get('/api/exec/log-files/content/', {'path': rel, 'tail': 'true', 'limit': 12})
+            tail = r.json()['data']
+            r = c.get('/api/exec/log-files/content/', {'path': rel, 'offset': 12, 'limit': 12})
+            mid = r.json()['data']
+        self.assertEqual(tail['content'], 'ok: [local]\n')
+        self.assertEqual(tail['offset'], tail['size'] - 12)
+        self.assertTrue(tail['eof'])
+        self.assertEqual(mid['offset'], 12)
+        self.assertFalse(mid['eof'])
+
+    def test_download_file(self):
+        rel = f'{self.task.id}/{self.log.id}.d/step1/direct/command.txt'
+        with override_settings(TASK_LOG_DIR=self.dir):
+            r = self._client().get('/api/exec/log-files/download/', {'path': rel})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn('attachment', r['Content-Disposition'])
+        self.assertIn(b'echo hi', b''.join(r.streaming_content))
+
+    def test_path_traversal_rejected(self):
+        with override_settings(TASK_LOG_DIR=self.dir):
+            c = self._client()
+            for params in ({'path': '../../../../etc'}, {'path': f'{self.task.id}/../../etc'}):
+                self.assertEqual(c.get('/api/exec/log-files/', params).status_code, 400)
+            r = c.get('/api/exec/log-files/content/', {'path': '../../../../etc/passwd'})
+            self.assertEqual(r.status_code, 400)
+            r = c.get('/api/exec/log-files/download/', {'path': '../../../../etc/passwd'})
+            self.assertEqual(r.status_code, 400)
+
+    def test_symlink_outside_root_rejected(self):
+        """指向根目录外的软链接同样拒绝（realpath 比较）。"""
+        outside = tempfile.mkdtemp(prefix='outside_')
+        self.addCleanup(shutil.rmtree, outside, True)
+        self._write(os.path.join(outside, 'secret.txt'), 'top secret')
+        link = os.path.join(self.dir, 'escape.txt')
+        os.symlink(os.path.join(outside, 'secret.txt'), link)
+        with override_settings(TASK_LOG_DIR=self.dir):
+            r = self._client().get('/api/exec/log-files/content/', {'path': 'escape.txt'})
+        self.assertEqual(r.status_code, 400)
+
+    def test_missing_path_and_root(self):
+        with override_settings(TASK_LOG_DIR=self.dir):
+            c = self._client()
+            self.assertEqual(c.get('/api/exec/log-files/', {'path': 'nope'}).status_code, 400)
+            self.assertEqual(c.get('/api/exec/log-files/content/').status_code, 400)
+        # 根目录尚未创建（从未执行过任务）时返回空列表而非报错
+        with override_settings(TASK_LOG_DIR=os.path.join(self.dir, 'not-created')):
+            r = self._client().get('/api/exec/log-files/')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()['data']['entries'], [])
+
+    def test_non_admin_forbidden(self):
+        u = User.objects.create(username='logviewer')
+        u.set_password('Pass!2345xyz')
+        u.save()
+        with override_settings(TASK_LOG_DIR=self.dir):
+            c = self._client('logviewer')
+            self.assertEqual(c.get('/api/exec/log-files/').status_code, 403)
+            self.assertEqual(c.get('/api/exec/log-files/content/',
+                                   {'path': f'{self.task.id}/{self.log.id}.log'}).status_code, 403)
+            self.assertEqual(c.get('/api/exec/log-files/download/',
+                                   {'path': f'{self.task.id}/{self.log.id}.log'}).status_code, 403)

@@ -113,6 +113,12 @@ const router = createRouter({
           meta: { title: '执行日志', activeMenu: '/task/executions' },
         },
         {
+          path: 'task/log-files',
+          name: 'TaskLogFiles',
+          component: () => import('../views/task/LogFiles.vue'),
+          meta: { title: '日志文件', staff: true },
+        },
+        {
           path: 'task/artifacts',
           name: 'TaskArtifacts',
           component: () => import('../views/task/Artifacts.vue'),

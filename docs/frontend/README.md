@@ -16,3 +16,4 @@
 | [服务器管理](views/servers.md) | CRUD 弹窗复用、筛选分页 |
 | [审计日志](views/audit-logs.md) | 只读列表、方法筛选 |
 | [系统配置](views/system-configs.md) | 键值对 CRUD、key 禁用逻辑 |
+| [日志文件](views/task-log-files.md) | 日志目录浏览、分段读取、下载 |
