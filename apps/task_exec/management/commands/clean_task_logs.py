@@ -4,6 +4,7 @@
   - 落盘日志文件：settings.TASK_LOG_FILE_RETENTION_DAYS（--file-days 覆盖），
     按文件 mtime 扫 TASK_LOG_DIR 清理，顺带清掉记录已删的孤儿文件，
     对应记录的 log_file 置空（详情页自动退回数据库预览）；
+    执行现场归档目录 <log_id>.d/（inventory/变量/命令）同保留期一并清理；
   - TaskExecutionLog 记录：settings.TASK_LOG_RETENTION_DAYS（--days 覆盖）。
 
 建议挂 cron / celery beat 每日执行：
@@ -11,6 +12,7 @@
     python manage.py clean_task_logs
 """
 import logging
+import shutil
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -22,6 +24,9 @@ from django.utils import timezone
 from apps.task_exec.models import TaskExecutionLog
 
 logger = logging.getLogger('apps.task_exec')
+
+# 执行现场归档目录后缀（runner.step_archive_dir 生成 <log_id>.d/step<order>/…）
+SCENE_DIR_SUFFIX = '.d'
 
 
 class Command(BaseCommand):
@@ -76,6 +81,9 @@ class Command(BaseCommand):
                     removed_files += 1
             except OSError:
                 logger.warning('日志文件删除失败：%s', path)
+        # 执行现场归档目录随记录一并清理（log_file 为空的记录也可能有归档）
+        for log_id, task_id in qs.values_list('id', 'task_id').iterator():
+            self._remove_scene_dir(log_root / str(task_id) / f'{log_id}.d')
         deleted, _ = qs.delete()
 
         self._prune_empty_dirs(log_root)
@@ -114,9 +122,37 @@ class Command(BaseCommand):
                 stale_rel = []
         if stale_rel:
             TaskExecutionLog.objects.filter(log_file__in=stale_rel).update(log_file='')
+        removed += self._clean_scene_dirs(log_root, deadline, dry_run)
         if not dry_run:
             self._prune_empty_dirs(log_root)
         return removed
+
+    def _clean_scene_dirs(self, log_root, deadline, dry_run):
+        """按 mtime 清理过期的执行现场归档目录（<log_id>.d），返回清理数量。
+
+        目录 mtime 取内部文件的最新值：归档在执行时一次性写入，重试会追加
+        新的 step 子目录，用最新值可避免长任务的早期模块被提前清掉。
+        """
+        removed = 0
+        for scene in log_root.glob(f'*/*{SCENE_DIR_SUFFIX}'):
+            if not scene.is_dir():
+                continue
+            mtimes = [p.stat().st_mtime for p in scene.rglob('*') if p.is_file()]
+            if mtimes and max(mtimes) >= deadline:
+                continue
+            removed += 1
+            if not dry_run:
+                self._remove_scene_dir(scene)
+        return removed
+
+    @staticmethod
+    def _remove_scene_dir(scene):
+        if not scene.is_dir():
+            return
+        try:
+            shutil.rmtree(scene)
+        except OSError:
+            logger.warning('执行现场归档目录删除失败：%s', scene)
 
     @staticmethod
     def _prune_empty_dirs(log_root):

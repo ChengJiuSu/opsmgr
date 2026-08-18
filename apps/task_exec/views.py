@@ -1,13 +1,18 @@
 import os
+from pathlib import Path
+
+import yaml
 
 from django.conf import settings
+from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from drf_spectacular.types import OpenApiTypes
-from drf_spectacular.utils import extend_schema
+from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.views import APIView
 
+from common.ansible import resolve_within
 from common.permissions import IsAdmin, IsAdminOrReadOnly
 from common.response import fail, ok
 
@@ -94,6 +99,74 @@ class ExecVariableViewSet(viewsets.ModelViewSet):
             from django.db.models import Q
             qs = qs.filter(Q(key__icontains=keyword) | Q(description__icontains=keyword))
         return qs
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter('project_group', str, description='项目组（id 或 code），必填'),
+            OpenApiParameter('channel', str, description='渠道（id 或 code），必填'),
+            OpenApiParameter('env', str, description='环境（id 或 code），必填'),
+            OpenApiParameter('output', str, description='json（默认）| yaml，yaml 直接返回纯文本'),
+            OpenApiParameter('include_artifact', str, description='true 时附加 package_* 制品变量'),
+            OpenApiParameter('artifact_version', str, description='锁定制品版本，留空取最新'),
+        ],
+        responses=OpenApiTypes.OBJECT,
+    )
+    @action(detail=False, methods=['get'])
+    def resolved(self, request):
+        """按维度返回已解析合并的变量字典，供外部系统直接喂给 ansible。
+
+        与执行器共用 runner.collect_dim_variables，语义完全一致（一条变量记录
+        = 一个 ansible 变量，值为 YAML 解析结果）。三维度必填，避免精确匹配语义
+        含糊；output=yaml 时返回不带 {code,msg,data} 包装的纯 YAML，可直接
+        `curl -o vars.yml` 后 `ansible-playbook -e @vars.yml`（用 output 而非
+        format，后者被 DRF 内容协商占用）。
+        """
+        from .runner import ArtifactLookupError, collect_artifact_vars, collect_dim_variables
+
+        dims, err = self._resolve_dims(request.query_params)
+        if err:
+            return fail(err)
+        variables = collect_dim_variables(dims['project_group'].id, dims['channel'].id,
+                                          dims['environment'].id)
+        if request.query_params.get('include_artifact') == 'true':
+            try:
+                variables.update(collect_artifact_vars(
+                    dims['project_group'].id, dims['channel'].id, dims['environment'].id,
+                    locked=request.query_params.get('artifact_version', ''),
+                ))
+            except ArtifactLookupError as exc:
+                return fail(str(exc))
+        if request.query_params.get('output') == 'yaml':
+            text = yaml.safe_dump(variables, allow_unicode=True, default_flow_style=False)
+            return HttpResponse(text, content_type='application/x-yaml; charset=utf-8')
+        return ok({
+            'dims': {name: {'id': obj.id, 'code': obj.code, 'name': obj.name}
+                     for name, obj in dims.items()},
+            'count': len(variables),
+            'vars': variables,
+        })
+
+    @staticmethod
+    def _resolve_dims(params):
+        """解析三维度查询参数为字典对象，返回 (dims, 错误信息)。纯数字按 id、否则按 code。"""
+        from apps.asset_mgr.models import Channel, Environment, ProjectGroup
+
+        specs = (
+            ('project_group', 'project_group', ProjectGroup, '项目组'),
+            ('channel', 'channel', Channel, '渠道'),
+            ('environment', 'env', Environment, '环境'),
+        )
+        dims = {}
+        for field, param, model, label in specs:
+            value = (params.get(param) or '').strip()
+            if not value:
+                return None, f'缺少查询参数 {param}（{label}），三个维度均为必填'
+            lookup = {'id': value} if value.isdigit() else {'code': value}
+            obj = model.objects.filter(**lookup).first()
+            if obj is None:
+                return None, f'{label}不存在：{param}={value}'
+            dims[field] = obj
+        return dims, None
 
     @action(detail=True, methods=['get'])
     def versions(self, request, pk=None):
@@ -325,3 +398,45 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
         task = self.get_object()
         log = get_object_or_404(task.logs.select_related('triggered_by'), pk=log_id)
         return ok(TaskExecutionLogDetailSerializer(log).data)
+
+    # 执行现场文件的单次读取上限（字符），超出截断——现场文件本应很小，
+    # 超限通常意味着变量表异常膨胀，截断即可，不必把大字符串塞给前端
+    SCENE_READ_LIMIT = 200000
+
+    @extend_schema(
+        parameters=[OpenApiParameter('file', str, description='归档内相对路径，缺省则列出清单')],
+        responses=OpenApiTypes.OBJECT,
+    )
+    @action(detail=True, methods=['get'], url_path=r'logs/(?P<log_id>\d+)/scene',
+            permission_classes=[IsAdmin])
+    def log_scene(self, request, pk=None, log_id=None):
+        """执行现场归档（inventory / 变量 / 命令）：缺省列清单，带 file 返回内容。
+
+        归档含变量值，仅管理员可读；file 经 resolve_within 限制在本条执行记录
+        的归档目录内，防路径穿越。文件过保留期被清理后清单为空。
+        """
+        task = self.get_object()
+        log = get_object_or_404(task.logs, pk=log_id)
+        root = Path(settings.TASK_LOG_DIR) / str(task.pk) / f'{log.pk}.d'
+        rel = (request.query_params.get('file') or '').strip()
+        if not rel:
+            files = sorted(
+                ({'path': str(p.relative_to(root)), 'size': p.stat().st_size}
+                 for p in root.rglob('*') if p.is_file()),
+                key=lambda item: item['path'],
+            ) if root.is_dir() else []
+            return ok({'files': files, 'retained': bool(files)})
+        try:
+            # 报错文案面向本接口，resolve_within 的默认文案是 Ansible 项目目录
+            path = Path(resolve_within(str(root), rel))
+        except ValueError:
+            return fail(f'执行现场文件路径非法：{rel}')
+        if not path.is_file():
+            return fail(f'执行现场文件不存在或已过保留期：{rel}')
+        content = path.read_text(encoding='utf-8', errors='replace')
+        truncated = len(content) > self.SCENE_READ_LIMIT
+        return ok({
+            'path': rel,
+            'content': content[:self.SCENE_READ_LIMIT],
+            'truncated': truncated,
+        })

@@ -53,6 +53,10 @@
         <div class="output-meta">
           <span v-if="current">返回码：{{ current.return_code ?? '-' }}</span>
           <span v-if="currentServers" class="muted">{{ currentServers }}</span>
+          <!-- 执行现场归档含变量值，仅管理员可读 -->
+          <el-button v-if="authStore.isStaff && current?.id" link type="primary" size="small" @click="openScene">
+            执行现场
+          </el-button>
         </div>
         <!-- 暂停处理操作条：暂停确认模块（继续/中止）或模块失败等待（重试/跳过/中止） -->
         <el-alert v-if="task?.status === 'paused'" :type="pausedFailed ? 'error' : 'warning'" :closable="false" show-icon class="pause-bar">
@@ -78,6 +82,28 @@
         />
       </div>
     </div>
+
+    <!-- 执行现场：本次执行各模块实际用的 inventory / 变量 / 命令，供 debug 复现 -->
+    <el-dialog v-model="sceneVisible" title="执行现场" width="900px" top="6vh">
+      <div v-loading="sceneLoading" class="scene-body">
+        <template v-if="sceneFiles.length">
+          <el-menu :default-active="sceneActive" class="scene-menu" @select="loadSceneFile">
+            <el-menu-item v-for="f in sceneFiles" :key="f.path" :index="f.path">
+              <span class="scene-path">{{ f.path }}</span>
+              <span class="muted scene-size">{{ f.size }}B</span>
+            </el-menu-item>
+          </el-menu>
+          <div class="scene-content">
+            <pre v-if="sceneContent">{{ sceneContent }}</pre>
+            <el-empty v-else description="选择左侧文件查看内容" :image-size="60" />
+            <el-alert v-if="sceneTruncated" type="warning" :closable="false" show-icon
+                      title="内容过长已截断，完整文件见服务器归档目录" />
+          </div>
+        </template>
+        <el-empty v-else-if="!sceneLoading" :image-size="80"
+                  description="无执行现场归档（该次执行早于本功能上线，或归档已过保留期被清理）" />
+      </div>
+    </el-dialog>
   </el-card>
 </template>
 
@@ -86,7 +112,7 @@ import { ref, computed, nextTick, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { Back, CopyDocument, Loading, Refresh } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { getTask, getTaskLogs, getTaskLogDetail, getTaskOutput, confirmTask } from '../../api/tasks'
+import { getTask, getTaskLogs, getTaskLogDetail, getTaskLogScene, getTaskOutput, confirmTask } from '../../api/tasks'
 import { useAuthStore } from '../../stores/auth'
 import { openTaskLogStream } from '../../utils/taskLogStream'
 import StepOutput from '../../components/StepOutput.vue'
@@ -269,6 +295,38 @@ async function handleConfirm(action) {
   }
 }
 
+// ── 执行现场：inventory / 变量 / 命令归档（仅管理员）────────
+const sceneVisible = ref(false)
+const sceneLoading = ref(false)
+const sceneFiles = ref([])
+const sceneActive = ref('')
+const sceneContent = ref('')
+const sceneTruncated = ref(false)
+
+async function openScene() {
+  sceneVisible.value = true
+  sceneLoading.value = true
+  sceneFiles.value = []
+  sceneActive.value = ''
+  sceneContent.value = ''
+  sceneTruncated.value = false
+  try {
+    const res = await getTaskLogScene(taskId, current.value.id)
+    sceneFiles.value = res.data?.files || []
+    // 默认展开第一个文件，省一次点击（多为 step1/direct/command.txt）
+    if (sceneFiles.value.length) await loadSceneFile(sceneFiles.value[0].path)
+  } finally {
+    sceneLoading.value = false
+  }
+}
+
+async function loadSceneFile(path) {
+  sceneActive.value = path
+  const res = await getTaskLogScene(taskId, current.value.id, path)
+  sceneContent.value = res.data?.content || '（空文件）'
+  sceneTruncated.value = !!res.data?.truncated
+}
+
 async function copyLink() {
   const url = window.location.href
   try {
@@ -302,4 +360,12 @@ onUnmounted(stopFollow)
 .pause-actions { display: inline-flex; gap: 8px; }
 /* 独立页输出区高度：占满视口剩余高度（视觉样式在 StepOutput 组件内） */
 .output-host { height: max(480px, calc(100vh - 260px)); }
+/* 执行现场弹窗：左文件树右内容 */
+.scene-body { display: flex; gap: 12px; min-height: 320px; }
+.scene-menu { width: 280px; flex-shrink: 0; border-right: 1px solid #ebeef5; }
+.scene-menu :deep(.el-menu-item) { height: 34px; line-height: 34px; font-size: 12px; display: flex; justify-content: space-between; }
+.scene-path { overflow: hidden; text-overflow: ellipsis; }
+.scene-size { margin-left: 8px; flex-shrink: 0; }
+.scene-content { flex: 1; min-width: 0; max-height: 60vh; overflow: auto; }
+.scene-content pre { margin: 0; padding: 10px; background: #f5f7fa; border-radius: 4px; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
 </style>

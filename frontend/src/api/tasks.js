@@ -15,6 +15,9 @@ export const getTaskOutput = (id, offset = 0) =>
 export const confirmTask = (id, action) => request.post(`/api/exec/tasks/${id}/confirm/`, { action })
 export const getTaskLogs = (id) => request.get(`/api/exec/tasks/${id}/logs/`)
 export const getTaskLogDetail = (id, logId) => request.get(`/api/exec/tasks/${id}/logs/${logId}/`)
+// 执行现场归档（inventory/变量/命令，仅管理员）：不带 file 取清单，带 file 取内容
+export const getTaskLogScene = (id, logId, file) =>
+  request.get(`/api/exec/tasks/${id}/logs/${logId}/scene/`, { params: file ? { file } : {} })
 
 // 剧本列表（ANSIBLE_PROJECT_DIR 内可选剧本）
 export const getPlaybooks = () => request.get('/api/exec/playbooks/')

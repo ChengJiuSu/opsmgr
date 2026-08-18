@@ -48,7 +48,8 @@ class AnsiblePlaybookExecutor(BaseExecutor):
             cmd += ['--tags', tags]
         if limit:
             cmd += ['--limit', limit]
-        # 变量管理启用变量 + 模块额外变量（后者覆盖同名项）
-        cmd += extra_vars_args(task)
+        # 变量管理启用变量 + 模块额外变量（后者覆盖同名项）；变量文件与 inventory
+        # 同处 runner 建的临时工作目录，执行结束由 runner 统一清理
+        cmd += extra_vars_args(task, os.path.dirname(inventory_path))
 
         return run_stream(cmd, timeout=task.timeout or 300, cwd=project_dir, on_data=on_data)

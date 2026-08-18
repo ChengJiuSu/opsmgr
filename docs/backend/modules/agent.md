@@ -55,9 +55,24 @@ apps/agent_mgr/
   2MB 超限截断。`task.result` 幂等，重复上报只重 ack。
 - runner 侧（task_exec/runner.py）：命令/剧本模块主机按 `Server.agent`
   分组，直连组走原 `run_subprocess`，agent 组生成**无密钥 inventory**
-  （密码/私钥不出通道，SSH 免密凭据驻留 agent 主机）+ extra_vars 值列表
-  下发；混合通道时输出按 `[直连 · n 台]` / `[经 Agent xx · n 台]` 标头
-  拼接，纯直连输出与旧行为完全一致；rc 取首个非零。
+  （密码/私钥不出通道，SSH 免密凭据驻留 agent 主机）+ 变量下发；混合通道时
+  输出按 `[直连 · n 台]` / `[经 Agent xx · n 台]` 标头拼接，纯直连输出与旧
+  行为完全一致；rc 取首个非零。
+- **payload 变量字段（新旧双发）**：manager 侧变量已改为落文件 `-e @vars.yml`，
+  payload 同时带三个字段，兼容未升级的存量 agent：
+
+  | 字段 | 谁用 | 内容 |
+  |------|------|------|
+  | `vars_file` | 新 agent | 变量管理 + 制品变量的 YAML 文本，落盘后 `-e @vars.yml` |
+  | `step_extra_vars` | 新 agent | 模块额外变量原文，在 `vars_file` **之后**再 `-e` |
+  | `extra_vars` | 旧 agent | 旧格式值列表（合并 JSON → 模块额外变量），逐个 `-e` |
+
+  新 agent 见到 `vars_file` 字段即忽略 `extra_vars`（两者内容等价，同时用会
+  重复注入但结果相同）。旧 agent 不认新字段，照旧只读 `extra_vars`。
+  **agent 升级完成后**才可移除 `extra_vars`——提前删会让旧 agent 静默丢变量。
+- 下发前把 payload 的 inventory 与变量归档到执行记录目录
+  `TASK_LOG_DIR/<task_id>/<log_id>.d/step<order>/agent-<agent_id>/`，
+  供事后在 agent 主机上复现。
 - v1 限制：方法模块不走 agent 通道（ansible_playbook provider 遇 agent
   通道主机提前失败并提示）；模块执行中 agent 日志不实时进任务输出（终态
   后整段并入，v1.1 计划流式合并）。

@@ -28,12 +28,38 @@ skipped）；模块内主机按任务级 exec_mode 并发/串行（串行 = `--f
 **执行变量**（`ExecVariable`）：变量绑定**项目组/渠道/环境生效条件**
 （三维度必选），执行时仅加载与**模块有效维度**（自定义范围用模块维度，
 否则任务全局维度）精确匹配的启用变量；变量值为 **YAML 文本**（保存时
-校验），解析后以 `--extra-vars` JSON 注入三类模块（命令内可用 Jinja
-`{{ var }}` / `{{ var.子键 }}` 引用），模块自身的额外变量作为后一个
-`-e` 传入（ansible 同名覆盖）。每次保存/回滚落一条**版本快照**
+校验），解析后与 CD 制品变量合并落临时工作目录 `vars.yml`，以
+`--extra-vars @vars.yml` 注入三类模块（命令内可用 Jinja `{{ var }}` /
+`{{ var.子键 }}` 引用），模块自身的额外变量作为后一个 `-e` 传入
+（ansible 同名覆盖）。
+
+走文件而非命令行 JSON 的原因：变量值不进 argv（同机 `ps` 可见）、不进
+`common.ansible` 的命令行日志，且事后可原样复制复现。**仍是 extra vars，
+ansible 优先级最高**——剧本内 `vars:` 不会反过来覆盖平台变量，与改造前语义
+一致（若要让剧本可覆盖，才需要改用 inventory group_vars，本期不做）。
+每次保存/回滚落一条**版本快照**
 （`ExecVariableVersion`，`EXEC_VARIABLE_VERSION_LIMIT` 默认保留 10 版），
-支持回滚。变量列表 API 亦可供 Jenkins 等外部系统拉取，配合服务器接口
-（`executable=true`）自行拼装 ansible 调用（规划中）。
+支持回滚。
+
+**对外取值**（`GET /api/exec/variables/resolved/`）：供 Jenkins 等外部系统按
+维度拉取**已解析合并**的变量字典，配合服务器接口（`executable=true`）自行
+拼装 ansible 调用。与执行器共用 `runner.collect_dim_variables()`，保证内外
+注入语义一致（一条记录 = 一个 ansible 变量，值为 YAML 解析结果，空值为
+`''`）。三维度必填（缺任一个 400，避免精确匹配语义含糊），取值纯数字按 id、
+否则按 code；`include_artifact=true` 追加该维度制品变量 `package_url` /
+`package_version` / `package_md5`（`artifact_version` 可锁定版本，不存在则
+400）；`output=yaml` 返回**不带 `{code,msg,data}` 包装**的纯 YAML，可直接：
+
+```bash
+curl -sH "Authorization: Bearer $TOKEN" \
+  "$BASE/api/exec/variables/resolved/?project_group=p01&channel=qixia&env=dev&output=yaml" \
+  -o vars.yml
+ansible-playbook site.yml -e @vars.yml
+```
+
+参数名用 `output` 而非 `format`：后者被 DRF 内容协商（`URL_FORMAT_OVERRIDE`）
+占用，传 `format=yaml` 会 404。变量不做跨记录 flatten（顶层键合并会因同名互相
+覆盖且与执行器行为不一致），需要顶层变量就按 `key` 建独立记录。
 
 **保存与执行分离**：新建/编辑仅保存定义（嵌套模块整体替换）；执行为独立
 动作，每次执行落一条执行日志（含全局主机快照与逐模块结果 steps_result），
@@ -106,11 +132,34 @@ ansible 输出不再等模块跑完才可见：`common.ansible.run_stream` 以
   `/ws/` 已反代到 daphne 8001（见 `deploy/nginx.conf`）。dev 的 runserver
   自带 ASGI，同端口即可，vite 已代理 `/ws`。
 
+### 执行现场归档（debug 复现）
+
+临时工作目录执行完即删（含 inventory 与临时私钥），事后无从复现，故每个
+模块执行时把现场归档到执行记录目录：
+
+```
+TASK_LOG_DIR/<task_id>/<log_id>.d/step<order>[-retry<n>]/
+├── direct/                 # 直连组（agent 组为 agent-<agent_id>/）
+│   ├── inventory.ini       # 无密钥版本
+│   ├── vars.yml            # 变量管理 + 制品变量
+│   └── command.txt         # 实际 argv，路径已改写为归档副本，复制即可重跑
+```
+
+- inventory 一律落**无密钥**版本（不写密码与私钥路径），复现时自行补凭据，
+  `command.txt` 首行注释也写明这点；剧本模块另带 `# cwd:` 注释；
+- 归档目录 0700、文件 0600；归档失败只告警，不影响执行本体；
+- 重试单独落 `-retry<n>` 目录，每次尝试的现场都留痕；
+- 直接调 `runner.run`（无执行记录，如单测）不归档；
+- 读取走 `logs/{log_id}/scene/`（**仅管理员**，归档含变量值），前端执行日志页
+  `TaskLog.vue` 的「执行现场」按钮按文件浏览内容；`file` 参数经 `resolve_within`
+  限制在本条执行记录的归档目录内，防路径穿越。
+
 日志保留（`clean_task_logs`，建议 cron 每日）：落盘文件按 mtime 保留
 `TASK_LOG_FILE_RETENTION_DAYS`（默认 30 天，含记录已删的孤儿文件；清理后
-对应记录 `log_file` 置空，详情页退回数据库预览），执行日志记录保留
-`TASK_LOG_RETENTION_DAYS`（默认 90 天）。`--files-only` 只清文件、
-`--dry-run` 只统计。
+对应记录 `log_file` 置空，详情页退回数据库预览），**执行现场归档目录
+`<log_id>.d/` 同保留期一并清理**（目录 mtime 取内部文件最新值），执行日志
+记录保留 `TASK_LOG_RETENTION_DAYS`（默认 90 天，删记录时带走其归档目录）。
+`--files-only` 只清文件、`--dry-run` 只统计。
 
 ```bash
 # crontab：每日 03:10 清理
@@ -241,6 +290,9 @@ Ansible 项目目录内执行剧本：
 ```
 GET/POST/DELETE     /api/exec/credentials/        凭据 CRUD（仅管理员；密钥/密码只写不回显）
 GET/POST/PUT/PATCH/DELETE /api/exec/variables/    执行变量 CRUD（普通用户只读；支持 project_group/channel/env 筛选）
+GET                 /api/exec/variables/resolved/ 按维度取已解析变量字典（外部系统喂 ansible）
+                                                  必填 project_group/channel/env（id 或 code）；
+                                                  可选 include_artifact=true[&artifact_version=x]、output=yaml
 GET                 /api/exec/variables/{id}/versions/  历史版本列表（默认保留 10 版）
 POST                /api/exec/variables/{id}/rollback/  回滚到指定版本 body {version}（仅管理员，回滚亦落新版本）
 GET                 /api/exec/playbooks/          剧本列表（仅管理员；ANSIBLE_PROJECT_DIR 内相对路径）
@@ -251,6 +303,9 @@ POST                /api/exec/tasks/{id}/confirm/ 人工处理暂停：确认模
 GET                 /api/exec/tasks/{id}/output/  轻量轮询：状态与输出；?offset=N 只回增量（delta=true 时前端追加，返回新 offset）
 GET                 /api/exec/tasks/{id}/logs/    执行历史列表（含主机数/执行方式/逐模块结果 steps_result）
 GET                 /api/exec/tasks/{id}/logs/{log_id}/  单条日志详情（完整输出 + 主机快照）
+GET                 /api/exec/tasks/{id}/logs/{log_id}/scene/  执行现场归档（仅管理员）：
+                                                  缺省列清单 {files:[{path,size}],retained}；
+                                                  ?file=step1/direct/vars.yml 返回 {path,content,truncated}
 ```
 
 任务读写权限：普通用户只读，管理员可保存/编辑/执行（`IsAdminOrReadOnly`）。

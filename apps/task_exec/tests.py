@@ -3,6 +3,7 @@
 命令/方法执行依赖系统已安装 ansible，通过 local 连接在 127.0.0.1 上运行；
 方法执行使用临时 Ansible 项目目录（含带 tags 的剧本）。无 ansible 时相关用例跳过。
 """
+import json
 import os
 import shutil
 import sys
@@ -10,6 +11,8 @@ import tempfile
 import time
 from datetime import timedelta
 from unittest import mock
+
+import yaml
 
 from channels.db import database_sync_to_async
 from channels.routing import URLRouter
@@ -53,6 +56,26 @@ def _make_ansible_project():
             '      tags: [redis]\n'
         )
     return proj
+
+
+def _run_and_capture(client, task_id, payload=None):
+    """mock 子进程执行一次任务，返回 (ansible 命令行, 变量文件解析结果)。
+
+    变量以 `-e @vars.yml` 传入且临时目录执行完即删，故在子进程调用时读回。
+    """
+    captured = {'cmd': [], 'vars': None}
+
+    def fake_run(cmd, *args, **kwargs):
+        captured['cmd'] = cmd
+        for arg in cmd:
+            if arg.startswith('@'):
+                with open(arg[1:], encoding='utf-8') as f:
+                    captured['vars'] = yaml.safe_load(f.read())
+        return 0, 'ok'
+
+    with mock.patch('apps.task_exec.runner.run_stream', side_effect=fake_run):
+        client.post(f'/api/exec/tasks/{task_id}/execute/', payload or {}, format='json')
+    return captured['cmd'], captured['vars']
 
 
 class InventoryTests(TestCase):
@@ -756,6 +779,102 @@ class ExecutionAPITests(TestCase):
         self.assertEqual(len(versions), 10)
         self.assertEqual(versions[0]['version'], 15)  # 3 + 12
 
+    def test_variables_resolved_endpoint(self):
+        """resolved 接口：按维度返回解析合并后的变量字典，语义与执行注入一致。"""
+        from apps.asset_mgr.models import Environment
+
+        from .models import ExecVariable
+
+        other_env = Environment.objects.create(name='预发3', code='staging3')
+        ExecVariable.objects.create(
+            key='app_conf', value='mode: prod\nports:\n  - 80',
+            project_group=self.pg, channel=self.ch, environment=self.env,
+        )
+        ExecVariable.objects.create(
+            key='empty_var', value='',
+            project_group=self.pg, channel=self.ch, environment=self.env,
+        )
+        ExecVariable.objects.create(  # 维度不匹配：不返回
+            key='other_dim_var', value='x',
+            project_group=self.pg, channel=self.ch, environment=other_env,
+        )
+        ExecVariable.objects.create(  # 停用：不返回
+            key='disabled_var', value='x', enabled=False,
+            project_group=self.pg, channel=self.ch, environment=self.env,
+        )
+        c = self._client()
+        # 维度按 code 传（外部系统免去查 id）
+        r = c.get('/api/exec/variables/resolved/',
+                  {'project_group': self.pg.code, 'channel': self.ch.code, 'env': self.env.code})
+        self.assertEqual(r.status_code, 200)
+        data = r.json()['data']
+        self.assertEqual(data['vars'], {'app_conf': {'mode': 'prod', 'ports': [80]}, 'empty_var': ''})
+        self.assertEqual(data['count'], 2)
+        self.assertEqual(data['dims']['environment']['code'], self.env.code)
+
+        # 维度按 id 传，结果一致
+        r = c.get('/api/exec/variables/resolved/',
+                  {'project_group': self.pg.id, 'channel': self.ch.id, 'env': self.env.id})
+        self.assertEqual(r.json()['data']['vars']['app_conf']['mode'], 'prod')
+
+    def test_variables_resolved_yaml_and_param_validation(self):
+        """resolved 接口：output=yaml 返回纯文本；三维度必填、不存在的维度值报错。"""
+        from .models import ExecVariable
+
+        ExecVariable.objects.create(
+            key='app_conf', value='mode: prod',
+            project_group=self.pg, channel=self.ch, environment=self.env,
+        )
+        c = self._client()
+        r = c.get('/api/exec/variables/resolved/', {
+            'project_group': self.pg.code, 'channel': self.ch.code,
+            'env': self.env.code, 'output': 'yaml',
+        })
+        self.assertEqual(r.status_code, 200)
+        self.assertIn('x-yaml', r['Content-Type'])
+        self.assertEqual(yaml.safe_load(r.content.decode()), {'app_conf': {'mode': 'prod'}})
+
+        # 缺维度参数
+        r = c.get('/api/exec/variables/resolved/', {'project_group': self.pg.code})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('channel', r.json()['msg'])
+        # 维度值不存在
+        r = c.get('/api/exec/variables/resolved/', {
+            'project_group': self.pg.code, 'channel': self.ch.code, 'env': 'no-such-env',
+        })
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('环境不存在', r.json()['msg'])
+
+    def test_variables_resolved_with_artifact(self):
+        """resolved 接口：include_artifact=true 附加 package_*，锁定版本不存在则 400。"""
+        from apps.artifact_mgr.models import Artifact
+
+        from .models import ExecVariable
+
+        ExecVariable.objects.create(
+            key='app_conf', value='mode: prod',
+            project_group=self.pg, channel=self.ch, environment=self.env,
+        )
+        Artifact.objects.create(
+            project_group=self.pg, channel=self.ch, environment=self.env,
+            version='1.2.3', md5='d' * 32,
+            file_path='app-1.2.3.tar.gz', original_name='app-1.2.3.tar.gz', size=1024,
+        )
+        c = self._client()
+        base = {'project_group': self.pg.code, 'channel': self.ch.code, 'env': self.env.code}
+        r = c.get('/api/exec/variables/resolved/', dict(base, include_artifact='true'))
+        variables = r.json()['data']['vars']
+        self.assertEqual(variables['package_version'], '1.2.3')
+        self.assertIn('app_conf', variables)
+        # 默认不带制品变量
+        r = c.get('/api/exec/variables/resolved/', base)
+        self.assertNotIn('package_version', r.json()['data']['vars'])
+        # 锁定不存在的版本
+        r = c.get('/api/exec/variables/resolved/',
+                  dict(base, include_artifact='true', artifact_version='9.9.9'))
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('9.9.9', r.json()['msg'])
+
     def test_method_step_params_json_roundtrip(self):
         """方法模块参数：JSON 对象保存回显；非对象类型 400。"""
         method = Method.objects.create(
@@ -779,7 +898,7 @@ class ExecutionAPITests(TestCase):
         self.assertIn('JSON 对象', str(r.json()))
 
     def test_variables_injected_by_dimensions(self):
-        """执行注入：仅加载与模块有效维度精确匹配的启用变量，YAML 解析后 JSON 注入。"""
+        """执行注入：仅加载与模块有效维度精确匹配的启用变量，落变量文件以 -e @ 传入。"""
         from apps.asset_mgr.models import Environment
 
         from .models import ExecVariable
@@ -799,18 +918,17 @@ class ExecutionAPITests(TestCase):
         )
         c = self._client()
         task_id = self._create_task(c, steps=[self._step(extra_vars='override=1')])
-        with mock.patch('apps.task_exec.runner.run_stream', return_value=(0, 'ok')) as m:
-            c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
-        cmd = m.call_args[0][0]
+        cmd, variables = _run_and_capture(c, task_id)
         idxs = [i for i, a in enumerate(cmd) if a == '--extra-vars']
         self.assertEqual(len(idxs), 2)
-        injected = cmd[idxs[0] + 1]
-        self.assertIn('"app_conf"', injected)
-        self.assertIn('"mode": "prod"', injected)   # YAML 解析为结构化 JSON
-        self.assertIn('[80, 443]', injected)
-        self.assertNotIn('other_dim_var', injected)
-        self.assertNotIn('disabled_var', injected)
+        self.assertTrue(cmd[idxs[0] + 1].startswith('@'))
+        self.assertEqual(variables, {'app_conf': {'mode': 'prod', 'ports': [80, 443]}})
+        self.assertNotIn('other_dim_var', variables)
+        self.assertNotIn('disabled_var', variables)
         self.assertEqual(cmd[idxs[1] + 1], 'override=1')  # 模块变量在后，ansible 同名覆盖
+        # 变量值不进 argv（同机 ps 可见、且会落入命令行日志）
+        self.assertNotIn('suchengjiu', ' '.join(cmd))
+        self.assertNotIn('mode', ' '.join(cmd))
 
 
 @override_settings(TASK_EXEC_BACKEND='sync', TASK_FAILURE_WAIT_TIMEOUT=0)
@@ -836,21 +954,20 @@ class ArtifactInjectTests(TestCase):
 
     def _run_step_cmd(self, c, task_id):
         """mock 子进程执行一次任务，返回捕获到的 ansible 命令行。"""
-        with mock.patch('apps.task_exec.runner.run_stream', return_value=(0, 'ok')) as m:
-            c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
-        return m.call_args[0][0]
+        cmd, _ = _run_and_capture(c, task_id)
+        return cmd
 
     def test_latest_artifact_injected_as_extra_vars(self):
         self._make_artifact('1.0.0')
         latest = self._make_artifact('1.1.0', md5='b' * 32)
         c = self._client()
-        cmd = self._run_step_cmd(c, self._create_task(c))
+        cmd, variables = _run_and_capture(c, self._create_task(c))
         idxs = [i for i, a in enumerate(cmd) if a == '--extra-vars']
         self.assertEqual(len(idxs), 1)
-        injected = cmd[idxs[0] + 1]
-        self.assertIn('"package_version": "1.1.0"', injected)
-        self.assertIn(f'"package_md5": "{"b" * 32}"', injected)
-        self.assertIn(f'/api/artifacts/{latest.id}/download/?sig=', injected)
+        self.assertTrue(cmd[idxs[0] + 1].startswith('@'))  # 走变量文件而非命令行 JSON
+        self.assertEqual(variables['package_version'], '1.1.0')
+        self.assertEqual(variables['package_md5'], 'b' * 32)
+        self.assertIn(f'/api/artifacts/{latest.id}/download/?sig=', variables['package_url'])
 
     def test_no_artifact_no_injection(self):
         c = self._client()
@@ -862,10 +979,9 @@ class ArtifactInjectTests(TestCase):
         self._make_artifact('1.1.0')
         c = self._client()
         task_id = self._create_task(c, steps=[self._step(params={'artifact_version': '1.0.0'})])
-        cmd = self._run_step_cmd(c, task_id)
-        injected = cmd[cmd.index('--extra-vars') + 1]
-        self.assertIn('"package_version": "1.0.0"', injected)
-        self.assertIn(f'/api/artifacts/{target.id}/download/', injected)
+        _, variables = _run_and_capture(c, task_id)
+        self.assertEqual(variables['package_version'], '1.0.0')
+        self.assertIn(f'/api/artifacts/{target.id}/download/', variables['package_url'])
 
     def test_locked_version_missing_fails_step(self):
         self._make_artifact('1.0.0')
@@ -896,10 +1012,9 @@ class ArtifactInjectTests(TestCase):
             use_custom_scope=True,
             project_group=self.pg.id, channel=self.ch.id, environment=other_env.id,
         )])
-        cmd = self._run_step_cmd(c, task_id)
-        injected = cmd[cmd.index('--extra-vars') + 1]
-        self.assertIn('"package_version": "2.0.0"', injected)
-        self.assertIn(f'/api/artifacts/{scoped.id}/download/', injected)
+        _, variables = _run_and_capture(c, task_id)
+        self.assertEqual(variables['package_version'], '2.0.0')
+        self.assertIn(f'/api/artifacts/{scoped.id}/download/', variables['package_url'])
 
 
 class PauseStepTests(TestCase):
@@ -1039,7 +1154,7 @@ class ParallelStageTests(TestCase):
         self._step(2, '并B', parallel=True)
         barrier = threading.Barrier(2, timeout=10)
 
-        def fake_handler(step, task, servers, on_data=None):
+        def fake_handler(step, task, servers, on_data=None, **kwargs):
             barrier.wait()  # 两模块必须同时在跑才能都过闸
             return 0, f'{step.name} done'
 
@@ -1059,7 +1174,7 @@ class ParallelStageTests(TestCase):
         self._step(2, '并B', parallel=True)
         self._step(3, '串尾')
 
-        def fake_handler(step, task, servers, on_data=None):
+        def fake_handler(step, task, servers, on_data=None, **kwargs):
             return (1, 'boom') if step.name == '并B' else (0, 'ok')
 
         with mock.patch.dict(runner._STEP_HANDLERS, {'command': fake_handler}), \
@@ -1132,7 +1247,7 @@ class FailureHandlingTests(TestCase):
         self._step(2, '后续')
         calls = {'n': 0}
 
-        def handler(step, task, servers, on_data=None):
+        def handler(step, task, servers, on_data=None, **kwargs):
             if step.name == '会失败':
                 calls['n'] += 1
                 return (1, 'boom') if calls['n'] == 1 else (0, 'ok after retry')
@@ -1154,7 +1269,7 @@ class FailureHandlingTests(TestCase):
         self._step(1, '会失败')
         self._step(2, '后续')
 
-        def handler(step, task, servers, on_data=None):
+        def handler(step, task, servers, on_data=None, **kwargs):
             return (1, 'boom') if step.name == '会失败' else (0, 'tail ok')
 
         rc, output, results = self._run(handler, ['skip'])
@@ -1169,7 +1284,7 @@ class FailureHandlingTests(TestCase):
         self._step(1, '会失败')
         self._step(2, '后续')
 
-        def handler(step, task, servers, on_data=None):
+        def handler(step, task, servers, on_data=None, **kwargs):
             return (1, 'boom') if step.name == '会失败' else (0, 'tail ok')
 
         rc, output, results = self._run(handler, ['abort'])
@@ -1183,7 +1298,7 @@ class FailureHandlingTests(TestCase):
         self._step(1, '会失败')
         self._step(2, '后续')
 
-        def handler(step, task, servers, on_data=None):
+        def handler(step, task, servers, on_data=None, **kwargs):
             return (1, 'boom') if step.name == '会失败' else (0, 'tail ok')
 
         with override_settings(TASK_FAILURE_WAIT_TIMEOUT=1):
@@ -1198,7 +1313,7 @@ class FailureHandlingTests(TestCase):
         self._step(2, '并B', parallel=True)
         calls = {'A': 0, 'B': 0}
 
-        def handler(step, task, servers, on_data=None):
+        def handler(step, task, servers, on_data=None, **kwargs):
             key = 'A' if step.name == '并A' else 'B'
             calls[key] += 1
             if key == 'B' and calls['B'] == 1:
@@ -1445,6 +1560,176 @@ class StreamedTaskLogTests(TestCase):
         self.assertEqual(len(data['output']), PREVIEW_LIMIT + 10)
 
 
+@override_settings(TASK_EXEC_BACKEND='sync', TASK_FAILURE_WAIT_TIMEOUT=0)
+class ExecSceneArchiveTests(TestCase):
+    """执行现场归档：inventory/变量/命令随执行记录落盘，供事后 debug 复现。"""
+
+    setUp = ExecutionAPITests.setUp
+    _client = ExecutionAPITests._client
+    _step = staticmethod(ExecutionAPITests._step)
+    _create_task = ExecutionAPITests._create_task
+
+    def _scene_dir(self, log_dir, task_id, sub='step1/direct'):
+        log = TaskExecutionLog.objects.get(task_id=task_id)
+        return os.path.join(log_dir, str(task_id), f'{log.id}.d', sub)
+
+    def test_scene_archived_for_direct_run(self):
+        from .models import Credential, ExecVariable
+
+        ExecVariable.objects.create(
+            key='app_conf', value='mode: prod',
+            project_group=self.pg, channel=self.ch, environment=self.env,
+        )
+        credential = Credential.objects.create(
+            name='ut-cred', username='deploy', auth_type='password', password='s3cr3t')
+        # 远端主机才会带连接凭据（本机走 ansible_connection=local）
+        from apps.asset_mgr.models import ServerService
+
+        remote = Server.objects.create(
+            name='remote', private_ip='10.0.0.9', ssh_port=2222,
+            project_group=self.pg, channel=self.ch, environment=self.env,
+        )
+        ServerService.objects.create(
+            server=remote, service_type=self.base_service, status='planned')
+        log_dir = tempfile.mkdtemp(prefix='task_logs_')
+        try:
+            with override_settings(TASK_LOG_DIR=log_dir):
+                c = self._client()
+                task_id = self._create_task(c, credential=credential.id)
+                _run_and_capture(c, task_id)
+                scene = self._scene_dir(log_dir, task_id)
+                with open(os.path.join(scene, 'vars.yml'), encoding='utf-8') as f:
+                    self.assertEqual(yaml.safe_load(f.read()), {'app_conf': {'mode': 'prod'}})
+                with open(os.path.join(scene, 'inventory.ini'), encoding='utf-8') as f:
+                    inventory = f.read()
+                with open(os.path.join(scene, 'command.txt'), encoding='utf-8') as f:
+                    command = f.read()
+        finally:
+            shutil.rmtree(log_dir, ignore_errors=True)
+
+        # 归档 inventory 为无密钥版本：主机与连接参数在，密码不落盘
+        self.assertIn('ansible_user=deploy', inventory)
+        self.assertNotIn('s3cr3t', inventory)
+        # 命令内的临时目录路径改写为归档副本，复制即可重跑
+        self.assertIn(os.path.join(scene, 'inventory.ini'), command)
+        self.assertIn('@' + os.path.join(scene, 'vars.yml'), command)
+        self.assertNotIn('/tmp/ops_cmd_', command)
+
+    def test_scene_api_lists_and_reads_files(self):
+        from .models import ExecVariable
+
+        ExecVariable.objects.create(
+            key='app_conf', value='mode: prod',
+            project_group=self.pg, channel=self.ch, environment=self.env,
+        )
+        log_dir = tempfile.mkdtemp(prefix='task_logs_')
+        try:
+            with override_settings(TASK_LOG_DIR=log_dir):
+                c = self._client()
+                task_id = self._create_task(c)
+                _run_and_capture(c, task_id)
+                log = TaskExecutionLog.objects.get(task_id=task_id)
+                base = f'/api/exec/tasks/{task_id}/logs/{log.id}/scene/'
+
+                r = c.get(base)
+                self.assertEqual(r.status_code, 200)
+                paths = [f['path'] for f in r.json()['data']['files']]
+                self.assertIn(os.path.join('step1', 'direct', 'vars.yml'), paths)
+                self.assertIn(os.path.join('step1', 'direct', 'inventory.ini'), paths)
+                self.assertIn(os.path.join('step1', 'direct', 'command.txt'), paths)
+
+                r = c.get(base, {'file': os.path.join('step1', 'direct', 'vars.yml')})
+                self.assertEqual(
+                    yaml.safe_load(r.json()['data']['content']), {'app_conf': {'mode': 'prod'}})
+                # 路径穿越拒绝
+                r = c.get(base, {'file': '../../../../etc/passwd'})
+                self.assertEqual(r.status_code, 400)
+                # 不存在的文件
+                r = c.get(base, {'file': 'step9/direct/vars.yml'})
+                self.assertEqual(r.status_code, 400)
+
+                # 归档含变量值，仅管理员可读
+                u = User.objects.create(username='scene_viewer')
+                u.set_password('Pass!2345xyz')
+                u.save()
+                vc = APIClient()
+                login = vc.post('/api/auth/login/',
+                                {'username': 'scene_viewer', 'password': 'Pass!2345xyz'},
+                                format='json')
+                vc.credentials(HTTP_AUTHORIZATION='Bearer ' + login.json()['access'])
+                self.assertEqual(vc.get(base).status_code, 403)
+        finally:
+            shutil.rmtree(log_dir, ignore_errors=True)
+
+    def test_scene_api_empty_after_cleanup(self):
+        """归档过保留期被清理后清单为空，接口不报错。"""
+        log_dir = tempfile.mkdtemp(prefix='task_logs_')
+        try:
+            with override_settings(TASK_LOG_DIR=log_dir):
+                c = self._client()
+                task_id = self._create_task(c)
+                _run_and_capture(c, task_id)
+                log = TaskExecutionLog.objects.get(task_id=task_id)
+                shutil.rmtree(os.path.join(log_dir, str(task_id), f'{log.id}.d'))
+                r = c.get(f'/api/exec/tasks/{task_id}/logs/{log.id}/scene/')
+                self.assertEqual(r.status_code, 200)
+                self.assertEqual(r.json()['data'], {'files': [], 'retained': False})
+        finally:
+            shutil.rmtree(log_dir, ignore_errors=True)
+
+    def test_no_archive_without_log_binding(self):
+        """直接调 runner.run（无执行记录，如单测/预演）不归档，也不报错。"""
+        from .runner import step_archive_dir
+
+        task = ExecutionTask.objects.create(name='no-log')
+        step = TaskStep.objects.create(
+            task=task, order=1, name='cmd', task_type='command', command='echo')
+        self.assertIsNone(step_archive_dir(LiveSink(task.pk), step))
+
+
+class AgentPayloadVarsTests(TestCase):
+    """agent 下发 payload 的变量字段：新旧双发，内容等价。"""
+
+    setUp = ExecutionAPITests.setUp
+
+    def test_payload_carries_vars_file_and_legacy_list(self):
+        from .models import ExecVariable
+        from .runner import _agent_payload_base
+
+        ExecVariable.objects.create(
+            key='app_conf', value='mode: prod',
+            project_group=self.pg, channel=self.ch, environment=self.env,
+        )
+        task = ExecutionTask.objects.create(
+            name='agent', project_group=self.pg, channel=self.ch, environment=self.env)
+        step = TaskStep.objects.create(
+            task=task, order=1, name='cmd', task_type='command',
+            command='echo', extra_vars='override=1')
+
+        payload = _agent_payload_base(step, task, [self.server])
+        # 新字段：变量文件文本 + 模块额外变量分离
+        self.assertEqual(yaml.safe_load(payload['vars_file']), {'app_conf': {'mode': 'prod'}})
+        self.assertEqual(payload['step_extra_vars'], 'override=1')
+        # 旧字段：逐个 -e 的值列表，效果等价（旧版 agent 不认新字段时兜底）
+        self.assertEqual(len(payload['extra_vars']), 2)
+        self.assertEqual(json.loads(payload['extra_vars'][0]), {'app_conf': {'mode': 'prod'}})
+        self.assertEqual(payload['extra_vars'][1], 'override=1')
+        # inventory 下发无密钥版本
+        self.assertNotIn('ansible_ssh_pass', payload['inventory'])
+
+    def test_payload_vars_empty_when_no_variables(self):
+        from .runner import _agent_payload_base
+
+        task = ExecutionTask.objects.create(
+            name='agent2', project_group=self.pg, channel=self.ch, environment=self.env)
+        step = TaskStep.objects.create(
+            task=task, order=1, name='cmd', task_type='command', command='echo')
+        payload = _agent_payload_base(step, task, [self.server])
+        self.assertEqual(payload['vars_file'], '')
+        self.assertEqual(payload['step_extra_vars'], '')
+        self.assertEqual(payload['extra_vars'], [])
+
+
 class CleanTaskLogFilesTests(TestCase):
     """落盘日志清理：按 mtime 清过期文件（含孤儿），记录按各自保留期清。"""
 
@@ -1496,6 +1781,39 @@ class CleanTaskLogFilesTests(TestCase):
 
         self.assertFalse(os.path.exists(path))
         self.assertFalse(TaskExecutionLog.objects.filter(pk=old_log.pk).exists())
+
+    def _write_scene(self, rel, days_old):
+        """造一份执行现场归档：<task>/<log>.d/step1/direct/{inventory.ini,vars.yml}。"""
+        scene = os.path.join(self.dir, rel, 'step1', 'direct')
+        os.makedirs(scene, exist_ok=True)
+        old = time.time() - days_old * 86400
+        for name in ('inventory.ini', 'vars.yml'):
+            path = os.path.join(scene, name)
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write('scene')
+            os.utime(path, (old, old))
+        return os.path.join(self.dir, rel)
+
+    def test_expired_scene_dirs_removed(self):
+        """归档目录与落盘日志同保留期：过期按 mtime 清，未过期保留。"""
+        fresh = self._write_scene('1/10.d', 3)
+        old = self._write_scene('1/11.d', 45)
+        with override_settings(TASK_LOG_DIR=self.dir, TASK_LOG_FILE_RETENTION_DAYS=30):
+            call_command('clean_task_logs', '--files-only')
+        self.assertTrue(os.path.isdir(fresh))
+        self.assertFalse(os.path.exists(old))
+
+    def test_scene_dir_removed_with_record(self):
+        """记录过期删除时带走归档目录（log_file 为空的记录也有归档）。"""
+        log = TaskExecutionLog.objects.create(task=self.task)
+        TaskExecutionLog.objects.filter(pk=log.pk).update(
+            created_at=timezone.now() - timedelta(days=120))
+        scene = self._write_scene(f'{self.task.pk}/{log.pk}.d', 1)  # 未过期，随记录一起清
+        with override_settings(TASK_LOG_DIR=self.dir, TASK_LOG_RETENTION_DAYS=90,
+                               TASK_LOG_FILE_RETENTION_DAYS=30):
+            call_command('clean_task_logs')
+        self.assertFalse(os.path.exists(scene))
+        self.assertFalse(TaskExecutionLog.objects.filter(pk=log.pk).exists())
 
     def test_dry_run_keeps_everything(self):
         old_log = TaskExecutionLog.objects.create(task=self.task, log_file='1/old.log')
