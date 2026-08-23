@@ -11,7 +11,10 @@ python-decouple>=3.8
 
 # 异步任务（任务执行 celery 后端 / P2 成本告警模块使用）
 celery>=5.4.0
-redis>=5.2.0
+# 上界锁大版本：8.0 曾把 socket_timeout 默认值由 None 改成 5s，正好撞上
+# channels_redis 的 5s 阻塞读（详见 settings/base.py 的 CHANNEL_LAYER_SOCKET_TIMEOUT）。
+# 连接参数现已在 settings 里显式声明，但默认值再变仍需先验证。
+redis>=5.2.0,<9
 django-celery-beat>=2.7.0
 django-celery-results>=2.5.0
 
