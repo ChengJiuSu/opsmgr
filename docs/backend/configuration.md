@@ -45,6 +45,18 @@ os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'ops_manager.settings.dev')
 用 `memory` 层而跨了进程时不会报错，只会静默失效：日志推送收不到（前端自动回退
 轮询），agent 下发返回失败。
 
+#### Redis 层的连接参数
+
+`redis` 层的连接参数在 `settings/base.py` 的 `channel_layers_for()` 里显式声明，
+不走 redis-py 默认值。关键约束：`socket_timeout` 必须大于 channels_redis 的
+`brpop_timeout`（阻塞读时长，当前 5s）。
+
+redis-py 8.0 把 `socket_timeout` 默认值由 `None` 改成了 5s，与阻塞读时长相等时，
+客户端读超时必然先触发（计时从命令发出前开始），表现为 daphne 反复抛
+`TimeoutError: Timeout reading from <redis>` 并断开 agent 的 WebSocket——此时
+Redis 本身是健康的，`redis-cli ping` 正常，容易误判成 Redis 故障。
+`ChannelLayerConfigTests` 锁住了这个不变式。
+
 ### 生产环境（prod）
 
 切换方式：

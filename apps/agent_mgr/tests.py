@@ -293,3 +293,28 @@ class RunnerChannelSplitTests(TestCase):
                 mock.patch('apps.agent_mgr.dispatch.run_via_agent', return_value=(2, '失败')):
             rc, out = runner._run_command_step(step, task, [self.direct, self.via_agent])
         self.assertEqual(rc, 2)
+
+
+class ChannelLayerConfigTests(TestCase):
+    """Redis 层连接参数：锁死 socket_timeout 与阻塞读时长的关系。
+
+    redis-py 8.0 把 socket_timeout 默认值由 None 改成 5s，与 channels_redis 的
+    BZPOPMIN 阻塞时长（brpop_timeout，5s）相等，导致客户端读超时必然先触发，
+    daphne 每 5s 断开 agent 连接。二者关系必须由配置显式保证。
+    """
+
+    def test_socket_timeout_exceeds_brpop_timeout(self):
+        from channels_redis.core import RedisChannelLayer
+        from channels_redis.utils import create_pool, decode_hosts
+
+        from ops_manager.settings.base import channel_layers_for
+
+        config = channel_layers_for('redis')['default']['CONFIG']
+        kwargs = create_pool(decode_hosts(config['hosts'])[0]).connection_kwargs
+        self.assertGreater(kwargs['socket_timeout'], RedisChannelLayer.brpop_timeout)
+
+    def test_memory_layer_needs_no_connection_config(self):
+        from ops_manager.settings.base import channel_layers_for
+
+        layers = channel_layers_for('memory')
+        self.assertNotIn('CONFIG', layers['default'])

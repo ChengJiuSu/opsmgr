@@ -243,6 +243,17 @@ CELERY_TIMEZONE = 'Asia/Shanghai'
 # dev.py 默认 memory（本地免装 Redis），prod.py 不覆盖即 redis。
 CHANNEL_LAYER_BACKENDS = ('redis', 'memory')
 
+# channels_redis 的 receive() 用 BZPOPMIN 阻塞读，阻塞时长取自库内
+# RedisChannelLayer.brpop_timeout（当前 5s）。而 redis-py 8.0 起 socket_timeout
+# 默认也是 5s（8.x 之前为 None 即不限，见 redis/_defaults.py），两者相等时客户端
+# 读超时必然先于服务端阻塞返回触发——计时从命令发出前就开始——于是每次空闲接收
+# 都抛 TimeoutError: Timeout reading from <redis>，连接被判死，异常从
+# await_many_dispatch 冒出，daphne 记 "Exception inside application" 并断开
+# WebSocket（此时 Redis 本身完全健康，redis-cli ping 正常）。
+# 因此 socket_timeout 必须显式放宽到阻塞时长之上，不能依赖库默认值。
+CHANNEL_LAYER_BRPOP_TIMEOUT = 5  # 与 channels_redis.core.RedisChannelLayer.brpop_timeout 保持一致
+CHANNEL_LAYER_SOCKET_TIMEOUT = CHANNEL_LAYER_BRPOP_TIMEOUT + 15
+
 
 def channel_layers_for(backend):
     """按后端名构造 CHANNEL_LAYERS（名字非法直接报错，避免静默退回 Redis）。"""
@@ -254,7 +265,20 @@ def channel_layers_for(backend):
     return {
         'default': {
             'BACKEND': 'channels_redis.core.RedisChannelLayer',
-            'CONFIG': {'hosts': [REDIS_URL]},
+            # hosts 传 dict 时，除 address 外的键会原样透给 redis-py 的
+            # ConnectionPool.from_url（见 channels_redis.utils.create_pool）。
+            'CONFIG': {
+                'hosts': [{
+                    'address': REDIS_URL,
+                    'socket_timeout': CHANNEL_LAYER_SOCKET_TIMEOUT,
+                    # 连接建立不涉及阻塞读，单独收紧，避免跟着读超时一起放大
+                    'socket_connect_timeout': 5,
+                    # agent 连接是长连接（nginx 侧 proxy_read_timeout 300s），
+                    # 开 keepalive + 空闲探活，避免中间设备静默断链后才发现
+                    'socket_keepalive': True,
+                    'health_check_interval': 30,
+                }],
+            },
         },
     }
 
