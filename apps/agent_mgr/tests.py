@@ -353,6 +353,65 @@ class ChannelLayerConfigTests(TestCase):
         self.assertNotIn('CONFIG', layers['default'])
 
 
+class AgentRouteApiTests(BaseApiTest):
+    """通道路由 API：仅管理员、唯一冲突转中文报错、影响面预览。"""
+
+    def setUp(self):
+        from apps.asset_mgr.models import Environment, ProjectGroup
+
+        self.admin = self._client()
+        self.agent = AgentNode.objects.create(name='api-gw', token_hash='x')
+        self.pg = ProjectGroup.objects.create(name='路由项目', code='route-p1')
+        self.env = Environment.objects.create(name='路由正式', code='route-prod')
+
+    def _create(self, **kwargs):
+        payload = {'agent': self.agent.id, 'project_group': self.pg.id, **kwargs}
+        return self.admin.post('/api/agent-routes/', payload, format='json')
+
+    def test_crud(self):
+        r = self._create(environment=self.env.id, remark='上海 NAT')
+        self.assertEqual(r.status_code, 201)
+        route_id = r.json()['id']
+        r = self.admin.get('/api/agent-routes/')
+        rows = r.json()
+        self.assertEqual(rows[0]['agent_name'], 'api-gw')
+        self.assertEqual(rows[0]['environment_name'], '路由正式')
+        self.assertEqual(self.admin.patch(
+            f'/api/agent-routes/{route_id}/', {'enabled': False}, format='json').status_code, 200)
+        self.assertEqual(self.admin.delete(f'/api/agent-routes/{route_id}/').status_code, 204)
+
+    def test_duplicate_rejected_with_message(self):
+        self._create(environment=self.env.id)
+        r = self._create(environment=self.env.id)
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('已存在通道路由规则', str(r.json()))
+
+    def test_duplicate_project_default_rejected(self):
+        self._create()
+        r = self._create()
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('不限环境', str(r.json()))
+
+    def test_admin_only(self):
+        normal = self._client(is_staff=False, username='route_user')
+        self.assertEqual(normal.get('/api/agent-routes/').status_code, 403)
+
+    def test_preview_counts_only_auto_hosts(self):
+        from apps.asset_mgr.models import Server
+
+        Server.objects.create(name='r-01', private_ip='10.7.0.1',
+                              project_group=self.pg, environment=self.env)
+        Server.objects.create(name='r-02', private_ip='10.7.0.2', project_group=self.pg,
+                              environment=self.env, channel_mode='direct')
+        r = self.admin.get(f'/api/agent-routes/preview/?project_group={self.pg.id}')
+        data = r.json()['data']
+        self.assertEqual(data['count'], 1)  # 强制直连的主机不受规则影响
+        self.assertEqual(data['hosts'][0]['name'], 'r-01')
+
+    def test_preview_requires_project_group(self):
+        self.assertEqual(self.admin.get('/api/agent-routes/preview/').status_code, 400)
+
+
 class ChannelResolveTests(TestCase):
     """执行通道解析：主机三态优先于路由规则，规则内精确环境优先于项目组默认。"""
 

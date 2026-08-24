@@ -92,10 +92,17 @@
           <el-tag size="small" :type="statusType(row.status)">{{ statusLabel(row.status) }}</el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="执行通道" width="110">
+      <!-- 展示解析后的实际通道：来源可能是主机指定，也可能是项目组/环境路由规则 -->
+      <el-table-column label="执行通道" width="150">
         <template #default="{ row }">
-          <el-tag v-if="row.agent_name" size="small" type="warning">{{ row.agent_name }}</el-tag>
-          <span v-else class="muted">直连</span>
+          <template v-if="row.effective_agent_name">
+            <el-tag size="small" type="warning">{{ row.effective_agent_name }}</el-tag>
+            <span class="channel-source">{{ row.channel_source === 'host' ? '主机' : '规则' }}</span>
+          </template>
+          <template v-else>
+            <span class="muted">直连</span>
+            <span v-if="row.channel_mode === 'direct'" class="channel-source">强制</span>
+          </template>
         </template>
       </el-table-column>
       <el-table-column v-if="authStore.isStaff" label="操作" width="140" fixed="right">
@@ -214,8 +221,21 @@
         <!-- 执行通道选项来自 Agent 管理（仅管理员接口），普通用户不展示 -->
         <el-col v-if="authStore.isStaff" :span="12">
           <el-form-item label="执行通道">
-            <el-select v-model="form.agent" clearable placeholder="直连（默认）" style="width:100%">
-              <el-option v-for="o in agents" :key="o.id" :label="`Agent：${o.name}`" :value="o.id" />
+            <el-select v-model="form.channel_mode" style="width:100%" @change="onChannelModeChange">
+              <el-option label="自动（按路由规则）" value="auto" />
+              <el-option label="强制直连" value="direct" />
+              <el-option label="指定 Agent" value="agent" />
+            </el-select>
+            <div class="form-tip">
+              自动 = 按「Agent 管理 → 通道路由」的项目组/环境规则解析，无规则命中则直连；
+              自身有公网 IP 的管理服建议选「强制直连」，避免被项目级规则拖进 agent 通道
+            </div>
+          </el-form-item>
+        </el-col>
+        <el-col v-if="authStore.isStaff && form.channel_mode === 'agent'" :span="12">
+          <el-form-item label="指定 Agent" prop="agent">
+            <el-select v-model="form.agent" clearable placeholder="请选择 Agent" style="width:100%">
+              <el-option v-for="o in agents" :key="o.id" :label="o.name" :value="o.id" />
             </el-select>
           </el-form-item>
         </el-col>
@@ -263,13 +283,23 @@
             v-model="batchForm.ssh_port.value" :disabled="!batchForm.ssh_port.on"
             :min="1" :max="65535" style="flex:1"
           />
-          <el-select
-            v-else-if="field.key === 'agent'"
-            v-model="batchForm.agent.value" :disabled="!batchForm.agent.on"
-            clearable placeholder="直连" style="flex:1"
-          >
-            <el-option v-for="o in agents" :key="o.id" :label="`Agent：${o.name}`" :value="o.id" />
-          </el-select>
+          <template v-else-if="field.key === 'channel_mode'">
+            <el-select
+              v-model="batchForm.channel_mode.value" :disabled="!batchForm.channel_mode.on"
+              style="flex:1"
+            >
+              <el-option label="自动（按路由规则）" value="auto" />
+              <el-option label="强制直连" value="direct" />
+              <el-option label="指定 Agent" value="agent" />
+            </el-select>
+            <el-select
+              v-if="batchForm.channel_mode.value === 'agent'"
+              v-model="batchForm.channel_mode.agent" :disabled="!batchForm.channel_mode.on"
+              placeholder="选择 Agent" style="flex:1"
+            >
+              <el-option v-for="o in agents" :key="o.id" :label="o.name" :value="o.id" />
+            </el-select>
+          </template>
           <el-input
             v-else
             v-model="batchForm[field.key].value" :disabled="!batchForm[field.key].on"
@@ -394,7 +424,8 @@ const MEMORY_OPTIONS = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262
 const emptyForm = () => ({
   name: '', private_ip: '', public_ip: '', os: '', cpu: null, memory: null, status: 'running',
   environment: null, project_group: null, channel: null, cloud_provider: null,
-  region: '', ssh_user: 'root', ssh_port: 22, remark: '', service_type_ids: [], agent: null,
+  region: '', ssh_user: 'root', ssh_port: 22, remark: '', service_type_ids: [],
+  channel_mode: 'auto', agent: null,
 })
 const form = reactive(emptyForm())
 const rules = {
@@ -462,8 +493,17 @@ function openDialog(row = null) {
   formRef.value?.clearValidate()
 }
 
+// 切走「指定 Agent」时清空选中的 Agent，避免提交不生效的残留值
+function onChannelModeChange(mode) {
+  if (mode !== 'agent') form.agent = null
+}
+
 async function handleSubmit() {
   await formRef.value.validate()
+  if (form.channel_mode === 'agent' && !form.agent) {
+    ElMessage.warning('执行通道选择「指定 Agent」时必须选择 Agent')
+    return
+  }
   submitting.value = true
   try {
     const payload = { ...form }
@@ -505,7 +545,7 @@ const batchFields = [
   { key: 'region', label: '地域/机房', placeholder: '如 cn-hangzhou（留空表示清空）' },
   { key: 'ssh_user', label: 'SSH 用户', placeholder: '如 root' },
   { key: 'ssh_port', label: 'SSH 端口' },
-  { key: 'agent', label: '执行通道' },
+  { key: 'channel_mode', label: '执行通道' },
   { key: 'remark', label: '备注', placeholder: '留空表示清空' },
 ]
 const batchForm = reactive({
@@ -514,7 +554,7 @@ const batchForm = reactive({
   region: { on: false, value: '' },
   ssh_user: { on: false, value: 'root' },
   ssh_port: { on: false, value: 22 },
-  agent: { on: false, value: null },
+  channel_mode: { on: false, value: 'auto', agent: null },
   remark: { on: false, value: '' },
 })
 
@@ -531,6 +571,13 @@ async function handleBatchEdit() {
   if (!Object.keys(update).length) {
     ElMessage.warning('请至少勾选一个要修改的字段')
     return
+  }
+  if (update.channel_mode === 'agent') {
+    if (!batchForm.channel_mode.agent) {
+      ElMessage.warning('执行通道选择「指定 Agent」时必须选择 Agent')
+      return
+    }
+    update.agent = batchForm.channel_mode.agent
   }
   submitting.value = true
   try {
@@ -646,6 +693,7 @@ onMounted(() => {
 .form-tip { color: #909399; font-size: 12px; line-height: 1.5; margin-top: 4px; }
 .batch-line { display: flex; gap: 10px; align-items: center; width: 100%; }
 .muted { color: #c0c4cc; }
+.channel-source { color: #909399; font-size: 12px; margin-left: 4px; }
 .batch-line > :last-child { flex: 1; }
 .import-toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
 </style>

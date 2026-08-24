@@ -2,7 +2,8 @@
 
 - Agent CRUD：创建/重置令牌时明文 token 仅在响应中出现一次；
 - 删除保护：有未终态任务单元的 agent 禁止删除；
-- jobs 动作：该 agent 最近任务单元列表（排障）。
+- jobs 动作：该 agent 最近任务单元列表（排障）；
+- 通道路由 CRUD + preview：建规则前先看影响哪些主机。
 """
 from rest_framework import viewsets
 from rest_framework.decorators import action
@@ -10,8 +11,8 @@ from rest_framework.decorators import action
 from common.permissions import IsAdmin
 from common.response import fail, ok
 
-from .models import AgentJob, AgentNode
-from .serializers import AgentJobSerializer, AgentNodeSerializer
+from .models import AgentJob, AgentNode, AgentRoute
+from .serializers import AgentJobSerializer, AgentNodeSerializer, AgentRouteSerializer
 
 JOBS_LIMIT = 50
 
@@ -52,3 +53,36 @@ class AgentNodeViewSet(viewsets.ModelViewSet):
         """该 agent 最近任务单元（排障用，固定最近 50 条）。"""
         qs = self.get_object().jobs.all()[:JOBS_LIMIT]
         return ok(AgentJobSerializer(qs, many=True).data)
+
+
+class AgentRouteViewSet(viewsets.ModelViewSet):
+    """通道路由规则：项目组（必填）+ 环境（可空 = 该项目组默认）→ agent。"""
+
+    queryset = AgentRoute.objects.select_related('agent', 'project_group', 'environment')
+    serializer_class = AgentRouteSerializer
+    permission_classes = [IsAdmin]
+    pagination_class = None  # 规则条数与项目组同量级，全量返回便于一眼看完
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        params = self.request.query_params
+        for key in ('agent', 'project_group', 'environment'):
+            value = params.get(key)
+            if value:
+                qs = qs.filter(**{f'{key}_id': value})
+        return qs
+
+    @action(detail=False, methods=['get'])
+    def preview(self, request):
+        """规则影响面预览：该维度下会被规则接管的主机（channel_mode=auto 才受影响）。"""
+        from apps.asset_mgr.models import Server
+
+        project_group = request.query_params.get('project_group')
+        if not project_group:
+            return fail('缺少 project_group')
+        qs = Server.objects.filter(project_group_id=project_group, channel_mode='auto')
+        environment = request.query_params.get('environment')
+        if environment:
+            qs = qs.filter(environment_id=environment)
+        hosts = list(qs.order_by('name').values('id', 'name', 'private_ip', 'public_ip')[:200])
+        return ok({'count': qs.count(), 'hosts': hosts})
