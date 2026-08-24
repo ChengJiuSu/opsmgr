@@ -2,6 +2,8 @@ from django.db import transaction
 from rest_framework import serializers
 from rest_framework.validators import UniqueValidator
 
+from apps.agent_mgr.channel import SOURCE_DIRECT, SOURCE_LABELS, resolve_channels
+
 from .models import Channel, CloudProvider, Environment, ProjectGroup, Server, ServerService, ServiceType
 
 
@@ -43,8 +45,13 @@ class ServerSerializer(serializers.ModelSerializer):
     environment_code = serializers.CharField(source='environment.code', read_only=True, default=None)
     environment_is_prod = serializers.BooleanField(source='environment.is_prod', read_only=True, default=None)
     cloud_provider_name = serializers.CharField(source='cloud_provider.name', read_only=True, default=None)
-    # 执行通道展示：空 = 直连
+    # 执行通道展示：agent_name 是主机显式指定的目标（channel_mode='agent' 时才生效），
+    # effective_* 是解析后的实际通道（含路由规则命中），列表页展示看后者。
     agent_name = serializers.CharField(source='agent.name', read_only=True, default=None)
+    effective_agent = serializers.SerializerMethodField()
+    effective_agent_name = serializers.SerializerMethodField()
+    channel_source = serializers.SerializerMethodField()
+    channel_source_label = serializers.SerializerMethodField()
     # 主机服务摘要：已规划/已部署/已下线记录列表（视图层需 prefetch services__service_type）
     services = serializers.SerializerMethodField()
     # 新增主机时可选分配服务类型：直接创建 planned 记录并自动生成进程名（仅创建时生效）
@@ -79,6 +86,46 @@ class ServerSerializer(serializers.ModelSerializer):
             if qs.exists():
                 raise serializers.ValidationError('该公网 IP 已被其他主机使用')
         return value
+
+    def validate(self, attrs):
+        # 执行通道一致性：仅「指定 Agent」模式保留 agent，其余模式清空，
+        # 避免库里留下不生效却看着像生效的残留配置。
+        mode = attrs.get('channel_mode', getattr(self.instance, 'channel_mode', 'auto'))
+        agent = attrs.get('agent', getattr(self.instance, 'agent', None))
+        # 兼容只传 agent 不传 channel_mode 的旧客户端：视为钉死该 agent，
+        # 否则下面的清理分支会把选中的 agent 静默丢掉。
+        if 'channel_mode' not in attrs and attrs.get('agent') is not None:
+            attrs['channel_mode'] = mode = 'agent'
+        if mode == 'agent' and agent is None:
+            raise serializers.ValidationError({'agent': '执行通道选择「指定 Agent」时必须选择 Agent'})
+        if mode != 'agent':
+            attrs['agent'] = None
+        return attrs
+
+    def _channel(self, obj):
+        """解析后的 (agent, source)：列表序列化时一次性批量解析并缓存。
+
+        逐条解析会退化成 N+1，故用 ListSerializer 的 instance 做批量入口。
+        """
+        cache = self.context.setdefault('_channel_cache', {})
+        if obj.pk not in cache:
+            batch = self.parent.instance if isinstance(self.parent, serializers.ListSerializer) else None
+            cache.update(resolve_channels(batch if batch is not None else [obj]))
+        return cache.get(obj.pk, (None, SOURCE_DIRECT))
+
+    def get_effective_agent(self, obj):
+        agent = self._channel(obj)[0]
+        return agent.pk if agent else None
+
+    def get_effective_agent_name(self, obj):
+        agent = self._channel(obj)[0]
+        return agent.name if agent else None
+
+    def get_channel_source(self, obj):
+        return self._channel(obj)[1]
+
+    def get_channel_source_label(self, obj):
+        return SOURCE_LABELS[self._channel(obj)[1]]
 
     def get_services(self, obj):
         return [

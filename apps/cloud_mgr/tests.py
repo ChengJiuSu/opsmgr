@@ -538,8 +538,9 @@ class CertDeploymentApiTests(BaseApiTest):
     def test_deploy_rejects_agent_channel_host(self):
         from apps.agent_mgr.models import AgentNode
         agent = AgentNode.objects.create(name='nat-gw', token_hash='x' * 64)
+        self.server.channel_mode = 'agent'
         self.server.agent = agent
-        self.server.save(update_fields=['agent'])
+        self.server.save(update_fields=['channel_mode', 'agent'])
         dep = self._create_deployment()
         admin = self._client()
         with self.settings(TASK_EXEC_BACKEND='sync'):

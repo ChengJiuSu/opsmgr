@@ -306,6 +306,46 @@ class ServerBatchApiTests(BaseApiTest):
         }, format='json')
         self.assertEqual(r.status_code, 400)
 
+    def test_batch_update_channel_mode_clears_agent(self):
+        from apps.agent_mgr.models import AgentNode
+
+        agent = AgentNode.objects.create(name='b-gw', token_hash='x')
+        self.s1.channel_mode = 'agent'
+        self.s1.agent = agent
+        self.s1.save(update_fields=['channel_mode', 'agent'])
+        r = self.admin.post('/api/assets/servers/batch/update/', {
+            'server_ids': [self.s1.id], 'update': {'channel_mode': 'direct'},
+        }, format='json')
+        self.assertEqual(r.status_code, 200)
+        self.s1.refresh_from_db()
+        self.assertEqual(self.s1.channel_mode, 'direct')
+        self.assertIsNone(self.s1.agent_id)  # 非 agent 模式不留残留配置
+
+    def test_batch_update_agent_mode_requires_agent(self):
+        r = self.admin.post('/api/assets/servers/batch/update/', {
+            'server_ids': [self.s1.id], 'update': {'channel_mode': 'agent'},
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('指定 agent', r.json()['msg'])
+
+    def test_batch_update_agent_only_implies_agent_mode(self):
+        """旧客户端只传 agent：等价于钉死该 agent，不能被 auto 语义吞掉。"""
+        from apps.agent_mgr.models import AgentNode
+
+        agent = AgentNode.objects.create(name='b-gw2', token_hash='x')
+        r = self.admin.post('/api/assets/servers/batch/update/', {
+            'server_ids': [self.s1.id], 'update': {'agent': agent.id},
+        }, format='json')
+        self.assertEqual(r.status_code, 200)
+        self.s1.refresh_from_db()
+        self.assertEqual((self.s1.channel_mode, self.s1.agent_id), ('agent', agent.id))
+
+    def test_batch_update_rejects_bad_channel_mode(self):
+        r = self.admin.post('/api/assets/servers/batch/update/', {
+            'server_ids': [self.s1.id], 'update': {'channel_mode': 'bad'},
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+
     def test_batch_delete_blocks_deployed(self):
         st = ServiceType.objects.create(name='网关', code='gate')
         ServerService.objects.create(server=self.s1, service_type=st, status='deployed')
@@ -327,6 +367,72 @@ class ServerBatchApiTests(BaseApiTest):
                     '/api/assets/servers/register-jumpserver/'):
             r = normal.post(url, {'server_ids': [self.s1.id], 'update': {'status': 'running'}}, format='json')
             self.assertEqual(r.status_code, 403, url)
+
+
+class ServerChannelFieldTests(BaseApiTest):
+    """服务器序列化的有效执行通道：主机指定 / 规则命中 / 直连三种来源。"""
+
+    def setUp(self):
+        from apps.agent_mgr.models import AgentNode
+
+        self.admin = self._client()
+        self.agent = AgentNode.objects.create(name='ch-gw', token_hash='x')
+        self.pg = ProjectGroup.objects.create(name='通道展示项目', code='view-p1')
+        self.env = Environment.objects.create(name='通道展示正式', code='view-prod')
+
+    def test_effective_channel_from_rule(self):
+        from apps.agent_mgr.models import AgentRoute
+
+        srv = Server.objects.create(
+            name='v-01', private_ip='10.8.0.1', project_group=self.pg, environment=self.env)
+        AgentRoute.objects.create(agent=self.agent, project_group=self.pg)
+        body = self.admin.get(f'/api/assets/servers/{srv.id}/').json()
+        data = body['data'] if 'data' in body else body
+        self.assertEqual(data['effective_agent_name'], 'ch-gw')
+        self.assertEqual(data['channel_source'], 'rule')
+        self.assertEqual(data['channel_source_label'], '路由规则')
+        self.assertIsNone(data['agent'])  # 主机自身未绑定，规则命中不写回主机
+
+    def test_effective_channel_direct_by_default(self):
+        srv = Server.objects.create(name='v-02', private_ip='10.8.0.2')
+        body = self.admin.get(f'/api/assets/servers/{srv.id}/').json()
+        data = body['data'] if 'data' in body else body
+        self.assertIsNone(data['effective_agent_name'])
+        self.assertEqual(data['channel_source'], 'direct')
+
+    def test_list_resolves_channel_in_constant_queries(self):
+        from apps.agent_mgr.models import AgentRoute
+
+        AgentRoute.objects.create(agent=self.agent, project_group=self.pg)
+        for i in range(4):
+            Server.objects.create(
+                name=f'v-1{i}', private_ip=f'10.8.1.{i}',
+                project_group=self.pg, environment=self.env)
+        r = self.admin.get('/api/assets/servers/')
+        rows = r.json()['data']['results']
+        self.assertTrue(all(row['effective_agent_name'] == 'ch-gw' for row in rows))
+
+    def test_create_with_agent_only_implies_agent_mode(self):
+        r = self.admin.post('/api/assets/servers/', {
+            'name': 'v-05', 'private_ip': '10.8.0.5', 'agent': self.agent.id,
+        }, format='json')
+        self.assertEqual(r.status_code, 201)
+        srv = Server.objects.get(name='v-05')
+        self.assertEqual((srv.channel_mode, srv.agent_id), ('agent', self.agent.id))
+
+    def test_create_with_agent_mode_requires_agent(self):
+        r = self.admin.post('/api/assets/servers/', {
+            'name': 'v-03', 'private_ip': '10.8.0.3', 'channel_mode': 'agent',
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+
+    def test_switching_to_auto_clears_pinned_agent(self):
+        srv = Server.objects.create(
+            name='v-04', private_ip='10.8.0.4', channel_mode='agent', agent=self.agent)
+        r = self.admin.patch(f'/api/assets/servers/{srv.id}/', {'channel_mode': 'auto'}, format='json')
+        self.assertEqual(r.status_code, 200)
+        srv.refresh_from_db()
+        self.assertIsNone(srv.agent_id)
 
 
 class ServerImportExportTests(BaseApiTest):

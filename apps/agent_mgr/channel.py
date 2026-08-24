@@ -24,6 +24,12 @@ from .models import AgentNode, AgentRoute
 SOURCE_HOST = 'host'
 SOURCE_RULE = 'rule'
 SOURCE_DIRECT = 'direct'
+# 来源中文名：错误文案与前端展示共用，避免各处自己拼
+SOURCE_LABELS = {
+    SOURCE_HOST: '主机指定',
+    SOURCE_RULE: '路由规则',
+    SOURCE_DIRECT: '直连',
+}
 
 
 def _load_rules(project_group_ids):

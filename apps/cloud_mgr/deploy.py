@@ -75,15 +75,17 @@ def _build_playbook(certificate, deployment, workdir):
 
 def deploy_to_server(certificate, deployment):
     """推送证书到目标服务器并执行重载。返回执行输出，失败抛 CertDeployError。"""
+    from apps.agent_mgr.channel import resolve_agent
     from apps.task_exec.runner import _write_inventory
 
     server = deployment.server
     if server is None:
         raise CertDeployError('分发目标服务器已不存在（可能已被删除），请重新选择。')
-    if server.agent_id:
+    channel_agent = resolve_agent(server)
+    if channel_agent:
         raise CertDeployError(
-            f'主机 {server.name} 为 agent 执行通道，证书分发 v1 暂不支持经 agent 下发'
-            f'（证书内容不出通道）。请改直连通道或手动部署。'
+            f'主机 {server.name} 经 Agent {channel_agent.name} 执行，证书分发 v1 暂不支持'
+            f'经 agent 下发（证书内容不出通道）。请把执行通道改为「强制直连」或手动部署。'
         )
     if not (deployment.deploy_path or '').strip():
         raise CertDeployError('未配置部署目录。')

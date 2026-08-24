@@ -343,14 +343,20 @@ def _guard(servers):
 def _split_by_agent(servers):
     """按执行通道拆分主机：返回 (直连主机列表, [(agent, 该 agent 主机列表)])。
 
-    agent 组按 agent id 排序，保证输出顺序稳定。
+    通道由 agent_mgr.channel 统一解析（主机三态优先于项目组/环境路由规则），
+    此处只做分组。agent 组按 agent id 排序，保证输出顺序稳定。
     """
+    from apps.agent_mgr.channel import resolve_channels
+
+    servers = list(servers)
+    resolved = resolve_channels(servers)
     direct, groups = [], {}
     for srv in servers:
-        if srv.agent_id:
-            groups.setdefault(srv.agent, []).append(srv)
-        else:
+        agent = resolved[srv.pk][0]
+        if agent is None:
             direct.append(srv)
+        else:
+            groups.setdefault(agent, []).append(srv)
     return direct, sorted(groups.items(), key=lambda item: item[0].pk)
 
 
@@ -501,11 +507,18 @@ def _run_method_step(step, task, servers, on_data=None, archive_dir=None):
     # v1 限制：方法模块不走 agent 通道。剧本类方法从 manager 直连 SSH，
     # agent 通道主机（NAT 内网）不可达，提前失败给出明确指引。
     if method.provider == 'ansible_playbook':
-        agent_hosts = [s for s in servers if s.agent_id]
+        from apps.agent_mgr.channel import SOURCE_LABELS, resolve_channels
+
+        resolved = resolve_channels(servers)
+        agent_hosts = [(s, *resolved[s.pk]) for s in servers if resolved[s.pk][0]]
         if agent_hosts:
-            names = '、'.join(f'{s.name}({s.conn_ip})' for s in agent_hosts[:5])
-            return 1, (f'方法模块暂不支持经 Agent 通道执行，主机 {names} 已配置执行通道。'
-                       '请改用命令/剧本模块，或将主机切回直连通道。')
+            # 带上通道来源：命中路由规则时，主机上看不到任何 agent 配置
+            names = '、'.join(
+                f'{s.name}({s.conn_ip} → Agent {agent.name}，{SOURCE_LABELS[source]})'
+                for s, agent, source in agent_hosts[:5]
+            )
+            return 1, (f'方法模块暂不支持经 Agent 通道执行：{names}。'
+                       '请改用命令/剧本模块，或把主机执行通道改为「强制直连」。')
 
     workdir = tempfile.mkdtemp(prefix='ops_mtd_')
     try:

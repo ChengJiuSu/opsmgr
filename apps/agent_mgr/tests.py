@@ -223,7 +223,7 @@ class RunnerChannelSplitTests(TestCase):
             name='gw-run', token_hash='x', status='online', channel_name='ch')
         self.direct = Server.objects.create(name='direct-01', private_ip='10.0.0.1')
         self.via_agent = Server.objects.create(
-            name='nat-01', private_ip='192.168.1.10', agent=self.agent)
+            name='nat-01', private_ip='192.168.1.10', channel_mode='agent', agent=self.agent)
         svc = ServiceType.objects.create(name='游戏服', code='game-server')
         for srv in (self.direct, self.via_agent):
             ServerService.objects.create(server=srv, service_type=svc, status='planned')
@@ -246,6 +246,35 @@ class RunnerChannelSplitTests(TestCase):
         self.assertEqual(len(groups), 1)
         self.assertEqual(groups[0][0], self.agent)
         self.assertEqual(groups[0][1], [self.via_agent])
+
+    def test_split_by_agent_via_route_rule(self):
+        """主机没有任何 agent 配置，靠项目组路由规则进 agent 组。"""
+        from apps.asset_mgr.models import Environment, ProjectGroup, Server
+        from apps.task_exec.runner import _split_by_agent
+
+        pg = ProjectGroup.objects.create(name='分组项目', code='split-p1')
+        env = Environment.objects.create(name='分组正式', code='split-prod')
+        ruled = Server.objects.create(
+            name='ruled-01', private_ip='192.168.2.10', project_group=pg, environment=env)
+        AgentRoute.objects.create(agent=self.agent, project_group=pg)
+
+        direct, groups = _split_by_agent([self.direct, ruled])
+        self.assertEqual(direct, [self.direct])
+        self.assertEqual(groups[0][1], [ruled])
+
+    def test_split_by_agent_force_direct_overrides_rule(self):
+        from apps.asset_mgr.models import Environment, ProjectGroup, Server
+        from apps.task_exec.runner import _split_by_agent
+
+        pg = ProjectGroup.objects.create(name='强直项目', code='split-p2')
+        Environment.objects.create(name='强直正式', code='split-prod2')
+        pinned_direct = Server.objects.create(
+            name='mgr-01', private_ip='192.168.2.20', project_group=pg, channel_mode='direct')
+        AgentRoute.objects.create(agent=self.agent, project_group=pg)
+
+        direct, groups = _split_by_agent([pinned_direct])
+        self.assertEqual(direct, [pinned_direct])
+        self.assertEqual(groups, [])
 
     def test_agent_inventory_excludes_secrets(self):
         from apps.task_exec.models import Credential

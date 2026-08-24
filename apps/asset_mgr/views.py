@@ -41,7 +41,8 @@ CSV_DICT_FIELDS = {
     'cloud_provider': (CloudProvider, '云厂商'),
 }
 # 批量编辑允许的普通字段（字典外键分配走「配置管理 → 服务器分配」的批量分配）
-BATCH_UPDATE_FIELDS = ('status', 'os', 'region', 'ssh_user', 'ssh_port', 'remark', 'agent')
+BATCH_UPDATE_FIELDS = ('status', 'os', 'region', 'ssh_user', 'ssh_port', 'remark',
+                       'channel_mode', 'agent')
 
 
 class BaseDictViewSet(viewsets.ModelViewSet):
@@ -105,7 +106,7 @@ class ServiceTypeViewSet(BaseDictViewSet):
 class ServerViewSet(viewsets.ModelViewSet):
     queryset = (
         Server.objects
-        .select_related('project_group', 'channel', 'environment', 'cloud_provider')
+        .select_related('project_group', 'channel', 'environment', 'cloud_provider', 'agent')
         .prefetch_related('services__service_type')
         .order_by('-created_at')
     )
@@ -278,8 +279,17 @@ class ServerBatchUpdateView(APIView):
         for key in ('os', 'region', 'ssh_user', 'remark'):
             if key in update:
                 fields[key] = str(update[key] or '')
+        if 'channel_mode' in update:
+            mode = update['channel_mode']
+            valid = {key for key, _ in Server.CHANNEL_MODE_CHOICES}
+            if mode not in valid:
+                return fail(f'channel_mode 必须为 {" / ".join(sorted(valid))}')
+            fields['channel_mode'] = mode
+            # 非「指定 Agent」模式清空钉死目标，避免留下不生效的残留配置
+            if mode != 'agent':
+                fields['agent'] = None
         if 'agent' in update:
-            # 执行通道批量切换：null = 回退直连
+            # 执行通道批量切换：null = 清空钉死目标（模式由 channel_mode 决定）
             agent_id = update['agent']
             if agent_id is None:
                 fields['agent'] = None
@@ -290,6 +300,11 @@ class ServerBatchUpdateView(APIView):
                 if agent is None:
                     return fail('指定的 Agent 不存在')
                 fields['agent'] = agent
+        # 兼容只传 agent 的旧客户端：视为钉死该 agent
+        if 'channel_mode' not in update and fields.get('agent') is not None:
+            fields['channel_mode'] = 'agent'
+        if fields.get('channel_mode') == 'agent' and fields.get('agent') is None:
+            return fail('执行通道设为「指定 Agent」时必须同时指定 agent')
 
         with transaction.atomic():
             updated = servers.update(**fields, updated_at=timezone.now())
