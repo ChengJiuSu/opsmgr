@@ -93,6 +93,15 @@ class Server(models.Model):
         ('stopped', '已停止'),
         ('maintenance', '维护中'),
     ]
+    # 执行通道模式（解析口径见 apps/agent_mgr/channel.py）：
+    #   auto   按 AgentRoute 路由规则（项目组/环境）解析，无规则命中则直连
+    #   direct 强制直连，忽略路由规则（如自身有公网 IP 的项目管理服）
+    #   agent  钉死到 agent 字段指定的 Agent
+    CHANNEL_MODE_CHOICES = [
+        ('auto', '自动（按路由规则）'),
+        ('direct', '强制直连'),
+        ('agent', '指定 Agent'),
+    ]
 
     # 主机名全局唯一：作为导入更新、JumpServer 注册查重的匹配键
     name = models.CharField('服务器名称', max_length=100, unique=True)
@@ -122,8 +131,12 @@ class Server(models.Model):
         null=True, blank=True, related_name='servers',
     )
     region = models.CharField('地域/机房', max_length=50, blank=True)
-    # 执行通道：空 = 直连（manager 本机跑 ansible）；有值 = 经该 agent 下发
-    # （NAT 内网主机场景）。agent 删除时回退直连而非删主机。
+    # 执行通道：auto（默认）走 AgentRoute 规则，direct 强制直连，
+    # agent 钉死到下面的 agent 字段（NAT 内网主机场景）。
+    channel_mode = models.CharField(
+        '执行通道模式', max_length=10, choices=CHANNEL_MODE_CHOICES, default='auto')
+    # 仅 channel_mode='agent' 时生效；agent 删除时 SET_NULL，解析器把
+    # 「mode=agent 但 agent 为空」按 auto 处理，不让主机变成不可执行。
     agent = models.ForeignKey(
         'agent_mgr.AgentNode', verbose_name='执行通道 Agent', on_delete=models.SET_NULL,
         null=True, blank=True, related_name='servers',

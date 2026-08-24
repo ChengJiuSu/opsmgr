@@ -1,15 +1,19 @@
-"""agent_mgr 测试：管理 API 权限与 token、Consumer 协议、dispatch 与 runner 分组。"""
+"""agent_mgr 测试：管理 API 权限与 token、Consumer 协议、dispatch、通道解析与 runner 分组。"""
+import importlib
 from unittest import mock
 
 from channels.routing import URLRouter
 from channels.testing import WebsocketCommunicator
 
+from django.apps import apps as django_apps
 from django.contrib.auth import get_user_model
+from django.db.utils import IntegrityError
 from django.test import TestCase, TransactionTestCase, override_settings
 from rest_framework.test import APIClient
 
+from .channel import resolve_channel, resolve_channels
 from .dispatch import run_via_agent
-from .models import AgentJob, AgentNode, hash_token
+from .models import AgentJob, AgentNode, AgentRoute, hash_token
 from .routing import websocket_urlpatterns
 
 User = get_user_model()
@@ -318,3 +322,177 @@ class ChannelLayerConfigTests(TestCase):
 
         layers = channel_layers_for('memory')
         self.assertNotIn('CONFIG', layers['default'])
+
+
+class ChannelResolveTests(TestCase):
+    """执行通道解析：主机三态优先于路由规则，规则内精确环境优先于项目组默认。"""
+
+    def setUp(self):
+        from apps.asset_mgr.models import Environment, ProjectGroup, Server
+
+        self.agent_a = AgentNode.objects.create(name='gw-a', token_hash='x')
+        self.agent_b = AgentNode.objects.create(name='gw-b', token_hash='y')
+        # 字典项由种子迁移预置，测试用独立编码避免撞唯一约束
+        self.pg = ProjectGroup.objects.create(name='通道项目一', code='ch-p1')
+        self.other_pg = ProjectGroup.objects.create(name='通道项目二', code='ch-p2')
+        self.env_test = Environment.objects.create(name='通道测试', code='ch-test')
+        self.env_prod = Environment.objects.create(name='通道正式', code='ch-prod')
+        self.server = Server.objects.create(
+            name='nat-01', private_ip='192.168.1.10',
+            project_group=self.pg, environment=self.env_prod)
+
+    def _route(self, agent=None, environment=None, enabled=True, project_group=None):
+        return AgentRoute.objects.create(
+            agent=agent or self.agent_a, project_group=project_group or self.pg,
+            environment=environment, enabled=enabled)
+
+    def test_no_rule_is_direct(self):
+        self.assertEqual(resolve_channel(self.server), (None, 'direct'))
+
+    def test_project_default_rule(self):
+        self._route()
+        self.assertEqual(resolve_channel(self.server), (self.agent_a, 'rule'))
+
+    def test_exact_env_rule_beats_project_default(self):
+        self._route(agent=self.agent_a)                            # 项目组默认
+        self._route(agent=self.agent_b, environment=self.env_prod)  # 精确环境
+        self.assertEqual(resolve_channel(self.server), (self.agent_b, 'rule'))
+
+    def test_other_env_rule_falls_back_to_default(self):
+        self._route(agent=self.agent_a)
+        self._route(agent=self.agent_b, environment=self.env_test)
+        self.assertEqual(resolve_channel(self.server), (self.agent_a, 'rule'))
+
+    def test_other_project_rule_does_not_leak(self):
+        self._route(agent=self.agent_b, project_group=self.other_pg)
+        self.assertEqual(resolve_channel(self.server), (None, 'direct'))
+
+    def test_disabled_rule_ignored(self):
+        self._route(enabled=False)
+        self.assertEqual(resolve_channel(self.server), (None, 'direct'))
+
+    def test_host_pin_wins_over_rule(self):
+        self._route(agent=self.agent_a)
+        self.server.channel_mode = 'agent'
+        self.server.agent = self.agent_b
+        self.server.save()
+        self.assertEqual(resolve_channel(self.server), (self.agent_b, 'host'))
+
+    def test_force_direct_ignores_rule(self):
+        self._route(agent=self.agent_a)
+        self.server.channel_mode = 'direct'
+        self.server.save()
+        self.assertEqual(resolve_channel(self.server), (None, 'direct'))
+
+    def test_pinned_agent_deleted_falls_back_to_rule(self):
+        """agent 删除后 FK 置空，mode 仍是 agent：按 auto 处理，不做僵尸配置。"""
+        self._route(agent=self.agent_a)
+        self.server.channel_mode = 'agent'
+        self.server.agent = self.agent_b
+        self.server.save()
+        self.agent_b.delete()
+        self.server.refresh_from_db()
+        self.assertEqual(resolve_channel(self.server), (self.agent_a, 'rule'))
+
+    def test_rule_agent_disabled_still_routed(self):
+        """agent 禁用只影响建连，不改变路由——静默改走直连只会换来 SSH 超时。"""
+        self.agent_a.enabled = False
+        self.agent_a.save()
+        self._route(agent=self.agent_a)
+        self.assertEqual(resolve_channel(self.server), (self.agent_a, 'rule'))
+
+    def test_host_without_project_group_is_direct(self):
+        from apps.asset_mgr.models import Server
+
+        self._route()
+        orphan = Server.objects.create(name='no-pg', private_ip='10.0.0.9')
+        self.assertEqual(resolve_channel(orphan), (None, 'direct'))
+
+    def test_batch_resolve_query_count(self):
+        """批量解析固定 2 次查询（规则 + 钉死 agent），不随主机数增长。"""
+        from apps.asset_mgr.models import Server
+
+        self._route()
+        for i in range(5):
+            Server.objects.create(
+                name=f'h{i}', private_ip=f'10.1.0.{i}', project_group=self.pg,
+                environment=self.env_prod, channel_mode='agent', agent=self.agent_b)
+        # 从库里重取（无 select_related）：钉死的 agent 也只补一次 in_bulk
+        servers = list(Server.objects.all())
+        with self.assertNumQueries(2):
+            resolved = resolve_channels(servers)
+        self.assertEqual(resolved[self.server.pk], (self.agent_a, 'rule'))
+        pinned = Server.objects.get(name='h0')
+        self.assertEqual(resolved[pinned.pk], (self.agent_b, 'host'))
+
+
+class AgentRouteConstraintTests(TestCase):
+    """规则唯一性：同项目组同环境唯一，项目组默认（环境为空）也唯一。"""
+
+    def setUp(self):
+        from apps.asset_mgr.models import Environment, ProjectGroup
+
+        self.agent = AgentNode.objects.create(name='gw-c', token_hash='x')
+        self.pg = ProjectGroup.objects.create(name='约束项目', code='ch-c1')
+        self.env = Environment.objects.create(name='约束正式', code='ch-c-prod')
+
+    def test_duplicate_exact_rule_rejected(self):
+        AgentRoute.objects.create(agent=self.agent, project_group=self.pg, environment=self.env)
+        with self.assertRaises(IntegrityError):
+            AgentRoute.objects.create(
+                agent=self.agent, project_group=self.pg, environment=self.env)
+
+    def test_duplicate_project_default_rejected(self):
+        """环境为空的默认规则：SQL 中 NULL != NULL，靠带条件的单字段约束兜住。"""
+        AgentRoute.objects.create(agent=self.agent, project_group=self.pg)
+        with self.assertRaises(IntegrityError):
+            AgentRoute.objects.create(agent=self.agent, project_group=self.pg)
+
+    def test_default_and_exact_coexist(self):
+        AgentRoute.objects.create(agent=self.agent, project_group=self.pg)
+        AgentRoute.objects.create(agent=self.agent, project_group=self.pg, environment=self.env)
+        self.assertEqual(AgentRoute.objects.count(), 2)
+
+    def test_deleting_agent_removes_its_routes(self):
+        AgentRoute.objects.create(agent=self.agent, project_group=self.pg)
+        self.agent.delete()
+        self.assertEqual(AgentRoute.objects.count(), 0)
+
+
+class ChannelModeMigrationTests(TestCase):
+    """0010 数据迁移：存量绑定 agent 的主机必须被钉成 mode=agent。"""
+
+    def _migration(self):
+        return importlib.import_module('apps.asset_mgr.migrations.0010_server_channel_mode')
+
+    def test_existing_agent_hosts_pinned(self):
+        from apps.asset_mgr.models import Server
+
+        agent = AgentNode.objects.create(name='gw-m', token_hash='x')
+        pinned = Server.objects.create(name='old-nat', private_ip='192.168.9.1', agent=agent)
+        plain = Server.objects.create(name='old-direct', private_ip='10.9.0.1')
+        # 迁移前的库态：字段已加、值仍是默认 auto
+        Server.objects.update(channel_mode='auto')
+
+        self._migration().pin_existing_agent_hosts(django_apps, None)
+
+        pinned.refresh_from_db()
+        plain.refresh_from_db()
+        self.assertEqual(pinned.channel_mode, 'agent')
+        self.assertEqual(plain.channel_mode, 'auto')
+
+    def test_reverse_clears_agent_on_non_agent_hosts(self):
+        from apps.asset_mgr.models import Server
+
+        agent = AgentNode.objects.create(name='gw-m2', token_hash='x')
+        auto_host = Server.objects.create(
+            name='auto-h', private_ip='10.9.0.2', agent=agent, channel_mode='auto')
+        kept = Server.objects.create(
+            name='pinned-h', private_ip='10.9.0.3', agent=agent, channel_mode='agent')
+
+        self._migration().unpin(django_apps, None)
+
+        auto_host.refresh_from_db()
+        kept.refresh_from_db()
+        self.assertIsNone(auto_host.agent_id)
+        self.assertEqual(kept.agent_id, agent.pk)

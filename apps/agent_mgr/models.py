@@ -6,6 +6,9 @@ AgentNode：NAT 出口主机上部署的执行代理，经 WebSocket（/ws/agent
 AgentJob：runner 下发给 agent 的「模块执行单元」（一个任务流模块中路由到
 某 agent 的主机组），记录 payload、回传日志与终态；与 task_exec 仅以
 task_id/log_id 弱关联（整型字段，不建外键），避免 app 间耦合。
+
+AgentRoute：按维度（项目组 + 可选环境）把主机默认路由到某个 agent，供
+Server.channel_mode='auto' 的主机继承；解析口径见 channel.py。
 """
 import hashlib
 import secrets
@@ -104,3 +107,51 @@ class AgentJob(models.Model):
 
     def __str__(self):
         return f'{self.agent.name}#{self.job_id}'
+
+
+class AgentRoute(models.Model):
+    """执行通道路由规则：项目组（必填）+ 环境（可空=该项目组默认）→ agent。
+
+    只对 Server.channel_mode='auto' 的主机生效，主机侧 direct/agent 优先级更高
+    （解析见 channel.py）。规则维度刻意只做两维且项目组必填：两级回落无歧义，
+    无需优先级字段与重叠检测，唯一性由下面两条带条件的约束保证
+    （SQL 中 NULL != NULL，环境为空的「项目组默认」规则必须单独约束）。
+    """
+
+    agent = models.ForeignKey(
+        AgentNode, verbose_name='Agent', on_delete=models.CASCADE, related_name='routes')
+    project_group = models.ForeignKey(
+        'asset_mgr.ProjectGroup', verbose_name='项目组', on_delete=models.PROTECT,
+        related_name='agent_routes',
+    )
+    # 留空 = 该项目组下所有环境的默认规则（被同项目组的精确环境规则覆盖）
+    environment = models.ForeignKey(
+        'asset_mgr.Environment', verbose_name='环境', on_delete=models.PROTECT,
+        null=True, blank=True, related_name='agent_routes',
+    )
+    enabled = models.BooleanField('启用', default=True)
+    remark = models.CharField('备注', max_length=200, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Agent 通道路由'
+        verbose_name_plural = 'Agent 通道路由'
+        db_table = 'agent_route'
+        ordering = ['project_group_id', 'environment_id', 'id']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['project_group', 'environment'],
+                condition=models.Q(environment__isnull=False),
+                name='uniq_agent_route_pg_env',
+            ),
+            models.UniqueConstraint(
+                fields=['project_group'],
+                condition=models.Q(environment__isnull=True),
+                name='uniq_agent_route_pg_default',
+            ),
+        ]
+
+    def __str__(self):
+        env = self.environment.name if self.environment_id else '不限环境'
+        return f'{self.project_group.name}/{env} → {self.agent.name}'
