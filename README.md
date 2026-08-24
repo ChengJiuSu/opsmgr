@@ -58,7 +58,7 @@ source venv/bin/activate        # Windows: venv\Scripts\activate
 
 # 2. 安装依赖（开发环境无需 mysqlclient）
 pip install Django djangorestframework djangorestframework-simplejwt \
-    django-cors-headers python-decouple drf-spectacular
+    django-cors-headers python-decouple drf-spectacular daphne channels requests
 
 # 3. 数据库迁移
 python manage.py migrate
