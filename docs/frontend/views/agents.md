@@ -1,7 +1,8 @@
 # Agent 管理（views/system/Agents.vue）
 
 **路由：** `/system/agents`（仅管理员，`meta.staff`）
-**API：** `src/api/agents.js`（`/api/agents/`，后端模块见 `docs/backend/modules/agent.md`）
+**API：** `src/api/agents.js`（`/api/agents/`、`/api/agent-routes/`，
+后端模块见 `docs/backend/modules/agent.md`）
 
 ## 功能
 
@@ -15,10 +16,27 @@
 - 任务单元弹窗：该 agent 最近 50 条 AgentJob（状态 / rc / 通道错误），
   task_id 链接跳转执行日志页。
 
+## 通道路由 tab
+
+同页第二个 tab（不单独占菜单项，路由规则属于 Agent 范畴）。
+
+- 列表：项目组 / 环境（空显示「不限（项目组默认）」）/ 执行通道 / 生效状态 /
+  备注；规则条数与项目组同量级，后端不分页。
+- 新增 / 编辑：项目组必选、环境可空、Agent 必选；维度变化时调
+  `previewAgentRoute()` 实时显示「该规则将接管 N 台主机：xxx」——只统计
+  `channel_mode=auto` 的主机。
+- 停用 / 删除：二次确认文案点明命中该规则的主机将回退直连，NAT 内网主机会
+  以 SSH 超时失败。这是本页最容易误操作的按钮，后果必须写死在确认框里。
+- 唯一冲突由后端转中文报错（同项目组同环境、同项目组默认规则各自唯一）。
+
 ## 服务器页联动（views/assets/Servers.vue）
 
-- 表格新增「执行通道」列：直连置灰 / agent 名 warning tag。
-- 表单（仅管理员可见）「执行通道」下拉：清空 = 直连；选项来自
-  `getAgents()`（普通用户不加载，避免 403 弹错）。
-- 批量编辑新增「执行通道」字段：勾选后可批量切换 / 清空回退直连
-  （走 `servers/batch/update/` 的 `update.agent`）。
+- 表格「执行通道」列展示**解析后的实际通道** `effective_agent_name` + 来源
+  角标（主机 / 规则 / 强制），**对所有用户可见**：普通用户也需要知道自己的
+  主机走哪条通道。
+- 表单（仅管理员可见）「执行通道」三态下拉，选「指定 Agent」才出现 Agent
+  选择框，切走时自动清空；提示文案点名建议自身有公网 IP 的管理服选「强制直连」。
+  Agent 选项来自 `getAgents()`（普通用户不加载，避免 403 弹错）。
+- 批量编辑「执行通道」字段同为三态（模式 + Agent 同行），选「指定 Agent」
+  未选目标时前端先拦（走 `servers/batch/update/` 的 `update.channel_mode`
+  与 `update.agent`）。

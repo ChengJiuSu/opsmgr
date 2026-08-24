@@ -17,7 +17,8 @@ NAT 出口执行代理（ops-agent）的服务端：agent 主动外连 WebSocket
 |------|------|
 | `AgentNode` | 一台 NAT 出口主机上的 agent；token 只存哈希，明文仅创建/重置时展示一次 |
 | `AgentJob` | 一次下发单元（任务流某模块的某 agent 主机组）；payload + 日志缓冲 + 终态；与 task_exec 仅以 task_id/log_id 整型弱关联 |
-| 执行通道 | `asset_mgr.Server.agent` 可空外键：空 = 直连（现状），有值 = 经该 agent 执行；agent 删除时 SET_NULL 回退直连 |
+| `AgentRoute` | 通道路由规则：项目组（必填）+ 环境（可空 = 该项目组默认）→ agent，只对 `channel_mode='auto'` 的主机生效 |
+| 执行通道 | `asset_mgr.Server.channel_mode` 三态 + `agent` 外键；解析口径见下节，全项目唯一实现在 `channel.py` |
 
 ---
 
@@ -25,7 +26,8 @@ NAT 出口执行代理（ops-agent）的服务端：agent 主动外连 WebSocket
 
 ```
 apps/agent_mgr/
-├── models.py      # AgentNode / AgentJob / hash_token（sha256 口径）
+├── models.py      # AgentNode / AgentJob / AgentRoute / hash_token（sha256 口径）
+├── channel.py     # 执行通道解析：主机三态 + 路由规则 → (agent, source)
 ├── consumers.py   # AgentConsumer：鉴权、心跳落库、log.chunk 幂等追加、result 终态
 ├── dispatch.py    # run_via_agent：创建 job → channel layer 下发 → 轮询终态（同步阻塞）
 ├── routing.py     # /ws/agent/ 路由（ops_manager/asgi.py 挂载）
@@ -35,6 +37,31 @@ apps/agent_mgr/
 ```
 
 ---
+
+## 执行通道解析（channel.py）
+
+```
+Server.channel_mode='direct'                → 直连          source=direct
+Server.channel_mode='agent' 且 agent 有效    → 该 agent      source=host
+Server.channel_mode='auto'（默认）：
+    AgentRoute(项目组, 环境, enabled)          → 该 agent     source=rule
+    AgentRoute(项目组, 环境为空, enabled)       → 该 agent     source=rule
+    无命中                                    → 直连         source=direct
+```
+
+- `resolve_channels(servers)` 批量解析（≤2 次查询：规则表 + 钉死 agent 的
+  `in_bulk`），`resolve_channel/resolve_agent` 为单主机糖。调用方：
+  `task_exec.runner._split_by_agent`、方法模块拦截、`cloud_mgr.deploy`、
+  `ServerSerializer` 的 `effective_*` 字段。
+- 「`mode=agent` 但 `agent` 为空」（agent 被删 SET_NULL）按 `auto` 处理。
+- 规则命中不看 `AgentNode.enabled`：**禁用 agent 不改路由**，只影响建连，
+  下发时 dispatch fail fast。要回退直连请停用规则（`AgentRoute.enabled=False`），
+  否则 NAT 主机静默走直连只会换来 SSH 超时。
+- 规则唯一性：`(项目组, 环境)` 与 `(项目组, 环境为空)` 两条带条件唯一约束
+  （SQL 中 `NULL != NULL`，默认规则必须单独约束）；序列化器把冲突转中文报错。
+- 上线顺序：**先把管理服批量置 `direct`，再建规则**，否则自身有公网 IP 的
+  管理服会被项目级规则接管，出现「agent 通过自己执行自己」，且 agent 一挂
+  连管理服都碰不了。
 
 ## 在线判定与踢旧连接
 
@@ -53,7 +80,7 @@ apps/agent_mgr/
 - 日志分片 `log.chunk` 携带严格递增 `chunk_seq`：Consumer 只追加大于当前
   游标的分片（重复/乱序重 ack 游标，agent 按游标补传），单 job 输出上限
   2MB 超限截断。`task.result` 幂等，重复上报只重 ack。
-- runner 侧（task_exec/runner.py）：命令/剧本模块主机按 `Server.agent`
+- runner 侧（task_exec/runner.py）：命令/剧本模块主机按 `resolve_channels`
   分组，直连组走原 `run_subprocess`，agent 组生成**无密钥 inventory**
   （密码/私钥不出通道，SSH 免密凭据驻留 agent 主机）+ 变量下发；混合通道时
   输出按 `[直连 · n 台]` / `[经 Agent xx · n 台]` 标头拼接，纯直连输出与旧
@@ -84,11 +111,25 @@ GET/POST/PUT/PATCH/DELETE /api/agents/   Agent CRUD（仅管理员；创建响�
                                           有未终态 job 禁止删除，可先禁用）
 POST /api/agents/{id}/regen_token/       重置令牌（旧 token 即刻失效，响应含一次性新 token）
 GET  /api/agents/{id}/jobs/              最近 50 条任务单元（排障；不含 output 全文）
+GET/POST/PUT/PATCH/DELETE /api/agent-routes/   通道路由规则 CRUD（仅管理员，不分页，
+                                          支持 agent/project_group/environment 过滤）
+GET  /api/agent-routes/preview/?project_group=&environment=
+                                          影响面预览：该维度下 channel_mode=auto 的主机
+                                          （强制直连与钉死 agent 的主机不受规则影响，不计入）
 WS   /ws/agent/                          agent 接入（握手头 Authorization: Token <raw>）
 ```
 
-`asset_mgr` 关联：服务器批量编辑接口 `update.agent` 支持批量切换执行通道
-（null = 回退直连）；ServerSerializer 增加只读 `agent_name`。
+`asset_mgr` 关联：
+
+- 服务器批量编辑 `update.channel_mode` 切换三态（`agent` 模式须同时给
+  `update.agent`；其余模式自动清空 agent，不留不生效的残留配置）；
+- `ServerSerializer` 增加只读 `agent_name`（主机显式指定的目标）与
+  `effective_agent` / `effective_agent_name` / `channel_source` /
+  `channel_source_label`（解析后的实际通道，列表页展示看后者）；列表序列化
+  经 ListSerializer 一次性批量解析，不退化成 N+1。
+- **旧客户端兼容**：只传 `agent` 不传 `channel_mode` 视为 `channel_mode='agent'`
+  （单条与批量两条路径都覆盖）。外部脚本与导入接口可能只发 `agent`，去掉这条
+  会让选中的 Agent 被静默清空。
 
 ## 消息协议摘要
 

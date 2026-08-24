@@ -174,15 +174,51 @@ AgentNode
 └── enabled         禁用后拒绝连接
 ```
 
-### 4.2 Server 增加执行通道
+### 4.2 执行通道解析（主机三态 + 路由规则）
 
-`asset_mgr.Server` 新增可空外键 `agent = FK(AgentNode, null=True)`：
+> v1 初版只有 `Server.agent` 一个可空外键（有值即经该 agent）。逐台绑定
+> 新增主机易漏配，且无法表达「忽略规则、强制直连」——项目管理服自身有公网
+> IP，不该被项目级规则拖进 agent 通道。故改为三态 + 维度规则（2026-08-24）。
 
-- `agent is None` → 直连通道（现状，manager 本机跑 ansible）；
-- `agent` 有值 → 该主机的 ansible 执行下发给对应 agent。
+`asset_mgr.Server`：
 
-服务器表单增加「执行通道」选择（默认直连）。批量设置入口挂在服务器列表
-批量操作。
+| 字段 | 语义 |
+|------|------|
+| `channel_mode='auto'`（默认） | 按 `AgentRoute` 路由规则解析，无规则命中则直连 |
+| `channel_mode='direct'` | 强制直连，忽略路由规则（管理服等自身可达的主机） |
+| `channel_mode='agent'` | 钉死到 `agent` 外键指定的 Agent |
+
+`agent_mgr.AgentRoute`：`project_group`（必填）+ `environment`（可空 =
+该项目组默认）→ `agent`，带 `enabled` 开关。**刻意只做两维且项目组必填**：
+两级回落无歧义，无需优先级字段与重叠检测；唯一性由两条带条件的
+`UniqueConstraint` 保证（SQL 中 `NULL != NULL`，环境为空的默认规则必须单独
+约束）。渠道维不做——渠道通常不改变主机的网络位置，开了只增加规则爆炸。
+
+解析优先级（`apps/agent_mgr/channel.py`，全项目唯一口径）：
+
+```
+channel_mode='direct'              → 直连                     source=direct
+channel_mode='agent' 且 agent 有效  → 该 agent                 source=host
+channel_mode='auto'：
+    AgentRoute(项目组, 环境, enabled)   → 该 agent             source=rule
+    AgentRoute(项目组, 环境为空, enabled) → 该 agent            source=rule
+    无命中                              → 直连                source=direct
+```
+
+两条边界决定：
+
+- 「`mode=agent` 但 `agent` 为空」（agent 被删，FK SET_NULL）按 `auto` 处理，
+  不留不可执行的僵尸配置；
+- 规则命中的 agent **不看 `AgentNode.enabled`**：agent 禁用只影响能否建连，
+  下发时由 dispatch fail fast 给出明确原因。要让主机回退直连请停用规则本身
+  （`AgentRoute.enabled=False`）——NAT 主机静默改走直连只会换来 SSH 超时。
+
+服务器表单/批量编辑提供三态选择，Agent 管理页「通道路由」tab 维护规则并提供
+影响面预览。**上线顺序**：先把各项目管理服批量置 `direct`，再建规则；顺序
+反了会出现「agent 通过自己执行自己」。
+
+v2 候选：规则加优先级与备用 agent 列表（主 agent 离线自动降级），逐台绑定
+无法承载这个演进。
 
 ### 4.3 runner 改造（`task_exec/runner.py`）
 
@@ -378,6 +414,7 @@ steps_result / 失败处理（retry/skip/abort）流程。
 |------|------|------|
 | v1 | Channels 接入 + AgentNode 模型/管理页 + Server.agent 通道字段 + runner 通道分组下发 + agent（心跳/command/playbook/日志回传/留存/资源限制） | NAT 主机可经 agent 执行任务流，日志前端实时可见 |
 | v1.1 | task.cancel 取消、崩溃恢复补传、磁盘水位清理 | 可靠性补齐 |
+| P1（2026-08-24） | 主机通道三态 + 项目组/环境路由规则 + 有效通道展示 | 新增主机自动继承通道，管理服可钉死直连 |
 | v2 | 剧本 commit 校验、method 模块经 agent（provider 透传）、多 agent 冷备切换、心跳携带指标进 dashboard | 能力扩展 |
 
 ### 现有代码改造点清单
@@ -387,7 +424,8 @@ steps_result / 失败处理（retry/skip/abort）流程。
 | `requirements.txt` | + channels、channels-redis、（agent 侧独立 requirements：websockets、ansible-runner） |
 | `ops_manager/asgi.py` + 部署 | ASGI 路由 `/ws/agent/`，nginx 分流 |
 | `apps/agent_mgr/`（新） | AgentNode 模型、Consumer、管理 API |
-| `apps/asset_mgr/models.py` | Server + `agent` FK（迁移），序列化器/表单 |
+| `apps/asset_mgr/models.py` | Server + `agent` FK、`channel_mode` 三态（迁移），序列化器/表单 |
+| `apps/agent_mgr/channel.py` | 通道解析唯一口径（runner / 证书分发 / 序列化共用） |
 | `apps/task_exec/runner.py` | 模块主机按通道分组；agent 组走 dispatch 等待，输出拼接 |
 | `frontend` | Agent 管理页；服务器表单「执行通道」项 |
 | `ops-agent/`（新仓库或本仓库子目录） | agent 全部代码 |

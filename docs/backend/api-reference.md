@@ -218,11 +218,18 @@ POST /api/assets/servers/
   "channel": 1,                   // 渠道字典 id，可为 null
   "cloud_provider": 1,            // 云厂商字典 id，可为 null
   "region": "cn-hangzhou",
+  "channel_mode": "auto",         // auto（按路由规则）/ direct（强制直连）/ agent（钉死）
+  "agent": null,                  // Agent id，channel_mode='agent' 时必填
   "remark": "主站 Web 服务器"
 }
 ```
 
-**成功响应（201）：** 返回创建的服务器对象（含 `*_name` 只读展示字段）
+**成功响应（201）：** 返回创建的服务器对象（含 `*_name` 只读展示字段，以及
+解析后的执行通道 `effective_agent` / `effective_agent_name` / `channel_source`
+（host / rule / direct）/ `channel_source_label`）
+
+> `channel_mode` 非 `agent` 时后端会清空 `agent`，避免残留不生效的配置；
+> 只传 `agent` 不传 `channel_mode` 视为 `channel_mode='agent'`（旧客户端兼容）。
 
 ---
 
@@ -445,6 +452,43 @@ DELETE /api/system/configs/{id}/
 ```
 
 **成功响应（204）：** 无响应体
+
+---
+
+## Agent 与执行通道 `/api/agents/`、`/api/agent-routes/`
+
+均仅管理员可访问，列表不分页。完整语义见 `docs/backend/modules/agent.md`。
+
+| 方法与地址 | 说明 |
+|------|------|
+| `GET/POST/PUT/PATCH/DELETE /api/agents/` | Agent 节点 CRUD；创建响应含一次性明文 token；有未终态任务单元时禁止删除 |
+| `POST /api/agents/{id}/regen_token/` | 重置令牌，旧 token 立即失效，响应含一次性新 token |
+| `GET /api/agents/{id}/jobs/` | 该 agent 最近 50 条任务单元（排障，不含 output 全文）|
+| `GET/POST/PUT/PATCH/DELETE /api/agent-routes/` | 通道路由规则 CRUD，支持 `agent` / `project_group` / `environment` 过滤 |
+| `GET /api/agent-routes/preview/?project_group=&environment=` | 影响面预览：该维度下 `channel_mode='auto'` 的主机（`count` + 最多 200 条 `hosts`）|
+
+**路由规则请求体：**
+
+```json
+{
+  "agent": 1,                 // 必填
+  "project_group": 2,         // 必填
+  "environment": 3,           // 可空，null = 该项目组默认规则
+  "enabled": true,
+  "remark": "上海 NAT 出口"
+}
+```
+
+同项目组同环境（或同项目组默认规则）重复时返回 400 中文报错。
+
+**批量切换执行通道：**
+
+```json
+POST /api/assets/servers/batch/update/
+{"server_ids": [1, 2], "update": {"channel_mode": "agent", "agent": 1}}
+```
+
+`channel_mode='agent'` 时必须同时给 `agent`；其余模式自动清空 `agent`。
 
 ---
 

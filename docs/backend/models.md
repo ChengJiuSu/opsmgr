@@ -12,6 +12,11 @@ asset_mgr.Channel ───────┤  FK (on_delete=PROTECT, 可空)
 asset_mgr.Environment ───┼──► asset_mgr.Server
 asset_mgr.CloudProvider ─┘
 
+agent_mgr.AgentNode ──── FK (SET_NULL, 可空) ──► asset_mgr.Server.agent
+agent_mgr.AgentNode ──── FK (CASCADE) ────────► agent_mgr.AgentRoute
+asset_mgr.ProjectGroup ─ FK (PROTECT) ────────► agent_mgr.AgentRoute
+asset_mgr.Environment ── FK (PROTECT, 可空) ──► agent_mgr.AgentRoute
+
 auth_mgr.User    独立
 system_cfg.SystemConfig 独立
 ```
@@ -89,6 +94,8 @@ system_cfg.SystemConfig 独立
 | `environment` | FK → Environment | null | 环境（PROTECT）|
 | `cloud_provider` | FK → CloudProvider | null | 云厂商（PROTECT）|
 | `region` | CharField(50) | '' | 地域/机房（如 cn-hangzhou）|
+| `channel_mode` | CharField(10) | 'auto' | 执行通道模式：auto（按路由规则）/ direct（强制直连）/ agent（钉死）|
+| `agent` | FK → agent_mgr.AgentNode | null | 钉死的执行通道 Agent（SET_NULL），仅 channel_mode='agent' 时生效 |
 | `ssh_port` | PositiveIntegerField | 22 | SSH 端口 |
 | `ssh_user` | CharField(50) | 'root' | SSH 用户 |
 | `remark` | TextField | '' | 备注 |
@@ -107,6 +114,34 @@ system_cfg.SystemConfig 独立
 > 存量数据由迁移 `0004` 自动转换回填。
 
 **默认排序：** `-created_at`（最新创建的优先）
+
+---
+
+## AgentRoute（执行通道路由规则）
+
+**App：** `agent_mgr` | **表名：** `agent_route`
+
+| 字段 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `id` | BigAutoField | PK | 主键 |
+| `agent` | FK → AgentNode | — | 目标 Agent（CASCADE，删 agent 连带删规则）|
+| `project_group` | FK → ProjectGroup | — | 项目组，必填（PROTECT）|
+| `environment` | FK → Environment | null | 环境，留空 = 该项目组默认规则（PROTECT）|
+| `enabled` | BooleanField | True | 停用后该规则不参与解析 |
+| `remark` | CharField(200) | '' | 备注 |
+
+**唯一约束（两条带条件）：**
+
+| 约束 | 条件 | 作用 |
+|------|------|------|
+| `uniq_agent_route_pg_env` | `environment IS NOT NULL` | 同项目组同环境只能有一条 |
+| `uniq_agent_route_pg_default` | `environment IS NULL` | 同项目组的默认规则只能有一条 |
+
+> SQL 中 `NULL != NULL`，环境为空的默认规则不能靠 `unique_together` 兜住，
+> 必须单独一条带条件约束。
+
+只对 `Server.channel_mode='auto'` 的主机生效，解析优先级见
+`docs/backend/modules/agent.md`。
 
 ---
 
