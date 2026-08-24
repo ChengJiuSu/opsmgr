@@ -513,6 +513,50 @@ class ServerImportExportTests(BaseApiTest):
         self.assertIn('文件内主机名重复', joined)
         self.assertIn('已被主机「occupied」使用', joined)
 
+    def test_import_channel_columns(self):
+        from apps.agent_mgr.models import AgentNode
+        agent = AgentNode.objects.create(name='nat-hz', token_hash='x')
+        csv_text = (
+            'name,private_ip,channel_mode,agent\n'
+            'ch-01,10.8.5.1,agent,nat-hz\n'
+            'ch-02,10.8.5.2,direct,\n'
+            'ch-03,10.8.5.3,,\n'
+        )
+        r = self._import(csv_text)
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(
+            (Server.objects.get(name='ch-01').channel_mode, Server.objects.get(name='ch-01').agent_id),
+            ('agent', agent.id))
+        self.assertEqual(Server.objects.get(name='ch-02').channel_mode, 'direct')
+        self.assertEqual(Server.objects.get(name='ch-03').channel_mode, 'auto')
+
+        # 缺列的 update 导入不动已有执行通道
+        r = self._import('name,private_ip,status\nch-01,10.8.5.1,stopped\n', mode='update')
+        self.assertEqual(r.status_code, 200, r.content)
+        srv = Server.objects.get(name='ch-01')
+        self.assertEqual((srv.status, srv.channel_mode, srv.agent_id), ('stopped', 'agent', agent.id))
+
+        # 切回 direct 时清空钉死的 Agent
+        r = self._import('name,private_ip,channel_mode,agent\nch-01,10.8.5.1,direct,nat-hz\n', mode='update')
+        self.assertEqual(r.status_code, 200, r.content)
+        srv.refresh_from_db()
+        self.assertEqual((srv.channel_mode, srv.agent_id), ('direct', None))
+
+    def test_import_channel_validation_errors(self):
+        csv_text = (
+            'name,private_ip,channel_mode,agent\n'
+            'bad-01,10.8.6.1,flying,\n'
+            'bad-02,10.8.6.2,agent,\n'
+            'bad-03,10.8.6.3,agent,ghost\n'
+        )
+        r = self._import(csv_text)
+        self.assertEqual(r.status_code, 400)
+        joined = ' '.join(e for row in r.json()['data']['errors'] for e in row['errors'])
+        self.assertIn('channel_mode 非法：flying', joined)
+        self.assertIn('channel_mode=agent 时必须在 agent 列填写 Agent 名称', joined)
+        self.assertIn('Agent 不存在：ghost', joined)
+        self.assertFalse(Server.objects.filter(name__startswith='bad-').exists())
+
     def test_export_roundtrip(self):
         Server.objects.create(name='exp-01', private_ip='10.8.2.1', project_group=self.group, ssh_port=2222)
         r = self.admin.get('/api/assets/servers/export/')
@@ -520,6 +564,7 @@ class ServerImportExportTests(BaseApiTest):
         body = r.content.decode('utf-8-sig')
         self.assertIn('exp-01,10.8.2.1', body)
         self.assertIn('legend', body)
+        self.assertIn('channel_mode,agent,ssh_port', body.splitlines()[0])
 
 
 class ServerJumpServerTests(BaseApiTest):

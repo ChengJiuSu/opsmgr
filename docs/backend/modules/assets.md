@@ -160,8 +160,13 @@ region         = CharField(max_length=50, blank=True)
 
 ## CSV 导入导出
 
-- 列：`name,private_ip,public_ip,os,cpu,memory,status,project_group,channel,environment,cloud_provider,region,ssh_port,ssh_user,remark`，
+- 列：`name,private_ip,public_ip,os,cpu,memory,status,project_group,channel,environment,cloud_provider,region,channel_mode,agent,ssh_port,ssh_user,remark`，
   字典外键列填字典**编码**（兼容名称），`name`/`private_ip` 必填。
+- 执行通道两列（注意 `channel` 是 CMDB「渠道」字典，与执行通道无关）：
+  - `channel_mode`：`auto`（默认，按路由规则）/ `direct`（强制直连）/ `agent`（指定 Agent），兼容填中文标签；
+  - `agent`：Agent **名称**（`AgentNode.name` 唯一），仅 `channel_mode=agent` 生效，其余模式导入时清空钉死目标
+    （与批量编辑口径一致）；`channel_mode=agent` 而 `agent` 为空、或 Agent 名称不存在均校验拦截。
+  - 文件里两列都缺省时**不改动**主机现有执行通道（避免 `mode=update` 用缺列 CSV 把钉死的 Agent 重置为 auto）。
 - 导入全量校验通过才写库（原子）；任一行有错返回 400，`data.errors` 携带
   `[{line, name, errors[]}]` 逐行明细。`mode=skip`（默认）主机名已存在跳过，`mode=update` **按主机名**匹配更新；
   文件内主机名/公网 IP 重复、公网 IP 已被其他主机占用均校验拦截。

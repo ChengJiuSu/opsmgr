@@ -317,7 +317,8 @@
   <!-- CSV 导入弹窗 -->
   <el-dialog v-model="importVisible" title="批量导入服务器" width="560px">
     <el-alert type="info" :closable="false" show-icon style="margin-bottom:12px">
-      按模板填写（字典列填编码，如环境 prod）；任一行校验失败则整体不导入并提示逐行错误
+      按模板填写（字典列填编码，如环境 prod；channel 为渠道字典）；执行通道 channel_mode 填
+      auto/direct/agent，agent 列填 Agent 名称（仅 channel_mode=agent 时生效）；任一行校验失败则整体不导入并提示逐行错误
     </el-alert>
     <div class="import-toolbar">
       <el-button size="small" :icon="Download" @click="handleTemplateDownload">下载 CSV 模板</el-button>

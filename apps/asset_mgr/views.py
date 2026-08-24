@@ -28,10 +28,12 @@ from .serializers import (
 )
 
 # CSV 导入导出列（顺序即模板列顺序）：字典外键列填字典编码（code），name/private_ip 必填
+# CSV 列顺序（导出 / 模板 / 导入共用）。注意 channel 是 CMDB「渠道」字典，
+# 执行通道是 channel_mode（auto/direct/agent）+ agent（Agent 名称，仅 agent 模式生效）。
 CSV_COLUMNS = [
     'name', 'private_ip', 'public_ip', 'os', 'cpu', 'memory', 'status',
     'project_group', 'channel', 'environment', 'cloud_provider',
-    'region', 'ssh_port', 'ssh_user', 'remark',
+    'region', 'channel_mode', 'agent', 'ssh_port', 'ssh_user', 'remark',
 ]
 # CSV 字典外键列 → (模型, 展示名)
 CSV_DICT_FIELDS = {
@@ -212,7 +214,8 @@ class ServerViewSet(viewsets.ModelViewSet):
                 s.channel.code if s.channel else '',
                 s.environment.code if s.environment else '',
                 s.cloud_provider.code if s.cloud_provider else '',
-                s.region, s.ssh_port, s.ssh_user, s.remark,
+                s.region, s.channel_mode, s.agent.name if s.agent else '',
+                s.ssh_port, s.ssh_user, s.remark,
             ])
         return response
 
@@ -232,7 +235,8 @@ class ServerImportTemplateView(APIView):
         writer.writerow([
             'web-server-01', '192.168.1.100', '', 'Ubuntu 22.04', '4', '8192', 'running',
             'legend', 'official', 'prod', 'aliyun',
-            'cn-hangzhou', '22', 'root', '示例行，导入前请删除',
+            'cn-hangzhou', 'auto', '', '22', 'root',
+            '示例行，导入前请删除；channel_mode 填 auto/direct/agent，填 agent 时 agent 列写 Agent 名称',
         ])
         return response
 
@@ -385,6 +389,10 @@ class ServerImportView(APIView):
                   **{o.name: o for o in model.objects.all()}}
             for key, (model, _) in CSV_DICT_FIELDS.items()
         }
+        # 执行通道 Agent 缓存：CSV 的 agent 列填 Agent 名称（AgentNode.name 唯一）
+        from apps.agent_mgr.models import AgentNode
+
+        agent_cache = {a.name: a for a in AgentNode.objects.all()}
         # 主机名全局唯一，导入按 name 匹配更新目标
         existing_by_name = {s.name: s for s in Server.objects.all()}
         existing_public_ips = {
@@ -394,7 +402,7 @@ class ServerImportView(APIView):
         errors, to_create, to_update, skipped = [], [], [], 0
         seen_names, seen_public_ips = set(), set()
         for lineno, row in enumerate(reader, start=2):  # 第 1 行为表头
-            parsed, row_errors = self._parse_row(row, dict_cache)
+            parsed, row_errors = self._parse_row(row, dict_cache, agent_cache)
             if parsed is None and row_errors is None:
                 continue  # 空行
             name = parsed.get('name')
@@ -433,7 +441,7 @@ class ServerImportView(APIView):
         return ok({'created': len(to_create), 'updated': len(to_update), 'skipped': skipped})
 
     @staticmethod
-    def _parse_row(row, dict_cache):
+    def _parse_row(row, dict_cache, agent_cache):
         """解析单行，返回 (字段字典, 错误列表)；整行为空返回 (None, None)。"""
         get = lambda key: (row.get(key) or '').strip()  # noqa: E731
         if not any(get(key) for key in CSV_COLUMNS):
@@ -488,6 +496,29 @@ class ServerImportView(APIView):
                 errors.append(f'{label}不存在：{raw}（填字典编码，可在对应字典页查看）')
             else:
                 parsed[key] = obj
+
+        # 执行通道：channel_mode 填模式码（兼容中文标签），agent 填 Agent 名称。
+        # 两列都不在文件里时整体跳过，避免 update 模式用缺列的 CSV 把已钉死的通道重置为 auto。
+        if 'channel_mode' in row or 'agent' in row:
+            mode_by_label = {label: key for key, label in Server.CHANNEL_MODE_CHOICES}
+            raw_mode = get('channel_mode')
+            mode = mode_by_label.get(raw_mode, raw_mode) or 'auto'
+            valid_modes = {key for key, _ in Server.CHANNEL_MODE_CHOICES}
+            if mode not in valid_modes:
+                errors.append(
+                    f'channel_mode 非法：{raw_mode}（可选 {"/".join(sorted(valid_modes))}）')
+                mode = 'auto'
+            raw_agent = get('agent')
+            agent = None
+            if raw_agent:
+                agent = agent_cache.get(raw_agent)
+                if agent is None:
+                    errors.append(f'Agent 不存在：{raw_agent}（填 Agent 名称，见「执行代理」页）')
+            if mode == 'agent' and not raw_agent:
+                errors.append('channel_mode=agent 时必须在 agent 列填写 Agent 名称')
+            parsed['channel_mode'] = mode
+            # 非「指定 Agent」模式清空钉死目标，与批量编辑口径一致
+            parsed['agent'] = agent if mode == 'agent' else None
 
         parsed['os'] = get('os')
         parsed['region'] = get('region')
