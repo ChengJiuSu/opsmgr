@@ -26,9 +26,10 @@
 
 | key | 说明 |
 |-----|------|
-| `jenkins.url` | Jenkins 根地址，如 `http://jenkins.internal:8080` |
-| `jenkins.user` | Jenkins 用户名 |
-| `jenkins.api_token` | 该用户的 API Token（用户设置 → API Token 生成） |
+| `jenkins.url` | Jenkins 根地址，如 `http://jenkins.internal:8080`（**直连模式**用） |
+| `jenkins.user` | Jenkins 用户名（直连模式用） |
+| `jenkins.api_token` | 该用户的 API Token（用户设置 → API Token 生成；直连模式用） |
+| `jenkins.agent` | 经 Agent 触发时的默认 Agent 名（manager 在公网、Jenkins 在内网时配置；留空 = 直连） |
 | `artifact.api_key` | 制品上报/下载签名 API Key（自定义随机长串；环境变量 `ARTIFACT_API_KEY` 兜底） |
 
 settings：`ARTIFACT_ROOT`（制品落盘根目录，默认 `media/artifacts`）、
@@ -64,24 +65,55 @@ apps/task_exec/runner.py               # _artifact_vars：CD 制品变量注入�
 方法配置 `config`（均可选）：
 
 ```json
-{"default_params": {"BRANCH": "master"}, "allow_unstable": false}
+{"default_params": {"BRANCH": "master"}, "allow_unstable": false, "agent": "nat-gw-01"}
 ```
 
 任务模块参数 `params`：
 
 ```json
-{"job_name": "build-app", "BRANCH": "release", "artifact_version": "1.2.3"}
+{"job_name": "build-app", "BRANCH": "release", "artifact_version": "1.2.3",
+ "agent": "nat-gw-01"}
 ```
 
 - `job_name` 必填（未填模块直接失败并给出提示；存量方法 config 中的
   job_name 仍可作兜底默认值）。
 - 构建参数 = `default_params` 被模块 `params` **覆盖合并**；
-  `job_name` / `artifact_version` 为平台保留键，不透传给 Jenkins。
+  `job_name` / `artifact_version` / `agent` 为平台保留键，不透传给 Jenkins。
 - 执行流程：`buildWithParameters`（无参 `build`）→ 队列轮询拿 build number
   → `logText/progressiveText` 增量拉日志 → 结果 `SUCCESS`（`allow_unstable`
   时 `UNSTABLE` 亦可）→ rc 0，其余 rc 1；整体受模块 `timeout` 约束
   （**CI 构建耗时长，模块 timeout 需调大**，超时 rc=124 但构建仍在 Jenkins 继续）。
 - 认证：API Token Basic Auth（Jenkins 2.96+ 免 CSRF crumb；403 时自动取 crumb 重试）。
+- 直连请求 `trust_env=False`：内网 Jenkins 走环境代理只会拿到 502。
+
+### 经 Agent 触发（manager 在公网、Jenkins 在内网）
+
+manager 到不了内网 Jenkins 时，本模块把执行单元打成 `step_type='jenkins'`
+下发 ops-agent，由 agent 在内网触发并**流式**回传控制台日志（直连模式是终态
+整段返回，经 agent 反而更实时）。
+
+通道解析（`agent_mgr.channel.resolve_service_agent`，四级取第一个命中）：
+
+```
+模块参数 params.agent  →  方法配置 config.agent  →  系统配置 jenkins.agent
+  →  AgentRoute(任务/模块的项目组 + 环境)  →  直连
+```
+
+- 主机三态那套解析用不上：Jenkins 构建不 SSH 任何主机；
+- 名字写了却查不到 agent → 模块直接失败（不静默回退直连，那只会换来一次
+  连接超时）；
+- **凭据不出通道**：payload 只带 `job_name` / `params` / `allow_unstable` /
+  `timeout`，Jenkins 连接信息在 agent 主机 `config.yaml` 的 `jenkins:` 段
+  维护（与 SSH 私钥同口径）；agent 未配置该段 → 模块 rc=126 并提示；
+- agent 侧 rc：0/1 构建成功失败，124 等待超时，143 manager 取消
+  （`abort_on_cancel` 默认 true，会连带中止 Jenkins 上的构建），
+  126 payload/配置错误，137 agent 重启中断（**Jenkins 构建不随 agent 消亡，
+  仍会跑完**）；
+- 老 agent（未上报 `capabilities`）不会被拦，由 agent 侧 `task.ack` 拒收
+  兜底；上报了能力清单且不含 `jenkins` 的，dispatch 直接 fail fast 提示升级。
+
+制品上报方向不变：Jenkins 仍直接 `POST /api/artifacts/report/` 到公网
+manager（需要 Jenkins 所在内网能出公网；不能出网时得另做 agent 代上报）。
 
 ## 接口
 

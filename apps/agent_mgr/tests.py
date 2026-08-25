@@ -11,7 +11,9 @@ from django.db.utils import IntegrityError
 from django.test import TestCase, TransactionTestCase, override_settings
 from rest_framework.test import APIClient
 
-from .channel import resolve_channel, resolve_channels
+from .channel import (
+    ChannelError, resolve_channel, resolve_channels, resolve_service_agent,
+)
 from .dispatch import run_via_agent
 from .models import AgentJob, AgentNode, AgentRoute, hash_token
 from .routing import websocket_urlpatterns
@@ -124,7 +126,8 @@ class AgentConsumerTests(TransactionTestCase):
     async def test_register_and_heartbeat(self):
         comm = await self._connect()
         await comm.send_json_to({'type': 'register', 'data': {
-            'version': '1.0.0', 'hostname': 'natgw'}})
+            'version': '1.1.0', 'hostname': 'natgw',
+            'capabilities': ['command', 'jenkins', 'playbook']}})
         reply = await comm.receive_json_from()
         self.assertEqual(reply['type'], 'register.ack')
         await comm.send_json_to({'type': 'heartbeat', 'data': {
@@ -132,8 +135,9 @@ class AgentConsumerTests(TransactionTestCase):
         await comm.receive_nothing()
         node = await AgentNode.objects.aget(pk=self.node.pk)
         self.assertEqual(node.status, 'online')
-        self.assertEqual(node.version, '1.0.0')
+        self.assertEqual(node.version, '1.1.0')
         self.assertEqual(node.meta.get('hostname'), 'natgw')
+        self.assertEqual(node.meta.get('capabilities'), ['command', 'jenkins', 'playbook'])
         self.assertEqual(node.meta.get('running_jobs'), 1)
         self.assertIsNotNone(node.last_heartbeat)
         await comm.disconnect()
@@ -211,6 +215,27 @@ class DispatchTests(TestCase):
         rc, out = run_via_agent(node, {'step_type': 'command'}, timeout=10)
         self.assertEqual(rc, 1)
         self.assertIn('已禁用', out)
+
+    def test_capability_missing_fails_fast(self):
+        node = AgentNode.objects.create(
+            name='gw-old', token_hash='x', status='online', channel_name='ch',
+            version='1.0.0', meta={'capabilities': ['command', 'playbook']})
+        rc, out = run_via_agent(node, {'step_type': 'jenkins'}, timeout=10,
+                                capability='jenkins')
+        self.assertEqual(rc, 1)
+        self.assertIn('不支持 jenkins', out)
+        self.assertFalse(AgentJob.objects.exists())
+
+    def test_capability_unknown_agent_not_blocked(self):
+        """老 agent 不上报 capabilities：不拦，交由 agent 侧 task.ack 拒收兜底。"""
+        node = AgentNode.objects.create(
+            name='gw-nocap', token_hash='x', status='online', channel_name='ch')
+        with mock.patch('apps.agent_mgr.dispatch.get_channel_layer', return_value=None):
+            rc, out = run_via_agent(node, {'step_type': 'jenkins'}, timeout=10,
+                                    capability='jenkins')
+        self.assertEqual(rc, 1)
+        self.assertIn('channel layer', out)  # 已过能力校验，卡在下发环节
+        self.assertTrue(AgentJob.objects.exists())
 
 
 class RunnerChannelSplitTests(TestCase):
@@ -410,6 +435,62 @@ class AgentRouteApiTests(BaseApiTest):
 
     def test_preview_requires_project_group(self):
         self.assertEqual(self.admin.get('/api/agent-routes/preview/').status_code, 400)
+
+
+class ServiceAgentResolveTests(TestCase):
+    """无主机执行单元（Jenkins 构建）的通道解析：显式指定 → 规则 → 直连。"""
+
+    def setUp(self):
+        from apps.asset_mgr.models import Environment, ProjectGroup
+
+        self.agent_a = AgentNode.objects.create(name='svc-gw-a', token_hash='x')
+        self.agent_b = AgentNode.objects.create(name='svc-gw-b', token_hash='y')
+        self.pg = ProjectGroup.objects.create(name='服务项目一', code='svc-p1')
+        self.env = Environment.objects.create(name='服务正式', code='svc-prod')
+
+    def test_no_candidate_no_rule_is_direct(self):
+        self.assertEqual(resolve_service_agent([]), (None, 'direct'))
+        self.assertEqual(
+            resolve_service_agent([('step', ''), ('method', None)],
+                                  project_group_id=self.pg.pk),
+            (None, 'direct'))
+
+    def test_first_non_empty_candidate_wins(self):
+        agent, source = resolve_service_agent([
+            ('step', ''), ('method', 'svc-gw-b'), ('config', 'svc-gw-a')])
+        self.assertEqual((agent, source), (self.agent_b, 'method'))
+
+    def test_unknown_agent_name_raises(self):
+        with self.assertRaises(ChannelError) as ctx:
+            resolve_service_agent([('config', 'ghost-gw')])
+        self.assertIn('ghost-gw', str(ctx.exception))
+        self.assertIn('系统配置', str(ctx.exception))
+
+    def test_falls_back_to_route_rule(self):
+        AgentRoute.objects.create(agent=self.agent_a, project_group=self.pg)
+        self.assertEqual(
+            resolve_service_agent([], project_group_id=self.pg.pk),
+            (self.agent_a, 'rule'))
+
+    def test_exact_env_rule_beats_project_default(self):
+        AgentRoute.objects.create(agent=self.agent_a, project_group=self.pg)
+        AgentRoute.objects.create(agent=self.agent_b, project_group=self.pg,
+                                  environment=self.env)
+        self.assertEqual(
+            resolve_service_agent([], project_group_id=self.pg.pk,
+                                  environment_id=self.env.pk),
+            (self.agent_b, 'rule'))
+
+    def test_explicit_name_beats_rule(self):
+        AgentRoute.objects.create(agent=self.agent_a, project_group=self.pg)
+        self.assertEqual(
+            resolve_service_agent([('step', 'svc-gw-b')], project_group_id=self.pg.pk),
+            (self.agent_b, 'step'))
+
+    def test_disabled_rule_ignored(self):
+        AgentRoute.objects.create(agent=self.agent_a, project_group=self.pg, enabled=False)
+        self.assertEqual(
+            resolve_service_agent([], project_group_id=self.pg.pk), (None, 'direct'))
 
 
 class ChannelResolveTests(TestCase):

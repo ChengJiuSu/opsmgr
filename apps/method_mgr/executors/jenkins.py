@@ -15,7 +15,18 @@
      "BRANCH": "release"}       # 其余键为构建参数，覆盖 default_params 同名项
 
 artifact_version 亦为平台保留键（CD 锁定制品版本用），不透传给 Jenkins。
-Jenkins 连接信息读系统配置：jenkins.url / jenkins.user / jenkins.api_token。
+
+执行通道两条路：
+
+- **直连**（manager 与 Jenkins 网络可达）：本模块自己发 REST，连接信息读系统
+  配置 jenkins.url / jenkins.user / jenkins.api_token；
+- **经 Agent**（manager 在公网、Jenkins 在内网）：打成 step_type='jenkins' 的
+  执行单元下发给 agent，由 agent 在内网触发并流式回传控制台日志。此路
+  **不下发任何 Jenkins 凭据**，凭据只在 agent 本地 config.yaml 维护。
+
+通道解析（agent_mgr.channel.resolve_service_agent，四级取第一个命中）：
+    模块参数 params.agent → 方法配置 config.agent
+    → 系统配置 jenkins.agent → AgentRoute(任务项目组/环境) → 直连
 """
 import re
 import time
@@ -34,8 +45,11 @@ CONSOLE_NOTE_RE = re.compile(r'(?:\x1b\[8m)?ha:////[A-Za-z0-9+/=]+(?:\x1b\[0m)?'
 ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*m')
 
 # 平台保留键，不作为 Jenkins 构建参数透传：
-#   job_name 指定触发的 job（本执行器消费）；artifact_version 由 task_exec.runner 消费
-RESERVED_PARAM_KEYS = ('job_name', 'artifact_version')
+#   job_name 指定触发的 job、agent 指定执行通道（本执行器消费）；
+#   artifact_version 由 task_exec.runner 消费
+RESERVED_PARAM_KEYS = ('job_name', 'artifact_version', 'agent')
+# 经 agent 下发时的等待余量已由 dispatch 处理，此处只传模块 timeout
+DEFAULT_TIMEOUT = 300
 
 
 class _JenkinsStepError(Exception):
@@ -45,6 +59,30 @@ class _JenkinsStepError(Exception):
         super().__init__(output)
         self.rc = rc
         self.output = output
+
+
+def _resolve_agent(step, config):
+    """解析该 Jenkins 模块的执行通道，返回 (agent 或 None, source)。
+
+    候选名按优先级取第一个非空；全空时按任务维度（模块自定义范围优先于任务
+    全局）回落到 AgentRoute 规则。
+    """
+    from apps.agent_mgr.channel import (
+        SOURCE_CONFIG, SOURCE_METHOD, SOURCE_STEP, resolve_service_agent,
+    )
+    from apps.system_cfg.services import get_config
+
+    candidates = [
+        (SOURCE_STEP, (step.params or {}).get('agent')),
+        (SOURCE_METHOD, config.get('agent')),
+        (SOURCE_CONFIG, get_config('jenkins.agent')),
+    ]
+    scope = step if step.use_custom_scope else step.task
+    return resolve_service_agent(
+        candidates,
+        project_group_id=scope.project_group_id,
+        environment_id=scope.environment_id,
+    )
 
 
 def _jenkins_settings():
@@ -68,19 +106,16 @@ class JenkinsExecutor(BaseExecutor):
 
     def execute(self, task, method, inventory_path=None, servers=None, on_data=None):
         # task 为 TaskStep：params/timeout 为模块级入参；Jenkins 构建不涉及目标主机，
-        # 忽略 inventory_path；构建日志按轮询整段同步，暂不走 on_data 流式回传。
+        # 忽略 inventory_path 与 servers。直连路径按轮询整段同步（不走 on_data），
+        # 经 agent 路径由 agent 分片回传，on_data 实时可见。
+        step = task
         config = method.config or {}
         try:
             self.validate_config(config)
         except ValueError as exc:
             return 1, str(exc)
 
-        base_url, user, token = _jenkins_settings()
-        if not (base_url and user and token):
-            return 1, ('Jenkins 连接信息不完整，请在「系统配置」维护 '
-                       'jenkins.url / jenkins.user / jenkins.api_token。')
-
-        step_params = task.params or {}
+        step_params = step.params or {}
         # job 由任务模块参数指定（方法为公共能力，不绑定具体 job）；
         # 兼容存量：方法 config 中的 job_name 仍作为兜底默认值
         job_name = str(step_params.get('job_name') or config.get('job_name') or '').strip()
@@ -94,9 +129,30 @@ class JenkinsExecutor(BaseExecutor):
             params.pop(key, None)
         params = {str(k): str(v) for k, v in params.items()}
 
+        from apps.agent_mgr.channel import ChannelError
+
+        try:
+            agent, source = _resolve_agent(step, config)
+        except ChannelError as exc:
+            return 1, str(exc)
+        if agent is not None:
+            return self._run_via_agent(agent, source, step, job_name, params, config, on_data)
+        return self._run_direct(step, job_name, params, config)
+
+    # ── 直连路径 ──────────────────────────────────────────
+
+    def _run_direct(self, step, job_name, params, config):
+        base_url, user, token = _jenkins_settings()
+        if not (base_url and user and token):
+            return 1, ('Jenkins 连接信息不完整，请在「系统配置」维护 '
+                       'jenkins.url / jenkins.user / jenkins.api_token；'
+                       'Jenkins 在内网时改为配置 jenkins.agent 经 Agent 触发。')
+
         session = requests.Session()
         session.auth = (user, token)
-        deadline = time.monotonic() + (task.timeout or 300)
+        # trust_env=False：内网 Jenkins 走环境代理只会拿到 502
+        session.trust_env = False
+        deadline = time.monotonic() + (step.timeout or DEFAULT_TIMEOUT)
 
         try:
             return self._trigger_and_wait(session, base_url, job_name, params, config, deadline)
@@ -104,6 +160,30 @@ class JenkinsExecutor(BaseExecutor):
             return exc.rc, exc.output
         except requests.RequestException as exc:
             return 1, f'Jenkins 请求异常：{exc}'
+
+    # ── Agent 通道路径 ────────────────────────────────────
+
+    def _run_via_agent(self, agent, source, step, job_name, params, config, on_data):
+        """打成 jenkins 执行单元下发 agent，阻塞等终态；输出加通道标头。"""
+        from apps.agent_mgr.channel import SOURCE_LABELS
+        from apps.agent_mgr.dispatch import run_via_agent
+
+        timeout = step.timeout or DEFAULT_TIMEOUT
+        payload = {
+            'step_type': 'jenkins',
+            'job_name': job_name,
+            'params': params,
+            'allow_unstable': bool(config.get('allow_unstable')),
+            'timeout': timeout,
+        }
+        header = f'───── [经 Agent {agent.name} · {SOURCE_LABELS[source]}] ─────'
+        if on_data:
+            on_data(header + '\n')
+        rc, output = run_via_agent(
+            agent, payload, timeout=timeout,
+            task_id=step.task_id, step_order=step.order, on_data=on_data,
+            capability='jenkins')
+        return rc, f'{header}\n{output}'
 
     # ── 内部流程（失败抛 _JenkinsStepError）────────────────
 

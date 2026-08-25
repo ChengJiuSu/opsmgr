@@ -1,4 +1,4 @@
-"""平台方法 Jenkins 执行器测试（requests 全程 mock，无需真实 Jenkins）。"""
+"""平台方法执行器测试（Jenkins 直连 requests 全程 mock，经 Agent 路径 mock 下发）。"""
 from types import SimpleNamespace
 from unittest import mock
 
@@ -29,13 +29,20 @@ class FakeResp:
         return self._json
 
 
-def _step(params=None, timeout=60):
-    """执行器只读取 TaskStep 的 params/timeout，用简单对象即可。
+def _step(params=None, timeout=60, project_group_id=None, environment_id=None,
+          use_custom_scope=False, order=1, task_id=1):
+    """执行器只读取 TaskStep 的少量字段，用简单对象即可。
 
-    job_name 由模块参数指定，默认给出以覆盖主流程用例。
+    job_name 由模块参数指定，默认给出以覆盖主流程用例；project_group/environment
+    经 step.task 提供（通道解析按任务维度回落 AgentRoute 规则）。
     """
-    return SimpleNamespace(params={'job_name': 'build-app'} if params is None else params,
-                           timeout=timeout)
+    return SimpleNamespace(
+        params={'job_name': 'build-app'} if params is None else params,
+        timeout=timeout, order=order, task_id=task_id,
+        use_custom_scope=use_custom_scope,
+        project_group_id=project_group_id, environment_id=environment_id,
+        task=SimpleNamespace(project_group_id=project_group_id,
+                             environment_id=environment_id))
 
 
 class JenkinsExecutorTests(TestCase):
@@ -181,6 +188,128 @@ class JenkinsExecutorTests(TestCase):
         })
         self.assertFalse(s.is_valid())
         self.assertIn('config', s.errors)
+
+
+class JenkinsViaAgentTests(TestCase):
+    """Jenkins 经 Agent 通道：通道解析优先级、payload 形状、通道层失败。"""
+
+    def setUp(self):
+        from apps.agent_mgr.models import AgentNode, AgentRoute
+        from apps.asset_mgr.models import Environment, ProjectGroup
+
+        SystemConfig.objects.create(key='jenkins.url', value=BASE)
+        SystemConfig.objects.create(key='jenkins.user', value='ops')
+        SystemConfig.objects.create(key='jenkins.api_token', value='token-xyz')
+        self.agent = AgentNode.objects.create(
+            name='nat-gw-01', token_hash='x', status='online', channel_name='ch',
+            meta={'capabilities': ['command', 'jenkins', 'playbook']})
+        self.agent2 = AgentNode.objects.create(name='nat-gw-02', token_hash='y')
+        self.pg = ProjectGroup.objects.create(name='CI 项目', code='ci-p1')
+        self.env = Environment.objects.create(name='CI 正式', code='ci-prod')
+        self.route_cls = AgentRoute
+        self.method = Method(
+            name='构建', code='build-app', provider='jenkins',
+            config={'default_params': {'BRANCH': 'master'}})
+        self.executor = get_executor('jenkins')
+
+    def _execute(self, step, method=None, rc=0, output='ok'):
+        """mock run_via_agent，返回 (执行结果, 调用参数 kwargs, payload)。"""
+        with mock.patch('apps.agent_mgr.dispatch.run_via_agent',
+                        return_value=(rc, output)) as dispatched:
+            result = self.executor.execute(step, method or self.method)
+        args, kwargs = dispatched.call_args
+        return result, kwargs, args[1]
+
+    def test_system_config_routes_to_agent(self):
+        SystemConfig.objects.create(key='jenkins.agent', value='nat-gw-01')
+        (code, output), kwargs, payload = self._execute(_step(params={
+            'job_name': 'build-app', 'BRANCH': 'release'}))
+        self.assertEqual(code, 0)
+        self.assertIn('经 Agent nat-gw-01 · 系统配置', output)
+        self.assertIn('ok', output)
+        self.assertEqual(payload, {
+            'step_type': 'jenkins', 'job_name': 'build-app',
+            'params': {'BRANCH': 'release'}, 'allow_unstable': False, 'timeout': 60})
+        self.assertEqual(kwargs['capability'], 'jenkins')
+        self.assertEqual(kwargs['timeout'], 60)
+        self.assertEqual(kwargs['step_order'], 1)
+
+    def test_step_param_beats_method_and_config(self):
+        SystemConfig.objects.create(key='jenkins.agent', value='nat-gw-02')
+        self.method.config = dict(self.method.config, agent='nat-gw-02')
+        (code, output), _, _ = self._execute(_step(params={
+            'job_name': 'build-app', 'agent': 'nat-gw-01'}))
+        self.assertEqual(code, 0)
+        self.assertIn('经 Agent nat-gw-01 · 模块参数', output)
+
+    def test_method_config_beats_system_config(self):
+        SystemConfig.objects.create(key='jenkins.agent', value='nat-gw-02')
+        self.method.config = dict(self.method.config, agent='nat-gw-01')
+        (_, output), _, _ = self._execute(_step())
+        self.assertIn('经 Agent nat-gw-01 · 方法配置', output)
+
+    def test_agent_reserved_key_not_passed_to_jenkins(self):
+        SystemConfig.objects.create(key='jenkins.agent', value='nat-gw-01')
+        _, _, payload = self._execute(_step(params={
+            'job_name': 'build-app', 'agent': 'nat-gw-01', 'artifact_version': '1.2.3',
+            'BRANCH': 'dev'}))
+        self.assertEqual(payload['params'], {'BRANCH': 'dev'})
+
+    def test_route_rule_fallback(self):
+        self.route_cls.objects.create(agent=self.agent, project_group=self.pg)
+        (_, output), _, _ = self._execute(_step(project_group_id=self.pg.pk,
+                                                environment_id=self.env.pk))
+        self.assertIn('经 Agent nat-gw-01 · 路由规则', output)
+
+    def test_custom_scope_dims_used_when_enabled(self):
+        """模块自定义范围时按模块维度解析，不看任务全局维度。"""
+        self.route_cls.objects.create(agent=self.agent, project_group=self.pg)
+        step = _step(project_group_id=self.pg.pk, use_custom_scope=True)
+        step.task = SimpleNamespace(project_group_id=None, environment_id=None)
+        (_, output), _, _ = self._execute(step)
+        self.assertIn('经 Agent nat-gw-01', output)
+
+    def test_unknown_agent_name_fails_without_dispatch(self):
+        SystemConfig.objects.create(key='jenkins.agent', value='ghost-gw')
+        with mock.patch('apps.agent_mgr.dispatch.run_via_agent') as dispatched, \
+                mock.patch('apps.method_mgr.executors.jenkins.requests.Session') as session:
+            rc, output = self.executor.execute(_step(), self.method)
+        self.assertEqual(rc, 1)
+        self.assertIn('ghost-gw', output)
+        dispatched.assert_not_called()
+        session.assert_not_called()
+
+    def test_allow_unstable_passed_through(self):
+        SystemConfig.objects.create(key='jenkins.agent', value='nat-gw-01')
+        self.method.config = dict(self.method.config, allow_unstable=True)
+        _, _, payload = self._execute(_step())
+        self.assertTrue(payload['allow_unstable'])
+
+    def test_channel_failure_propagates_rc(self):
+        SystemConfig.objects.create(key='jenkins.agent', value='nat-gw-01')
+        (rc, output), _, _ = self._execute(
+            _step(), rc=1, output='Agent「nat-gw-01」离线（最近心跳：从未），无法下发。')
+        self.assertEqual(rc, 1)
+        self.assertIn('离线', output)
+
+    def test_offline_agent_real_dispatch_fails_fast(self):
+        """不 mock dispatch：离线 agent 应在下发前失败，不落 AgentJob。"""
+        from apps.agent_mgr.models import AgentJob
+
+        SystemConfig.objects.create(key='jenkins.agent', value='nat-gw-02')  # 从未连接
+        rc, output = self.executor.execute(_step(), self.method)
+        self.assertEqual(rc, 1)
+        self.assertIn('离线', output)
+        self.assertFalse(AgentJob.objects.exists())
+
+    def test_direct_when_no_agent_configured(self):
+        """无任何 agent 配置与规则：仍走直连 REST（现状不变）。"""
+        with mock.patch('apps.method_mgr.executors.jenkins.requests.Session') as session:
+            session.return_value.post.return_value = FakeResp(status=500, text='boom')
+            rc, output = self.executor.execute(_step(), self.method)
+        self.assertEqual(rc, 1)
+        self.assertIn('HTTP 500', output)
+        self.assertFalse(session.return_value.trust_env)
 
 
 class JumpServerExecutorTests(TestCase):

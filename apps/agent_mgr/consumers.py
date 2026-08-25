@@ -85,9 +85,16 @@ class AgentConsumer(AsyncJsonWebsocketConsumer):
                 'code': 'internal', 'message': f'消息处理失败：{msg_type}'}})
 
     async def _on_register(self, data):
+        # capabilities：agent 支持的 step_type 清单（command/playbook/jenkins…）。
+        # 老 agent 不上报，此时 meta 里没有该键，dispatch 侧按「不校验」处理。
+        capabilities = data.get('capabilities')
         await self._update_node(
             version=str(data.get('version') or '')[:32],
-            meta_patch={'hostname': data.get('hostname', '')},
+            meta_patch={
+                'hostname': data.get('hostname', ''),
+                'capabilities': ([str(c) for c in capabilities]
+                                 if isinstance(capabilities, list) else None),
+            },
         )
         await self.send_json({'type': 'register.ack', 'data': {'name': self.agent_name}})
 

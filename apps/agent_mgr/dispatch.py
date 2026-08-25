@@ -21,24 +21,34 @@ POLL_INTERVAL = 1  # 秒
 DISPATCH_MARGIN = 60  # 等待余量：模块 timeout 之外留给下发/回传的时间
 
 
-def agent_offline_reason(agent):
-    """下发前置检查，返回不可下发原因（None = 可下发）。"""
+def agent_offline_reason(agent, capability=None):
+    """下发前置检查，返回不可下发原因（None = 可下发）。
+
+    capability 非空时额外校验 agent 上报的能力清单（register 时落 meta）：
+    老 agent 不上报 capabilities，此时不校验，由 agent 侧 task.ack 拒收兜底。
+    """
     if not agent.enabled:
         return f'Agent「{agent.name}」已禁用。'
     if agent.status != 'online' or not agent.channel_name:
         return f'Agent「{agent.name}」离线（最近心跳：{agent.last_heartbeat or "从未"}），无法下发。'
+    capabilities = (agent.meta or {}).get('capabilities')
+    if capability and isinstance(capabilities, list) and capability not in capabilities:
+        return (f'Agent「{agent.name}」（版本 {agent.version or "未知"}）不支持 '
+                f'{capability} 执行单元，请升级 agent。当前能力：'
+                f'{"、".join(capabilities) or "无"}。')
     return None
 
 
 def run_via_agent(agent, payload, timeout, task_id=None, log_id=None,
-                  step_order=None, on_data=None):
+                  step_order=None, on_data=None, capability=None):
     """经 agent 执行一个模块单元，阻塞等待终态，返回 (rc, output)。
 
     通道层失败（离线/拒收/等待超时）rc=1/124，输出为中文原因；
-    执行结果 rc 与 ansible 输出由 agent 上报原样透传。on_data 为实时输出
-    回调：轮询到新分片即回调增量（agent 侧日志分片由 consumer 异步落库）。
+    执行结果 rc 与 agent 侧输出原样透传。on_data 为实时输出回调：轮询到新
+    分片即回调增量（agent 侧日志分片由 consumer 异步落库）。capability 为
+    该 payload 需要的 agent 能力（如 'jenkins'），用于对老 agent fail fast。
     """
-    reason = agent_offline_reason(agent)
+    reason = agent_offline_reason(agent, capability=capability)
     if reason:
         return 1, reason
 

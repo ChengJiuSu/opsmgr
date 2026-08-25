@@ -1,6 +1,6 @@
 # ops-agent 设计文档
 
-> 状态：v1 已实现（2026-07-27）。manager 侧模块文档：`docs/backend/modules/agent.md`；
+> 状态：v1 已实现（2026-07-27）；Jenkins 代触发已实现（2026-08-25，见 3.4 / 4.6）。manager 侧模块文档：`docs/backend/modules/agent.md`；
 > agent 代码：独立仓库 `~/workspace/ops-agent`。
 > 关联模块：`agent_mgr`（新增）、`task_exec`（任务执行）、`asset_mgr`（服务器）
 >
@@ -102,7 +102,7 @@ JSON 文本帧，统一信封：
 
 | 类型 | 方向 | data 字段 | 说明 |
 |------|------|-----------|------|
-| `register` | agent → mgr | `agent_name, version, hostname, capabilities` | 连接后首条消息，manager 校验后回 `register.ack` |
+| `register` | agent → mgr | `agent_name, version, hostname, capabilities` | 连接后首条消息，manager 校验后回 `register.ack`；`capabilities` 为支持的 step_type 清单（`command`/`playbook`/`jenkins`），落 `AgentNode.meta`，下发时对老 agent fail fast（未上报则不校验） |
 | `heartbeat` | agent → mgr | `running_tasks, load1, disk_free_pct, version` | 30s 周期 |
 | `task.dispatch` | mgr → agent | 见 3.4 | 下发一个「模块执行单元」 |
 | `task.ack` | agent → mgr | `job_id, accepted, reason` | 收单确认；队列满/磁盘不足时 `accepted=false` |
@@ -140,6 +140,7 @@ manager 侧完成全部业务解析（主机匹配、变量注入、凭据选择
 }
 ```
 
+- `step_type='jenkins'` 的单元不涉及主机，payload 形状另一套（见下）；
 - `inventory` 直接下发文本，agent 落临时文件后传给 ansible，**复用 manager
   现有动态 inventory 口径**（主机名别名、`service_types` 变量、服务分组）；
 - NAT 内主机 `conn_ip` 回退私网 IP 的现有逻辑正好适配：agent 在内网，
@@ -147,6 +148,45 @@ manager 侧完成全部业务解析（主机匹配、变量注入、凭据选择
 - **SSH 凭据不下发**：私钥驻留 agent 主机（`~/.ssh` 或配置指定路径），
   manager 只下发 `ansible_user/ansible_port`（已在 inventory 内）。降低
   密钥在通道与 manager 库中暴露的面。
+
+### 3.4.1 Jenkins 执行单元（`step_type='jenkins'`）
+
+manager 部署在公网、Jenkins 在公司内网时，manager 直连不通，改由 agent 代
+触发（2026-08-25 落地）：
+
+```json
+{
+  "job_id": "uuid",
+  "task_id": 42, "step_order": 2,
+  "step_type": "jenkins",
+  "job_name": "build-app",
+  "params": {"BRANCH": "release"},
+  "allow_unstable": false,
+  "timeout": 1800
+}
+```
+
+- **凭据不下发**：Jenkins url/user/api_token 在 agent 本地 `config.yaml` 的
+  `jenkins:` 段维护，与 3.4 的 SSH 私钥同一原则（密钥不出通道、不入 manager
+  库）。agent 未配置该段 → rc=126 并回传中文提示；
+- agent 侧流程：`buildWithParameters`（无参用 `build`，403 取 crumb 重试）
+  → 队列轮询拿 build 号 → `logText/progressiveText` 增量拉控制台日志（剥
+  ConsoleNote/ANSI，逐行经 `log.chunk` 回传）→ `api/json` 取构建结果；
+- rc：0 = SUCCESS（或 UNSTABLE 且 `allow_unstable`），1 = 其余结果/请求失败，
+  124 等待超时，143 manager 取消，126 payload/配置错误；
+- `task.cancel` 与等待超时：agent 停止跟踪并按 `abort_on_cancel`（默认 true）
+  `POST <build_url>/stop` 中止 Jenkins 上的构建；
+- 与 ansible 单元**分开计并发**（`max_concurrent_jenkins_jobs`，默认 4）：
+  Jenkins 单元是纯 IO 等待，不该占用 ansible 的执行槽；
+- HTTP 用标准库 urllib（不新增 agent 依赖），阻塞调用经 `asyncio.to_thread`
+  出让事件循环；忽略环境 `http_proxy`（内网 Jenkins 走代理只会拿 502）。
+
+**副产品**：经 agent 的 Jenkins 日志是实时分片回传的，比 manager 直连模式
+（终态整段返回）更早可见。
+
+**已知边界**：agent 重启时该单元按 rc=137 上报中断，但 Jenkins 上的构建不随
+agent 进程消亡，仍会跑完（与 ansible 子进程不同）；v2 可用 spool 里的
+build_url 重连续跟。
 
 ### 3.5 Ansible 项目目录同步（playbook 模块）
 
@@ -253,7 +293,25 @@ v2 候选：规则加优先级与备用 agent 列表（主 agent 离线自动降
 - `AgentConsumer` 职责：鉴权、register、心跳落库、dispatch 转发、
   log/result 落库与 ack、断线置 offline。
 
-### 4.6 管理与可视化
+### 4.6 Jenkins 方法的通道解析（无目标主机）
+
+Jenkins 构建不 SSH 任何主机，主机三态解析用不上，改由
+`agent_mgr.channel.resolve_service_agent` 四级解析：
+
+```
+模块参数 params.agent  →  方法配置 config.agent  →  系统配置 jenkins.agent
+  →  AgentRoute(任务/模块的项目组 + 环境)  →  直连
+```
+
+- 名字写了却查不到 agent → 抛 `ChannelError`，模块直接失败。**不静默回退
+  直连**：公网 manager 直连内网 Jenkins 只会换来一次连接超时；
+- 模块 `use_custom_scope=True` 时按模块维度解析，否则按任务全局维度；
+- `params.agent` 与 `job_name`/`artifact_version` 同为平台保留键，不透传给
+  Jenkins；
+- 解析不出 agent 时走原直连路径（`method_mgr/executors/jenkins.py` 自己发
+  REST，连接信息读系统配置 `jenkins.*`），存量部署行为不变。
+
+### 4.7 管理与可视化
 
 - 「Agent 管理」页：列表（名称/状态/版本/最近心跳/运行任务数）、创建
   （生成 token，一次性展示）、禁用/删除；
@@ -415,7 +473,8 @@ steps_result / 失败处理（retry/skip/abort）流程。
 | v1 | Channels 接入 + AgentNode 模型/管理页 + Server.agent 通道字段 + runner 通道分组下发 + agent（心跳/command/playbook/日志回传/留存/资源限制） | NAT 主机可经 agent 执行任务流，日志前端实时可见 |
 | v1.1 | task.cancel 取消、崩溃恢复补传、磁盘水位清理 | 可靠性补齐 |
 | P1（2026-08-24） | 主机通道三态 + 项目组/环境路由规则 + 有效通道展示 | 新增主机自动继承通道，管理服可钉死直连 |
-| v2 | 剧本 commit 校验、method 模块经 agent（provider 透传）、多 agent 冷备切换、心跳携带指标进 dashboard | 能力扩展 |
+| P2（2026-08-25） | Jenkins 代触发：`step_type='jenkins'` 单元 + agent 侧 REST 客户端 + register capabilities + 四级通道解析 + 系统配置 `jenkins.agent` | 公网 manager 可触发内网 Jenkins，构建日志实时回传 |
+| v2 | 剧本 commit 校验、ansible_playbook method 经 agent、多 Jenkins 实例（payload 带实例名）、agent 重启后按 build_url 续跟构建、多 agent 冷备切换、心跳指标进 dashboard | 能力扩展 |
 
 ### 现有代码改造点清单
 
@@ -427,6 +486,8 @@ steps_result / 失败处理（retry/skip/abort）流程。
 | `apps/asset_mgr/models.py` | Server + `agent` FK、`channel_mode` 三态（迁移），序列化器/表单 |
 | `apps/agent_mgr/channel.py` | 通道解析唯一口径（runner / 证书分发 / 序列化共用） |
 | `apps/task_exec/runner.py` | 模块主机按通道分组；agent 组走 dispatch 等待，输出拼接 |
+| `apps/method_mgr/executors/jenkins.py` | 直连/经 agent 双路：解析出 agent 则打 `step_type='jenkins'` payload 下发（P2） |
+| `ops-agent/ops_agent/jenkins.py` | agent 侧 Jenkins REST 客户端与执行句柄（P2） |
 | `frontend` | Agent 管理页；服务器表单「执行通道」项 |
 | `ops-agent/`（新仓库或本仓库子目录） | agent 全部代码 |
 

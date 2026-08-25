@@ -27,8 +27,10 @@ class Method(models.Model):
     )
     # provider 专属配置。ansible_playbook: {"playbook": "site.yml", "tags": "nginx,restart",
     #   "limit": ""}（主机/inventory 由任务执行入口按所选服务器动态生成）；
-    #   jenkins: {"default_params": {"BRANCH": "master"}, "allow_unstable": false}
-    #   （job 不绑定在方法上，由任务模块 params.job_name 指定；构建参数被模块 params 覆盖合并）；
+    #   jenkins: {"default_params": {"BRANCH": "master"}, "allow_unstable": false,
+    #     "agent": "nat-gw-01"}（job 不绑定在方法上，由任务模块 params.job_name 指定；
+    #     构建参数被模块 params 覆盖合并；agent 指定执行通道，留空按系统配置
+    #     jenkins.agent 与通道路由解析，见 method_mgr/executors/jenkins.py）；
     #   cloud_host: {"action": "reboot", ...}
     config = models.JSONField('方法配置', default=dict, blank=True)
     # 预留：方法接受的参数定义，用于前端动态表单/校验

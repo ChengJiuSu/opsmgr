@@ -15,7 +15,7 @@
     </div>
 
     <el-alert type="info" :closable="false" show-icon style="margin-bottom:12px">
-      平台方法用于集中管理可复用的执行能力。Ansible 剧本方法 = 指定剧本文件 + tags；Jenkins 构建方法 = 指定 Job 触发 CI（连接信息在「系统配置」维护 jenkins.url / jenkins.user / jenkins.api_token）；JumpServer 注册方法 = 把目标主机注册为 JumpServer 资产（jumpserver.url / jumpserver.token）；云主机管理等 provider 为后续扩展预留。
+      平台方法用于集中管理可复用的执行能力。Ansible 剧本方法 = 指定剧本文件 + tags；Jenkins 构建方法 = 指定 Job 触发 CI（直连时连接信息在「系统配置」维护 jenkins.url / jenkins.user / jenkins.api_token；Jenkins 在内网时经 Agent 触发，凭据放 agent 本机 config.yaml）；JumpServer 注册方法 = 把目标主机注册为 JumpServer 资产（jumpserver.url / jumpserver.token）；云主机管理等 provider 为后续扩展预留。
     </el-alert>
 
     <el-table v-loading="loading" :data="tableData" stripe>
@@ -40,6 +40,9 @@
             <el-tag size="small" type="info">job 由任务参数指定</el-tag>
             <el-tag v-if="Object.keys(row.config?.default_params || {}).length" size="small" type="info" style="margin-left:6px">
               默认参数 {{ Object.keys(row.config.default_params).length }} 项
+            </el-tag>
+            <el-tag v-if="row.config?.agent" size="small" type="warning" style="margin-left:6px">
+              Agent {{ row.config.agent }}
             </el-tag>
           </span>
           <span v-else class="muted">—</span>
@@ -108,9 +111,14 @@
           <el-switch v-model="form.config.allow_unstable" />
           <span class="form-tip">开启后 UNSTABLE 构建结果视为成功</span>
         </el-form-item>
+        <el-form-item label="执行 Agent">
+          <el-input v-model="form.config.agent" placeholder="留空=按系统配置 jenkins.agent 与通道路由解析" />
+          <span class="form-tip">填 Agent 名则本方法固定经该 Agent 触发（Jenkins 在内网时用）</span>
+        </el-form-item>
         <el-alert type="warning" :closable="false" style="margin-bottom:18px">
           Jenkins 方法为公共方法，不绑定具体 job：任务模块的方法参数中通过
-          <code>"job_name"</code> 指定要触发的 job。
+          <code>"job_name"</code> 指定要触发的 job；模块参数 <code>"agent"</code>
+          可临时覆盖执行通道。
         </el-alert>
       </template>
 
@@ -168,7 +176,7 @@ const rawParams = ref('{}')
 const emptyForm = () => ({
   name: '', code: '', provider: 'ansible_playbook', description: '', service_type: null,
   enabled: true,
-  config: { playbook: '', tags: '', inventory: '', limit: '', allow_unstable: false },
+  config: { playbook: '', tags: '', inventory: '', limit: '', allow_unstable: false, agent: '' },
 })
 const form = reactive(emptyForm())
 const rules = {
@@ -216,7 +224,7 @@ function openDialog(row = null) {
       name: row.name, code: row.code, provider: row.provider,
       description: row.description, enabled: row.enabled, service_type: row.service_type,
       config: {
-        playbook: '', tags: '', inventory: '', limit: '', allow_unstable: false,
+        playbook: '', tags: '', inventory: '', limit: '', allow_unstable: false, agent: '',
         ...(row.config || {}),
       },
     })
@@ -249,6 +257,9 @@ async function handleSubmit() {
       default_params: defaultParams,
       allow_unstable: !!form.config.allow_unstable,
     }
+    // 留空即不写 agent 键：解析回落到系统配置与通道路由
+    const agent = (form.config.agent || '').trim()
+    if (agent) config.agent = agent
   } else if (form.provider !== 'ansible_playbook') {
     try {
       config = JSON.parse(rawConfig.value || '{}')

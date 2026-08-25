@@ -13,11 +13,15 @@ NAT 出口执行代理（ops-agent）的服务端：agent 主动外连 WebSocket
 路由到 agent 通道的主机组打包为**自包含执行单元**（AgentJob）下发，agent
 本地调用 ansible 执行并流式回传日志。
 
+执行单元有三类 `step_type`：`command` / `playbook`（agent 侧调 ansible）与
+`jenkins`（agent 侧调内网 Jenkins REST，用于 manager 在公网而 Jenkins 在内网
+的场景，见 `docs/backend/modules/artifacts.md`）。
+
 | 概念 | 说明 |
 |------|------|
 | `AgentNode` | 一台 NAT 出口主机上的 agent；token 只存哈希，明文仅创建/重置时展示一次 |
 | `AgentJob` | 一次下发单元（任务流某模块的某 agent 主机组）；payload + 日志缓冲 + 终态；与 task_exec 仅以 task_id/log_id 整型弱关联 |
-| `AgentRoute` | 通道路由规则：项目组（必填）+ 环境（可空 = 该项目组默认）→ agent，只对 `channel_mode='auto'` 的主机生效 |
+| `AgentRoute` | 通道路由规则：项目组（必填）+ 环境（可空 = 该项目组默认）→ agent，对 `channel_mode='auto'` 的主机与无主机单元（Jenkins）生效 |
 | 执行通道 | `asset_mgr.Server.channel_mode` 三态 + `agent` 外键；解析口径见下节，全项目唯一实现在 `channel.py` |
 
 ---
@@ -27,7 +31,8 @@ NAT 出口执行代理（ops-agent）的服务端：agent 主动外连 WebSocket
 ```
 apps/agent_mgr/
 ├── models.py      # AgentNode / AgentJob / AgentRoute / hash_token（sha256 口径）
-├── channel.py     # 执行通道解析：主机三态 + 路由规则 → (agent, source)
+├── channel.py     # 执行通道解析：主机三态 + 路由规则 → (agent, source)；
+│                  #   resolve_service_agent：无主机单元（Jenkins）的四级解析
 ├── consumers.py   # AgentConsumer：鉴权、心跳落库、log.chunk 幂等追加、result 终态
 ├── dispatch.py    # run_via_agent：创建 job → channel layer 下发 → 轮询终态（同步阻塞）
 ├── routing.py     # /ws/agent/ 路由（ops_manager/asgi.py 挂载）
@@ -57,6 +62,11 @@ Server.channel_mode='auto'（默认）：
 - 规则命中不看 `AgentNode.enabled`：**禁用 agent 不改路由**，只影响建连，
   下发时 dispatch fail fast。要回退直连请停用规则（`AgentRoute.enabled=False`），
   否则 NAT 主机静默走直连只会换来 SSH 超时。
+- **无目标主机的执行单元**（Jenkins 构建）走 `resolve_service_agent(candidates,
+  project_group_id, environment_id)`：`candidates` 为 `[(source, agent_name)…]`
+  按优先级（模块参数 → 方法配置 → 系统配置 `jenkins.agent`），取第一个非空名
+  查库，全空时回落同一张 `AgentRoute` 表，仍无命中 → 直连。名字写了查不到
+  抛 `ChannelError`（调用方转模块失败文案），**不静默回退直连**。
 - 规则唯一性：`(项目组, 环境)` 与 `(项目组, 环境为空)` 两条带条件唯一约束
   （SQL 中 `NULL != NULL`，默认规则必须单独约束）；序列化器把冲突转中文报错。
 - 上线顺序：**先把管理服批量置 `direct`，再建规则**，否则自身有公网 IP 的
@@ -73,10 +83,12 @@ Server.channel_mode='auto'（默认）：
 
 ## 下发与可靠回传
 
-- `run_via_agent(agent, payload, timeout)` 同步阻塞（与 runner 每模块同步
-  语义一致）：离线/禁用 fail fast 不落 job；下发后 1s 轮询 AgentJob 至
-  终态，超时（模块 timeout + 60s 余量）置 failed(rc=124) 并转发
-  `task.cancel`。
+- `run_via_agent(agent, payload, timeout, capability=None)` 同步阻塞（与
+  runner 每模块同步语义一致）：离线/禁用 fail fast 不落 job；下发后 1s 轮询
+  AgentJob 至终态，超时（模块 timeout + 60s 余量）置 failed(rc=124) 并转发
+  `task.cancel`。`capability`（如 `'jenkins'`）非空时校验 agent `register`
+  上报的能力清单（落 `meta.capabilities`）：不支持则 fail fast 提示升级；
+  老 agent 不上报该字段时不校验，由 agent 侧 `task.ack` 拒收兜底。
 - 日志分片 `log.chunk` 携带严格递增 `chunk_seq`：Consumer 只追加大于当前
   游标的分片（重复/乱序重 ack 游标，agent 按游标补传），单 job 输出上限
   2MB 超限截断。`task.result` 幂等，重复上报只重 ack。
@@ -100,9 +112,11 @@ Server.channel_mode='auto'（默认）：
 - 下发前把 payload 的 inventory 与变量归档到执行记录目录
   `TASK_LOG_DIR/<task_id>/<log_id>.d/step<order>/agent-<agent_id>/`，
   供事后在 agent 主机上复现。
-- v1 限制：方法模块不走 agent 通道（ansible_playbook provider 遇 agent
-  通道主机提前失败并提示）；模块执行中 agent 日志不实时进任务输出（终态
-  后整段并入，v1.1 计划流式合并）。
+- 方法模块：`ansible_playbook` provider 仍不走 agent 通道（遇 agent 通道主机
+  提前失败并提示）；`jenkins` provider **已支持**，按 `resolve_service_agent`
+  解析后下发 `step_type='jenkins'` 单元，payload 只含 job 名/构建参数/
+  allow_unstable/timeout，**不含任何 Jenkins 凭据**（凭据在 agent 本地
+  config.yaml）。
 
 ## 接口
 
@@ -133,9 +147,11 @@ WS   /ws/agent/                          agent 接入（握手头 Authorization:
 
 ## 消息协议摘要
 
-上行（agent → manager）：`register`、`heartbeat`、`task.ack`、`log.chunk`、
-`task.result`；下行：`register.ack`、`task.dispatch`、`task.cancel`、
-`log.ack`、`result.ack`、`error`。字段明细见设计文档第 3.3/3.4 节。
+上行（agent → manager）：`register`（含 `capabilities`：支持的 step_type
+清单）、`heartbeat`、`task.ack`、`log.chunk`、`task.result`；下行：
+`register.ack`、`task.dispatch`（`step_type` = command / playbook /
+jenkins）、`task.cancel`、`log.ack`、`result.ack`、`error`。字段明细见设计
+文档第 3.3/3.4 节。
 
 ## 部署
 

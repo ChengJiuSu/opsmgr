@@ -17,6 +17,10 @@
   由 dispatch fail fast 给出明确原因。要让主机回退直连请停用规则本身
   （AgentRoute.enabled=False），而不是禁用 agent——NAT 主机静默改走直连只会
   换来一次 SSH 超时。
+
+无目标主机的执行单元（Jenkins 构建）走 resolve_service_agent：主机三态无从
+谈起，改由「模块参数 → 方法配置 → 系统配置 jenkins.agent → 项目组/环境规则」
+四级解析（同一张 AgentRoute 表）。
 """
 from .models import AgentNode, AgentRoute
 
@@ -24,12 +28,23 @@ from .models import AgentNode, AgentRoute
 SOURCE_HOST = 'host'
 SOURCE_RULE = 'rule'
 SOURCE_DIRECT = 'direct'
+# 无主机执行单元（Jenkins 构建等）的显式指定来源，优先级由高到低
+SOURCE_STEP = 'step'
+SOURCE_METHOD = 'method'
+SOURCE_CONFIG = 'config'
 # 来源中文名：错误文案与前端展示共用，避免各处自己拼
 SOURCE_LABELS = {
     SOURCE_HOST: '主机指定',
     SOURCE_RULE: '路由规则',
     SOURCE_DIRECT: '直连',
+    SOURCE_STEP: '模块参数',
+    SOURCE_METHOD: '方法配置',
+    SOURCE_CONFIG: '系统配置',
 }
+
+
+class ChannelError(Exception):
+    """通道解析失败（如指定的 agent 名不存在），文案直接面向使用者。"""
 
 
 def _load_rules(project_group_ids):
@@ -107,3 +122,35 @@ def resolve_channel(server):
 def resolve_agent(server):
     """单主机只取 agent（None = 直连）。"""
     return resolve_channel(server)[0]
+
+
+def resolve_service_agent(candidates, project_group_id=None, environment_id=None):
+    """无目标主机的执行单元（Jenkins 构建等）解析通道，返回 (agent 或 None, source)。
+
+    主机维度的解析（resolve_channels）用不上：这类单元不 SSH 任何主机，
+    「该走哪个 agent」只能由配置指定或按任务维度回落。
+
+        candidates：[(source, agent_name), ...] 按优先级排列（模块参数 →
+          方法配置 → 系统配置），取第一个非空名字查库；
+        项目组/环境：候选名全空时按 AgentRoute 规则回落（与主机 auto 同一张表，
+          同一套两级优先级），无规则命中 → 直连。
+
+    名字写了却查不到 agent 时抛 ChannelError，不静默回退直连——公网 manager
+    直连内网 Jenkins 只会换来一次连接超时。
+    """
+    for source, name in candidates:
+        name = (name or '').strip()
+        if not name:
+            continue
+        agent = AgentNode.objects.filter(name=name).first()
+        if agent is None:
+            raise ChannelError(
+                f'{SOURCE_LABELS[source]}指定的 Agent「{name}」不存在，请在'
+                f'「Agent 管理」核对名称。')
+        return agent, source
+    if project_group_id:
+        exact, default = _load_rules([project_group_id])
+        agent = exact.get((project_group_id, environment_id)) or default.get(project_group_id)
+        if agent is not None:
+            return agent, SOURCE_RULE
+    return None, SOURCE_DIRECT
