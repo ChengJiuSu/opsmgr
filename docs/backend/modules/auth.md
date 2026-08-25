@@ -195,7 +195,7 @@ POST /api/auth/mfa/verify/  {mfa_token, code}
 | 通道 | 谁能用 | 说明 |
 |------|--------|------|
 | `POST /api/auth/users/{id}/reset_mfa/` | 管理员 | 清绑定，用户下次登录重新绑。不构成越权：管理员本来就能 `reset_password`，清 MFA 后仍要密码才能登 |
-| `manage.py mfa_reset <username> [--yes]` | 服务器 shell | **开启全员强制前必须先确认这条命令可用**：最后一个管理员也丢了验证器时，Web 上就没人能给他重置了 |
+| `manage.py mfa_reset <username> [--yes]` | 服务器 shell | **开启全员强制前必须先确认这条命令可用**：最后一个管理员也丢了验证器时，Web 上就没人能给他重置了。验证请用 `--check`（只读报告状态），别拿真账号跑真清除 |
 
 解绑与重发恢复码要**密码 + 当前验证码**双确认：只要密码不够（钓鱼拿得到），
 只要验证码也不够（捡到已解锁手机就行），两个都要才算本人。
@@ -204,6 +204,16 @@ POST /api/auth/mfa/verify/  {mfa_token, code}
 
 MFA 相关请求都是写操作，由审计中间件记录；`code` / `secret` / `recovery_code`
 在敏感键名表里，入库前打码（见 `docs/backend/modules/audit.md`）。
+
+### 部署要点
+
+- **必须执行迁移** `auth_mgr.0002`（建 `auth_user_mfa` / `auth_mfa_recovery_code`）。
+  `LoginView` 每次登录都查 `UserMFA` 判断是否走第二步，漏迁移的表现是全站登不
+  进去（`no such table: auth_user_mfa`），不是「MFA 功能不可用」而已。
+  部署脚本与 docker 入口会自动跑，手工 `git pull` 的路径要自己补。
+- `.env` 配 `MFA_SECRET_KEY`（留空则与 `SECRET_KEY` 绑死，之后无法单独轮换）。
+- 开强制前先确认 `manage.py mfa_reset <用户名>` 可用、服务器 NTP 正常。
+- 完整顺序见 `deploy/README.md` 的「上线后配置」。
 
 ---
 

@@ -61,7 +61,7 @@ pip install Django djangorestframework djangorestframework-simplejwt \
     django-cors-headers python-decouple drf-spectacular daphne channels requests
 
 # 3. 数据库迁移
-python manage.py migrate
+python manage.py migrate   # 拉取新代码后若带了新迁移，需重跑
 
 # 4. 创建管理员账号
 python manage.py createsuperuser

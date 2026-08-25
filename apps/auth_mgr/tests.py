@@ -558,3 +558,13 @@ class MfaAdminResetTests(TestCase):
         from django.core.management import call_command
         call_command('mfa_reset', 'hank', '--yes')
         self.assertFalse(UserMFA.objects.filter(user=self.target).exists())
+
+    def test_management_command_check_is_read_only(self):
+        """--check 只报状态：部署前验证兜底通道时不能顺手清掉真绑定。"""
+        from io import StringIO
+
+        from django.core.management import call_command
+        out = StringIO()
+        call_command('mfa_reset', 'hank', '--check', stdout=out)
+        self.assertIn('已启用', out.getvalue())
+        self.assertTrue(UserMFA.objects.filter(user=self.target).exists())
