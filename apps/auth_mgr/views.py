@@ -1,10 +1,14 @@
+import logging
+
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
 from django.db.models import Q
 from drf_spectacular.utils import OpenApiResponse, extend_schema, inline_serializer
-from rest_framework import serializers, viewsets
+from rest_framework import serializers, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import APIException
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
 from rest_framework_simplejwt.exceptions import TokenError
@@ -12,6 +16,8 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 
 from common.permissions import IsAdmin
+from common.ratelimit import blocked_seconds, record_failure, reset
+from common.request import client_ip
 from common.response import fail, ok
 
 from .serializers import (
@@ -21,10 +27,69 @@ from .serializers import (
 )
 
 User = get_user_model()
+logger = logging.getLogger(__name__)
+
+# 限速分桶：按用户名与按客户端 IP 各算一份（阈值见 settings）
+SCOPE_USER = 'login_user'
+SCOPE_IP = 'login_ip'
 
 
 class LoginView(TokenObtainPairView):
+    """JWT 登录，带失败限速。
+
+    窗口内失败达阈值即锁定，锁定期直接 429 且**不再校验密码**——密码正确也
+    不放行，否则限速只是给攻击者多一次尝试机会。用户名与 IP 分开计数，IP
+    阈值宽松（办公网共用出口 IP，见 settings.LOGIN_FAIL_IP_LIMIT 注释）。
+    缓存不可用时放行并告警（common.ratelimit 的 fail-open 取舍）。
+    """
+
     serializer_class = CustomTokenObtainPairSerializer
+
+    def post(self, request, *args, **kwargs):
+        username = str(request.data.get('username') or '')[:150].lower()
+        ip = client_ip(request)
+        buckets = [(SCOPE_USER, username), (SCOPE_IP, ip)]
+
+        for scope, ident in buckets:
+            if not ident:
+                continue
+            remaining = blocked_seconds(scope, ident)
+            if remaining:
+                logger.warning('登录被限速：scope=%s ip=%s user=%s 剩余 %ss',
+                               scope, ip, username, remaining)
+                minutes = max(1, -(-remaining // 60))  # 向上取整，别显示「0 分钟后」
+                return fail(f'登录失败次数过多，请 {minutes} 分钟后再试。',
+                            code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            status=status.HTTP_429_TOO_MANY_REQUESTS)
+
+        try:
+            response = super().post(request, *args, **kwargs)
+        except APIException:
+            # 凭据错误 / 账号停用：simplejwt 抛 AuthenticationFailed 或校验异常
+            self._record_failure(buckets, ip, username)
+            raise
+
+        if response.status_code == 200:
+            for scope, ident in buckets:
+                if ident:
+                    reset(scope, ident)
+        else:
+            self._record_failure(buckets, ip, username)
+        return response
+
+    @staticmethod
+    def _record_failure(buckets, ip, username):
+        limits = {SCOPE_USER: settings.LOGIN_FAIL_LIMIT,
+                  SCOPE_IP: settings.LOGIN_FAIL_IP_LIMIT}
+        for scope, ident in buckets:
+            if not ident:
+                continue
+            blocked = record_failure(
+                scope, ident, limit=limits[scope],
+                window=settings.LOGIN_FAIL_WINDOW, block=settings.LOGIN_FAIL_BLOCK)
+            if blocked:
+                logger.warning('登录失败超阈值，锁定 %ss：scope=%s ip=%s user=%s',
+                               blocked, scope, ip, username)
 
 
 class LogoutView(APIView):

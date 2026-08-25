@@ -140,6 +140,8 @@ CORS_ALLOWED_ORIGINS=http://localhost:5173
 JWT_ACCESS_TOKEN_LIFETIME_MINUTES=60
 JWT_REFRESH_TOKEN_LIFETIME_DAYS=7
 REDIS_URL=redis://127.0.0.1:6379/0
+# 缓存后端：登录失败限速的计数存这里，多进程部署必须 redis（dev 默认 memory）
+CACHE_BACKEND=redis
 ```
 
 ---

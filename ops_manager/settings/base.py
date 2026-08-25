@@ -286,6 +286,60 @@ def channel_layers_for(backend):
 CHANNEL_LAYER_BACKEND = config('CHANNEL_LAYER_BACKEND', default='redis')
 CHANNEL_LAYERS = channel_layers_for(CHANNEL_LAYER_BACKEND)
 
+# ── 缓存（登录失败限速等跨进程状态）───────────────────────
+# CACHE_BACKEND 选层：
+#   redis  —— 跨进程共享，复用 celery 同一 Redis（KEY_PREFIX 隔开键空间）。
+#             生产必须用它：WSGI/daphne/celery 是各自独立的进程，限速计数必须
+#             读写同一份。
+#   memory —— 进程内 LocMemCache，仅本地开发与测试可用。多进程下每个 worker
+#             各算一份配额，限速形同虚设（等于把阈值乘以进程数）。
+# dev.py 默认 memory（本地免装 Redis），prod.py 不覆盖即 redis。
+CACHE_BACKENDS = ('redis', 'memory')
+# 缓存超时兜底（秒）：各调用点都显式传 timeout，这里只防漏传写成永不过期
+CACHE_DEFAULT_TIMEOUT = 300
+
+
+def caches_for(backend):
+    """按后端名构造 CACHES（名字非法直接报错，避免静默退回 Redis）。"""
+    if backend not in CACHE_BACKENDS:
+        raise ImproperlyConfigured(
+            f'CACHE_BACKEND 只能是 {"/".join(CACHE_BACKENDS)}，收到 {backend!r}')
+    if backend == 'memory':
+        return {'default': {
+            'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+            'LOCATION': 'ops-manager',
+            'TIMEOUT': CACHE_DEFAULT_TIMEOUT,
+        }}
+    return {'default': {
+        'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+        'LOCATION': CACHE_URL,
+        'KEY_PREFIX': 'opsmgr',
+        'TIMEOUT': CACHE_DEFAULT_TIMEOUT,
+        # OPTIONS 里除 pool_class/parser_class/serializer 外的键会原样透给
+        # redis-py 的 ConnectionPool.from_url，用来给「Redis 卡住」兜底：
+        # 登录路径同步读缓存，不设超时会把请求一起挂死。
+        'OPTIONS': {
+            'socket_timeout': 3,
+            'socket_connect_timeout': 3,
+        },
+    }}
+
+
+# 缓存 Redis 地址：默认与 celery 同库，键有 KEY_PREFIX 前缀不会串；
+# 想彻底隔开就把 CACHE_URL 指到别的 db（如 redis://127.0.0.1:6379/2）
+CACHE_URL = config('CACHE_URL', default=REDIS_URL)
+CACHE_BACKEND = config('CACHE_BACKEND', default='redis')
+CACHES = caches_for(CACHE_BACKEND)
+
+# ── 登录失败限速（common/ratelimit.py）────────────────────
+# 窗口内累计失败达阈值即锁定，锁定期内直接 429，不再校验密码。
+# 按用户与按 IP 分别计数：IP 阈值刻意宽松——办公网整层人共用一个出口 IP，
+# 阈值定小了一个人反复输错就能把全组挡在门外；用户阈值才是防爆破主力。
+LOGIN_FAIL_LIMIT = config('LOGIN_FAIL_LIMIT', default=10, cast=int)
+LOGIN_FAIL_IP_LIMIT = config('LOGIN_FAIL_IP_LIMIT', default=50, cast=int)
+LOGIN_FAIL_WINDOW = config('LOGIN_FAIL_WINDOW', default=900, cast=int)
+LOGIN_FAIL_BLOCK = config('LOGIN_FAIL_BLOCK', default=900, cast=int)
+
 # ── 任务执行后端 ──────────────────────────────────────────
 # thread（默认，无需 Redis）/ celery（生产，需 worker）/ sync（同步，测试用）
 TASK_EXEC_BACKEND = config('TASK_EXEC_BACKEND', default='thread')

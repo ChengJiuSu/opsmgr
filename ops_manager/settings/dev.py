@@ -21,6 +21,11 @@ CORS_ALLOW_ALL_ORIGINS = True
 CHANNEL_LAYER_BACKEND = config('CHANNEL_LAYER_BACKEND', default='memory')
 CHANNEL_LAYERS = channel_layers_for(CHANNEL_LAYER_BACKEND)
 
+# 缓存默认进程内（本地免装 Redis）；测试同样走这里，无需外部依赖。
+# 本地要验限速的跨进程行为时设 CACHE_BACKEND=redis
+CACHE_BACKEND = config('CACHE_BACKEND', default='memory')
+CACHES = caches_for(CACHE_BACKEND)
+
 # 开发环境日志默认 DEBUG（可通过 LOG_LEVEL 环境变量覆盖）
 LOGGING['root']['level'] = config('LOG_LEVEL', default='DEBUG')
 LOGGING['loggers']['django']['level'] = config('LOG_LEVEL', default='DEBUG')

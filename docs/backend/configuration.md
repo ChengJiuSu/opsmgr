@@ -13,6 +13,12 @@
 | `JWT_REFRESH_TOKEN_LIFETIME_DAYS` | `7` | Refresh Token 有效期（天）|
 | `REDIS_URL` | `redis://127.0.0.1:6379/0` | Redis 连接地址 |
 | `CHANNEL_LAYER_BACKEND` | `redis`（dev 默认 `memory`）| channel layer 后端：`redis` 跨进程，`memory` 进程内免依赖 |
+| `CACHE_BACKEND` | `redis`（dev 默认 `memory`）| 缓存后端：登录限速计数存这里，多进程必须 `redis` |
+| `CACHE_URL` | 同 `REDIS_URL` | 缓存 Redis 地址（键带 `opsmgr` 前缀，与 celery 同库不串；要彻底隔开就换 db 号）|
+| `LOGIN_FAIL_LIMIT` | `10` | 同一用户名在窗口内的失败次数上限，超限锁定 |
+| `LOGIN_FAIL_IP_LIMIT` | `50` | 同一客户端 IP 的失败上限（办公网共用出口 IP，刻意宽松）|
+| `LOGIN_FAIL_WINDOW` | `900` | 失败计数窗口（秒）|
+| `LOGIN_FAIL_BLOCK` | `900` | 触发后的锁定时长（秒）|
 
 ---
 
@@ -41,6 +47,10 @@ os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'ops_manager.settings.dev')
 - `TASK_EXEC_BACKEND=celery`（Redis 同时作为 broker/result backend）；
 - 多进程运行（gunicorn 多 worker、daphne 多进程）；
 - 调试 ops-agent 下发（`agent_mgr` 的 WebSocket 与 runner 不在同一进程时）。
+
+`CACHE_BACKEND` 同理：默认 `LocMemCache` 是**进程内**的，WSGI/daphne/celery
+各算一份登录失败计数，等于把阈值乘以进程数——生产必须 `redis`。缓存不可用时
+限速**放行并告警**（fail-open）：运维平台正是故障时最需要能登进去的系统。
 
 用 `memory` 层而跨了进程时不会报错，只会静默失效：日志推送收不到（前端自动回退
 轮询），agent 下发返回失败。
