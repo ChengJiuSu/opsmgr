@@ -9,21 +9,35 @@ from drf_spectacular.utils import OpenApiResponse, extend_schema, inline_seriali
 from rest_framework import serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import APIException
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
+
+from rest_framework_simplejwt.exceptions import TokenError as SimpleJWTTokenError
 
 from common.permissions import IsAdmin
 from common.ratelimit import blocked_seconds, record_failure, reset
 from common.request import client_ip
 from common.response import fail, ok
 
+from . import services
 from .serializers import (
     ChangePasswordSerializer,
     CustomTokenObtainPairSerializer,
+    MfaCodeSerializer,
+    MfaSensitiveSerializer,
+    MfaVerifySerializer,
     UserSerializer,
+)
+from .tokens import (
+    consume_challenge,
+    count_attempt,
+    issue_after_mfa,
+    issue_challenge,
+    load_challenge,
 )
 
 User = get_user_model()
@@ -32,6 +46,7 @@ logger = logging.getLogger(__name__)
 # 限速分桶：按用户名与按客户端 IP 各算一份（阈值见 settings）
 SCOPE_USER = 'login_user'
 SCOPE_IP = 'login_ip'
+SCOPE_MFA_USER = 'mfa_user'
 
 
 class LoginView(TokenObtainPairView):
@@ -62,20 +77,32 @@ class LoginView(TokenObtainPairView):
                             code=status.HTTP_429_TOO_MANY_REQUESTS,
                             status=status.HTTP_429_TOO_MANY_REQUESTS)
 
+        serializer = self.get_serializer(data=request.data)
         try:
-            response = super().post(request, *args, **kwargs)
+            serializer.is_valid(raise_exception=True)
         except APIException:
             # 凭据错误 / 账号停用：simplejwt 抛 AuthenticationFailed 或校验异常
             self._record_failure(buckets, ip, username)
             raise
 
-        if response.status_code == 200:
-            for scope, ident in buckets:
-                if ident:
-                    reset(scope, ident)
-        else:
-            self._record_failure(buckets, ip, username)
-        return response
+        user = serializer.user
+        for scope, ident in buckets:
+            if ident:
+                reset(scope, ident)
+
+        if services.is_enabled(user):
+            # 已绑定：这一步不发访问令牌，只发短时效挑战票据（token_type='mfa'，
+            # 当 Bearer 用会被认证类拒），换正式令牌见 /api/auth/mfa/verify/
+            token, ttl = issue_challenge(user)
+            logger.info('用户 %s 密码通过，等待 MFA 校验', user.username)
+            return Response({'mfa_required': True, 'mfa_token': token, 'expires_in': ttl})
+
+        data = dict(serializer.validated_data)
+        if services.required_for(user):
+            # 在强制范围内却没绑：正常发令牌（amr 只有 pwd），但前端要立刻跳
+            # 绑定页；除白名单外的接口由 MfaJWTAuthentication 挡住
+            data['mfa_enrollment_required'] = True
+        return Response(data)
 
     @staticmethod
     def _record_failure(buckets, ip, username):
@@ -90,6 +117,154 @@ class LoginView(TokenObtainPairView):
             if blocked:
                 logger.warning('登录失败超阈值，锁定 %ss：scope=%s ip=%s user=%s',
                                blocked, scope, ip, username)
+
+
+class MfaVerifyView(APIView):
+    """登录第二步：挑战票据 + 验证码（或恢复码）→ 正式令牌。"""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []  # 此时还没有访问令牌
+
+    @extend_schema(request=MfaVerifySerializer, responses=OpenApiResponse(
+        description='access + refresh'))
+    def post(self, request):
+        serializer = MfaVerifySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        ip = client_ip(request)
+
+        try:
+            challenge = load_challenge(serializer.validated_data['mfa_token'])
+        except SimpleJWTTokenError as exc:
+            return fail(f'{exc}'.strip() or '验证票据无效或已过期，请重新登录。',
+                        status=status.HTTP_401_UNAUTHORIZED)
+
+        user = User.objects.filter(pk=challenge.get('user_id')).first()
+        if user is None or not user.is_active:
+            consume_challenge(challenge)
+            return fail('账号不存在或已停用。', status=status.HTTP_401_UNAUTHORIZED)
+
+        # 票据内计次之外再按用户/IP 计一份：换票据重试同样受限
+        for scope, ident in ((SCOPE_MFA_USER, user.username.lower()), (SCOPE_IP, ip)):
+            if ident and blocked_seconds(scope, ident):
+                return fail('验证失败次数过多，请稍后再试。',
+                            code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            status=status.HTTP_429_TOO_MANY_REQUESTS)
+
+        try:
+            method = services.verify(user, serializer.validated_data['code'])
+        except services.MfaError as exc:
+            remaining = count_attempt(challenge)
+            self._record_mfa_failure(user, ip)
+            if remaining == 0:
+                return fail('验证码错误次数过多，请重新登录。',
+                            status=status.HTTP_401_UNAUTHORIZED)
+            return fail(f'{exc}（还可尝试 {remaining} 次）',
+                        status=status.HTTP_400_BAD_REQUEST)
+
+        consume_challenge(challenge)
+        reset(SCOPE_MFA_USER, user.username.lower())
+        if ip:
+            reset(SCOPE_IP, ip)
+        logger.info('用户 %s 通过 MFA 校验（%s）', user.username, method)
+        data = issue_after_mfa(user)
+        if method == 'recovery':
+            data['recovery_codes_left'] = services.status(user)['recovery_codes_left']
+        return Response(data)
+
+    @staticmethod
+    def _record_mfa_failure(user, ip):
+        limits = ((SCOPE_MFA_USER, user.username.lower(), settings.LOGIN_FAIL_LIMIT),
+                  (SCOPE_IP, ip, settings.LOGIN_FAIL_IP_LIMIT))
+        for scope, ident, limit in limits:
+            if ident:
+                record_failure(scope, ident, limit=limit,
+                               window=settings.LOGIN_FAIL_WINDOW,
+                               block=settings.LOGIN_FAIL_BLOCK)
+
+
+class MfaStatusView(APIView):
+    """当前用户的 MFA 状态（前端据此显示绑定入口或已绑定）。"""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return ok(services.status(request.user))
+
+
+class MfaSetupView(APIView):
+    """开始绑定：返回二维码 URI、手动密钥与恢复码（**仅此一次**明文可见）。"""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(responses=OpenApiResponse(description='secret / uri / recovery_codes'))
+    def post(self, request):
+        try:
+            return ok(services.start_enrollment(request.user))
+        except services.MfaError as exc:
+            return fail(str(exc))
+
+
+class MfaActivateView(APIView):
+    """用一个正确验证码启用绑定（验过才启用，避免把自己锁在门外）。"""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(request=MfaCodeSerializer, responses=OpenApiResponse(description='已启用'))
+    def post(self, request):
+        serializer = MfaCodeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            services.activate(request.user, serializer.validated_data['code'])
+        except services.MfaError as exc:
+            return fail(str(exc))
+        # 绑定完成后换一套带 otp 声明的令牌，否则强制策略下当前会话仍被挡
+        return ok(issue_after_mfa(request.user), msg='MFA 已启用')
+
+
+class MfaDisableView(APIView):
+    """解绑：需密码 + 当前验证码。"""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(request=MfaSensitiveSerializer,
+                   responses=OpenApiResponse(description='已解绑'))
+    def post(self, request):
+        error = _check_password_and_code(request)
+        if error:
+            return error
+        services.disable(request.user)
+        return ok(msg='MFA 已解绑')
+
+
+class MfaRecoveryCodesView(APIView):
+    """重新生成恢复码（旧码全部作废）：需密码 + 当前验证码。"""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(request=MfaSensitiveSerializer,
+                   responses=OpenApiResponse(description='新恢复码'))
+    def post(self, request):
+        error = _check_password_and_code(request)
+        if error:
+            return error
+        try:
+            codes = services.regenerate_recovery_codes(request.user)
+        except services.MfaError as exc:
+            return fail(str(exc))
+        return ok({'recovery_codes': codes}, msg='恢复码已重新生成，旧码已全部作废')
+
+
+def _check_password_and_code(request):
+    """敏感操作双确认，通过返回 None，否则返回失败响应。"""
+    serializer = MfaSensitiveSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    if not request.user.check_password(serializer.validated_data['password']):
+        return fail('密码不正确')
+    try:
+        services.verify(request.user, serializer.validated_data['code'])
+    except services.MfaError as exc:
+        return fail(str(exc))
+    return None
 
 
 class LogoutView(APIView):
@@ -183,6 +358,21 @@ class UserViewSet(viewsets.ModelViewSet):
         user.is_active = not user.is_active
         user.save(update_fields=['is_active'])
         return ok({'is_active': user.is_active})
+
+    @action(detail=True, methods=['post'])
+    def reset_mfa(self, request, pk=None):
+        """清除该用户的 MFA 绑定（丢手机时的兜底），用户下次登录需重新绑定。
+
+        不构成越权：管理员本来就能 reset_password，清 MFA 之后仍要密码才能
+        登录。操作会进审计与日志。
+        """
+        user = self.get_object()
+        if not services.is_enabled(user) and services.get_binding(user) is None:
+            return fail(f'用户 {user.username} 未绑定 MFA')
+        services.reset(user)
+        logger.warning('管理员 %s 重置了用户 %s 的 MFA 绑定',
+                       request.user.username, user.username)
+        return ok(msg=f'已清除 {user.username} 的 MFA 绑定')
 
     @action(detail=True, methods=['post'])
     def reset_password(self, request, pk=None):

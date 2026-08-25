@@ -23,7 +23,23 @@ def custom_exception_handler(exc, context):
             'msg': _extract_msg(response.data),
             'data': None,
         }
+        # 机器可读错误码（DRF 异常的 default_code，如 mfa_enrollment_required）：
+        # 前端靠它区分「该跳绑定页」与普通 403，不必去匹配提示文案
+        error_code = _extract_code(exc)
+        if error_code:
+            response.data['error_code'] = error_code
     return response
+
+
+def _extract_code(exc):
+    codes = getattr(exc, 'get_codes', None)
+    if codes is None:
+        return None
+    try:
+        value = codes()
+    except Exception:  # noqa: BLE001 - 取不到错误码不影响主响应
+        return None
+    return value if isinstance(value, str) else None
 
 
 def _extract_msg(data):

@@ -182,7 +182,9 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 # ── DRF 配置 ──────────────────────────────────────────────
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
+        # JWTAuthentication 的子类，额外做 MFA 强制检查（放认证层而非权限层：
+        # 大量 ViewSet 自带 permission_classes，全局默认权限对它们不生效）
+        'apps.auth_mgr.authentication.MfaJWTAuthentication',
     ),
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
@@ -285,6 +287,20 @@ def channel_layers_for(backend):
 
 CHANNEL_LAYER_BACKEND = config('CHANNEL_LAYER_BACKEND', default='redis')
 CHANNEL_LAYERS = channel_layers_for(CHANNEL_LAYER_BACKEND)
+
+# ── MFA（二次认证）────────────────────────────────────────
+# TOTP 密钥的加密 key（common/crypto.py）。留空则从 SECRET_KEY 派生；
+# 换 key 会让已绑定用户的密钥全部解不开（需管理员重置绑定），生产建议显式
+# 配置并与 SECRET_KEY 分开轮换。
+MFA_SECRET_KEY = config('MFA_SECRET_KEY', default='')
+# 扫码后在验证器 App 里显示的归属名
+MFA_ISSUER = config('MFA_ISSUER', default='OpsManager')
+# 二次认证挑战票据（登录第一步返回）的有效期（秒）：够输一次码即可
+MFA_CHALLENGE_TTL = config('MFA_CHALLENGE_TTL', default=300, cast=int)
+# 单张挑战票据允许的验证码错误次数，超了作废票据、要求重新输密码
+MFA_MAX_ATTEMPTS = config('MFA_MAX_ATTEMPTS', default=5, cast=int)
+# 恢复码数量（一次性展示，用一个作废一个）
+MFA_RECOVERY_CODES = config('MFA_RECOVERY_CODES', default=10, cast=int)
 
 # ── 缓存（登录失败限速等跨进程状态）───────────────────────
 # CACHE_BACKEND 选层：

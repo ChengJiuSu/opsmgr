@@ -106,6 +106,9 @@
                 <el-dropdown-item command="password">
                   <el-icon><Lock /></el-icon> 修改密码
                 </el-dropdown-item>
+                <el-dropdown-item command="mfa">
+                  <el-icon><Key /></el-icon> 二次认证
+                </el-dropdown-item>
                 <el-dropdown-item command="logout" divided>
                   <el-icon><SwitchButton /></el-icon> 退出登录
                 </el-dropdown-item>
@@ -147,7 +150,7 @@ import { ref, reactive } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   Monitor, DataBoard, Box, Document, Setting, SetUp,
-  Fold, Expand, ArrowDown, SwitchButton, Lock, Promotion, Cloudy,
+  Fold, Expand, ArrowDown, SwitchButton, Lock, Promotion, Cloudy, Key,
 } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../stores/auth'
@@ -183,6 +186,8 @@ async function handleCommand(cmd) {
     Object.assign(pwdForm, { old_password: '', new_password: '', confirm: '' })
     pwdVisible.value = true
     pwdFormRef.value?.clearValidate()
+  } else if (cmd === 'mfa') {
+    router.push({ name: 'SecurityMfa' })
   }
 }
 

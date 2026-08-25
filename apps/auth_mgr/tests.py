@@ -1,10 +1,17 @@
-"""认证测试：登录失败限速（按用户 / 按 IP）、成功清零、缓存故障放行。"""
+"""认证测试：登录限速、MFA 绑定链路、两步登录、强制策略与管理员重置。"""
 from unittest import mock
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
+from rest_framework_simplejwt.tokens import AccessToken
+
+from apps.system_cfg.models import SystemConfig
+from common import totp
+
+from .models import MFARecoveryCode, UserMFA
 
 User = get_user_model()
 PASSWORD = 'Pass!2345xyz'
@@ -116,3 +123,438 @@ class LoginRateLimitTests(TestCase):
             for _ in range(5):
                 self.assertEqual(self._login(password=WRONG).status_code, 401)
             self.assertEqual(self._login().status_code, 200)
+
+
+@override_settings(**SMALL_LIMITS)
+class MfaEnrollmentTests(TestCase):
+    """绑定链路：setup → activate，以及解绑/恢复码的双确认。"""
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create(username='carol')
+        self.user.set_password(PASSWORD)
+        self.user.save()
+        self.client = APIClient()
+        self._auth()
+
+    def tearDown(self):
+        cache.clear()
+
+    def _auth(self, token=None):
+        if token is None:
+            r = self.client.post('/api/auth/login/',
+                                 {'username': 'carol', 'password': PASSWORD}, format='json')
+            token = r.json()['access']
+        self.client.credentials(HTTP_AUTHORIZATION='Bearer ' + token)
+
+    @staticmethod
+    def _code(secret, offset=0):
+        return totp.code_at(secret, totp.current_counter() + offset)
+
+    def test_status_before_setup(self):
+        data = self.client.get('/api/auth/mfa/status/').json()['data']
+        self.assertFalse(data['enabled'])
+        self.assertFalse(data['pending'])
+        self.assertEqual(data['recovery_codes_left'], 0)
+
+    def test_setup_returns_secret_uri_and_codes(self):
+        data = self.client.post('/api/auth/mfa/setup/').json()['data']
+        self.assertTrue(data['secret'])
+        self.assertIn('otpauth://totp/', data['uri'])
+        self.assertEqual(len(data['recovery_codes']), settings.MFA_RECOVERY_CODES)
+        # 密钥加密入库，不是明文
+        binding = UserMFA.objects.get(user=self.user)
+        self.assertNotIn(data['secret'], binding.secret_enc)
+        self.assertEqual(binding.get_secret(), data['secret'])
+        self.assertFalse(binding.enabled)  # 未激活前不生效
+        # 恢复码只存哈希
+        for row in MFARecoveryCode.objects.filter(user=self.user):
+            self.assertEqual(len(row.code_hash), 64)
+            for code in data['recovery_codes']:
+                self.assertNotIn(code.replace('-', ''), row.code_hash)
+
+    def test_activate_with_wrong_code_keeps_disabled(self):
+        self.client.post('/api/auth/mfa/setup/')
+        r = self.client.post('/api/auth/mfa/activate/', {'code': '000000'}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertFalse(UserMFA.objects.get(user=self.user).enabled)
+
+    def test_activate_success_returns_new_tokens(self):
+        secret = self.client.post('/api/auth/mfa/setup/').json()['data']['secret']
+        r = self.client.post('/api/auth/mfa/activate/',
+                             {'code': self._code(secret)}, format='json')
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(UserMFA.objects.get(user=self.user).enabled)
+        # 新令牌带 otp 声明，强制策略下当前会话不会被自己挡住
+        access = AccessToken(r.json()['data']['access'])
+        self.assertEqual(access['amr'], ['pwd', 'otp'])
+
+    def test_setup_rejected_when_already_enabled(self):
+        secret = self.client.post('/api/auth/mfa/setup/').json()['data']['secret']
+        self.client.post('/api/auth/mfa/activate/', {'code': self._code(secret)},
+                         format='json')
+        r = self.client.post('/api/auth/mfa/setup/')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('已绑定', r.json()['msg'])
+
+    def test_disable_requires_password_and_code(self):
+        secret = self._enable()
+        bad = self.client.post('/api/auth/mfa/disable/',
+                               {'password': 'nope', 'code': self._code(secret)},
+                               format='json')
+        self.assertEqual(bad.status_code, 400)
+        self.assertTrue(UserMFA.objects.filter(user=self.user).exists())
+        ok_resp = self.client.post('/api/auth/mfa/disable/',
+                                   {'password': PASSWORD, 'code': self._code(secret, 1)},
+                                   format='json')
+        self.assertEqual(ok_resp.status_code, 200)
+        self.assertFalse(UserMFA.objects.filter(user=self.user).exists())
+        self.assertFalse(MFARecoveryCode.objects.filter(user=self.user).exists())
+
+    def test_regenerate_recovery_codes_invalidates_old(self):
+        secret = self._enable()
+        old = list(MFARecoveryCode.objects.filter(user=self.user)
+                   .values_list('code_hash', flat=True))
+        r = self.client.post('/api/auth/mfa/recovery-codes/',
+                             {'password': PASSWORD, 'code': self._code(secret, 1)},
+                             format='json')
+        self.assertEqual(r.status_code, 200)
+        new = list(MFARecoveryCode.objects.filter(user=self.user)
+                   .values_list('code_hash', flat=True))
+        self.assertEqual(len(new), settings.MFA_RECOVERY_CODES)
+        self.assertFalse(set(old) & set(new))
+
+    def _enable(self):
+        secret = self.client.post('/api/auth/mfa/setup/').json()['data']['secret']
+        r = self.client.post('/api/auth/mfa/activate/', {'code': self._code(secret)},
+                             format='json')
+        self._auth(r.json()['data']['access'])
+        return secret
+
+
+@override_settings(LOGIN_FAIL_LIMIT=30, LOGIN_FAIL_IP_LIMIT=99,
+                   LOGIN_FAIL_WINDOW=900, LOGIN_FAIL_BLOCK=900,
+                   MFA_MAX_ATTEMPTS=3)
+class MfaLoginTests(TestCase):
+    """两步登录：挑战票据、验证码/恢复码、防重放、票据一次性与错误次数。
+
+    限速阈值放宽：本类专测票据机制，限速与 MFA 的联动单独在
+    MfaRateLimitTests 里验。激活用的是当前时间窗的码（last_counter 已推进），
+    所以后续用例一律取 +1 窗口的码——同一个窗口的码用过就不再认（防重放）。
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create(username='dave')
+        self.user.set_password(PASSWORD)
+        self.user.save()
+        self.client = APIClient()
+        self.secret, self.recovery = self._enable_mfa()
+        self.client.credentials()  # 后续用例从未登录态开始
+
+    def tearDown(self):
+        cache.clear()
+
+    def _enable_mfa(self):
+        r = self.client.post('/api/auth/login/',
+                             {'username': 'dave', 'password': PASSWORD}, format='json')
+        self.client.credentials(HTTP_AUTHORIZATION='Bearer ' + r.json()['access'])
+        data = self.client.post('/api/auth/mfa/setup/').json()['data']
+        self.client.post('/api/auth/mfa/activate/',
+                         {'code': self._code(data['secret'])}, format='json')
+        return data['secret'], data['recovery_codes']
+
+    @staticmethod
+    def _code(secret, offset=0):
+        return totp.code_at(secret, totp.current_counter() + offset)
+
+    def _password_step(self):
+        r = self.client.post('/api/auth/login/',
+                             {'username': 'dave', 'password': PASSWORD}, format='json')
+        self.assertEqual(r.status_code, 200)
+        return r.json()
+
+    def test_password_step_returns_challenge_not_tokens(self):
+        body = self._password_step()
+        self.assertTrue(body['mfa_required'])
+        self.assertNotIn('access', body)
+        self.assertNotIn('refresh', body)
+        self.assertEqual(body['expires_in'], settings.MFA_CHALLENGE_TTL)
+
+    def test_challenge_token_is_not_usable_as_access_token(self):
+        """票据 token_type='mfa'，当 Bearer 用必须被拒，否则第一步就等于登录成功。"""
+        body = self._password_step()
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION='Bearer ' + body['mfa_token'])
+        self.assertEqual(client.get('/api/auth/me/').status_code, 401)
+
+    def test_verify_returns_tokens_with_otp_amr(self):
+        body = self._password_step()
+        r = self.client.post('/api/auth/mfa/verify/',
+                             {'mfa_token': body['mfa_token'],
+                              'code': self._code(self.secret, 1)}, format='json')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(AccessToken(r.json()['access'])['amr'], ['pwd', 'otp'])
+
+    def test_wrong_code_then_correct(self):
+        body = self._password_step()
+        bad = self.client.post('/api/auth/mfa/verify/',
+                               {'mfa_token': body['mfa_token'], 'code': '000000'},
+                               format='json')
+        self.assertEqual(bad.status_code, 400)
+        self.assertIn('还可尝试', bad.json()['msg'])
+        good = self.client.post('/api/auth/mfa/verify/',
+                                {'mfa_token': body['mfa_token'],
+                                 'code': self._code(self.secret, 1)}, format='json')
+        self.assertEqual(good.status_code, 200)
+
+    def test_challenge_single_use(self):
+        body = self._password_step()
+        payload = {'mfa_token': body['mfa_token'], 'code': self._code(self.secret, 1)}
+        self.assertEqual(self.client.post('/api/auth/mfa/verify/', payload,
+                                          format='json').status_code, 200)
+        again = self.client.post('/api/auth/mfa/verify/', payload, format='json')
+        self.assertEqual(again.status_code, 401)
+        self.assertIn('已使用', again.json()['msg'])
+
+    def test_code_replay_blocked_on_new_challenge(self):
+        """同一个 30 秒窗口的码用过一次就不能再用，即便换一张新票据。"""
+        code = self._code(self.secret, 1)
+        first = self._password_step()
+        self.assertEqual(self.client.post(
+            '/api/auth/mfa/verify/', {'mfa_token': first['mfa_token'], 'code': code},
+            format='json').status_code, 200)
+        second = self._password_step()
+        replay = self.client.post('/api/auth/mfa/verify/',
+                                  {'mfa_token': second['mfa_token'], 'code': code},
+                                  format='json')
+        self.assertEqual(replay.status_code, 400)
+
+    def test_attempts_exhausted_invalidates_challenge(self):
+        body = self._password_step()
+        for _ in range(settings.MFA_MAX_ATTEMPTS - 1):
+            self.assertEqual(self.client.post(
+                '/api/auth/mfa/verify/',
+                {'mfa_token': body['mfa_token'], 'code': '000000'},
+                format='json').status_code, 400)
+        last = self.client.post('/api/auth/mfa/verify/',
+                                {'mfa_token': body['mfa_token'], 'code': '000000'},
+                                format='json')
+        self.assertEqual(last.status_code, 401)
+        # 票据已作废：正确的码也不能再用它
+        after = self.client.post('/api/auth/mfa/verify/',
+                                 {'mfa_token': body['mfa_token'],
+                                  'code': self._code(self.secret, 1)}, format='json')
+        self.assertEqual(after.status_code, 401)
+
+    def test_recovery_code_login_and_single_use(self):
+        code = self.recovery[0]
+        body = self._password_step()
+        r = self.client.post('/api/auth/mfa/verify/',
+                             {'mfa_token': body['mfa_token'], 'code': code},
+                             format='json')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()['recovery_codes_left'],
+                         settings.MFA_RECOVERY_CODES - 1)
+        again = self._password_step()
+        reuse = self.client.post('/api/auth/mfa/verify/',
+                                 {'mfa_token': again['mfa_token'], 'code': code},
+                                 format='json')
+        self.assertEqual(reuse.status_code, 400)
+
+    def test_recovery_code_accepts_without_dashes(self):
+        code = self.recovery[1].replace('-', '').lower()
+        body = self._password_step()
+        r = self.client.post('/api/auth/mfa/verify/',
+                             {'mfa_token': body['mfa_token'], 'code': code},
+                             format='json')
+        self.assertEqual(r.status_code, 200)
+
+    def test_expired_challenge_rejected(self):
+        with override_settings(MFA_CHALLENGE_TTL=-1):
+            body = self._password_step()
+            r = self.client.post('/api/auth/mfa/verify/',
+                                 {'mfa_token': body['mfa_token'],
+                                  'code': self._code(self.secret, 1)}, format='json')
+        self.assertEqual(r.status_code, 401)
+
+    def test_wrong_password_never_reaches_mfa(self):
+        r = self.client.post('/api/auth/login/',
+                             {'username': 'dave', 'password': WRONG}, format='json')
+        self.assertEqual(r.status_code, 401)
+
+
+
+
+@override_settings(LOGIN_FAIL_LIMIT=3, LOGIN_FAIL_IP_LIMIT=99,
+                   LOGIN_FAIL_WINDOW=900, LOGIN_FAIL_BLOCK=900,
+                   MFA_MAX_ATTEMPTS=99)
+class MfaRateLimitTests(TestCase):
+    """换票据重试也受限：票据内计次之外还有按用户/IP 的失败计数。
+
+    票据次数放到 99、限速阈值压到 3，好让限速先触发（现实里两者都在，先撞
+    哪个取决于配置）。
+    """
+
+    def setUp(self):
+        cache.clear()
+        user = User.objects.create(username='ivan')
+        user.set_password(PASSWORD)
+        user.save()
+        self.client = APIClient()
+        r = self.client.post('/api/auth/login/',
+                             {'username': 'ivan', 'password': PASSWORD}, format='json')
+        self.client.credentials(HTTP_AUTHORIZATION='Bearer ' + r.json()['access'])
+        data = self.client.post('/api/auth/mfa/setup/').json()['data']
+        self.secret = data['secret']
+        self.client.post('/api/auth/mfa/activate/',
+                         {'code': totp.code_at(self.secret, totp.current_counter())},
+                         format='json')
+        self.client.credentials()
+
+    def tearDown(self):
+        cache.clear()
+
+    def _password_step(self):
+        return self.client.post('/api/auth/login/',
+                                {'username': 'ivan', 'password': PASSWORD},
+                                format='json').json()
+
+    def _code(self, secret, offset=0):
+        return totp.code_at(secret, totp.current_counter() + offset)
+
+    def test_mfa_failures_count_toward_ratelimit(self):
+        for _ in range(3):
+            body = self._password_step()
+            self.client.post('/api/auth/mfa/verify/',
+                             {'mfa_token': body['mfa_token'], 'code': '000000'},
+                             format='json')
+        blocked = self.client.post('/api/auth/mfa/verify/',
+                                   {'mfa_token': self._password_step()['mfa_token'],
+                                    'code': self._code(self.secret, 1)}, format='json')
+        self.assertEqual(blocked.status_code, 429)
+
+
+class MfaEnforcementTests(TestCase):
+    """强制策略：scope=off/staff/all 下未绑定用户的可达范围。"""
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create(username='erin', is_staff=False)
+        self.user.set_password(PASSWORD)
+        self.user.save()
+        self.admin = User.objects.create(username='frank', is_staff=True)
+        self.admin.set_password(PASSWORD)
+        self.admin.save()
+
+    def tearDown(self):
+        cache.clear()
+
+    def _scope(self, value):
+        SystemConfig.objects.update_or_create(
+            key='mfa.enforce_scope', defaults={'value': value})
+
+    def _client(self, username='erin'):
+        client = APIClient()
+        r = client.post('/api/auth/login/',
+                        {'username': username, 'password': PASSWORD}, format='json')
+        client.credentials(HTTP_AUTHORIZATION='Bearer ' + r.json()['access'])
+        return client, r.json()
+
+    def test_default_scope_off_allows_everything(self):
+        client, body = self._client()
+        self.assertNotIn('mfa_enrollment_required', body)
+        self.assertEqual(client.get('/api/assets/servers/').status_code, 200)
+
+    def test_scope_all_blocks_unbound_user(self):
+        self._scope('all')
+        client, body = self._client()
+        self.assertTrue(body['mfa_enrollment_required'])
+        r = client.get('/api/assets/servers/')
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()['error_code'], 'mfa_enrollment_required')
+
+    def test_scope_all_still_allows_enrollment_endpoints(self):
+        """否则就是死锁：被要求绑定，却连绑定接口都调不了。"""
+        self._scope('all')
+        client, _ = self._client()
+        self.assertEqual(client.get('/api/auth/me/').status_code, 200)
+        self.assertEqual(client.get('/api/auth/mfa/status/').status_code, 200)
+        self.assertEqual(client.post('/api/auth/mfa/setup/').status_code, 200)
+
+    def test_scope_staff_targets_only_staff(self):
+        self._scope('staff')
+        member, _ = self._client('erin')
+        self.assertEqual(member.get('/api/assets/servers/').status_code, 200)
+        admin, body = self._client('frank')
+        self.assertTrue(body['mfa_enrollment_required'])
+        self.assertEqual(admin.get('/api/assets/servers/').status_code, 403)
+
+    def test_invalid_scope_falls_back_to_off(self):
+        """配置值拼错不该把全员挡在门外。"""
+        self._scope('ALL_USERS')
+        client, _ = self._client()
+        self.assertEqual(client.get('/api/assets/servers/').status_code, 200)
+
+    def test_bound_user_passes_after_verify(self):
+        self._scope('all')
+        client, _ = self._client()
+        data = client.post('/api/auth/mfa/setup/').json()['data']
+        activated = client.post('/api/auth/mfa/activate/',
+                                {'code': totp.code_at(data['secret'],
+                                                      totp.current_counter())},
+                                format='json')
+        client.credentials(HTTP_AUTHORIZATION='Bearer '
+                           + activated.json()['data']['access'])
+        self.assertEqual(client.get('/api/assets/servers/').status_code, 200)
+
+
+class MfaAdminResetTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.admin = User.objects.create(username='gina', is_staff=True)
+        self.admin.set_password(PASSWORD)
+        self.admin.save()
+        self.target = User.objects.create(username='hank')
+        self.target.set_password(PASSWORD)
+        self.target.save()
+        binding = UserMFA(user=self.target, enabled=True)
+        binding.set_secret(totp.random_secret())
+        binding.save()
+        MFARecoveryCode.objects.create(user=self.target, code_hash='x' * 64)
+        self.client = APIClient()
+        r = self.client.post('/api/auth/login/',
+                             {'username': 'gina', 'password': PASSWORD}, format='json')
+        self.client.credentials(HTTP_AUTHORIZATION='Bearer ' + r.json()['access'])
+
+    def tearDown(self):
+        cache.clear()
+
+    def test_admin_can_reset(self):
+        r = self.client.post(f'/api/auth/users/{self.target.pk}/reset_mfa/')
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(UserMFA.objects.filter(user=self.target).exists())
+        self.assertFalse(MFARecoveryCode.objects.filter(user=self.target).exists())
+
+    def test_reset_unbound_user_reports(self):
+        self.client.post(f'/api/auth/users/{self.target.pk}/reset_mfa/')
+        r = self.client.post(f'/api/auth/users/{self.target.pk}/reset_mfa/')
+        self.assertEqual(r.status_code, 400)
+
+    def test_non_admin_forbidden(self):
+        client = APIClient()
+        r = client.post('/api/auth/login/',
+                        {'username': 'hank', 'password': PASSWORD}, format='json')
+        # hank 已启用 MFA，密码步只拿到挑战票据，够不到管理接口
+        self.assertTrue(r.json()['mfa_required'])
+
+    def test_user_list_shows_mfa_state(self):
+        rows = self.client.get('/api/auth/users/').json()['data']['results']
+        states = {row['username']: row['mfa_enabled'] for row in rows}
+        self.assertTrue(states['hank'])
+        self.assertFalse(states['gina'])
+
+    def test_management_command_resets(self):
+        from django.core.management import call_command
+        call_command('mfa_reset', 'hank', '--yes')
+        self.assertFalse(UserMFA.objects.filter(user=self.target).exists())

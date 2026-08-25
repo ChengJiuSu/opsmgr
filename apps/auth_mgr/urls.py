@@ -7,6 +7,12 @@ from .views import (
     LoginView,
     LogoutView,
     MeView,
+    MfaActivateView,
+    MfaDisableView,
+    MfaRecoveryCodesView,
+    MfaSetupView,
+    MfaStatusView,
+    MfaVerifyView,
     UserViewSet,
 )
 
@@ -20,4 +26,11 @@ urlpatterns = [
     path('token/verify/', TokenVerifyView.as_view(), name='token_verify'),
     path('me/', MeView.as_view(), name='me'),
     path('change-password/', ChangePasswordView.as_view(), name='change_password'),
+    # ── MFA（二次认证）──
+    path('mfa/verify/', MfaVerifyView.as_view(), name='mfa_verify'),
+    path('mfa/status/', MfaStatusView.as_view(), name='mfa_status'),
+    path('mfa/setup/', MfaSetupView.as_view(), name='mfa_setup'),
+    path('mfa/activate/', MfaActivateView.as_view(), name='mfa_activate'),
+    path('mfa/disable/', MfaDisableView.as_view(), name='mfa_disable'),
+    path('mfa/recovery-codes/', MfaRecoveryCodesView.as_view(), name='mfa_recovery_codes'),
 ] + router.urls

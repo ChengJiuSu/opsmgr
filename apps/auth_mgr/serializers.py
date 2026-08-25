@@ -3,6 +3,8 @@ from django.contrib.auth.password_validation import validate_password
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
+from .services import AMR_PASSWORD
+
 User = get_user_model()
 
 
@@ -13,6 +15,8 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
         token['username'] = user.username
         token['department'] = user.department
         token['is_staff'] = user.is_staff
+        # 这条路径只过了密码；过了第二因子的令牌由 tokens.issue_after_mfa 签发
+        token['amr'] = [AMR_PASSWORD]
         return token
 
 
@@ -22,14 +26,22 @@ class UserSerializer(serializers.ModelSerializer):
     password = serializers.CharField(
         write_only=True, required=False, allow_blank=True, style={'input_type': 'password'}
     )
+    # 只读展示：管理员在用户列表看谁还没绑 MFA（绑定与解绑只能由本人操作，
+    # 管理员只能重置，见 UserViewSet.reset_mfa）
+    mfa_enabled = serializers.SerializerMethodField()
 
     class Meta:
         model = User
         fields = [
             'id', 'username', 'password', 'email', 'phone', 'department',
-            'is_active', 'is_staff', 'is_ldap', 'last_login', 'date_joined',
+            'is_active', 'is_staff', 'is_ldap', 'mfa_enabled',
+            'last_login', 'date_joined',
         ]
-        read_only_fields = ['id', 'last_login', 'date_joined', 'is_ldap']
+        read_only_fields = ['id', 'last_login', 'date_joined', 'is_ldap', 'mfa_enabled']
+
+    def get_mfa_enabled(self, obj):
+        mfa = getattr(obj, 'mfa', None)
+        return bool(mfa and mfa.enabled)
 
     def validate_password(self, value):
         if value:
@@ -74,3 +86,25 @@ class ChangePasswordSerializer(serializers.Serializer):
         user.set_password(self.validated_data['new_password'])
         user.save(update_fields=['password'])
         return user
+
+
+class MfaVerifySerializer(serializers.Serializer):
+    """登录第二步：用挑战票据 + 验证码（或恢复码）换正式令牌。"""
+
+    mfa_token = serializers.CharField()
+    code = serializers.CharField()
+
+
+class MfaCodeSerializer(serializers.Serializer):
+    code = serializers.CharField()
+
+
+class MfaSensitiveSerializer(serializers.Serializer):
+    """解绑 / 重发恢复码：密码 + 当前验证码双确认。
+
+    只要密码不够——会话被劫持的人知道密码的概率不低（钓鱼），但拿不到验证器；
+    只要验证码也不够——捡到已解锁手机的人能拿到码。两个都要才算本人。
+    """
+
+    password = serializers.CharField()
+    code = serializers.CharField()

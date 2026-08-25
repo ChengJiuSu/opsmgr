@@ -42,13 +42,25 @@
           </el-tag>
         </template>
       </el-table-column>
+      <el-table-column label="MFA" width="90">
+        <template #default="{ row }">
+          <el-tag size="small" :type="row.mfa_enabled ? 'success' : 'info'">
+            {{ row.mfa_enabled ? '已绑定' : '未绑定' }}
+          </el-tag>
+        </template>
+      </el-table-column>
       <el-table-column label="最后登录" width="150">
         <template #default="{ row }">{{ formatTime(row.last_login) }}</template>
       </el-table-column>
-      <el-table-column label="操作" width="260" fixed="right">
+      <el-table-column label="操作" width="340" fixed="right">
         <template #default="{ row }">
           <el-button size="small" :icon="Edit" @click="openDialog(row)">编辑</el-button>
           <el-button size="small" :icon="Key" @click="openResetDialog(row)">重置密码</el-button>
+          <el-button
+            v-if="row.mfa_enabled"
+            size="small"
+            @click="handleResetMfa(row)"
+          >重置 MFA</el-button>
           <el-button
             size="small"
             :type="row.is_active ? 'warning' : 'success'"
@@ -128,7 +140,7 @@ import { Plus, Edit, Delete, Search, Key } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   getUsers, createUser, updateUser, deleteUser,
-  toggleUserActive, resetUserPassword,
+  toggleUserActive, resetUserPassword, resetUserMfa,
 } from '../../api/users'
 
 const loading = ref(false)
@@ -236,6 +248,17 @@ async function handleReset() {
 async function handleToggle(row) {
   await toggleUserActive(row.id)
   ElMessage.success(row.is_active ? '已停用' : '已启用')
+  fetchData()
+}
+
+async function handleResetMfa(row) {
+  // 丢手机时的兜底：清掉绑定，用户下次登录重新绑（仍需密码，不构成越权）
+  await ElMessageBox.confirm(
+    `确定清除用户「${row.username}」的 MFA 绑定吗？该用户下次登录需重新绑定。`,
+    '重置二次认证', { type: 'warning' },
+  )
+  await resetUserMfa(row.id)
+  ElMessage.success('已清除 MFA 绑定')
   fetchData()
 }
 

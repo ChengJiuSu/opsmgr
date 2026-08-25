@@ -7,3 +7,4 @@ export const deleteUser = (id) => request.delete(`/api/auth/users/${id}/`)
 export const toggleUserActive = (id) => request.post(`/api/auth/users/${id}/toggle_active/`)
 export const resetUserPassword = (id, data) =>
   request.post(`/api/auth/users/${id}/reset_password/`, data)
+export const resetUserMfa = (id) => request.post(`/api/auth/users/${id}/reset_mfa/`)

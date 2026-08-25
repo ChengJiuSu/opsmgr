@@ -154,6 +154,13 @@ const router = createRouter({
           component: () => import('../views/system/Configs.vue'),
           meta: { title: '系统配置' },
         },
+        // 二次认证（所有人可见，入口在右上角头像菜单，不进侧边栏）
+        {
+          path: 'security/mfa',
+          name: 'SecurityMfa',
+          component: () => import('../views/SecurityMfa.vue'),
+          meta: { title: '二次认证' },
+        },
       ],
     },
   ],
@@ -173,6 +180,12 @@ router.beforeEach((to) => {
     if (!user?.is_staff) {
       return { name: 'Dashboard' }
     }
+  }
+  // 强制 MFA 但未绑定：除绑定页本身外一律拦到绑定页（后端也会拦，这里只是
+  // 少一次失败请求）
+  if (token && localStorage.getItem('mfa_enrollment') === '1'
+      && to.name !== 'SecurityMfa') {
+    return { name: 'SecurityMfa' }
   }
 })
 
