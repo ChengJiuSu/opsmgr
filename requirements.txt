@@ -5,6 +5,9 @@ django-cors-headers>=4.7.0
 
 # 认证
 djangorestframework-simplejwt>=5.4.0
+# MFA 的 TOTP 密钥加密（Fernet）。随 ansible-core 已在环境里，显式声明避免
+# 哪天 ansible 换依赖链就静默丢失；TOTP 算法本身用标准库（common/totp.py）
+cryptography>=42.0
 
 # 环境变量管理
 python-decouple>=3.8
