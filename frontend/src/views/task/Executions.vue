@@ -213,7 +213,11 @@
   </el-dialog>
 
   <!-- 新建 / 编辑任务弹窗（任务流定义，仅保存不执行） -->
-  <el-dialog v-model="formVisible" :title="form.id ? '编辑任务' : (copySourceName ? `复制任务（源：${copySourceName}）` : '新建任务')" width="760px" top="4vh">
+  <el-dialog
+    v-model="formVisible"
+    :title="form.id ? '编辑任务' : (copySourceName ? `复制任务（源：${copySourceName}）` : '新建任务')"
+    width="1040px" top="6vh" class="exec-dialog"
+  >
     <el-form ref="formRef" :model="form" :rules="rules" label-width="90px">
       <el-row :gutter="16">
         <el-col :span="12">
@@ -268,9 +272,43 @@
         </span>
       </el-form-item>
 
-      <!-- 任务流模块列表 -->
-      <el-divider content-position="left">任务流（{{ form.steps.length }} 个模块，按序执行，失败中止）</el-divider>
-      <div v-for="(step, i) in form.steps" :key="i" class="step-card">
+      <!-- 任务流模块列表：流程图 + 左模块树 + 右单模块编辑（与执行弹窗一致） -->
+      <div class="exec-section">
+        <b>任务流</b>
+        <span class="muted">{{ form.steps.length }} 个模块，按序执行，失败中止后续模块</span>
+        <el-button size="small" text type="primary" style="margin-left:auto" @click="formFlowOpen = !formFlowOpen">
+          {{ formFlowOpen ? '收起流程图' : '查看流程图' }}
+        </el-button>
+      </div>
+      <FlowGraph
+        v-if="formFlowOpen"
+        :steps="formFlowSteps" :active="formView === ALL_STEPS ? null : formView"
+        :meta-map="formFlowMeta" clickable
+        style="margin-bottom:12px"
+        @select="formView = $event"
+      />
+
+      <div class="exec-flow">
+        <div class="flow-nav">
+          <div class="nav-header">任务流</div>
+          <div
+            v-for="(step, i) in form.steps" :key="i"
+            class="nav-node" :class="{ active: formView === i }" @click="formView = i"
+          >
+            <span class="nav-dot" :class="formNavDot(step)" />
+            <span class="nav-order">{{ i + 1 }}</span>
+            <span class="nav-title" :title="step.name">{{ step.name || `模块${i + 1}` }}</span>
+            <span class="nav-count muted">{{ FORM_TYPE_LABEL[step.task_type] }}</span>
+          </div>
+          <div class="nav-node nav-root" :class="{ active: formView === ALL_STEPS }" @click="formView = ALL_STEPS">
+            <span class="nav-dot root" />
+            <span class="nav-title">全部模块流程</span>
+          </div>
+          <el-button size="small" :icon="Plus" style="width:100%;margin-top:6px" @click="addStep">添加模块</el-button>
+        </div>
+
+        <div class="form-steps">
+      <div v-for="{ step, i } in visibleFormSteps" :key="i" class="step-card">
         <div class="step-head">
           <el-tag size="small" type="info" effect="dark" class="step-no">{{ i + 1 }}</el-tag>
           <el-input v-model="step.name" :placeholder="`模块名称，如：${stepNamePlaceholder(step)}`" style="width:200px" size="small" />
@@ -283,7 +321,7 @@
           <span class="step-actions">
             <el-button size="small" text :icon="Top" :disabled="i === 0" @click="moveStep(i, -1)" />
             <el-button size="small" text :icon="Bottom" :disabled="i === form.steps.length - 1" @click="moveStep(i, 1)" />
-            <el-button size="small" text type="danger" :icon="Delete" :disabled="form.steps.length === 1" @click="form.steps.splice(i, 1)" />
+            <el-button size="small" text type="danger" :icon="Delete" :disabled="form.steps.length === 1" @click="removeStep(i)" />
           </span>
         </div>
 
@@ -408,7 +446,8 @@
           </div>
         </div>
       </div>
-      <el-button size="small" :icon="Plus" style="width:100%" @click="addStep">添加模块</el-button>
+        </div>
+      </div>
     </el-form>
     <template #footer>
       <el-button @click="formVisible = false">取消</el-button>
@@ -851,13 +890,42 @@ function onMethodChange(step) {
   }
 }
 
+// 编辑弹窗的模块视图：索引 = 只编辑该模块，ALL_STEPS = 堆叠全部
+const formView = ref(0)
+const formFlowOpen = ref(true)
+const FORM_TYPE_LABEL = { command: '命令', playbook: 'Playbook', method: '平台方法', pause: '暂停确认' }
+const visibleFormSteps = computed(() => {
+  const list = form.steps.map((step, i) => ({ step, i }))
+  return formView.value === ALL_STEPS ? list : list.filter((x) => x.i === formView.value)
+})
+// 流程图数据源：表单模块没有主键，用下标当节点 id（与 formView 同一口径）
+const formFlowSteps = computed(() => form.steps.map((step, i) => ({
+  id: i, name: step.name || `模块${i + 1}`, task_type: step.task_type, run_parallel: step.run_parallel,
+})))
+const formFlowMeta = computed(() => Object.fromEntries(form.steps.map((step, i) => [
+  i,
+  step.task_type === 'pause' ? '等待人工确认'
+    : (dictOptions.serviceTypes.find((d) => d.id === step.service_type)?.name || '全部服务类型'),
+])))
+const formNavDot = (step) => (step.task_type === 'pause' ? 'pause' : 'ready')
+
 function addStep() {
   form.steps.push(emptyStep())
+  formView.value = form.steps.length - 1
+}
+
+// 删除模块后把视图落到相邻模块，避免停在已不存在的下标上
+function removeStep(i) {
+  form.steps.splice(i, 1)
+  if (formView.value !== ALL_STEPS) {
+    formView.value = Math.min(formView.value, form.steps.length - 1)
+  }
 }
 
 function moveStep(i, delta) {
   const j = i + delta
   ;[form.steps[i], form.steps[j]] = [form.steps[j], form.steps[i]]
+  if (formView.value === i) formView.value = j
 }
 
 async function openForm(row) {
@@ -887,6 +955,7 @@ async function openForm(row) {
     })
     form.steps.forEach(updateStepCount)
   }
+  formView.value = 0
   formVisible.value = true
   formRef.value?.clearValidate()
   loadDictOptions()
@@ -1573,6 +1642,8 @@ code { background: #f5f7fa; padding: 1px 6px; border-radius: 3px; font-size: 12p
 .nav-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .nav-count { font-size: 12px; color: #909399; }
 .exec-steps { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 16px; }
+.form-steps { flex: 1; min-width: 0; }
+.form-steps .step-card:last-child { margin-bottom: 0; }
 /* 纵深递进：弹窗白 → 模块 #fafbfc → 缩进区 #eef1f5 → 主机表白 */
 .exec-step {
   position: relative; display: flex; border: 1px solid #e4e7ed; border-radius: 6px;
