@@ -444,9 +444,28 @@
       <b v-if="!execTask?.default_select_all" class="danger">需人工勾选</b>
     </div>
 
-    <div v-loading="execLoading" class="exec-steps">
-      <div v-for="(s, i) in execTask?.steps || []" :key="s.id" class="exec-step">
-        <div class="exec-step-index">{{ i + 1 }}</div>
+    <div v-loading="execLoading" class="exec-flow">
+      <!-- 左侧模块树：任务流（全部模块）/ 单个模块，与执行日志面板一致 -->
+      <div class="flow-nav">
+        <div class="nav-node nav-root" :class="{ active: execView === ALL_STEPS }" @click="selectExecView(ALL_STEPS)">
+          <span class="nav-dot root" />
+          <span class="nav-title">任务流（全部模块）</span>
+        </div>
+        <div
+          v-for="(s, i) in execTask?.steps || []" :key="s.id"
+          class="nav-node" :class="{ active: execView === s.id }" @click="selectExecView(s.id)"
+        >
+          <span class="nav-dot" :class="navDotClass(s)" />
+          <span class="nav-order">{{ i + 1 }}</span>
+          <span class="nav-title" :title="s.name">{{ s.name }}</span>
+          <span v-if="s.task_type === 'pause'" class="nav-count muted">人工</span>
+          <span v-else class="nav-count" :class="{ danger: stepHostCount(s) === 0 }">{{ stepHostCount(s) }} 台</span>
+        </div>
+      </div>
+
+      <div class="exec-steps">
+      <div v-for="(s, i) in visibleExecSteps" :key="s.id" class="exec-step">
+        <div class="exec-step-index">{{ execView === ALL_STEPS ? i + 1 : stepOrderOf(s) }}</div>
         <div class="exec-step-main">
           <div class="exec-step-head">
             <b class="exec-step-name">{{ s.name }}</b>
@@ -561,6 +580,7 @@
             </el-alert>
           </div>
         </div>
+      </div>
       </div>
     </div>
 
@@ -1111,6 +1131,26 @@ const uniqueTargetHosts = computed(() => {
   return ids.size
 })
 
+// 模块视图：全部模块（堆叠）或单个模块，切换后重放该模块勾选到表格
+const ALL_STEPS = '__all__'
+const execView = ref(ALL_STEPS)
+const visibleExecSteps = computed(() => {
+  const steps = execTask.value?.steps || []
+  return execView.value === ALL_STEPS ? steps : steps.filter((s) => s.id === execView.value)
+})
+const stepOrderOf = (step) => (execTask.value?.steps || []).findIndex((s) => s.id === step.id) + 1
+const navDotClass = (step) => {
+  if (step.task_type === 'pause') return 'pause'
+  return stepHostCount(step) ? 'ready' : 'empty'
+}
+async function selectExecView(view) {
+  execView.value = view
+  await nextTick()
+  visibleExecSteps.value
+    .filter((s) => s.task_type !== 'pause' && !s.use_custom_scope)
+    .forEach(syncStepSelection)
+}
+
 const globalSteps = computed(() =>
   (execTask.value?.steps || []).filter((s) => s.task_type !== 'pause' && !s.use_custom_scope))
 
@@ -1130,6 +1170,7 @@ async function openExec(row) {
   execGlobal.value = []
   execStepsInfo.value = []
   // 主机数据到位前模板已渲染，筛选/勾选容器先按模块建好，避免 v-model 到 undefined
+  execView.value = ALL_STEPS
   stepSelection.value = Object.fromEntries((row.steps || []).map((s) => [s.id, new Set()]))
   stepFilters.value = Object.fromEntries(
     (row.steps || []).map((s) => [s.id, { keyword: '', serviceType: '' }]),
@@ -1481,15 +1522,35 @@ code { background: #f5f7fa; padding: 1px 6px; border-radius: 3px; font-size: 12p
 .exec-dialog :deep(.el-scrollbar__bar) { opacity: 1; }
 .exec-dialog :deep(.el-scrollbar__bar.is-vertical) { width: 8px; }
 .exec-dialog :deep(.el-scrollbar__thumb) { background: #c0c4cc; opacity: 1; }
-/* 执行弹窗：逐模块主机勾选卡片 */
-.exec-steps { display: flex; flex-direction: column; gap: 16px; margin-bottom: 14px; }
+/* 执行弹窗：左侧模块树 + 右侧逐模块主机勾选 */
+.exec-flow { display: flex; gap: 12px; margin-bottom: 14px; align-items: flex-start; }
+.flow-nav {
+  width: 190px; flex-shrink: 0; padding: 6px;
+  border: 1px solid #ebeef5; border-radius: 6px; background: #fafbfc;
+}
+.nav-node {
+  display: flex; align-items: center; gap: 6px; padding: 6px 8px;
+  border-radius: 4px; cursor: pointer; font-size: 13px; color: #606266;
+}
+.nav-node:hover { background: #f0f2f5; }
+.nav-node.active { background: #ecf5ff; color: #409eff; font-weight: 600; }
+.nav-root { border-bottom: 1px solid #ebeef5; border-radius: 4px 4px 0 0; margin-bottom: 4px; }
+.nav-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: #c0c4cc; }
+.nav-dot.root { background: #409eff; }
+.nav-dot.ready { background: #67c23a; }
+.nav-dot.empty { background: #f56c6c; }
+.nav-dot.pause { background: #e6a23c; }
+.nav-order { color: #a8abb2; font-size: 11px; }
+.nav-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nav-count { font-size: 12px; color: #909399; }
+.exec-steps { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 16px; }
 /* 纵深递进：弹窗白 → 模块 #fafbfc → 缩进区 #eef1f5 → 主机表白 */
 .exec-step {
   position: relative; display: flex; border: 1px solid #e4e7ed; border-radius: 6px;
   background: #fafbfc;
 }
 /* 模块之间短虚线相连，强调「按序执行」 */
-.exec-step:not(:last-child)::after {
+.exec-steps > .exec-step:not(:last-child)::after {
   content: ''; position: absolute; left: 20px; bottom: -17px;
   width: 0; height: 16px; border-left: 1px dashed #c0c4cc;
 }
