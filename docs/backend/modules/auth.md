@@ -200,6 +200,47 @@ POST /api/auth/mfa/verify/  {mfa_token, code}
 解绑与重发恢复码要**密码 + 当前验证码**双确认：只要密码不够（钓鱼拿得到），
 只要验证码也不够（捡到已解锁手机就行），两个都要才算本人。
 
+### 敏感操作二次验证（sudo 窗口）
+
+登录验过一次 MFA 后，access 能用 60 分钟、refresh 能用 7 天。对**持久扩大权限**
+的配置类写操作，这个跨度太长：一条被偷走的 token 在窗口内足够把整套凭据换掉。
+这些接口因此额外要求「刚刚证明过是本人」。
+
+```
+POST /api/auth/mfa/sudo/   {code} 或 {password}   → 开窗口（SUDO_TTL，默认 600s）
+GET  /api/auth/mfa/sudo/                          → {active, ttl, mfa_enabled}
+```
+
+- 启用了 MFA 的账号**必须给 code**，不接受密码：密码在钓鱼场景下拿得到，验证器
+  拿不到，而 sudo 的意义正是「刚刚证明过是本人」。未启用 MFA 的账号退回密码
+  确认，否则 `enforce_scope=off` 期间这道门形同虚设。
+- 窗口状态在缓存里，键绑**当前访问令牌的 jti**（`sudo:<user_id>:<jti>`）：同一
+  个人的另一条会话、或被偷走的另一个 token，都拿不到这次授权。代价是静默刷新
+  令牌后要再验一次——access 60 分钟、sudo 10 分钟，实际很少撞上。
+- 改密码、解绑 MFA 后主动 `revoke`：身份要素变了，之前那次证明不再算数。
+- 失败计入限速（`sudo_user` 桶，阈值复用 `LOGIN_FAIL_*`）。
+- **fail-closed**：缓存不可用时视为无授权、拒绝敏感操作。与 `common/ratelimit`
+  的 fail-open 刻意相反——限速挂了放行只是少一层防爆破，sudo 挂了放行等于这道
+  门直接没了；而拒绝的后果仅限「改不了配置」，日常读写照常。
+
+受控范围（`common/sudo.py` 的 `SudoRequired` 与既有权限类**并列**声明，
+`permission_classes = [IsAdmin, SudoRequired]`，DRF 是 AND 语义）：
+
+| ViewSet | 为什么 |
+|---------|--------|
+| `task_exec.CredentialViewSet` | SSH 密码/私钥，改了等于换掉全站执行身份 |
+| `auth_mgr.UserViewSet` | 建号、改权限、重置他人密码与 MFA |
+| `agent_mgr.AgentNodeViewSet` | 建 agent 发一次性 token，重置 token 顶掉现有连接 |
+| `agent_mgr.AgentRouteViewSet` | 改路由 = 改命令下发到哪台机器执行 |
+| `cloud_mgr.CloudAccountViewSet` | 云 AK/SK |
+| `system_cfg.SystemConfigViewSet` | 存着 `jenkins.api_token`、`artifact.api_key`、`mfa.enforce_scope` |
+
+只读方法（`SAFE_METHODS`）一律放行——sudo 防的是持久权限扩大，不是看一眼。
+**任务流执行刻意不纳入**：密集发布时会反复弹验证框，而单次执行不扩大权限。
+
+未授权时返回 **403 + `error_code: sudo_required`**，前端拦截器弹验证框并
+**重放原请求**（见 `docs/frontend/views/security-mfa.md`）。
+
 ### 审计
 
 MFA 相关请求都是写操作，由审计中间件记录；`code` / `secret` / `recovery_code`
@@ -245,3 +286,4 @@ SIMPLE_JWT = {
 | POST | `/api/auth/mfa/disable/` | 解绑（密码 + 当前验证码）|
 | POST | `/api/auth/mfa/recovery-codes/` | 重发恢复码（密码 + 当前验证码，旧码作废）|
 | POST | `/api/auth/users/{id}/reset_mfa/` | 管理员清除他人绑定（丢手机兜底）|
+| GET/POST | `/api/auth/mfa/sudo/` | 敏感操作二次验证窗口：查状态 / 开窗口 |

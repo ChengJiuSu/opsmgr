@@ -10,6 +10,7 @@ from rest_framework_simplejwt.tokens import AccessToken
 
 from apps.system_cfg.models import SystemConfig
 from common import totp
+from common.testing import grant_sudo
 
 from .models import MFARecoveryCode, UserMFA
 
@@ -526,6 +527,8 @@ class MfaAdminResetTests(TestCase):
         r = self.client.post('/api/auth/login/',
                              {'username': 'gina', 'password': PASSWORD}, format='json')
         self.client.credentials(HTTP_AUTHORIZATION='Bearer ' + r.json()['access'])
+        # 用户管理（含 reset_mfa）要求 sudo 二次验证
+        grant_sudo(self.client, PASSWORD)
 
     def tearDown(self):
         cache.clear()
@@ -568,3 +571,145 @@ class MfaAdminResetTests(TestCase):
         call_command('mfa_reset', 'hank', '--check', stdout=out)
         self.assertIn('已启用', out.getvalue())
         self.assertTrue(UserMFA.objects.filter(user=self.target).exists())
+
+
+@override_settings(SUDO_TTL=600)
+class SudoTests(TestCase):
+    """敏感操作二次验证：窗口开启/过期、绑 token、fail-closed、身份变更失效。"""
+
+    def setUp(self):
+        cache.clear()
+        self.admin = User.objects.create(username='sudo_admin', is_staff=True)
+        self.admin.set_password(PASSWORD)
+        self.admin.save()
+        self.client = APIClient()
+        self.access = self._login()
+
+    def tearDown(self):
+        cache.clear()
+
+    def _login(self, client=None):
+        client = client or self.client
+        r = client.post('/api/auth/login/',
+                        {'username': 'sudo_admin', 'password': PASSWORD}, format='json')
+        access = r.json()['access']
+        client.credentials(HTTP_AUTHORIZATION='Bearer ' + access)
+        return access
+
+    def _grant(self, **payload):
+        return self.client.post('/api/auth/mfa/sudo/', payload or {'password': PASSWORD},
+                                format='json')
+
+    # ── 拦截与放行 ────────────────────────────────────────
+
+    def test_write_blocked_without_sudo(self):
+        r = self.client.post('/api/exec/credentials/',
+                             {'name': 'c1', 'username': 'root', 'auth_type': 'password',
+                              'password': 'x'}, format='json')
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()['error_code'], 'sudo_required')
+
+    def test_read_allowed_without_sudo(self):
+        """只读不该被卡：sudo 防的是持久权限扩大，不是看一眼。"""
+        self.assertEqual(self.client.get('/api/exec/credentials/').status_code, 200)
+
+    def test_write_allowed_after_grant(self):
+        self.assertEqual(self._grant().status_code, 200)
+        r = self.client.post('/api/exec/credentials/',
+                             {'name': 'c2', 'username': 'root', 'auth_type': 'password',
+                              'password': 'x'}, format='json')
+        self.assertEqual(r.status_code, 201)
+
+    def test_all_config_surfaces_covered(self):
+        """配置面五处都要拦：漏一个就等于这道门没关。"""
+        cases = [
+            ('/api/auth/users/', {'username': 'someone'}),
+            ('/api/exec/credentials/', {'name': 'c3', 'username': 'root',
+                                        'auth_type': 'password', 'password': 'x'}),
+            ('/api/agents/', {'name': 'gw-sudo'}),
+            ('/api/agent-routes/', {'agent': 1, 'project_group': 1}),
+            ('/api/cloud/accounts/', {'name': 'acc'}),
+            ('/api/system/configs/', {'key': 'k', 'value': 'v'}),
+        ]
+        for path, payload in cases:
+            with self.subTest(path=path):
+                r = self.client.post(path, payload, format='json')
+                self.assertEqual(r.status_code, 403, path)
+                self.assertEqual(r.json()['error_code'], 'sudo_required', path)
+
+    def test_task_execution_not_gated(self):
+        """任务流执行刻意不纳入：否则密集发布时反复弹验证框。"""
+        r = self.client.get('/api/exec/tasks/')
+        self.assertEqual(r.status_code, 200)
+
+    # ── 凭证校验 ──────────────────────────────────────────
+
+    def test_wrong_password_rejected(self):
+        r = self._grant(password='nope')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('密码不正确', r.json()['msg'])
+
+    def test_password_required_when_no_mfa(self):
+        r = self._grant(code='123456')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('登录密码', r.json()['msg'])
+
+    def test_mfa_user_must_use_code(self):
+        """启用了 MFA 就不接受密码：密码钓得到，验证器钓不到。"""
+        binding = UserMFA(user=self.admin, enabled=True)
+        secret = totp.random_secret()
+        binding.set_secret(secret)
+        binding.save()
+        self.assertEqual(self._grant(password=PASSWORD).status_code, 400)
+        good = self._grant(code=totp.code_at(secret, totp.current_counter()))
+        self.assertEqual(good.status_code, 200)
+
+    def test_failures_rate_limited(self):
+        with override_settings(LOGIN_FAIL_LIMIT=3):
+            for _ in range(3):
+                self.assertEqual(self._grant(password='nope').status_code, 400)
+            self.assertEqual(self._grant(password='nope').status_code, 429)
+
+    # ── 窗口边界 ──────────────────────────────────────────
+
+    def test_window_expires(self):
+        with override_settings(SUDO_TTL=-1):   # 立即过期
+            self.assertEqual(self._grant().status_code, 200)
+        r = self.client.post('/api/system/configs/', {'key': 'k', 'value': 'v'},
+                             format='json')
+        self.assertEqual(r.status_code, 403)
+
+    def test_window_bound_to_access_token(self):
+        """换 token（静默刷新/另一条会话）不继承授权。"""
+        self._grant()
+        other = APIClient()
+        self._login(other)
+        r = other.post('/api/system/configs/', {'key': 'k2', 'value': 'v'}, format='json')
+        self.assertEqual(r.status_code, 403)
+
+    def test_status_endpoint(self):
+        before = self.client.get('/api/auth/mfa/sudo/').json()['data']
+        self.assertFalse(before['active'])
+        self.assertFalse(before['mfa_enabled'])
+        self._grant()
+        after = self.client.get('/api/auth/mfa/sudo/').json()['data']
+        self.assertTrue(after['active'])
+        self.assertEqual(after['ttl'], 600)
+
+    def test_change_password_revokes_window(self):
+        self._grant()
+        self.client.post('/api/auth/change-password/',
+                         {'old_password': PASSWORD, 'new_password': 'Newp!2345xyz'},
+                         format='json')
+        r = self.client.post('/api/system/configs/', {'key': 'k3', 'value': 'v'},
+                             format='json')
+        self.assertEqual(r.status_code, 403)
+
+    def test_cache_outage_denies(self):
+        """fail-closed：缓存挂了拒绝敏感操作（与限速的 fail-open 相反）。"""
+        self._grant()
+        with mock.patch('common.sudo.cache') as fake:
+            fake.get.side_effect = RuntimeError('redis down')
+            r = self.client.post('/api/system/configs/', {'key': 'k4', 'value': 'v'},
+                                 format='json')
+        self.assertEqual(r.status_code, 403)

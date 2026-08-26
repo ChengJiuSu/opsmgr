@@ -53,6 +53,8 @@
         <p class="intro">
           启用后登录需要两步：密码 + 验证器 App 上的 6 位动态码。
           支持任意兼容 TOTP 的验证器（Google Authenticator、Microsoft Authenticator、1Password 等）。
+          修改凭据、用户、Agent、云账号、系统配置这类配置数据时也会要求再验一次
+          （验过 {{ sudoMinutes }} 分钟内免重验）。
         </p>
         <el-button type="primary" @click="startEnroll">开始绑定</el-button>
       </template>
@@ -180,7 +182,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import QRCode from 'qrcode'
 import { ElMessage } from 'element-plus'
 import {
@@ -195,8 +197,9 @@ const submitting = ref(false)
 const enrolling = ref(false)
 const status = ref({
   enabled: false, pending: false, recovery_codes_left: 0,
-  enforced: false, enforce_scope: 'off',
+  enforced: false, enforce_scope: 'off', sudo_ttl: 600,
 })
+const sudoMinutes = computed(() => Math.max(1, Math.round((status.value.sudo_ttl || 600) / 60)))
 const enroll = reactive({
   secret: '', uri: '', qr: '', recoveryCodes: [], codesConfirmed: false, code: '',
 })
@@ -249,7 +252,7 @@ async function activate() {
     authStore.setEnrollmentRequired(false)
     enrolling.value = false
     ElMessage.success('二次认证已启用')
-    await fetchStatus()
+    await Promise.all([fetchStatus(), authStore.fetchMe()])
   } finally {
     submitting.value = false
   }

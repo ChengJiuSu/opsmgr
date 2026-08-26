@@ -5,6 +5,8 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 from rest_framework.test import APIClient
 
+from common.testing import grant_sudo
+
 from apps.asset_mgr.models import CloudProvider, Server
 from apps.cloud_mgr.models import CloudAccount, DnsRecord, Domain
 from apps.cloud_mgr.providers.base import BaseDnsProvider, DnsProviderError, DnsRecordData
@@ -57,6 +59,9 @@ class BaseApiTest(TestCase):
         c = APIClient()
         r = c.post('/api/auth/login/', {'username': username, 'password': 'Pass!2345xyz'}, format='json')
         c.credentials(HTTP_AUTHORIZATION='Bearer ' + r.json()['access'])
+        # 云账号写操作要求 sudo 二次验证（common/sudo.py）
+        if is_staff:
+            grant_sudo(c)
         return c
 
     def setUp(self):

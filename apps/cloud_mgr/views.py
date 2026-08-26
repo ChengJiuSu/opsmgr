@@ -25,6 +25,7 @@ from rest_framework.decorators import action
 from common.pagination import StandardPagination
 from common.permissions import IsAdmin, IsAdminOrReadOnly
 from common.response import fail, ok
+from common.sudo import SudoRequired
 
 from .acme import supported_provider_codes
 from .deploy import supported_target_types
@@ -76,7 +77,9 @@ def _to_provider_data(record):
 class CloudAccountViewSet(viewsets.ModelViewSet):
     queryset = CloudAccount.objects.select_related('provider').all()
     serializer_class = CloudAccountSerializer
-    permission_classes = [IsAdmin]
+    # 配置面写操作要求 sudo 二次验证（common/sudo.py）：改了就能拿到更多东西，
+    # 而登录那次 MFA 可能是 60 分钟前的事
+    permission_classes = [IsAdmin, SudoRequired]
     pagination_class = StandardPagination
 
     def get_queryset(self):

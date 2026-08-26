@@ -17,3 +17,7 @@ export const mfaActivate = (data) => request.post('/api/auth/mfa/activate/', dat
 export const mfaDisable = (data) => request.post('/api/auth/mfa/disable/', data)
 export const mfaRegenerateCodes = (data) =>
   request.post('/api/auth/mfa/recovery-codes/', data)
+
+// 敏感操作二次验证（sudo）：GET 查窗口状态，POST 开窗口
+export const getSudoStatus = () => request.get('/api/auth/mfa/sudo/')
+export const grantSudo = (data) => request.post('/api/auth/mfa/sudo/', data)

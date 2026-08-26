@@ -11,6 +11,8 @@ from django.db.utils import IntegrityError
 from django.test import TestCase, TransactionTestCase, override_settings
 from rest_framework.test import APIClient
 
+from common.testing import grant_sudo
+
 from .channel import (
     ChannelError, resolve_channel, resolve_channels, resolve_service_agent,
 )
@@ -32,6 +34,9 @@ class BaseApiTest(TestCase):
         c = APIClient()
         r = c.post('/api/auth/login/', {'username': username, 'password': 'Pass!2345xyz'}, format='json')
         c.credentials(HTTP_AUTHORIZATION='Bearer ' + r.json()['access'])
+        # Agent / 通道路由的写操作要求 sudo 二次验证（common/sudo.py）
+        if is_staff:
+            grant_sudo(c)
         return c
 
 

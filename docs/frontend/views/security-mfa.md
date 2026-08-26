@@ -48,3 +48,26 @@
 ```
 
 守卫只是少一次失败请求，真正的强制在后端认证层（`MfaJWTAuthentication`）。
+
+---
+
+## 敏感操作二次验证（sudo 弹窗）
+
+配置面写操作（凭据 / 用户 / Agent 与通道路由 / 云账号 / 系统配置）后端会返回
+403 + `error_code=sudo_required`。前端不在各页面各写一遍，而是在拦截器统一处理：
+
+```
+utils/request.js 拦到 sudo_required
+  → utils/sudo.js requestSudo()（单例 Promise，并发请求共用同一次验证）
+  → components/SudoDialog.vue（全局挂在 App.vue）弹框
+  → 验证通过 → config._sudoRetried = true → 重放原请求
+  → 取消 → 原样 reject
+```
+
+要点：
+
+- **弹哪个输入框问后端**：打开时拉 `GET /api/auth/mfa/sudo/` 取 `mfa_enabled`。
+  本地缓存的 `user` 可能是刚绑定 MFA 之前的，猜错就会让人白输一遍密码。
+- 验证码框同样带 autofill 契约（`one-time-code`），满 6 位自动提交。
+- 重放只做一次（`_sudoRetried`），避免后端反复 403 时死循环。
+- 绑定成功后页面会 `authStore.fetchMe()`，让别处的 `mfa_enabled` 立刻正确。

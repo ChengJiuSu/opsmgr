@@ -13,6 +13,7 @@ from .views import (
     MfaSetupView,
     MfaStatusView,
     MfaVerifyView,
+    SudoView,
     UserViewSet,
 )
 
@@ -33,4 +34,6 @@ urlpatterns = [
     path('mfa/activate/', MfaActivateView.as_view(), name='mfa_activate'),
     path('mfa/disable/', MfaDisableView.as_view(), name='mfa_disable'),
     path('mfa/recovery-codes/', MfaRecoveryCodesView.as_view(), name='mfa_recovery_codes'),
+    # 敏感操作二次验证窗口（sudo）
+    path('mfa/sudo/', SudoView.as_view(), name='mfa_sudo'),
 ] + router.urls

@@ -18,6 +18,7 @@ from rest_framework_simplejwt.views import TokenObtainPairView
 
 from rest_framework_simplejwt.exceptions import TokenError as SimpleJWTTokenError
 
+from common import sudo
 from common.permissions import IsAdmin
 from common.ratelimit import blocked_seconds, record_failure, reset
 from common.request import client_ip
@@ -30,6 +31,7 @@ from .serializers import (
     MfaCodeSerializer,
     MfaSensitiveSerializer,
     MfaVerifySerializer,
+    SudoSerializer,
     UserSerializer,
 )
 from .tokens import (
@@ -47,6 +49,7 @@ logger = logging.getLogger(__name__)
 SCOPE_USER = 'login_user'
 SCOPE_IP = 'login_ip'
 SCOPE_MFA_USER = 'mfa_user'
+SCOPE_SUDO_USER = 'sudo_user'
 
 
 class LoginView(TokenObtainPairView):
@@ -182,6 +185,78 @@ class MfaVerifyView(APIView):
                                block=settings.LOGIN_FAIL_BLOCK)
 
 
+class SudoView(APIView):
+    """敏感操作二次验证窗口：GET 查剩余时间，POST 开窗口。
+
+    哪些接口需要它见 common/sudo.py 的 SudoRequired 使用点（凭据、用户、
+    Agent 与通道路由、云账号、系统配置——都是「改了就能拿到更多东西」的配置面，
+    不含任务流执行，日常发布不受影响）。
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(responses=OpenApiResponse(description='active / expires_in'))
+    def get(self, request):
+        jti = sudo.token_jti(request)
+        active = sudo.is_active(request.user.pk, jti)
+        return ok({'active': active, 'ttl': settings.SUDO_TTL,
+                   'mfa_enabled': services.is_enabled(request.user)})
+
+    @extend_schema(request=SudoSerializer,
+                   responses=OpenApiResponse(description='expires_in'))
+    def post(self, request):
+        serializer = SudoSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = request.user
+        ident = user.username.lower()
+
+        remaining = blocked_seconds(SCOPE_SUDO_USER, ident)
+        if remaining:
+            return fail('验证失败次数过多，请稍后再试。',
+                        code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        status=status.HTTP_429_TOO_MANY_REQUESTS)
+
+        error = self._check(user, serializer.validated_data)
+        if error:
+            record_failure(SCOPE_SUDO_USER, ident, limit=settings.LOGIN_FAIL_LIMIT,
+                           window=settings.LOGIN_FAIL_WINDOW,
+                           block=settings.LOGIN_FAIL_BLOCK)
+            return fail(error)
+
+        jti = sudo.token_jti(request)
+        if not jti:
+            # 非 JWT 认证（机器接口）不该走到这里；给明确原因而不是静默失败
+            return fail('当前认证方式不支持二次验证。')
+        try:
+            ttl = sudo.grant(user.pk, jti)
+        except Exception:  # noqa: BLE001 - 缓存不可用时明确拒绝（fail-closed）
+            logger.exception('sudo 窗口写入失败：user=%s', user.username)
+            return fail('二次验证服务暂不可用（缓存故障），请稍后再试。',
+                        status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        reset(SCOPE_SUDO_USER, ident)
+        logger.info('用户 %s 开启 sudo 窗口（%ss）', user.username, ttl)
+        return ok({'expires_in': ttl}, msg='二次验证通过')
+
+    @staticmethod
+    def _check(user, data):
+        """校验二次验证凭证，通过返回 None，否则返回中文原因。"""
+        if services.is_enabled(user):
+            # 启用了 MFA 就必须用验证器/恢复码：密码可能被钓走，验证器不会
+            if not data.get('code'):
+                return '请输入验证器上的 6 位验证码。'
+            try:
+                services.verify(user, data['code'])
+            except services.MfaError as exc:
+                return str(exc)
+            return None
+        # 未启用 MFA 的账号退回密码确认，否则这道门在 enforce_scope=off 时形同虚设
+        if not data.get('password'):
+            return '请输入登录密码。'
+        if not user.check_password(data['password']):
+            return '密码不正确'
+        return None
+
+
 class MfaStatusView(APIView):
     """当前用户的 MFA 状态（前端据此显示绑定入口或已绑定）。"""
 
@@ -233,6 +308,7 @@ class MfaDisableView(APIView):
         if error:
             return error
         services.disable(request.user)
+        sudo.revoke(request.user.pk, sudo.token_jti(request))
         return ok(msg='MFA 已解绑')
 
 
@@ -318,6 +394,8 @@ class ChangePasswordView(APIView):
         serializer = ChangePasswordSerializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
         serializer.save()
+        # 身份要素变了，之前那次「证明是本人」不再算数
+        sudo.revoke(request.user.pk, sudo.token_jti(request))
         return ok(msg='密码修改成功')
 
 
@@ -326,7 +404,10 @@ class UserViewSet(viewsets.ModelViewSet):
 
     queryset = User.objects.all().order_by('-date_joined')
     serializer_class = UserSerializer
-    permission_classes = [IsAdmin]
+    # 配置面写操作要求 sudo 二次验证（common/sudo.py）：改了就能拿到更多东西，
+    # 而登录那次 MFA 可能是 60 分钟前的事
+    # 建号/改权限/重置他人密码或 MFA——权限扩大面里最直接的一条
+    permission_classes = [IsAdmin, sudo.SudoRequired]
 
     def get_queryset(self):
         qs = super().get_queryset()

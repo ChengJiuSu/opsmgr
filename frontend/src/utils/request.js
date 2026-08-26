@@ -1,6 +1,7 @@
 import axios from 'axios'
 import { ElMessage } from 'element-plus'
 import router from '../router'
+import { requestSudo } from './sudo'
 
 const baseURL = import.meta.env.VITE_API_BASE_URL || ''
 
@@ -93,8 +94,17 @@ request.interceptors.response.use(
       router.push('/login')
       ElMessage.error('登录已过期，请重新登录')
     } else if (status === 403) {
+      const errorCode = error.response?.data?.error_code
+      // 敏感操作（配置面写操作）：弹二次验证框，验过后重放原请求
+      if (errorCode === 'sudo_required' && !config._sudoRetried) {
+        if (await requestSudo()) {
+          config._sudoRetried = true
+          return await request(config)
+        }
+        return Promise.reject(error)
+      }
       // 强制 MFA 但未绑定：后端认证层返回该错误码，直接把人送去绑定页
-      if (error.response?.data?.error_code === 'mfa_enrollment_required') {
+      if (errorCode === 'mfa_enrollment_required') {
         localStorage.setItem('mfa_enrollment', '1')
         if (router.currentRoute.value.name !== 'SecurityMfa') {
           ElMessage.warning('按安全策略需先绑定二次认证（MFA）')

@@ -90,6 +90,8 @@ def status(user):
             user=user, used_at__isnull=True).count(),
         'enforced': required_for(user),
         'enforce_scope': enforce_scope(),
+        # 敏感操作二次验证窗口秒数，供前端提示「验过多久内免重验」
+        'sudo_ttl': settings.SUDO_TTL,
     }
 
 

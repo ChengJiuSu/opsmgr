@@ -108,3 +108,14 @@ class MfaSensitiveSerializer(serializers.Serializer):
 
     password = serializers.CharField()
     code = serializers.CharField()
+
+
+class SudoSerializer(serializers.Serializer):
+    """开 sudo 窗口的入参：二者给一个即可（校验逻辑在视图里按是否启用 MFA 分流）。
+
+    已启用 MFA 的账号必须给 code——密码在钓鱼场景下拿得到，验证器拿不到，
+    而 sudo 的意义正是「刚刚证明过是本人」。
+    """
+
+    code = serializers.CharField(required=False, allow_blank=True)
+    password = serializers.CharField(required=False, allow_blank=True)

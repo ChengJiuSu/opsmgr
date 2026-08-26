@@ -301,6 +301,9 @@ MFA_CHALLENGE_TTL = config('MFA_CHALLENGE_TTL', default=300, cast=int)
 MFA_MAX_ATTEMPTS = config('MFA_MAX_ATTEMPTS', default=5, cast=int)
 # 恢复码数量（一次性展示，用一个作废一个）
 MFA_RECOVERY_CODES = config('MFA_RECOVERY_CODES', default=10, cast=int)
+# 敏感操作二次验证（sudo）窗口秒数：验一次后这段时间内的配置类写操作免重验。
+# 绑当前访问令牌的 jti，换 token 即失效（见 common/sudo.py）
+SUDO_TTL = config('SUDO_TTL', default=600, cast=int)
 
 # ── 缓存（登录失败限速等跨进程状态）───────────────────────
 # CACHE_BACKEND 选层：

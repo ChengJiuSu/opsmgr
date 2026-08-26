@@ -28,6 +28,7 @@ from apps.asset_mgr.models import Server
 from apps.method_mgr.models import Method
 
 from common import ansible as common_ansible
+from common.testing import grant_sudo
 
 from .models import Credential, ExecutionTask, TaskExecutionLog, TaskStep
 from . import runner
@@ -673,6 +674,7 @@ class ExecutionAPITests(TestCase):
 
     def test_credential_secrets_not_exposed(self):
         c = self._client()
+        grant_sudo(c)   # 凭据写操作要求 sudo 二次验证（common/sudo.py）
         c.post('/api/exec/credentials/', {
             'name': 'k1', 'username': 'root', 'auth_type': 'password', 'password': 'topsecret',
         }, format='json')

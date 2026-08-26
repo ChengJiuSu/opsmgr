@@ -10,6 +10,7 @@ from rest_framework.decorators import action
 
 from common.permissions import IsAdmin
 from common.response import fail, ok
+from common.sudo import SudoRequired
 
 from .models import AgentJob, AgentNode, AgentRoute
 from .serializers import AgentJobSerializer, AgentNodeSerializer, AgentRouteSerializer
@@ -20,7 +21,10 @@ JOBS_LIMIT = 50
 class AgentNodeViewSet(viewsets.ModelViewSet):
     queryset = AgentNode.objects.all()
     serializer_class = AgentNodeSerializer
-    permission_classes = [IsAdmin]
+    # 配置面写操作要求 sudo 二次验证（common/sudo.py）：改了就能拿到更多东西，
+    # 而登录那次 MFA 可能是 60 分钟前的事
+    # 建 agent 会发出一次性 token，重置 token 能顶掉现有 agent 连接
+    permission_classes = [IsAdmin, SudoRequired]
     pagination_class = None  # agent 数量极少，直接全量返回
 
     def create(self, request, *args, **kwargs):
@@ -60,7 +64,10 @@ class AgentRouteViewSet(viewsets.ModelViewSet):
 
     queryset = AgentRoute.objects.select_related('agent', 'project_group', 'environment')
     serializer_class = AgentRouteSerializer
-    permission_classes = [IsAdmin]
+    # 配置面写操作要求 sudo 二次验证（common/sudo.py）：改了就能拿到更多东西，
+    # 而登录那次 MFA 可能是 60 分钟前的事
+    # 改路由 = 改命令下发到哪台机器执行
+    permission_classes = [IsAdmin, SudoRequired]
     pagination_class = None  # 规则条数与项目组同量级，全量返回便于一眼看完
 
     def get_queryset(self):
