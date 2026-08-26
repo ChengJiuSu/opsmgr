@@ -442,15 +442,24 @@
       <b>任务流</b>
       <span class="muted">按序执行，失败中止后续模块 · 每个模块单独勾选目标主机</span>
       <b v-if="!execTask?.default_select_all" class="danger">需人工勾选</b>
+      <el-button size="small" text type="primary" style="margin-left:auto" @click="flowGraphOpen = !flowGraphOpen">
+        {{ flowGraphOpen ? '收起流程图' : '查看流程图' }}
+      </el-button>
     </div>
+
+    <!-- 模块执行顺序示意图：点节点切到该模块 -->
+    <FlowGraph
+      v-if="flowGraphOpen"
+      :steps="execTask?.steps || []" :active="execView === ALL_STEPS ? null : execView"
+      :meta-map="flowMetaMap" clickable
+      style="margin-bottom:12px"
+      @select="selectExecView"
+    />
 
     <div v-loading="execLoading" class="exec-flow">
       <!-- 左侧模块树：任务流（全部模块）/ 单个模块，与执行日志面板一致 -->
       <div class="flow-nav">
-        <div class="nav-node nav-root" :class="{ active: execView === ALL_STEPS }" @click="selectExecView(ALL_STEPS)">
-          <span class="nav-dot root" />
-          <span class="nav-title">任务流（全部模块）</span>
-        </div>
+        <div class="nav-header">任务流</div>
         <div
           v-for="(s, i) in execTask?.steps || []" :key="s.id"
           class="nav-node" :class="{ active: execView === s.id }" @click="selectExecView(s.id)"
@@ -460,6 +469,10 @@
           <span class="nav-title" :title="s.name">{{ s.name }}</span>
           <span v-if="s.task_type === 'pause'" class="nav-count muted">人工</span>
           <span v-else class="nav-count" :class="{ danger: stepHostCount(s) === 0 }">{{ stepHostCount(s) }} 台</span>
+        </div>
+        <div class="nav-node nav-root" :class="{ active: execView === ALL_STEPS }" @click="selectExecView(ALL_STEPS)">
+          <span class="nav-dot root" />
+          <span class="nav-title">全部模块流程</span>
         </div>
       </div>
 
@@ -651,6 +664,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../../stores/auth'
 import { openTaskLogStream } from '../../utils/taskLogStream'
 import StepOutput from '../../components/StepOutput.vue'
+import FlowGraph from '../../components/FlowGraph.vue'
 import {
   getServers, fetchDictOptions, projectGroupApi, channelApi, environmentApi, serviceTypeApi,
 } from '../../api/assets'
@@ -1139,6 +1153,14 @@ const visibleExecSteps = computed(() => {
   return execView.value === ALL_STEPS ? steps : steps.filter((s) => s.id === execView.value)
 })
 const stepOrderOf = (step) => (execTask.value?.steps || []).findIndex((s) => s.id === step.id) + 1
+// 流程图：默认展开，节点副标题显示本模块目标台数
+const flowGraphOpen = ref(true)
+const flowMetaMap = computed(() => Object.fromEntries(
+  (execTask.value?.steps || []).map((s) => [
+    s.id,
+    s.task_type === 'pause' ? '等待人工确认' : `${stepHostCount(s)} 台`,
+  ]),
+))
 const navDotClass = (step) => {
   if (step.task_type === 'pause') return 'pause'
   return stepHostCount(step) ? 'ready' : 'empty'
@@ -1170,7 +1192,8 @@ async function openExec(row) {
   execGlobal.value = []
   execStepsInfo.value = []
   // 主机数据到位前模板已渲染，筛选/勾选容器先按模块建好，避免 v-model 到 undefined
-  execView.value = ALL_STEPS
+  // 默认定位第一个模块（无模块时退回全部流程）
+  execView.value = row.steps?.[0]?.id ?? ALL_STEPS
   stepSelection.value = Object.fromEntries((row.steps || []).map((s) => [s.id, new Set()]))
   stepFilters.value = Object.fromEntries(
     (row.steps || []).map((s) => [s.id, { keyword: '', serviceType: '' }]),
@@ -1191,7 +1214,9 @@ async function openExec(row) {
     })
     stepSelection.value = selection
     await nextTick()
-    globalSteps.value.forEach(syncStepSelection)
+    visibleExecSteps.value
+      .filter((step) => step.task_type !== 'pause' && !step.use_custom_scope)
+      .forEach(syncStepSelection)
   } finally {
     execLoading.value = false
   }
@@ -1524,6 +1549,10 @@ code { background: #f5f7fa; padding: 1px 6px; border-radius: 3px; font-size: 12p
 .exec-dialog :deep(.el-scrollbar__thumb) { background: #c0c4cc; opacity: 1; }
 /* 执行弹窗：左侧模块树 + 右侧逐模块主机勾选 */
 .exec-flow { display: flex; gap: 12px; margin-bottom: 14px; align-items: flex-start; }
+.nav-header {
+  padding: 4px 8px 8px; font-size: 12px; color: #909399;
+  border-bottom: 1px solid #ebeef5; margin-bottom: 4px;
+}
 .flow-nav {
   width: 190px; flex-shrink: 0; padding: 6px;
   border: 1px solid #ebeef5; border-radius: 6px; background: #fafbfc;
@@ -1534,7 +1563,7 @@ code { background: #f5f7fa; padding: 1px 6px; border-radius: 3px; font-size: 12p
 }
 .nav-node:hover { background: #f0f2f5; }
 .nav-node.active { background: #ecf5ff; color: #409eff; font-weight: 600; }
-.nav-root { border-bottom: 1px solid #ebeef5; border-radius: 4px 4px 0 0; margin-bottom: 4px; }
+.nav-root { border-top: 1px solid #ebeef5; border-radius: 0 0 4px 4px; margin-top: 4px; padding-top: 8px; }
 .nav-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: #c0c4cc; }
 .nav-dot.root { background: #409eff; }
 .nav-dot.ready { background: #67c23a; }
