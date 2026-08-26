@@ -450,6 +450,58 @@ class ExecutionAPITests(TestCase):
         self.assertEqual(r.status_code, 400)
         self.assertIn('服务类型「数据库」过滤后为空', str(r.json()))
 
+    def test_execute_step_servers_pick_per_module(self):
+        """逐模块勾选：每个跟随全局的模块各跑各自勾选的主机，快照落到模块上。"""
+        from apps.asset_mgr.models import ServerService
+
+        c = self._client()
+        other = Server.objects.create(
+            name='node-02', private_ip='10.0.9.2',
+            project_group=self.pg, channel=self.ch, environment=self.env,
+        )
+        ServerService.objects.create(server=other, service_type=self.base_service, status='planned')
+
+        task_id = self._create_task(c, steps=[
+            self._step(name='模块A'),
+            self._step(order=2, name='模块B'),
+        ])
+        task = ExecutionTask.objects.get(pk=task_id)
+        step_a, step_b = list(task.steps.all())
+        with mock.patch('apps.task_exec.runner.run_stream', return_value=(0, 'ok')):
+            r = c.post(f'/api/exec/tasks/{task_id}/execute/', {
+                'step_servers': {str(step_a.id): [self.server.id], str(step_b.id): [other.id]},
+            }, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual([s.id for s in step_a.servers.all()], [self.server.id])
+        self.assertEqual([s.id for s in step_b.servers.all()], [other.id])
+        # 任务级快照 = 各模块勾选并集
+        self.assertEqual({s.id for s in task.servers.all()}, {self.server.id, other.id})
+        log = task.logs.get()
+        self.assertEqual([(s['name'], s['server_count']) for s in log.steps_result],
+                         [('模块A', 1), ('模块B', 1)])
+
+    def test_execute_rejects_foreign_step_in_step_servers(self):
+        c = self._client()
+        task_id = self._create_task(c)
+        r = c.post(f'/api/exec/tasks/{task_id}/execute/',
+                   {'step_servers': {'999999': [self.server.id]}}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('不属于本任务的模块', str(r.json()))
+
+    def test_execute_requires_manual_pick_when_select_all_off(self):
+        """关闭默认全选的任务：缺省 server_ids 拒绝执行，显式勾选后放行。"""
+        c = self._client()
+        task_id = self._create_task(c, default_select_all=False)
+
+        r = c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('人工勾选目标主机', str(r.json()))
+
+        with mock.patch('apps.task_exec.runner.run_stream', return_value=(0, 'ok')):
+            r = c.post(f'/api/exec/tasks/{task_id}/execute/',
+                       {'server_ids': [self.server.id]}, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+
     def test_execute_blocked_while_running(self):
         c = self._client()
         task_id = self._create_task(c)

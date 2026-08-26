@@ -25,6 +25,20 @@ skipped）；模块内主机按任务级 exec_mode 并发/串行（串行 = `--f
 独立匹配（同样三维度必选）。执行时实时匹配可执行主机（仅已规划服务的
 主机）：全局范围主机默认全选、可勾除；自定义范围模块按其维度全量执行。
 
+**逐模块勾选**：执行表单不再共用一张全局主机表，**每个「跟随全局」的模块
+各有一张候选主机表**（候选 = 全局匹配集，按模块 `service_type` 收窄），各自
+勾选、各自筛选（主机名/IP + 服务类型），勾选按主机 id 维护，切筛选不丢。
+自定义范围模块按维度全量执行、只读展示；暂停模块不涉及主机。
+
+`execute` body：`step_servers = {模块id: [主机id]}` 为准，`server_ids`
+作为未单独勾选模块的兜底与任务级快照来源。模块勾选落库到
+`TaskStep.servers`（最近一次执行快照），`runner._step_servers` 优先取它，
+为空回退 `task.servers`（兼容存量/外部调用）；`task.servers` 存各模块并集。
+
+**默认全选开关**（`ExecutionTask.default_select_all`，默认 True）：关闭后
+执行表单每个模块都不预勾选，必须逐模块人工确认；`execute` 缺省
+`server_ids` 且模块未出现在 `step_servers` 时直接拒绝（点名未勾选的模块）。
+
 **模块服务类型**（`TaskStep.service_type`，留空=不限）：与 `use_custom_scope`
 **正交**，对「跟随全局」与「自定义」两种范围都生效——在该范围解析出的主机上
 再收窄到**已规划/已部署该服务类型**的主机。同一任务流据此对不同服务类型跑
@@ -264,7 +278,7 @@ Ansible 项目目录内执行剧本：
 |------|------|------|
 | `match_executable_servers` | 执行表单/执行入口 | 只匹配已规划/已部署服务的主机（offline 不算），按维度过滤（留空=不限），可再按服务类型收窄；任务全局与模块自定义共用口径 |
 | `TaskStep.resolve_servers` | 执行入口 / runner 每模块 | 模块最终主机：自定义范围实时匹配、否则取全局范围勾选主机，两者再按模块 `service_type` 过滤（`filter_by_service_type`） |
-| `execute` 动作校验 | 发起执行 | `server_ids` 仅作用于全局范围模块，必须在全局匹配集内；逐模块解析主机后必须 ≥1 台；执行中禁止再次发起 |
+| `execute` 动作校验 | 发起执行 | `step_servers`/`server_ids` 仅作用于全局范围模块，模块 id 必须属于本任务、主机必须在全局匹配集内；关闭 `default_select_all` 时未勾选的模块直接拒绝；逐模块解析主机后必须 ≥1 台；执行中禁止再次发起 |
 | `validate_service_planned` | 发起执行（方法模块，逐个） | 方法关联了服务类型时，该模块的目标主机必须已规划/已部署**该**服务（部署前置校验） |
 | `runner._guard` | 每个模块执行前 | 兜底：执行排队期间规划被撤销（服务全部下线）时该模块失败，不生成 inventory |
 
@@ -359,6 +373,7 @@ GET                 /api/exec/log-files/download/ 日志原文件下载（仅管
 | 主机范围 | 任务全局三维度**必选**；模块 `use_custom_scope` 时自定义三维度同样必选 |
 | 模块服务类型 | 可选（留空=不限），跟随全局/自定义范围均生效；`pause` 模块不允许选 |
 | 执行方式 | `exec_mode` 默认 parallel |
+| 默认全选主机 | `default_select_all` 默认 True；False 时执行必须显式传 `server_ids` |
 | 变量 | `key` 须为合法 ansible 变量名；`value` 须为合法 YAML；生效条件三维度必选 |
 | 超时 | 模块级 `timeout` 秒，默认 300 |
 

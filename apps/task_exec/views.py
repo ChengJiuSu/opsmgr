@@ -277,7 +277,9 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def execute(self, request, pk=None):
-        """执行任务流。body.server_ids 可选，仅作用于全局范围模块（缺省=全部全局匹配主机）；
+        """执行任务流。body.step_servers={模块id: [主机id]} 逐模块勾选（跟随全局的
+        模块各自独立），body.server_ids 为未单独勾选模块的兜底（缺省=全部全局匹配
+        主机，任务关闭 default_select_all 时缺省会被拒绝）；
         自定义范围模块按其维度全量执行。逐模块校验主机非空与方法服务规划。"""
         task = self.get_object()
         if task.status in ('running', 'paused'):
@@ -291,8 +293,38 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
 
         # 全局范围主机：维度匹配 ∩ 勾选子集
         matched = {s.id: s for s in task.matched_servers()}
+        step_ids = {s.id for s in steps}
+        step_servers = request.data.get('step_servers') or {}
+        if not isinstance(step_servers, dict):
+            return fail('step_servers 必须为 {模块id: [主机id]} 对象')
+        # 逐模块勾选：键为模块 id，值为主机 id 数组，主机必须在全局匹配集内
+        picked = {}
+        for raw_step_id, ids in step_servers.items():
+            try:
+                step_id = int(raw_step_id)
+            except (TypeError, ValueError):
+                return fail(f'step_servers 的模块 id「{raw_step_id}」非法')
+            if step_id not in step_ids:
+                return fail(f'step_servers 含不属于本任务的模块 id {step_id}，请刷新执行页面后重试')
+            if not isinstance(ids, list):
+                return fail(f'step_servers[{step_id}] 必须为主机 id 数组')
+            invalid = [i for i in ids if i not in matched]
+            if invalid:
+                return fail(f'主机 id {invalid} 不在全局范围匹配集内，请刷新执行页面后重试')
+            picked[step_id] = [matched[i] for i in ids]
+
         server_ids = request.data.get('server_ids')
         if server_ids is None:
+            # 关闭默认全选的任务：每个跟随全局的模块都必须由发起人逐台确认
+            if not task.default_select_all:
+                unpicked = [
+                    s.name for s in steps
+                    if s.task_type != 'pause' and not s.use_custom_scope and s.id not in picked
+                ]
+                if unpicked:
+                    return fail(
+                        f'该任务已关闭「默认全选主机」，模块 {"、".join(unpicked)} 需在执行表单中人工勾选目标主机'
+                    )
             selected_global = list(matched.values())
         else:
             if not isinstance(server_ids, list):
@@ -306,7 +338,7 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
         for step in steps:
             if step.task_type == 'pause':
                 continue
-            servers = step.resolve_servers(selected_global)
+            servers = step.resolve_servers(picked.get(step.id, selected_global))
             if not servers:
                 scope = '自定义范围维度未匹配到可执行主机' if step.use_custom_scope \
                     else '全局范围未匹配/未勾选任何主机'
@@ -318,8 +350,18 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
                 if error:
                     return fail(f'模块「{step.name}」：{error}')
 
-        # 固化全局范围主机到任务快照，重置最近一次执行状态
-        task.servers.set(selected_global)
+        # 固化主机快照：模块级勾选落到各模块，任务级存并集（日志/兜底口径）
+        for step in steps:
+            if step.use_custom_scope or step.task_type == 'pause':
+                step.servers.clear()
+            else:
+                step.servers.set(picked.get(step.id, selected_global))
+        snapshot = {}
+        for step in steps:
+            if step.use_custom_scope or step.task_type == 'pause':
+                continue
+            snapshot.update({s.id: s for s in picked.get(step.id, selected_global)})
+        task.servers.set(snapshot.values())
         task.status = 'pending'
         task.return_code = None
         task.output = ''

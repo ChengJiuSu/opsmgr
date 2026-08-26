@@ -323,9 +323,10 @@ def extra_vars_args(step, workdir):
 
 
 def _step_servers(step, task):
-    """解析模块的执行主机：自定义范围实时匹配，否则用任务全局范围快照；
-    两者都再按模块服务类型收窄（见 TaskStep.resolve_servers）。"""
-    return step.resolve_servers(task.servers.all())
+    """解析模块的执行主机：自定义范围实时匹配，否则用模块自己的勾选快照
+    （为空回退任务级快照，兼容存量/外部调用），再按模块服务类型收窄。"""
+    selected = list(step.servers.all()) or list(task.servers.all())
+    return step.resolve_servers(selected)
 
 
 def _guard(servers):

@@ -259,6 +259,13 @@
           <b :class="{ danger: matchedCount === 0 }">{{ matchedCount ?? '…' }}</b> 台可执行主机；
           模块可单独覆盖范围与服务类型，具体主机在「执行」时确认
         </div>
+        <!-- 关闭后执行表单不预勾选，必须人工挑主机（后端同样拒绝缺省 server_ids） -->
+        <el-checkbox v-model="form.default_select_all" size="small">
+          执行时默认全选范围主机
+        </el-checkbox>
+        <span class="form-tip" style="margin:0 0 0 8px">
+          取消后发起执行时不预勾选，必须人工确认要跑哪些主机
+        </span>
       </el-form-item>
 
       <!-- 任务流模块列表 -->
@@ -410,74 +417,174 @@
   </el-dialog>
 
   <!-- 执行任务弹窗：任务流预览 + 全局主机勾选 -->
-  <el-dialog v-model="execVisible" :title="`执行任务 — ${execTask?.name || ''}`" width="760px" top="4vh">
-    <el-descriptions :column="3" border size="small" style="margin-bottom: 12px">
-      <el-descriptions-item label="项目组">{{ execTask?.project_group_name || '不限' }}</el-descriptions-item>
-      <el-descriptions-item label="渠道">{{ execTask?.channel_name || '不限' }}</el-descriptions-item>
-      <el-descriptions-item label="环境">
-        <span :class="{ prod: execTask?.environment_is_prod }">{{ execTask?.environment_name || '不限' }}</span>
-      </el-descriptions-item>
-    </el-descriptions>
-
-    <div class="exec-hosts-header"><span>任务流（按序执行，失败中止后续模块）</span></div>
-    <el-table :data="execTask?.steps || []" size="small" style="margin-bottom: 14px">
-      <el-table-column label="#" width="42">
-        <template #default="{ $index }">{{ $index + 1 }}</template>
-      </el-table-column>
-      <el-table-column prop="name" label="模块" min-width="110" show-overflow-tooltip />
-      <el-table-column label="类型" width="120">
-        <template #default="{ row }">
-          <el-tag size="small" :type="typeTagType(row.task_type)" effect="plain">{{ row.task_type_display }}</el-tag>
-          <el-tag v-if="row.run_parallel" size="small" type="danger" effect="plain" style="margin-left:4px">并行</el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column label="内容" min-width="150" show-overflow-tooltip>
-        <template #default="{ row }">{{ stepContent(row) }}</template>
-      </el-table-column>
-      <el-table-column label="执行主机" width="150">
-        <template #default="{ row }">
-          <span :class="{ danger: stepHostCount(row) === 0 }">{{ stepHostLabel(row) }}</span>
-        </template>
-      </el-table-column>
-    </el-table>
-
-    <template v-if="hasGlobalStep">
-      <div class="exec-hosts-header">
-        <span>全局范围主机（默认全选，取消勾选即排除；仅作用于「跟随全局」的模块）</span>
-        <span class="muted">已选 {{ execSelection.length }} / {{ execGlobal.length }} 台</span>
-      </div>
-      <el-table
-        ref="hostTableRef"
-        v-loading="execLoading"
-        :data="execGlobal"
-        size="small" stripe max-height="260"
-        @selection-change="(rows) => (execSelection = rows)"
-      >
-        <el-table-column type="selection" width="42" />
-        <el-table-column prop="name" label="主机名" min-width="120" show-overflow-tooltip />
-        <!-- 连接地址口径：公网优先，NAT 主机回退私网，与实际 ansible 连接一致 -->
-        <el-table-column label="IP" width="130">
-          <template #default="{ row }">{{ row.public_ip || row.private_ip }}</template>
-        </el-table-column>
-        <el-table-column label="环境" width="100">
-          <template #default="{ row }">
-            <span :class="{ prod: row.environment_is_prod, unset: !row.environment_name }">{{ row.environment_name || '未分配' }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="已规划服务" min-width="140" show-overflow-tooltip>
-          <template #default="{ row }">{{ serviceCodes(row) }}</template>
-        </el-table-column>
-      </el-table>
-      <el-alert v-if="!execLoading && !execGlobal.length" type="warning" :closable="false" show-icon style="margin-top:8px">
-        全局范围未匹配到可执行主机（仅已在「服务器分配」中规划服务的主机可执行）
-      </el-alert>
+  <el-dialog v-model="execVisible" width="1040px" top="6vh" class="exec-dialog">
+    <template #header>
+      <span class="exec-title">执行任务</span>
+      <span class="exec-title-name">{{ execTask?.name }}</span>
     </template>
 
+    <!-- 任务概览：维度 + 模块数 -->
+    <div class="exec-meta">
+      <div class="exec-meta-cell"><span class="k">项目组</span><b>{{ execTask?.project_group_name || '不限' }}</b></div>
+      <div class="exec-meta-cell"><span class="k">渠道</span><b>{{ execTask?.channel_name || '不限' }}</b></div>
+      <div class="exec-meta-cell">
+        <span class="k">环境</span>
+        <b :class="{ prod: execTask?.environment_is_prod }">{{ execTask?.environment_name || '不限' }}</b>
+      </div>
+      <div class="exec-meta-cell">
+        <span class="k">模块</span>
+        <b>{{ execTask?.steps?.length || 0 }} 个</b>
+        <span class="muted">· {{ execTask?.exec_mode === 'serial' ? '主机串行' : '按序执行' }}</span>
+      </div>
+    </div>
+
+    <div class="exec-section">
+      <b>任务流</b>
+      <span class="muted">按序执行，失败中止后续模块 · 每个模块单独勾选目标主机</span>
+      <b v-if="!execTask?.default_select_all" class="danger">需人工勾选</b>
+    </div>
+
+    <div v-loading="execLoading" class="exec-steps">
+      <div v-for="(s, i) in execTask?.steps || []" :key="s.id" class="exec-step">
+        <div class="exec-step-index">{{ i + 1 }}</div>
+        <div class="exec-step-main">
+          <div class="exec-step-head">
+            <b class="exec-step-name">{{ s.name }}</b>
+            <!-- Role/命令/方法独立展示：竖线分隔，标签灰、值蓝色高亮 -->
+            <template v-if="stepBadgeValue(s)">
+              <span class="exec-step-sep" />
+              <span class="badge">{{ stepBadge(s) }}</span>
+              <span class="exec-step-role">{{ stepBadgeValue(s) }}</span>
+            </template>
+            <code v-if="stepPrimary(s)" class="exec-step-primary">{{ stepPrimary(s) }}</code>
+            <el-tag v-if="s.run_parallel" size="small" type="danger" effect="plain">并行</el-tag>
+            <!-- 模块勾选的服务类型：主机可能规划了多种服务，这里明确本模块只打哪一种 -->
+            <template v-if="s.service_type_name">
+              <span class="exec-step-sep" />
+              <span class="badge">SERVICE_TYPE</span>
+              <span class="exec-step-service">{{ s.service_type_name }}</span>
+            </template>
+            <span v-else-if="s.task_type !== 'pause'" class="exec-step-service-none">全部服务类型</span>
+            <span v-if="s.task_type !== 'pause'" class="exec-step-count">
+              <template v-if="s.use_custom_scope">
+                自定义 <b class="num">{{ stepHostCount(s) }}</b> 台
+              </template>
+              <template v-else>
+                已选 <b class="num" :class="{ danger: stepHostCount(s) === 0 }">{{ stepHostCount(s) }}</b>
+                /{{ stepCandidates(s).length }} 台
+              </template>
+            </span>
+          </div>
+
+          <!-- 暂停确认：不涉及主机 -->
+          <div v-if="s.task_type === 'pause'" class="form-tip">执行到本模块暂停，等待人工确认，不涉及目标主机</div>
+
+          <!-- 自定义范围：按模块维度全量执行，不参与勾选，只列出影响的主机 -->
+          <template v-else-if="s.use_custom_scope">
+            <div class="form-tip">自定义范围按模块维度全量执行，不可勾选：</div>
+            <div class="step-hosts">
+              <el-tag v-for="name in stepHostNames(s)" :key="name" size="small" effect="plain" class="host-chip">
+                {{ name }}
+              </el-tag>
+            </div>
+          </template>
+
+          <!-- 跟随全局：本模块独立勾选（候选已按模块服务类型收窄）-->
+          <div v-else class="exec-step-hosts">
+            <div class="host-filter">
+              <el-input
+                v-model="stepFilters[s.id].keyword" placeholder="搜索主机名/IP" clearable size="small"
+                style="width:180px" @input="syncStepSelection(s)" @clear="syncStepSelection(s)"
+              />
+              <el-select
+                v-model="stepFilters[s.id].serviceType" placeholder="服务类型（全部）" clearable size="small"
+                style="width:150px" @change="syncStepSelection(s)"
+              >
+                <el-option v-for="t in stepServiceTypes(s)" :key="t" :label="t" :value="t" />
+              </el-select>
+              <span class="muted" style="font-size:12px">当前 {{ stepVisibleHosts(s).length }} 台</span>
+              <el-button class="pick-btn" size="small" text type="primary" @click="selectStepHosts(s, true)">全选当前</el-button>
+              <el-button size="small" text @click="selectStepHosts(s, false)">取消当前</el-button>
+            </div>
+            <!-- 主机表自成滚动区：表头黏顶，行少时不留空白；超出时底部渐隐 -->
+            <div class="host-table-wrap" :class="{ 'has-more': stepVisibleHosts(s).length > VISIBLE_ROWS }">
+            <el-table
+              :ref="(el) => setStepTable(s.id, el)"
+              :data="stepVisibleHosts(s)"
+              size="small" :max-height="HOST_LIST_HEIGHT" row-key="id" scrollbar-always-on
+              class="host-table" :row-class-name="({ row }) => stepRowClass(s, row)"
+              @selection-change="(rows) => onStepSelectionChange(s, rows)"
+            >
+              <el-table-column type="selection" width="42" reserve-selection />
+              <el-table-column label="主机名" min-width="240" show-overflow-tooltip>
+                <template #default="{ row }">
+                  <span class="host-prefix">{{ splitHostName(row.name).prefix }}</span
+                  ><span class="host-suffix">{{ splitHostName(row.name).suffix }}</span>
+                </template>
+              </el-table-column>
+              <!-- 连接地址口径：公网优先，NAT 主机回退私网，与实际 ansible 连接一致 -->
+              <el-table-column label="IP" width="130">
+                <template #default="{ row }">{{ row.public_ip || row.private_ip }}</template>
+              </el-table-column>
+              <el-table-column label="环境" width="72">
+                <template #default="{ row }">
+                  <span :class="{ prod: row.environment_is_prod, unset: !row.environment_name }">
+                    {{ row.environment_name || '未分配' }}
+                  </span>
+                </template>
+              </el-table-column>
+              <el-table-column label="已规划服务" min-width="170">
+                <template #default="{ row }">
+                  <el-tooltip :content="serviceCodes(row)" placement="top">
+                    <span class="host-services">
+                      <el-tag
+                        v-for="x in hostServices(row)" :key="x.service_type"
+                        size="small" :effect="x.service_type === s.service_type ? 'dark' : 'plain'"
+                        :type="x.service_type === s.service_type ? 'primary' : 'info'"
+                      >{{ x.service_type_name }}</el-tag>
+                      <span v-if="!hostServices(row).length" class="unset">-</span>
+                    </span>
+                  </el-tooltip>
+                </template>
+              </el-table-column>
+              <el-table-column prop="project_group_name" label="项目组" min-width="100" show-overflow-tooltip />
+            </el-table>
+            </div>
+            <div v-if="stepVisibleHosts(s).length > VISIBLE_ROWS" class="exec-step-foot">
+              列表限高显示 {{ VISIBLE_ROWS }} 台，滚动查看其余 {{ stepVisibleHosts(s).length - VISIBLE_ROWS }} 台
+            </div>
+            <el-alert
+              v-if="!execLoading && !stepCandidates(s).length" type="warning" :closable="false" show-icon
+              style="margin-top:6px"
+            >
+              本模块范围内无可执行主机（需在「服务器分配」中规划服务{{ s.service_type_name ? `，且服务类型为「${s.service_type_name}」` : '' }}）
+            </el-alert>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 汇总：累计=各模块相加（同一台被多个模块用会重复计），去重=实际涉及主机数 -->
+    <div v-if="!execLoading" class="exec-summary">
+      <span>汇总</span>
+      <b>{{ execTask?.steps?.length || 0 }}</b> 个模块 ·
+      累计目标主机 <b>{{ totalTargetHosts }}</b> 台 ·
+      去重 <b>{{ uniqueTargetHosts }}</b> 台
+      <span v-if="hasProdTarget" class="prod">· 含生产环境主机</span>
+    </div>
+
     <template #footer>
-      <el-button @click="execVisible = false">取消</el-button>
-      <el-button type="primary" :disabled="!canExec" @click="confirmVisible = true">
-        执行（{{ execTask?.steps?.length || 0 }} 个模块）
-      </el-button>
+      <div class="exec-footer">
+        <span class="muted">
+          共 {{ execTask?.steps?.length || 0 }} 个模块，累计目标主机 {{ totalTargetHosts }} 台
+        </span>
+        <span>
+          <el-button @click="execVisible = false">取消</el-button>
+          <el-button type="primary" :disabled="!canExec" @click="confirmVisible = true">
+            执行（{{ execTask?.steps?.length || 0 }} 个模块）
+          </el-button>
+        </span>
+      </div>
     </template>
   </el-dialog>
 
@@ -495,6 +602,7 @@
     <ol class="flow-steps">
       <li v-for="s in execTask?.steps || []" :key="s.id">
         <b>{{ s.name }}</b>（{{ s.task_type_display }}{{ s.run_parallel ? ' · 并行' : '' }}）：{{ stepContent(s) }} → {{ stepHostLabel(s) }}
+        <div v-if="stepHostCount(s)" class="flow-hosts">{{ stepHostsTooltip(s) }}</div>
       </li>
       <li>{{ execTask?.exec_mode === 'serial' ? '各模块内主机串行逐台执行（--forks 1）' : `各模块内主机并发执行（每批 ${execTask?.forks || 10} 台）` }}</li>
       <li>执行结果落一条执行日志（含逐模块结果），可在任务列表下方查看</li>
@@ -513,7 +621,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, nextTick, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { debounce } from '../../utils/debounce'
 import { useRouter } from 'vue-router'
 import {
@@ -556,6 +664,11 @@ function stepContent(s) {
   if (s.task_type === 'method') return `${s.method_name || '-'}${s.tags ? ' · ' + s.tags : ''}`
   if (s.task_type === 'playbook') return `${s.playbook || '-'}${s.tags ? ' · ' + s.tags : ''}`
   return (s.command || '').slice(0, 50) || '-'
+}
+
+// 主机已规划/已部署的服务列表；命中模块服务类型的排在最前（表格里高亮显示）
+function hostServices(row) {
+  return (row.services || []).filter((x) => x.status === 'planned' || x.status === 'deployed')
 }
 
 function serviceCodes(s) {
@@ -633,7 +746,7 @@ const emptyStep = () => ({
 const emptyForm = () => ({
   id: null, name: '',
   project_group: null, channel: null, environment: null,
-  forks: 10, credential: null,
+  forks: 10, credential: null, default_select_all: true,
   steps: [emptyStep()],
 })
 const form = reactive(emptyForm())
@@ -724,6 +837,7 @@ async function openForm(row) {
       project_group: row.project_group || null, channel: row.channel || null,
       environment: row.environment || null,
       forks: row.exec_mode === 'serial' ? 1 : (row.forks || 10), credential: row.credential || null,
+      default_select_all: row.default_select_all !== false,
       steps: (row.steps || []).map((s) => ({
         name: s.name, task_type: s.task_type, command: s.command || '',
         playbook: s.playbook || '', pbMethod: null, method: s.method || null,
@@ -795,6 +909,7 @@ function buildPayload() {
     project_group: form.project_group, channel: form.channel, environment: form.environment,
     exec_mode: (form.forks || 10) === 1 ? 'serial' : 'parallel',
     forks: form.forks || 10, credential: form.credential,
+    default_select_all: form.default_select_all,
     steps: form.steps.map((s, i) => ({
       order: i + 1, name: s.name, task_type: s.task_type,
       command: s.task_type === 'command' ? s.command : '',
@@ -862,31 +977,142 @@ const confirmVisible = ref(false)
 const execLoading = ref(false)
 const executing = ref(false)
 const execTask = ref(null)
-const execGlobal = ref([])
-const execStepsInfo = ref([]) // matched_servers 返回的模块主机来源（含自定义匹配结果）
-const execSelection = ref([])
-const hostTableRef = ref()
+const execGlobal = ref([])          // 全局范围匹配主机（各模块的候选来源）
+const execStepsInfo = ref([])       // matched_servers 返回的模块主机来源
+// 逐模块勾选：模块 id → 已勾选主机 id 集合（跟随全局的模块各自独立）
+const stepSelection = ref({})
+// 逐模块筛选条件：模块 id → { keyword, serviceType }
+const stepFilters = ref({})
+const stepTables = {}               // 模块 id → el-table 实例（重放勾选用）
+const syncingSteps = new Set()      // 重放期间忽略该模块的表格事件
 
-const hasGlobalStep = computed(() => (execTask.value?.steps || []).some((s) => s.task_type !== 'pause' && !s.use_custom_scope))
 const stepInfoByOrder = computed(() => Object.fromEntries(execStepsInfo.value.map((s) => [s.order, s])))
 
-const stepHostCount = (step) => {
-  if (step.use_custom_scope) return stepInfoByOrder.value[step.order]?.total ?? 0
-  // 跟随全局：勾选主机 ∩ 后端给出的服务类型命中集（未选服务类型时即全部勾选）
+// 模块候选主机：跟随全局取全局匹配集，带服务类型的按后端命中集收窄
+const stepCandidates = (step) => {
+  if (step.task_type === 'pause' || step.use_custom_scope) return []
   const allowed = stepInfoByOrder.value[step.order]?.server_ids
   if (step.service_type && allowed) {
     const hit = new Set(allowed)
-    return execSelection.value.filter((s) => hit.has(s.id)).length
+    return execGlobal.value.filter((s) => hit.has(s.id))
   }
-  return execSelection.value.length
+  return execGlobal.value
 }
+
+// 模块实际执行的主机：自定义范围取后端匹配结果，跟随全局取本模块勾选
+const stepHosts = (step) => {
+  if (step.task_type === 'pause') return []
+  if (step.use_custom_scope) return stepInfoByOrder.value[step.order]?.servers || []
+  const picked = stepSelection.value[step.id]
+  return picked ? stepCandidates(step).filter((s) => picked.has(s.id)) : []
+}
+const stepHostCount = (step) => stepHosts(step).length
+const HOST_CHIP_LIMIT = 4
+const stepHostNames = (step) => stepHosts(step).map((s) => s.name)
+const stepHostsTooltip = (step) => stepHostNames(step).join('、') || '无'
 const stepHostLabel = (step) => {
   if (step.task_type === 'pause') return '人工确认'
   const svc = step.service_type_name ? ` · ${step.service_type_name}` : ''
   return step.use_custom_scope
     ? `自定义${svc} · ${stepHostCount(step)} 台`
-    : `全局${svc} · 已选 ${stepHostCount(step)} 台`
+    : `已选${svc} · ${stepHostCount(step)} / ${stepCandidates(step).length} 台`
 }
+
+// 模块筛选后的可见行：筛选只改可见范围，勾选按 id 保留（切筛选不丢）。
+// 用 computed 缓存数组：模板里现算会每次渲染产生新数组，el-table 视为
+// 数据变更并清空勾选（勾一台就全没了）
+const stepVisibleMap = computed(() => {
+  const out = {}
+  ;(execTask.value?.steps || []).forEach((step) => {
+    if (step.task_type === 'pause' || step.use_custom_scope) return
+    const f = stepFilters.value[step.id] || { keyword: '', serviceType: '' }
+    const kw = (f.keyword || '').trim().toLowerCase()
+    out[step.id] = stepCandidates(step).filter((s) => {
+      if (f.serviceType && !(s.services || []).some((x) => x.service_type_name === f.serviceType)) return false
+      if (!kw) return true
+      return `${s.name} ${s.public_ip || ''} ${s.private_ip || ''}`.toLowerCase().includes(kw)
+    })
+  })
+  return out
+})
+const stepVisibleHosts = (step) => stepVisibleMap.value[step.id] || []
+
+// 模块候选主机里出现过的服务类型（筛选下拉候选，无需额外请求）
+const stepServiceTypes = (step) => {
+  const names = new Set()
+  stepCandidates(step).forEach((s) => (s.services || []).forEach((x) => names.add(x.service_type_name)))
+  return [...names].sort()
+}
+
+function setStepTable(stepId, el) {
+  if (el) stepTables[stepId] = el
+  else delete stepTables[stepId]
+}
+
+// 表格勾选变化：只用可见行结果覆盖可见部分，被筛掉的已勾选主机原样保留
+function onStepSelectionChange(step, rows) {
+  if (syncingSteps.has(step.id)) return
+  const visibleIds = new Set(stepVisibleHosts(step).map((s) => s.id))
+  const next = new Set([...(stepSelection.value[step.id] || [])].filter((id) => !visibleIds.has(id)))
+  rows.forEach((r) => next.add(r.id))
+  stepSelection.value = { ...stepSelection.value, [step.id]: next }
+}
+
+function selectStepHosts(step, checked) {
+  const next = new Set(stepSelection.value[step.id] || [])
+  stepVisibleHosts(step).forEach((s) => (checked ? next.add(s.id) : next.delete(s.id)))
+  stepSelection.value = { ...stepSelection.value, [step.id]: next }
+  syncStepSelection(step)
+}
+
+// 把模块勾选集重放到表格复选框（数据/筛选变化后调用）
+async function syncStepSelection(step) {
+  syncingSteps.add(step.id)
+  await nextTick()
+  const table = stepTables[step.id]
+  table?.clearSelection()
+  const picked = stepSelection.value[step.id] || new Set()
+  stepVisibleHosts(step).forEach((s) => {
+    if (picked.has(s.id)) table?.toggleRowSelection(s, true)
+  })
+  await nextTick()
+  syncingSteps.delete(step.id)
+}
+
+// 模块摘要（对齐执行弹窗的两行展示）：主体内容 + 类型徽标 + 徽标值
+// 主机表滚动区：限高 228px = 表头 38 + 5 行 × 38，行高由 CSS 压到 38px；
+// 可见行数由高度推算，底部提示与实际能看到的台数保持一致
+const HOST_LIST_HEIGHT = 228
+const HOST_ROW_HEIGHT = 38
+const VISIBLE_ROWS = Math.floor(HOST_LIST_HEIGHT / HOST_ROW_HEIGHT) - 1
+const stepPrimary = (step) => (step.task_type === 'playbook' ? step.playbook : '')
+const stepBadge = (step) =>
+  ({ playbook: 'ROLE', command: 'CMD', method: 'METHOD', pause: 'PAUSE' }[step.task_type] || '')
+const stepBadgeValue = (step) => {
+  if (step.task_type === 'playbook') return step.tags
+  if (step.task_type === 'command') return step.command
+  if (step.task_type === 'method') return step.method_name
+  return `等待人工确认 ${step.timeout || 300}s`
+}
+// 主机名分段：末尾两段（nginx-01 / test-02）加深，前缀降灰，长名字便于扫读
+const splitHostName = (name) => {
+  const parts = (name || '').split('-')
+  if (parts.length <= 2) return { prefix: '', suffix: name || '' }
+  return { prefix: `${parts.slice(0, -2).join('-')}-`, suffix: parts.slice(-2).join('-') }
+}
+// 已勾选行加极浅蓝底，未选行留白，全选时也能看出层次
+const stepRowClass = (step, row) => (stepSelection.value[step.id]?.has(row.id) ? 'row-picked' : '')
+
+const totalTargetHosts = computed(() =>
+  (execTask.value?.steps || []).reduce((n, s) => n + stepHostCount(s), 0))
+const uniqueTargetHosts = computed(() => {
+  const ids = new Set()
+  ;(execTask.value?.steps || []).forEach((s) => stepHosts(s).forEach((h) => ids.add(h.id)))
+  return ids.size
+})
+
+const globalSteps = computed(() =>
+  (execTask.value?.steps || []).filter((s) => s.task_type !== 'pause' && !s.use_custom_scope))
 
 // 暂停确认模块不涉及主机，不参与「每模块必须有主机」校验
 const canExec = computed(() =>
@@ -896,24 +1122,35 @@ const canExec = computed(() =>
 
 const hasProdTarget = computed(() => {
   if (execTask.value?.environment_is_prod) return true
-  if (execSelection.value.some((s) => s.environment_is_prod)) return true
-  return execStepsInfo.value.some((st) => st.custom && (st.servers || []).some((s) => s.environment_is_prod))
+  return (execTask.value?.steps || []).some((s) => stepHosts(s).some((h) => h.environment_is_prod))
 })
 
 async function openExec(row) {
   execTask.value = row
   execGlobal.value = []
   execStepsInfo.value = []
-  execSelection.value = []
+  // 主机数据到位前模板已渲染，筛选/勾选容器先按模块建好，避免 v-model 到 undefined
+  stepSelection.value = Object.fromEntries((row.steps || []).map((s) => [s.id, new Set()]))
+  stepFilters.value = Object.fromEntries(
+    (row.steps || []).map((s) => [s.id, { keyword: '', serviceType: '' }]),
+  )
   execVisible.value = true
   execLoading.value = true
   try {
     const res = await getMatchedServers(row.id)
     execGlobal.value = res.data?.global?.results || []
     execStepsInfo.value = res.data?.steps || []
-    // 全局范围默认全选，取消勾选即排除
+    // 每个跟随全局的模块独立初始化：默认全选候选（可勾除）；
+    // 任务关闭默认全选时留空，必须逐模块人工挑主机
+    const selection = { ...stepSelection.value }
+    globalSteps.value.forEach((step) => {
+      selection[step.id] = new Set(
+        row.default_select_all !== false ? stepCandidates(step).map((s) => s.id) : [],
+      )
+    })
+    stepSelection.value = selection
     await nextTick()
-    hostTableRef.value?.toggleAllSelection()
+    globalSteps.value.forEach(syncStepSelection)
   } finally {
     execLoading.value = false
   }
@@ -922,8 +1159,17 @@ async function openExec(row) {
 async function doExecute() {
   executing.value = true
   try {
+    // step_servers 为准（逐模块），server_ids 传并集供未单独勾选的模块兜底
+    const stepServers = {}
+    const union = new Set()
+    globalSteps.value.forEach((step) => {
+      const ids = stepHosts(step).map((s) => s.id)
+      stepServers[step.id] = ids
+      ids.forEach((id) => union.add(id))
+    })
     const res = await executeTask(execTask.value.id, {
-      server_ids: execSelection.value.map((s) => s.id),
+      step_servers: stepServers,
+      server_ids: [...union],
     })
     ElMessage.success(res.msg || '已发起执行')
     confirmVisible.value = false
@@ -1209,12 +1455,107 @@ code { background: #f5f7fa; padding: 1px 6px; border-radius: 3px; font-size: 12p
 .match-num { color: #f56c6c; font-weight: 600; font-size: 13px; }
 .params-input :deep(textarea) { font-family: 'Courier New', monospace; font-size: 12px; }
 
+.host-filter { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+/* 执行弹窗标题：任务名单独高亮 */
+.exec-title { font-size: 16px; font-weight: 600; color: #303133; }
+.exec-title-name { margin-left: 10px; font-size: 15px; font-weight: 600; color: #409eff; }
+/* 任务概览条：四格等分，标签灰、值加粗 */
+.exec-meta {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 0 18px;
+  padding: 8px 12px; margin-bottom: 12px;
+  border: 1px solid #ebeef5; border-radius: 4px; background: #fafafa;
+}
+.exec-meta-cell { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.exec-meta-cell .k { color: #909399; font-size: 12px; }
+.exec-section { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; font-size: 13px; }
+.exec-section .muted { font-size: 12px; }
+/* 执行弹窗：整体限高 80vh，标题栏/操作栏固定，正文独立滚动 */
+.exec-dialog { display: flex; flex-direction: column; max-height: 80vh; box-shadow: 0 8px 24px rgba(0, 0, 0, .08); }
+.exec-dialog :deep(.el-dialog__body) { flex: 1; min-height: 0; overflow-y: auto; }
+/* 滚动条常显：默认细/透明，在弹窗里看不出内容可滚 */
+.exec-dialog :deep(.el-dialog__body)::-webkit-scrollbar { width: 10px; }
+.exec-dialog :deep(.el-dialog__body)::-webkit-scrollbar-thumb {
+  background: #c0c4cc; border-radius: 5px; border: 2px solid transparent; background-clip: content-box;
+}
+.exec-dialog :deep(.el-dialog__body)::-webkit-scrollbar-track { background: #f5f7fa; }
+.exec-dialog :deep(.el-scrollbar__bar) { opacity: 1; }
+.exec-dialog :deep(.el-scrollbar__bar.is-vertical) { width: 8px; }
+.exec-dialog :deep(.el-scrollbar__thumb) { background: #c0c4cc; opacity: 1; }
+/* 执行弹窗：逐模块主机勾选卡片 */
+.exec-steps { display: flex; flex-direction: column; gap: 16px; margin-bottom: 14px; }
+/* 纵深递进：弹窗白 → 模块 #fafbfc → 缩进区 #eef1f5 → 主机表白 */
+.exec-step {
+  position: relative; display: flex; border: 1px solid #e4e7ed; border-radius: 6px;
+  background: #fafbfc;
+}
+/* 模块之间短虚线相连，强调「按序执行」 */
+.exec-step:not(:last-child)::after {
+  content: ''; position: absolute; left: 20px; bottom: -17px;
+  width: 0; height: 16px; border-left: 1px dashed #c0c4cc;
+}
+/* 左侧序号轴：数字在顶，细线贯穿到卡片底 */
+.exec-step-index {
+  position: relative; width: 40px; flex-shrink: 0;
+  display: flex; align-items: flex-start; justify-content: center;
+  padding-top: 12px; color: #606266; font-size: 13px; font-weight: 600;
+}
+.exec-step-index::after {
+  content: ''; position: absolute; left: 50%; top: 34px; bottom: 10px;
+  width: 0; border-left: 1px solid #dcdfe6;
+}
+.exec-step-main { flex: 1; min-width: 0; padding: 10px 12px; }
+.exec-step-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.exec-step-name { font-size: 14px; }
+/* playbook 文件名降为次要信息；role 名蓝色高亮 */
+.exec-step-primary { color: #a8abb2; background: transparent; padding: 0; font-size: 12px; }
+.exec-step-sep { width: 1px; height: 13px; background: #dcdfe6; }
+.exec-step-head .badge { font-size: 11px; color: #a8abb2; letter-spacing: .5px; }
+.exec-step-role { color: #409eff; font-weight: 600; font-size: 13px; }
+/* 模块服务类型：与 role 同级但用橙色区分维度 */
+.exec-step-service { color: #e6a23c; font-weight: 600; font-size: 13px; }
+.exec-step-service-none { color: #c0c4cc; font-size: 12px; }
+.host-services { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+.exec-step-count { margin-left: auto; font-size: 12px; color: #909399; }
+.exec-step-count .num { color: #409eff; font-size: 13px; }
+.exec-step-count .num.danger { color: #f56c6c; }
+/* 主机区：操作栏在滚动区之上，表格自成滚动容器 */
+.exec-step-hosts { background: #eef1f5; border: 1px solid #e0e4ea; border-radius: 4px; padding: 8px; margin-top: 8px; }
+/* 滚动区底部渐隐遮罩：只在有溢出时出现 */
+.host-table-wrap { position: relative; }
+.host-table-wrap.has-more::after {
+  content: ''; position: absolute; left: 1px; right: 1px; bottom: 1px; height: 24px;
+  pointer-events: none; border-radius: 0 0 4px 4px;
+  background: linear-gradient(to bottom, rgba(255, 255, 255, 0), #fff);
+}
+/* 行高压到 38px，去掉主机名与 IP 之间的大片空档 */
+.host-table :deep(.el-table__row) td { padding: 4px 0; }
+.host-table :deep(.cell) { line-height: 30px; }
+/* 选中态：极浅蓝底（含 hover 时保持可辨） */
+.host-table :deep(.row-picked) td { background: #f5f9ff; }
+.host-table :deep(.row-picked:hover) td { background: #ecf4ff; }
+/* 主机名分段 */
+.host-prefix { color: #a8abb2; }
+.host-suffix { color: #303133; font-weight: 600; }
+.exec-step-hosts .host-filter { margin-bottom: 8px; }
+.exec-step-hosts .pick-btn { margin-left: auto; }
+.exec-step-foot { padding: 6px 4px 0; font-size: 12px; color: #a8abb2; }
+.exec-footer { display: flex; align-items: center; justify-content: space-between; }
+.exec-summary {
+  display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+  padding: 8px 12px; border: 1px solid #ebeef5; border-radius: 4px;
+  background: #fafafa; font-size: 13px; color: #606266;
+}
+.exec-summary > span:first-child { color: #909399; margin-right: 4px; }
+.exec-summary b { color: #409eff; }
 .exec-hosts-header {
   display: flex; justify-content: space-between; align-items: center;
   margin-bottom: 8px; font-size: 13px; color: #606266;
 }
 .flow-title { font-weight: 600; margin: 14px 0 6px; font-size: 14px; }
 .flow-steps { margin: 0; padding-left: 20px; color: #606266; font-size: 13px; line-height: 1.9; }
+.flow-hosts { color: #909399; font-size: 12px; line-height: 1.5; word-break: break-all; }
+.step-hosts { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 3px; }
+.host-chip { max-width: 100%; }
 .log-header { display: flex; justify-content: space-between; align-items: center; }
 .log-body { display: flex; gap: 16px; }
 /* 执行记录列表占 1/3，详细日志占 2/3 */

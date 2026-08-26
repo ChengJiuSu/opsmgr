@@ -233,6 +233,10 @@ class ExecutionTask(models.Model):
     exec_mode = models.CharField('主机执行方式', max_length=20, choices=EXEC_MODE_CHOICES, default='parallel')
     # 并发模式下的主机并发数（ansible --forks）：默认 10 台一批
     forks = models.PositiveIntegerField('主机并发数', default=10)
+    # 执行表单的主机预勾选策略：True=默认全选范围主机（可勾除）；
+    # False=默认不选，必须在执行时人工挑主机（execute 也拒绝缺省 server_ids），
+    # 用于范围内混着多种服务类型、必须逐台确认的任务
+    default_select_all = models.BooleanField('执行时默认全选主机', default=True)
 
     # ── 目标主机与连接：servers 为「最近一次执行的全局范围主机」快照 ──
     servers = models.ManyToManyField(
@@ -316,6 +320,12 @@ class TaskStep(models.Model):
     # 模块间并行：相邻的 run_parallel=True 模块合并为一个并行组同时执行，
     # 组内全部成功才进入下一阶段；默认 False=按序串行（pause 模块禁止并行）
     run_parallel = models.BooleanField('与相邻并行模块并发', default=False)
+
+    # 最近一次执行时该模块勾选的主机快照（跟随全局的模块逐个独立勾选；
+    # 自定义范围/暂停模块不写，执行时实时匹配）。为空则回退任务级快照
+    servers = models.ManyToManyField(
+        'asset_mgr.Server', verbose_name='模块目标主机', related_name='task_steps_selected', blank=True,
+    )
 
     # ── 主机范围：默认跟随任务全局，自定义时按模块维度独立匹配 ──
     use_custom_scope = models.BooleanField('自定义主机范围', default=False)
