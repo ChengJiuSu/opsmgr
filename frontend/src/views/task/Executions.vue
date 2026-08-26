@@ -427,11 +427,11 @@
                 </el-select>
               </template>
               <!-- 服务类型：与主机范围正交，跟随全局/自定义都可再按服务类型收窄 -->
-              <el-tooltip placement="top" content="在上述主机范围内，只对已规划/已部署该服务类型的主机执行本模块；不限=范围内全部主机">
-                <span class="setting-label inline" :class="{ active: step.service_type }">服务类型</span>
+              <el-tooltip placement="top" content="在上述主机范围内，只对已规划/已部署该服务类型的主机执行本模块（必选）">
+                <span class="setting-label inline required" :class="{ active: step.service_type }">服务类型</span>
               </el-tooltip>
               <el-select
-                v-model="step.service_type" placeholder="不限" clearable filterable
+                v-model="step.service_type" placeholder="必选" filterable
                 size="small" style="width:120px" @change="updateStepCount(step)"
               >
                 <el-option v-for="d in dictOptions.serviceTypes" :key="d.id" :label="d.name" :value="d.id" />
@@ -535,7 +535,7 @@
               <span class="badge">SERVICE_TYPE</span>
               <span class="exec-step-service">{{ s.service_type_name }}</span>
             </template>
-            <span v-else-if="s.task_type !== 'pause'" class="exec-step-service-none">全部服务类型</span>
+            <span v-else-if="s.task_type !== 'pause'" class="exec-step-service-none">服务类型未设置（存量任务按不限执行）</span>
             <span v-if="s.task_type !== 'pause'" class="exec-step-count">
               <template v-if="s.use_custom_scope">
                 自定义 <b class="num">{{ stepHostCount(s) }}</b> 台
@@ -905,7 +905,7 @@ const formFlowSteps = computed(() => form.steps.map((step, i) => ({
 const formFlowMeta = computed(() => Object.fromEntries(form.steps.map((step, i) => [
   i,
   step.task_type === 'pause' ? '等待人工确认'
-    : (dictOptions.serviceTypes.find((d) => d.id === step.service_type)?.name || '全部服务类型'),
+    : (dictOptions.serviceTypes.find((d) => d.id === step.service_type)?.name || '未选服务类型'),
 ])))
 const formNavDot = (step) => (step.task_type === 'pause' ? 'pause' : 'ready')
 
@@ -1002,6 +1002,7 @@ function validateSteps() {
     if (s.use_custom_scope && (!s.project_group || !s.channel || !s.environment)) {
       return `${label}：自定义主机范围必须选齐项目组/渠道/环境`
     }
+    if (!s.service_type) return `${label}：必须选择服务类型（不支持不限）`
   }
   return null
 }
@@ -1585,6 +1586,7 @@ code { background: #f5f7fa; padding: 1px 6px; border-radius: 3px; font-size: 12p
 /* 行内二级标签（服务类型）不占定宽列；选中服务类型时标红提示模块被收窄 */
 .setting-label.inline { width: auto; margin-left: 6px; }
 .setting-label.active { color: #f56c6c; font-weight: 600; }
+.setting-label.required::before { content: '*'; color: #f56c6c; margin-right: 2px; }
 .match-tag { margin-left: auto; }
 /* 匹配台数标红：本模块实际会执行几台，最需要一眼看清 */
 .match-num { color: #f56c6c; font-weight: 600; font-size: 13px; }

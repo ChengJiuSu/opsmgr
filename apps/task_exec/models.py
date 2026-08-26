@@ -331,7 +331,8 @@ class TaskStep(models.Model):
     use_custom_scope = models.BooleanField('自定义主机范围', default=False)
     # 服务类型过滤：与 use_custom_scope 正交，对「跟随全局」与「自定义」两种
     # 范围都生效（在解析出的主机上再收窄到已规划/已部署该服务的主机）。
-    # 留空=不按服务类型过滤。同一任务流据此对不同服务类型跑不同模块。
+    # 非暂停模块保存时必选（序列化器校验）；字段可空仅为兼容 pause 模块与
+    # 0015 之前的存量数据（存量视为不限，执行不拦）。
     service_type = models.ForeignKey(
         'asset_mgr.ServiceType', verbose_name='服务类型', on_delete=models.PROTECT,
         null=True, blank=True, related_name='task_steps',

@@ -202,10 +202,12 @@ class ExecutionAPITests(TestCase):
         c.credentials(HTTP_AUTHORIZATION='Bearer ' + r.json()['access'])
         return c
 
-    @staticmethod
-    def _step(**overrides):
+    def _step(self, **overrides):
+        """构造模块请求体：非暂停模块服务类型必选，未显式指定时默认基础服务。"""
         step = {'order': 1, 'name': '模块1', 'task_type': 'command', 'command': 'echo hi'}
         step.update(overrides)
+        if step.get('task_type') != 'pause' and 'service_type' not in overrides:
+            step['service_type'] = self.base_service.id
         return step
 
     def _create_task(self, c, steps=None, **overrides):
@@ -327,22 +329,27 @@ class ExecutionAPITests(TestCase):
         ServerService.objects.create(server=gw_srv, service_type=gateway, status='deployed')
 
         task_id = self._create_task(c, steps=[
-            self._step(name='全局全部'),
+            self._step(name='仅基础'),
             self._step(order=2, name='仅网关', service_type=gateway.id),
             self._step(order=3, name='自定义仅网关', use_custom_scope=True, service_type=gateway.id,
                        project_group=self.pg.id, channel=self.ch.id, environment=self.env.id),
         ])
         data = c.get(f'/api/exec/tasks/{task_id}/matched_servers/').json()['data']
         self.assertEqual({s['name'] for s in data['global']['results']}, {'local', 'gw-01'})
-        # 未选服务类型：全局全量，不下发命中集
-        self.assertEqual(data['steps'][0]['total'], 2)
-        self.assertNotIn('server_ids', data['steps'][0])
         # 跟随全局 + 服务类型：台数收窄，命中集供前端与勾选取交集
+        self.assertEqual(data['steps'][0]['total'], 1)
+        self.assertEqual(data['steps'][0]['server_ids'], [self.server.id])
         self.assertEqual(data['steps'][1]['total'], 1)
         self.assertEqual(data['steps'][1]['server_ids'], [gw_srv.id])
         self.assertEqual(data['steps'][1]['service_type_name'], '网关')
         # 自定义范围 + 服务类型
         self.assertEqual([s['name'] for s in data['steps'][2]['servers']], ['gw-01'])
+
+        # 存量模块（0015 之前、服务类型为空）视为不限：全局全量且不下发命中集
+        TaskStep.objects.filter(task_id=task_id, order=1).update(service_type=None)
+        data = c.get(f'/api/exec/tasks/{task_id}/matched_servers/').json()['data']
+        self.assertEqual(data['steps'][0]['total'], 2)
+        self.assertNotIn('server_ids', data['steps'][0])
 
     def test_service_type_filter_ignores_offline_service(self):
         """服务类型与状态须命中同一条服务记录：该类型已下线的主机不算可执行。"""
@@ -355,6 +362,16 @@ class ExecutionAPITests(TestCase):
         task_id = self._create_task(c, steps=[self._step(name='仅网关', service_type=gateway.id)])
         data = c.get(f'/api/exec/tasks/{task_id}/matched_servers/').json()['data']
         self.assertEqual(data['steps'][0]['total'], 0)
+
+    def test_step_requires_service_type(self):
+        """非暂停模块服务类型必选：未选不予保存。"""
+        c = self._client()
+        r = c.post('/api/exec/tasks/', {
+            'name': 'no-svc', 'project_group': self.pg.id, 'channel': self.ch.id, 'environment': self.env.id,
+            'steps': [self._step(service_type=None)],
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('必须选择服务类型', str(r.json()))
 
     def test_pause_step_rejects_service_type(self):
         c = self._client()
@@ -429,6 +446,8 @@ class ExecutionAPITests(TestCase):
             project_group=self.pg, channel=self.ch, environment=self.env,
         )
         ServerService.objects.create(server=gw_srv, service_type=gateway, status='planned')
+        # gw-01 同时规划基础服务，便于验证「按服务类型收窄」前后的台数差异
+        ServerService.objects.create(server=gw_srv, service_type=self.base_service, status='planned')
 
         task_id = self._create_task(c, steps=[
             self._step(name='全部'),
@@ -1075,7 +1094,7 @@ class ArtifactInjectTests(TestCase):
     # 复用任务流 API 测试的环境准备与辅助方法（不继承，避免父类用例重复执行）
     setUp = ExecutionAPITests.setUp
     _client = ExecutionAPITests._client
-    _step = staticmethod(ExecutionAPITests._step)
+    _step = ExecutionAPITests._step
     _create_task = ExecutionAPITests._create_task
 
     def _make_artifact(self, version, **overrides):
@@ -1597,7 +1616,7 @@ class StreamedTaskLogTests(TestCase):
 
     setUp = ExecutionAPITests.setUp
     _client = ExecutionAPITests._client
-    _step = staticmethod(ExecutionAPITests._step)
+    _step = ExecutionAPITests._step
     _create_task = ExecutionAPITests._create_task
 
     def test_full_log_always_persisted_to_file(self):
@@ -1703,7 +1722,7 @@ class ExecSceneArchiveTests(TestCase):
 
     setUp = ExecutionAPITests.setUp
     _client = ExecutionAPITests._client
-    _step = staticmethod(ExecutionAPITests._step)
+    _step = ExecutionAPITests._step
     _create_task = ExecutionAPITests._create_task
 
     def _scene_dir(self, log_dir, task_id, sub='step1/direct'):

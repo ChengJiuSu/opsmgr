@@ -200,6 +200,9 @@ class TaskStepSerializer(serializers.ModelSerializer):
         # 暂停确认不涉及主机，服务类型过滤无意义
         if task_type == 'pause' and attrs.get('service_type'):
             raise serializers.ValidationError({'service_type': f'{label}为暂停确认类型，不涉及主机，不能选服务类型'})
+        # 其余模块服务类型必选：不再支持「不限」，未选不予保存
+        if task_type != 'pause' and attrs.get('service_type') is None:
+            raise serializers.ValidationError({'service_type': f'{label}必须选择服务类型（不支持不限）'})
         # 自定义主机范围时三维度必选（与任务全局范围同策略，不支持留空=不限）
         if attrs.get('use_custom_scope'):
             for field, dim in (('project_group', '项目组'), ('channel', '渠道'), ('environment', '环境')):
