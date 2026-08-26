@@ -124,6 +124,7 @@ const step = ref('password')
 const useRecovery = ref(false)
 const code = ref('')
 const form = reactive({ username: '', password: '' })
+let lastVerified = ''   // 已提交过的验证码，防重复提交（票据一次性）
 
 const rules = {
   username: [{ required: true, message: '请输入用户名', trigger: 'blur' }],
@@ -149,11 +150,15 @@ async function handleLogin() {
 }
 
 async function handleVerify() {
+  // 填满自动提交后用户再回车会发第二次：票据是一次性的，第二次必然 401
+  if (loading.value) return
+  if (!useRecovery.value && code.value.trim() === lastVerified) return
   if (!code.value.trim()) {
     ElMessage.warning(useRecovery.value ? '请输入恢复码' : '请输入验证码')
     return
   }
   loading.value = true
+  lastVerified = code.value.trim()
   try {
     const res = await authStore.verifyMfa(code.value.trim())
     if (res.recoveryCodesLeft !== undefined) {
@@ -162,6 +167,7 @@ async function handleVerify() {
     afterLogin()
   } catch (err) {
     code.value = ''
+    lastVerified = ''
     // 票据过期/用尽次数时后端返回 401，退回密码步重新开始
     if (err?.response?.status === 401) {
       backToPassword()
@@ -185,6 +191,7 @@ function toggleRecovery() {
 
 function backToPassword() {
   authStore.cancelMfa()
+  lastVerified = ''
   step.value = 'password'
   useRecovery.value = false
   code.value = ''
@@ -197,7 +204,7 @@ function onCodeInput(value) {
   code.value = String(value).replace(/\D/g, '').slice(0, 6)
   // 满 6 位自动提交（省一次点击，输错也能立刻重来）。1Password 一次性填满
   // 时同样走这里，填完即验证，不用再点按钮
-  if (code.value.length === 6 && !loading.value) {
+  if (code.value.length === 6) {
     handleVerify()
   }
 }

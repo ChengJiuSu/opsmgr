@@ -219,6 +219,13 @@ GET  /api/auth/mfa/sudo/                          → {active, ttl, mfa_enabled}
   令牌后要再验一次——access 60 分钟、sudo 10 分钟，实际很少撞上。
 - 改密码、解绑 MFA 后主动 `revoke`：身份要素变了，之前那次证明不再算数。
 - 失败计入限速（`sudo_user` 桶，阈值复用 `LOGIN_FAIL_*`）。
+- **窗口已开着时 POST 幂等返回成功**，不再重复校验：前端「满 6 位自动提交」加上
+  用户再回车会打两次，第二次拿同一个码必然撞防重放——报错却其实已经放行，是最
+  费解的一种表现（用户看到的是「提示验证码不正确，但删除成功了」）。前端也加了
+  同码只提交一次的防抖，两侧都堵住。
+- 防重放拒掉的码**单独给文案**：「该验证码已使用过，请等验证器换出下一个 6 位码」。
+  登录刚消费掉当前 30 秒窗口的码，紧接着开 sudo 就会撞上；说成「不正确」会让人
+  反复怀疑密钥或手机时钟。
 - **fail-closed**：缓存不可用时视为无授权、拒绝敏感操作。与 `common/ratelimit`
   的 fail-open 刻意相反——限速挂了放行只是少一层防爆破，sudo 挂了放行等于这道
   门直接没了；而拒绝的后果仅限「改不了配置」，日常读写照常。
@@ -234,9 +241,19 @@ GET  /api/auth/mfa/sudo/                          → {active, ttl, mfa_enabled}
 | `agent_mgr.AgentRouteViewSet` | 改路由 = 改命令下发到哪台机器执行 |
 | `cloud_mgr.CloudAccountViewSet` | 云 AK/SK |
 | `system_cfg.SystemConfigViewSet` | 存着 `jenkins.api_token`、`artifact.api_key`、`mfa.enforce_scope` |
+| `asset_mgr.ServerViewSet`（仅 PUT/PATCH/DELETE）| `channel_mode`/`agent` 决定命令下发到哪台机器执行，与通道路由同性质。**新增不拦**——新加的主机不会改变已有主机的执行通道（`common.sudo.required_for()` 生成只管指定方法的权限类）|
+| `asset_mgr` 批量改/删、导入 | 一次能动一批主机的执行通道 |
 
 只读方法（`SAFE_METHODS`）一律放行——sudo 防的是持久权限扩大，不是看一眼。
-**任务流执行刻意不纳入**：密集发布时会反复弹验证框，而单次执行不扩大权限。
+刻意**不**纳入的：
+
+- **任务流执行**：密集发布时会反复弹验证框，而单次执行不扩大权限；
+- **CMDB 字典**（项目组/渠道/环境/服务类型/服务规划）：改的是分类归属，不直接
+  扩权，而这些是日常维护动作。
+
+窗口是全局的、不分资源：在 Agent 管理验过一次，10 分钟内改用户或系统配置也不会
+再弹——「为什么这次没弹」是它最容易被误判成漏拦的地方，顶栏因此常驻一个剩余
+时间标签（`docs/frontend/views/security-mfa.md`）。
 
 未授权时返回 **403 + `error_code: sudo_required`**，前端拦截器弹验证框并
 **重放原请求**（见 `docs/frontend/views/security-mfa.md`）。

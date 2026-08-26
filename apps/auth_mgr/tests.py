@@ -637,6 +637,36 @@ class SudoTests(TestCase):
                 self.assertEqual(r.status_code, 403, path)
                 self.assertEqual(r.json()['error_code'], 'sudo_required', path)
 
+    def test_server_write_gated_but_create_open(self):
+        """服务器改/删要 sudo（channel_mode 决定命令下发到哪台机器），新增不拦。"""
+        from apps.asset_mgr.models import Server
+
+        srv = Server.objects.create(name='s-sudo', private_ip='10.9.9.9')
+        blocked = self.client.patch(f'/api/assets/servers/{srv.pk}/',
+                                    {'channel_mode': 'direct'}, format='json')
+        self.assertEqual(blocked.status_code, 403)
+        self.assertEqual(blocked.json()['error_code'], 'sudo_required')
+        self.assertEqual(
+            self.client.delete(f'/api/assets/servers/{srv.pk}/').status_code, 403)
+        # 新增不拦：新加的主机不会改变已有主机的执行通道
+        created = self.client.post('/api/assets/servers/',
+                                   {'name': 's-new', 'private_ip': '10.9.9.10'},
+                                   format='json')
+        self.assertEqual(created.status_code, 201)
+
+    def test_server_batch_and_import_gated(self):
+        for path in ('/api/assets/servers/batch/update/',
+                     '/api/assets/servers/batch/delete/'):
+            with self.subTest(path=path):
+                r = self.client.post(path, {'ids': [1]}, format='json')
+                self.assertEqual(r.status_code, 403, path)
+                self.assertEqual(r.json()['error_code'], 'sudo_required', path)
+
+    def test_cmdb_dicts_not_gated(self):
+        """字典改的是分类归属，不扩权，刻意不纳入（400=校验错，说明没被拦）。"""
+        r = self.client.post('/api/assets/project-groups/', {}, format='json')
+        self.assertEqual(r.status_code, 400)
+
     def test_task_execution_not_gated(self):
         """任务流执行刻意不纳入：否则密集发布时反复弹验证框。"""
         r = self.client.get('/api/exec/tasks/')
@@ -663,6 +693,42 @@ class SudoTests(TestCase):
         self.assertEqual(self._grant(password=PASSWORD).status_code, 400)
         good = self._grant(code=totp.code_at(secret, totp.current_counter()))
         self.assertEqual(good.status_code, 200)
+
+    def test_repeated_submit_is_idempotent(self):
+        """窗口已开着时重复提交同一个码返回成功，而不是「验证码不正确」。
+
+        前端满 6 位自动提交 + 用户再回车会打两次，第二次拿同码必然撞防重放，
+        报错却其实已放行——用户看到的就是「提示验证码错，但删除成功了」。
+        """
+        binding = UserMFA(user=self.admin, enabled=True)
+        secret = totp.random_secret()
+        binding.set_secret(secret)
+        binding.save()
+        code = totp.code_at(secret, totp.current_counter())
+        first = self._grant(code=code)
+        second = self._grant(code=code)
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertIn('已生效', second.json()['msg'])
+
+    def test_replayed_code_says_so(self):
+        """码正确但窗口用过：文案要说「已使用过」，不能说「不正确」。
+
+        登录刚用掉当前窗口的码，紧接着开 sudo 会撞上；说成「不正确」会让人
+        反复怀疑密钥或手机时钟。
+        """
+        binding = UserMFA(user=self.admin, enabled=True)
+        secret = totp.random_secret()
+        binding.set_secret(secret)
+        counter = totp.current_counter()
+        binding.last_counter = counter          # 该窗口已被登录消费
+        binding.save()
+        r = self._grant(code=totp.code_at(secret, counter))
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('已使用过', r.json()['msg'])
+        # 下一个窗口的码照常可用
+        self.assertEqual(
+            self._grant(code=totp.code_at(secret, counter + 1)).status_code, 200)
 
     def test_failures_rate_limited(self):
         with override_settings(LOGIN_FAIL_LIMIT=3):

@@ -14,7 +14,26 @@ export const sudoState = reactive({
   loading: false,      // 正在查窗口状态（决定输验证码还是密码）
   mfaEnabled: false,   // true=输验证码，false=输登录密码（后端按此校验）
   submitting: false,
+  // 授权到期时间戳（毫秒）：顶栏据此显示剩余分钟。只是提示，真正的过期判定
+  // 在后端缓存 TTL —— 前端时钟不准也不会放行任何东西
+  expiresAt: 0,
 })
+
+/** 验证成功后登记窗口时长（秒）。 */
+export function markGranted(ttlSeconds) {
+  sudoState.expiresAt = Date.now() + (Number(ttlSeconds) || 0) * 1000
+}
+
+/** 剩余秒数（0 = 无授权或已过期）。 */
+export function sudoRemaining() {
+  if (!sudoState.expiresAt) return 0
+  return Math.max(0, Math.round((sudoState.expiresAt - Date.now()) / 1000))
+}
+
+/** 登出、改密码等场景清掉本地提示。 */
+export function clearSudo() {
+  sudoState.expiresAt = 0
+}
 
 let pending = null      // 进行中的验证 Promise，并发请求共用
 let resolvePending = null

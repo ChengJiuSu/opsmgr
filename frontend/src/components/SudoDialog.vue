@@ -52,10 +52,13 @@
 import { ref, computed, watch, nextTick } from 'vue'
 import { ElMessage } from 'element-plus'
 import { getSudoStatus, grantSudo } from '../api/auth'
-import { sudoState, settleSudo } from '../utils/sudo'
+import { sudoState, settleSudo, markGranted } from '../utils/sudo'
 
 const code = ref('')
 const password = ref('')
+// 已提交过的码：填满自动提交后用户再回车/点按钮，第二次拿同一个码去校验必然
+// 撞后端防重放，报「已使用过」却其实已经放行——最费解的一种错
+let lastSubmitted = ''
 const inputRef = ref()
 const ttl = ref(600)
 
@@ -69,6 +72,7 @@ watch(() => sudoState.visible, async (open) => {
   if (!open) return
   code.value = ''
   password.value = ''
+  lastSubmitted = ''
   sudoState.loading = true
   try {
     // 权威口径来自后端：本地缓存的 user 可能是绑定 MFA 之前的
@@ -88,10 +92,11 @@ watch(() => sudoState.visible, async (open) => {
 function onCodeInput(value) {
   // 只留数字（管理器填充常带空格），满 6 位自动提交
   code.value = String(value).replace(/\D/g, '').slice(0, 6)
-  if (code.value.length === 6 && !sudoState.submitting) submit()
+  if (code.value.length === 6) submit()
 }
 
 async function submit() {
+  if (sudoState.submitting || !sudoState.visible) return
   const payload = sudoState.mfaEnabled
     ? { code: code.value.trim() }
     : { password: password.value }
@@ -100,14 +105,18 @@ async function submit() {
     ElMessage.warning(sudoState.mfaEnabled ? '请输入验证码' : '请输入登录密码')
     return
   }
+  if (sudoState.mfaEnabled && value === lastSubmitted) return
+  lastSubmitted = value
   sudoState.submitting = true
   try {
     const res = await grantSudo(payload)
     ttl.value = res.data?.expires_in || ttl.value
+    markGranted(ttl.value)    // 顶栏显示剩余时间
     settleSudo(true)          // 拦截器据此重放原请求
   } catch {
     // 失败原因由拦截器统一提示（密码错/验证码错/超频），留在框里让人重试
     code.value = ''
+    lastSubmitted = ''
     sudoState.submitting = false
   }
 }

@@ -93,6 +93,17 @@
           </el-breadcrumb-item>
         </el-breadcrumb>
         <div class="header-right">
+          <!-- sudo 窗口提示：解释「为什么这次改配置没弹验证框」 -->
+          <el-tooltip
+            v-if="sudoLeft > 0"
+            content="已通过二次验证，窗口内修改凭据/用户/Agent/云账号/系统配置免重验"
+            placement="bottom"
+          >
+            <el-tag type="success" size="small" effect="plain" style="margin-right:12px">
+              <el-icon><Unlock /></el-icon>
+              二次验证 {{ Math.ceil(sudoLeft / 60) }} 分钟
+            </el-tag>
+          </el-tooltip>
           <el-dropdown @command="handleCommand">
             <span class="user-info">
               <el-avatar size="small" :style="{ background: '#409EFF' }">
@@ -146,20 +157,29 @@
 </template>
 
 <script setup>
-import { ref, reactive } from 'vue'
+import { ref, reactive, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   Monitor, DataBoard, Box, Document, Setting, SetUp,
-  Fold, Expand, ArrowDown, SwitchButton, Lock, Promotion, Cloudy, Key,
+  Fold, Expand, ArrowDown, SwitchButton, Lock, Promotion, Cloudy, Key, Unlock,
 } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../stores/auth'
 import { changePassword } from '../api/auth'
+import { sudoRemaining, clearSudo } from '../utils/sudo'
 
 const route = useRoute()
 const router = useRouter()
 const authStore = useAuthStore()
 const collapsed = ref(false)
+
+// sudo 窗口剩余秒数：每 10s 刷一次，到点标签自动消失
+const sudoLeft = ref(sudoRemaining())
+let sudoTimer = null
+onMounted(() => {
+  sudoTimer = setInterval(() => { sudoLeft.value = sudoRemaining() }, 10000)
+})
+onUnmounted(() => clearInterval(sudoTimer))
 
 const pwdVisible = ref(false)
 const pwdSubmitting = ref(false)
@@ -181,6 +201,8 @@ async function handleCommand(cmd) {
   if (cmd === 'logout') {
     await ElMessageBox.confirm('确定要退出登录吗？', '提示', { type: 'warning' })
     await authStore.logout()
+    clearSudo()
+    sudoLeft.value = 0
     router.push('/login')
   } else if (cmd === 'password') {
     Object.assign(pwdForm, { old_password: '', new_password: '', confirm: '' })
@@ -196,9 +218,13 @@ async function submitPassword() {
   pwdSubmitting.value = true
   try {
     await changePassword({ old_password: pwdForm.old_password, new_password: pwdForm.new_password })
+    clearSudo()   // 后端已 revoke 窗口，本地提示同步清掉
+    sudoLeft.value = 0
     ElMessage.success('密码修改成功，请重新登录')
     pwdVisible.value = false
     await authStore.logout()
+    clearSudo()
+    sudoLeft.value = 0
     router.push('/login')
   } finally {
     pwdSubmitting.value = false

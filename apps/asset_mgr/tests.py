@@ -3,6 +3,8 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 from rest_framework.test import APIClient
 
+from common.testing import grant_sudo
+
 from .models import Channel, CloudProvider, Environment, ProjectGroup, Server, ServerService, ServiceType
 
 User = get_user_model()
@@ -17,6 +19,9 @@ class BaseApiTest(TestCase):
         c = APIClient()
         r = c.post('/api/auth/login/', {'username': username, 'password': 'Pass!2345xyz'}, format='json')
         c.credentials(HTTP_AUTHORIZATION='Bearer ' + r.json()['access'])
+        # 服务器改/删、批量与导入要 sudo 二次验证（common/sudo.py）
+        if is_staff:
+            grant_sudo(c)
         return c
 
 

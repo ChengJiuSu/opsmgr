@@ -80,10 +80,17 @@ class SudoRequired(BasePermission):
     与既有权限类**并列**使用（DRF 是 AND 语义），不替换：
 
         permission_classes = [IsAdmin, SudoRequired]
+
+    只想管住部分方法时用 required_for()（见其说明）。
     """
+
+    #: None = 所有非安全方法都要；否则只管这些方法
+    methods = None
 
     def has_permission(self, request, view):
         if request.method in SAFE_METHODS:
+            return True
+        if self.methods is not None and request.method not in self.methods:
             return True
         user = getattr(request, 'user', None)
         if not (user and user.is_authenticated):
@@ -91,3 +98,16 @@ class SudoRequired(BasePermission):
         if is_active(user.pk, token_jti(request)):
             return True
         raise SudoRequiredError()
+
+
+def required_for(*methods):
+    """生成只管住指定方法的权限类。
+
+    用于「新增无所谓、改删要慎」的资源：服务器新增不改变已有主机的执行通道，
+    而修改（channel_mode/agent 决定命令下发到哪台机器）与删除才是要拦的。
+
+        permission_classes = [IsAdminOrReadCreate, required_for('PUT', 'PATCH', 'DELETE')]
+    """
+    upper = tuple(m.upper() for m in methods)
+    return type('SudoRequiredFor' + ''.join(m.title() for m in upper),
+                (SudoRequired,), {'methods': upper})

@@ -210,6 +210,12 @@ class SudoView(APIView):
         user = request.user
         ident = user.username.lower()
 
+        jti = sudo.token_jti(request)
+        if sudo.is_active(user.pk, jti):
+            # 幂等：窗口已开着就直接成功。前端可能重复提交（填满自动提交 + 回车），
+            # 第二次拿同一个码去校验必然撞防重放，报错却已放行，最费解
+            return ok({'expires_in': settings.SUDO_TTL}, msg='二次验证已生效')
+
         remaining = blocked_seconds(SCOPE_SUDO_USER, ident)
         if remaining:
             return fail('验证失败次数过多，请稍后再试。',
@@ -223,7 +229,6 @@ class SudoView(APIView):
                            block=settings.LOGIN_FAIL_BLOCK)
             return fail(error)
 
-        jti = sudo.token_jti(request)
         if not jti:
             # 非 JWT 认证（机器接口）不该走到这里；给明确原因而不是静默失败
             return fail('当前认证方式不支持二次验证。')

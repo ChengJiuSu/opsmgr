@@ -182,7 +182,20 @@ def verify(user, code):
         logger.warning('用户 %s 使用恢复码登录，剩余 %d 个', user.username, left)
         return 'recovery'
 
+    if _is_replayed(binding, code):
+        # 码本身是对的，只是这个 30 秒窗口已经用过（登录刚验过 / 表单重复提交）。
+        # 说成「不正确」会让人反复怀疑密钥或时钟，实际只需等下一个码
+        raise MfaError('该验证码已使用过，请等验证器换出下一个 6 位码再试。')
     raise MfaError('验证码不正确。')
+
+
+def _is_replayed(binding, code):
+    """码正确但所属时间窗已用过（防重放拒的那种），用于给出准确文案。"""
+    try:
+        secret = binding.get_secret()
+    except DecryptError:
+        return False
+    return totp.verify(secret, code) is not None
 
 
 def _verify_totp(binding, code):

@@ -15,6 +15,8 @@ from rest_framework.views import APIView
 
 from common.jumpserver import register_servers
 from common.permissions import IsAdmin, IsAdminOrReadCreate
+from common.sudo import SudoRequired
+from common.sudo import required_for as sudo_required_for
 from common.response import fail, ok
 
 from .models import Channel, CloudProvider, Environment, ProjectGroup, Server, ServerService, ServiceType
@@ -114,7 +116,9 @@ class ServerViewSet(viewsets.ModelViewSet):
     )
     serializer_class = ServerSerializer
     # 已认证用户可查看/新增服务器，修改与删除仅管理员
-    permission_classes = [IsAdminOrReadCreate]
+    # 改/删还要 sudo 二次验证：channel_mode/agent 决定命令下发到哪台机器执行，
+    # 与通道路由同性质。新增不拦——新加的主机不会改变已有主机的执行通道
+    permission_classes = [IsAdminOrReadCreate, sudo_required_for('PUT', 'PATCH', 'DELETE')]
 
     # 查询参数 → 字典外键字段映射（值为纯数字按 id 过滤，否则按 code 过滤）
     DICT_FILTERS = (
@@ -251,7 +255,8 @@ class ServerBatchUpdateView(APIView):
     仅提交的字段会被更新；字典外键归属走「配置管理 → 服务器分配」批量分配。
     """
 
-    permission_classes = [IsAdmin]
+    # 批量改/删与导入同样要 sudo：一次能动一批主机的执行通道
+    permission_classes = [IsAdmin, SudoRequired]
 
     @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
     def post(self, request):
@@ -323,7 +328,8 @@ class ServerBatchDeleteView(APIView):
         {"server_ids": [1, 2, 3]}
     """
 
-    permission_classes = [IsAdmin]
+    # 批量改/删与导入同样要 sudo：一次能动一批主机的执行通道
+    permission_classes = [IsAdmin, SudoRequired]
 
     @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
     def post(self, request):
@@ -362,7 +368,8 @@ class ServerImportView(APIView):
     全量校验通过才写库（原子），任一行有错则整体不导入并返回逐行错误。
     """
 
-    permission_classes = [IsAdmin]
+    # 批量改/删与导入同样要 sudo：一次能动一批主机的执行通道
+    permission_classes = [IsAdmin, SudoRequired]
 
     @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
     def post(self, request):
