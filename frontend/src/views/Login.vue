@@ -20,6 +20,8 @@
         <el-form-item prop="username">
           <el-input
             v-model="form.username"
+            name="username"
+            autocomplete="username"
             placeholder="用户名"
             :prefix-icon="User"
             clearable
@@ -29,6 +31,8 @@
           <el-input
             v-model="form.password"
             type="password"
+            name="password"
+            autocomplete="current-password"
             placeholder="密码"
             :prefix-icon="Lock"
             show-password
@@ -51,13 +55,32 @@
         <el-alert type="info" :closable="false" show-icon style="margin-bottom:16px">
           {{ useRecovery ? '输入一个未使用过的恢复码' : '输入验证器 App 上当前显示的 6 位验证码' }}
         </el-alert>
+        <p class="mfa-account">验证账号：<strong>{{ form.username }}</strong></p>
+        <!-- 只读用户名：留在 DOM 里让密码管理器把本页与已保存条目对上，
+             否则它拿不准该填哪个账号的一次性密码。aria-hidden + 视觉隐藏，
+             不进 tab 序列，读屏器也不会念第二遍（上面已有可见文案） -->
+        <input
+          class="visually-hidden"
+          type="text"
+          name="username"
+          autocomplete="username"
+          tabindex="-1"
+          aria-hidden="true"
+          readonly
+          :value="form.username"
+        />
         <el-form-item>
           <el-input
             ref="codeRef"
             v-model="code"
+            :name="useRecovery ? 'recovery-code' : 'otp'"
+            :autocomplete="useRecovery ? 'off' : 'one-time-code'"
+            :inputmode="useRecovery ? 'text' : 'numeric'"
+            :pattern="useRecovery ? undefined : '[0-9]*'"
             :placeholder="useRecovery ? '恢复码，如 ABCD-EFGH-JKMN' : '6 位验证码'"
             :prefix-icon="Key"
             :maxlength="useRecovery ? 20 : 6"
+            enterkeyhint="done"
             clearable
             @input="onCodeInput"
           />
@@ -170,8 +193,10 @@ function backToPassword() {
 
 function onCodeInput(value) {
   if (useRecovery.value) return
-  // 验证码只留数字，满 6 位自动提交（省一次点击，输错也能立刻重来）
-  code.value = value.replace(/\D/g, '').slice(0, 6)
+  // 只留数字：密码管理器/短信填充常带空格或 "123 456" 这类分组
+  code.value = String(value).replace(/\D/g, '').slice(0, 6)
+  // 满 6 位自动提交（省一次点击，输错也能立刻重来）。1Password 一次性填满
+  // 时同样走这里，填完即验证，不用再点按钮
   if (code.value.length === 6 && !loading.value) {
     handleVerify()
   }
@@ -209,5 +234,23 @@ function onCodeInput(value) {
   display: flex;
   justify-content: space-between;
   font-size: 13px;
+}
+.mfa-account {
+  margin: 0 0 12px;
+  font-size: 13px;
+  color: #606266;
+}
+/* 给密码管理器看的只读用户名：不能用 display:none / hidden——那样多数扩展
+   会跳过它，也就关联不上条目 */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
 }
 </style>

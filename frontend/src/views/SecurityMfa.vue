@@ -99,8 +99,13 @@
                 <el-form-item label="验证码">
                   <el-input
                     v-model="enroll.code"
+                    name="otp"
+                    autocomplete="one-time-code"
+                    inputmode="numeric"
+                    pattern="[0-9]*"
                     placeholder="App 上当前的 6 位码"
                     maxlength="6"
+                    @input="onEnrollCode"
                     @keyup.enter="activate"
                   />
                 </el-form-item>
@@ -131,10 +136,25 @@
       </el-alert>
       <el-form :model="sensitive.form" label-width="90px">
         <el-form-item label="登录密码">
-          <el-input v-model="sensitive.form.password" type="password" show-password />
+          <el-input
+            v-model="sensitive.form.password"
+            type="password"
+            name="password"
+            autocomplete="current-password"
+            show-password
+          />
         </el-form-item>
         <el-form-item label="验证码">
-          <el-input v-model="sensitive.form.code" maxlength="6" placeholder="当前 6 位码" />
+          <el-input
+            v-model="sensitive.form.code"
+            name="otp"
+            autocomplete="one-time-code"
+            inputmode="numeric"
+            pattern="[0-9]*"
+            maxlength="6"
+            placeholder="当前 6 位码"
+            @input="onSensitiveCode"
+          />
         </el-form-item>
       </el-form>
       <template #footer>
@@ -233,6 +253,15 @@ async function activate() {
   } finally {
     submitting.value = false
   }
+}
+
+// 密码管理器/手输都可能带空格或 "123 456" 分组，统一只留数字
+function onEnrollCode(value) {
+  enroll.code = String(value).replace(/\D/g, '').slice(0, 6)
+}
+
+function onSensitiveCode(value) {
+  sensitive.form.code = String(value).replace(/\D/g, '').slice(0, 6)
 }
 
 function cancelEnroll() {

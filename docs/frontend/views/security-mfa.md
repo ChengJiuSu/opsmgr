@@ -31,6 +31,10 @@
 - **验证码不对先看时间**：页面直接提示检查手机时间——TOTP 靠时间同步，差超过
   30 秒就算不上，这是最常见的「密钥没错但一直失败」。
 - 解绑与重发恢复码走同一个「密码 + 当前验证码」弹窗，重发后新码只显示一次。
+- **验证码框带 autofill 契约**（`autocomplete="one-time-code"`、`name="otp"`、
+  `inputmode="numeric"`）：绑定完成后 1Password 等管理器就能直接填码，
+  激活与敏感操作两处都有。Element Plus 的 `autocomplete` prop 默认 `'off'`，
+  不显式传扩展会跳过该字段（详见 `login.md` 的 autofill 契约小节）。
 
 ---
 
