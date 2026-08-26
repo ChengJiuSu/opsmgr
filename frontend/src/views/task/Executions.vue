@@ -229,7 +229,7 @@
               </el-tooltip>
             </template>
             <el-input-number v-model="form.forks" :min="1" :max="200" controls-position="right" style="width:100%" />
-            <div class="form-tip">同时执行的主机台数，1 = 逐台串行</div>
+            <div class="form-tip">1 = 逐台串行</div>
           </el-form-item>
         </el-col>
         <el-col :span="6">
@@ -255,9 +255,9 @@
           </el-select>
         </div>
         <div class="form-tip">
-          任务流的默认主机范围，项目组/渠道/环境<b>必选</b>（未选齐不予保存与执行），当前匹配
+          模块默认的主机范围，项目组/渠道/环境<b>必选</b>，当前匹配
           <b :class="{ danger: matchedCount === 0 }">{{ matchedCount ?? '…' }}</b> 台可执行主机；
-          模块可单独指定范围，具体主机在「执行」时确认
+          模块可单独覆盖范围与服务类型，具体主机在「执行」时确认
         </div>
       </el-form-item>
 
@@ -305,6 +305,7 @@
               v-model="step.method" filterable style="width:100%"
               placeholder="选择已启用的平台方法（非剧本类 provider）"
               no-data-text="方法管理暂无其他 provider 的平台方法"
+              @change="onMethodChange(step)"
             >
               <el-option v-for="m in otherMethods" :key="m.id" :label="`${m.name} (${m.provider_display})`" :value="m.id" />
             </el-select>
@@ -329,7 +330,7 @@
             </el-select>
             <el-input
               v-model="step.extra_vars" style="flex:2" size="small"
-              placeholder="额外变量 --extra-vars（可留空）；CD 剧本自动注入最新制品 package_url/package_version/package_md5"
+              placeholder="额外变量 --extra-vars（可留空，CD 剧本自动注入 package_* 制品变量）"
             />
           </div>
           <!-- 平台方法：JSON 参数框（jenkins 构建参数覆盖方法默认参数；其余 provider 自行消费） -->
@@ -349,32 +350,54 @@
 }'
           />
 
-          <div class="step-row">
-            <span class="step-label">{{ step.task_type === 'pause' ? '确认超时' : '超时' }}</span>
-            <el-input-number v-model="step.timeout" :min="10" :max="3600" size="small" style="width:130px" />
-            <!-- 暂停确认模块不涉及目标主机，也不允许并行 -->
-            <template v-if="step.task_type !== 'pause'">
-            <el-tooltip content="相邻的、勾选并行的模块合并为一个并行组同时执行，组内全部成功才进入下一模块；不勾选=按序串行" placement="top">
-              <el-checkbox v-model="step.run_parallel" size="small">与相邻并行模块并发</el-checkbox>
-            </el-tooltip>
-            <span class="step-label">主机范围</span>
-            <el-radio-group v-model="step.use_custom_scope" size="small">
-              <el-radio-button :value="false">跟随全局</el-radio-button>
-              <el-radio-button :value="true">自定义</el-radio-button>
-            </el-radio-group>
-            </template>
-            <template v-if="step.task_type !== 'pause' && step.use_custom_scope">
-              <el-select v-model="step.project_group" placeholder="项目组" clearable size="small" style="width:120px" @change="updateStepCount(step)">
-                <el-option v-for="d in dictOptions.projects" :key="d.id" :label="d.name" :value="d.id" />
+          <!-- 模块设置：执行（超时/并行）与主机（范围/服务类型）分两行 -->
+          <div class="step-settings">
+            <div class="setting-row">
+              <span class="setting-label">{{ step.task_type === 'pause' ? '确认超时' : '超时' }}</span>
+              <el-input-number v-model="step.timeout" :min="10" :max="3600" size="small" style="width:120px" />
+              <!-- 暂停确认模块不涉及目标主机，也不允许并行 -->
+              <el-tooltip
+                v-if="step.task_type !== 'pause'" placement="top"
+                content="相邻的、勾选并行的模块合并为一个并行组同时执行，组内全部成功才进入下一模块；不勾选=按序串行"
+              >
+                <el-checkbox v-model="step.run_parallel" size="small">与相邻并行模块并发</el-checkbox>
+              </el-tooltip>
+            </div>
+
+            <div v-if="step.task_type !== 'pause'" class="setting-row">
+              <span class="setting-label">主机范围</span>
+              <el-radio-group v-model="step.use_custom_scope" size="small" @change="updateStepCount(step)">
+                <el-radio-button :value="false">跟随全局</el-radio-button>
+                <el-radio-button :value="true">自定义</el-radio-button>
+              </el-radio-group>
+              <template v-if="step.use_custom_scope">
+                <el-select v-model="step.project_group" placeholder="项目组" clearable size="small" style="width:110px" @change="updateStepCount(step)">
+                  <el-option v-for="d in dictOptions.projects" :key="d.id" :label="d.name" :value="d.id" />
+                </el-select>
+                <el-select v-model="step.channel" placeholder="渠道" clearable size="small" style="width:100px" @change="updateStepCount(step)">
+                  <el-option v-for="d in dictOptions.channels" :key="d.id" :label="d.name" :value="d.id" />
+                </el-select>
+                <el-select v-model="step.environment" placeholder="环境" clearable size="small" style="width:100px" @change="updateStepCount(step)">
+                  <el-option v-for="d in dictOptions.envs" :key="d.id" :label="d.name" :value="d.id" />
+                </el-select>
+              </template>
+              <!-- 服务类型：与主机范围正交，跟随全局/自定义都可再按服务类型收窄 -->
+              <el-tooltip placement="top" content="在上述主机范围内，只对已规划/已部署该服务类型的主机执行本模块；不限=范围内全部主机">
+                <span class="setting-label inline" :class="{ active: step.service_type }">服务类型</span>
+              </el-tooltip>
+              <el-select
+                v-model="step.service_type" placeholder="不限" clearable filterable
+                size="small" style="width:120px" @change="updateStepCount(step)"
+              >
+                <el-option v-for="d in dictOptions.serviceTypes" :key="d.id" :label="d.name" :value="d.id" />
               </el-select>
-              <el-select v-model="step.channel" placeholder="渠道" clearable size="small" style="width:110px" @change="updateStepCount(step)">
-                <el-option v-for="d in dictOptions.channels" :key="d.id" :label="d.name" :value="d.id" />
-              </el-select>
-              <el-select v-model="step.environment" placeholder="环境" clearable size="small" style="width:110px" @change="updateStepCount(step)">
-                <el-option v-for="d in dictOptions.envs" :key="d.id" :label="d.name" :value="d.id" />
-              </el-select>
-              <span class="form-tip" style="margin:0">匹配 <b :class="{ danger: step._matched === 0 }">{{ step._matched ?? '…' }}</b> 台</span>
-            </template>
+              <el-tag
+                v-if="step.use_custom_scope || step.service_type" class="match-tag"
+                size="small" effect="plain" :type="step._matched === 0 ? 'danger' : 'info'"
+              >
+                匹配 <b class="match-num">{{ step._matched ?? '…' }}</b> 台
+              </el-tag>
+            </div>
           </div>
         </div>
       </div>
@@ -501,7 +524,7 @@ import { useAuthStore } from '../../stores/auth'
 import { openTaskLogStream } from '../../utils/taskLogStream'
 import StepOutput from '../../components/StepOutput.vue'
 import {
-  getServers, fetchDictOptions, projectGroupApi, channelApi, environmentApi,
+  getServers, fetchDictOptions, projectGroupApi, channelApi, environmentApi, serviceTypeApi,
 } from '../../api/assets'
 import {
   getTasks, createTask, updateTask, deleteTask, getMatchedServers, executeTask,
@@ -520,7 +543,7 @@ const filter = reactive({ keyword: '', task_type: '', status: '' })
 
 const credentialOptions = ref([])
 const methodOptions = ref([])
-const dictOptions = reactive({ projects: [], channels: [], envs: [] })
+const dictOptions = reactive({ projects: [], channels: [], envs: [], serviceTypes: [] })
 
 const statusType = (s) => ({ pending: 'info', running: 'warning', paused: 'primary', success: 'success', failed: 'danger' }[s] || 'info')
 const typeTagType = (t) => ({ command: 'info', playbook: 'success', method: 'warning', pause: 'danger' }[t] || 'info')
@@ -574,20 +597,24 @@ onUnmounted(() => searchDebounced.cancel())
 
 async function loadDictOptions() {
   if (dictOptions.projects.length) return
-  const [proj, chan, env] = await Promise.allSettled([
+  const [proj, chan, env, svc] = await Promise.allSettled([
     fetchDictOptions(projectGroupApi), fetchDictOptions(channelApi), fetchDictOptions(environmentApi),
+    fetchDictOptions(serviceTypeApi),
   ])
   if (proj.status === 'fulfilled') dictOptions.projects = proj.value.data?.results || []
   if (chan.status === 'fulfilled') dictOptions.channels = chan.value.data?.results || []
   if (env.status === 'fulfilled') dictOptions.envs = env.value.data?.results || []
+  if (svc.status === 'fulfilled') dictOptions.serviceTypes = svc.value.data?.results || []
 }
 
 // 按维度取匹配主机数（page_size=1 仅拿 total）
-async function fetchMatchedCount({ project_group, channel, environment }) {
+async function fetchMatchedCount({ project_group, channel, environment, service_type }) {
   const params = { executable: 'true', page_size: 1 }
   if (project_group) params.project_group = project_group
   if (channel) params.channel = channel
   if (environment) params.env = environment
+  // 服务类型与 executable 由后端合并进同一条 services 记录判定
+  if (service_type) params.service_type = service_type
   const res = await getServers(params)
   return res.data?.total ?? 0
 }
@@ -601,7 +628,7 @@ const emptyStep = () => ({
   name: '', task_type: 'command', command: '', playbook: '', pbMethod: null, method: null,
   tag: '', extra_vars: '', paramsText: '', timeout: 300, run_parallel: false,
   use_custom_scope: false, project_group: null, channel: null, environment: null,
-  _matched: null,
+  service_type: null, _matched: null,
 })
 const emptyForm = () => ({
   id: null, name: '',
@@ -645,14 +672,35 @@ async function updateMatchedCount() {
   } catch {
     matchedCount.value = null
   }
+  updateAllStepCounts()
 }
 
+// 模块匹配台数：自定义范围用模块自身维度，跟随全局用任务全局维度；
+// 两者都叠加模块服务类型。既不自定义也没选服务类型时台数即全局台数，不单独请求
 async function updateStepCount(step) {
   step._matched = null
+  if (step.task_type === 'pause' || (!step.use_custom_scope && !step.service_type)) return
+  const dims = step.use_custom_scope ? step : form
   try {
-    step._matched = await fetchMatchedCount(step)
+    step._matched = await fetchMatchedCount({ ...dims, service_type: step.service_type })
   } catch {
     step._matched = null
+  }
+}
+
+// 全局维度变更后，跟随全局且带服务类型过滤的模块台数需一并刷新
+function updateAllStepCounts() {
+  form.steps.forEach((s) => {
+    if (s.use_custom_scope || s.service_type) updateStepCount(s)
+  })
+}
+
+// 选定平台方法后，模块未指定服务类型则跟随方法登记的服务类型（与部署前置校验同源）
+function onMethodChange(step) {
+  const m = methodInfo(step)
+  if (m?.service_type && !step.service_type) {
+    step.service_type = m.service_type
+    updateStepCount(step)
   }
 }
 
@@ -685,10 +733,11 @@ async function openForm(row) {
         run_parallel: s.run_parallel || false,
         use_custom_scope: s.use_custom_scope || false,
         project_group: s.project_group || null, channel: s.channel || null,
-        environment: s.environment || null, _matched: null,
+        environment: s.environment || null, service_type: s.service_type || null,
+        _matched: null,
       })),
     })
-    form.steps.filter((s) => s.use_custom_scope).forEach(updateStepCount)
+    form.steps.forEach(updateStepCount)
   }
   formVisible.value = true
   formRef.value?.clearValidate()
@@ -760,6 +809,8 @@ function buildPayload() {
       project_group: s.task_type !== 'pause' && s.use_custom_scope ? s.project_group : null,
       channel: s.task_type !== 'pause' && s.use_custom_scope ? s.channel : null,
       environment: s.task_type !== 'pause' && s.use_custom_scope ? s.environment : null,
+      // 服务类型与自定义范围正交：跟随全局的模块也可只按服务类型收窄
+      service_type: s.task_type !== 'pause' ? s.service_type : null,
     })),
   }
 }
@@ -821,11 +872,20 @@ const stepInfoByOrder = computed(() => Object.fromEntries(execStepsInfo.value.ma
 
 const stepHostCount = (step) => {
   if (step.use_custom_scope) return stepInfoByOrder.value[step.order]?.total ?? 0
+  // 跟随全局：勾选主机 ∩ 后端给出的服务类型命中集（未选服务类型时即全部勾选）
+  const allowed = stepInfoByOrder.value[step.order]?.server_ids
+  if (step.service_type && allowed) {
+    const hit = new Set(allowed)
+    return execSelection.value.filter((s) => hit.has(s.id)).length
+  }
   return execSelection.value.length
 }
 const stepHostLabel = (step) => {
   if (step.task_type === 'pause') return '人工确认'
-  return step.use_custom_scope ? `自定义 · ${stepHostCount(step)} 台` : `全局 · 已选 ${stepHostCount(step)} 台`
+  const svc = step.service_type_name ? ` · ${step.service_type_name}` : ''
+  return step.use_custom_scope
+    ? `自定义${svc} · ${stepHostCount(step)} 台`
+    : `全局${svc} · 已选 ${stepHostCount(step)} 台`
 }
 
 // 暂停确认模块不涉及主机，不参与「每模块必须有主机」校验
@@ -1134,6 +1194,19 @@ code { background: #f5f7fa; padding: 1px 6px; border-radius: 3px; font-size: 12p
 .step-body { display: flex; flex-direction: column; gap: 8px; }
 .step-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .step-label { font-size: 12px; color: #606266; flex-shrink: 0; }
+/* 模块设置区：与内容区用虚线分隔；标签定宽右对齐，两行控件左边缘对齐 */
+.step-settings {
+  display: flex; flex-direction: column; gap: 8px;
+  padding-top: 8px; border-top: 1px dashed #e4e7ed;
+}
+.setting-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.setting-label { width: 60px; flex-shrink: 0; font-size: 12px; color: #909399; }
+/* 行内二级标签（服务类型）不占定宽列；选中服务类型时标红提示模块被收窄 */
+.setting-label.inline { width: auto; margin-left: 6px; }
+.setting-label.active { color: #f56c6c; font-weight: 600; }
+.match-tag { margin-left: auto; }
+/* 匹配台数标红：本模块实际会执行几台，最需要一眼看清 */
+.match-num { color: #f56c6c; font-weight: 600; font-size: 13px; }
 .params-input :deep(textarea) { font-family: 'Courier New', monospace; font-size: 12px; }
 
 .exec-hosts-header {

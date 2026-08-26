@@ -251,18 +251,24 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
         task = self.get_object()
         global_servers = list(task.matched_servers())
         steps = []
-        for step in task.steps.all():
+        for step in task.steps.select_related('service_type'):
             entry = {
                 'order': step.order, 'name': step.name, 'task_type': step.task_type,
                 'task_type_display': step.get_task_type_display(),
                 'custom': step.use_custom_scope,
+                'service_type': step.service_type_id,
+                'service_type_name': step.service_type.name if step.service_type_id else None,
             }
             if step.use_custom_scope:
                 servers = list(step.matched_servers())
                 entry['total'] = len(servers)
                 entry['servers'] = ServerSerializer(servers, many=True).data
             else:
-                entry['total'] = len(global_servers)
+                # 跟随全局：服务类型过滤后的全局主机 id 由前端与勾选取交集实时算台数
+                servers = step.resolve_servers(global_servers)
+                entry['total'] = len(servers)
+                if step.service_type_id:
+                    entry['server_ids'] = [s.id for s in servers]
             steps.append(entry)
         return ok({
             'global': {'results': ServerSerializer(global_servers, many=True).data, 'total': len(global_servers)},
@@ -300,10 +306,12 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
         for step in steps:
             if step.task_type == 'pause':
                 continue
-            servers = list(step.matched_servers()) if step.use_custom_scope else selected_global
+            servers = step.resolve_servers(selected_global)
             if not servers:
                 scope = '自定义范围维度未匹配到可执行主机' if step.use_custom_scope \
                     else '全局范围未匹配/未勾选任何主机'
+                if step.service_type_id:
+                    scope += f'（服务类型「{step.service_type.name}」过滤后为空）'
                 return fail(f'模块「{step.name}」{scope}，无法执行')
             if step.task_type == 'method':
                 error = validate_service_planned(step.method, servers)

@@ -160,6 +160,7 @@ class TaskStepSerializer(serializers.ModelSerializer):
     channel_name = serializers.CharField(source='channel.name', read_only=True, default=None)
     environment_name = serializers.CharField(source='environment.name', read_only=True, default=None)
     environment_is_prod = serializers.BooleanField(source='environment.is_prod', read_only=True, default=None)
+    service_type_name = serializers.CharField(source='service_type.name', read_only=True, default=None)
 
     class Meta:
         model = TaskStep
@@ -169,6 +170,7 @@ class TaskStepSerializer(serializers.ModelSerializer):
             'run_parallel',
             'use_custom_scope', 'project_group', 'project_group_name',
             'channel', 'channel_name', 'environment', 'environment_name', 'environment_is_prod',
+            'service_type', 'service_type_name',
         ]
 
     def validate_params(self, value):
@@ -195,6 +197,9 @@ class TaskStepSerializer(serializers.ModelSerializer):
         # 暂停确认必须独立成阶段：并行组内暂停会让组内其他模块空等，语义不成立
         if task_type == 'pause' and attrs.get('run_parallel'):
             raise serializers.ValidationError({'run_parallel': f'{label}为暂停确认类型，不允许标记并行'})
+        # 暂停确认不涉及主机，服务类型过滤无意义
+        if task_type == 'pause' and attrs.get('service_type'):
+            raise serializers.ValidationError({'service_type': f'{label}为暂停确认类型，不涉及主机，不能选服务类型'})
         # 自定义主机范围时三维度必选（与任务全局范围同策略，不支持留空=不限）
         if attrs.get('use_custom_scope'):
             for field, dim in (('project_group', '项目组'), ('channel', '渠道'), ('environment', '环境')):

@@ -323,16 +323,15 @@ def extra_vars_args(step, workdir):
 
 
 def _step_servers(step, task):
-    """解析模块的执行主机：自定义范围实时匹配，否则用任务全局范围快照。"""
-    if step.use_custom_scope:
-        return list(step.matched_servers())
-    return list(task.servers.all())
+    """解析模块的执行主机：自定义范围实时匹配，否则用任务全局范围快照；
+    两者都再按模块服务类型收窄（见 TaskStep.resolve_servers）。"""
+    return step.resolve_servers(task.servers.all())
 
 
 def _guard(servers):
     """模块执行前置：主机非空且均已规划服务（兜底执行排队期间规划被撤销）。"""
     if not servers:
-        return '未匹配到可执行主机（自定义范围维度无主机，或全局范围未勾选）。'
+        return '未匹配到可执行主机（自定义范围维度无主机、全局范围未勾选，或服务类型过滤后为空）。'
     unplanned = _unplanned_servers(servers)
     if unplanned:
         names = '、'.join(f'{s.name}({s.conn_ip})' for s in unplanned)
@@ -798,10 +797,10 @@ def _exec_step(step, task, idx, total, sink, parallel, attempt=1):
         server_count = None
     else:
         servers = _step_servers(step, task)
-        scope = '自定义范围' if step.use_custom_scope else '全局范围'
         mark = ' · 并行组' if parallel else ''
         header = (f'═══ 模块 {idx}/{total}：{step.name}'
-                  f'（{step.get_task_type_display()} · {scope} {len(servers)} 台{mark}{retry_mark}）═══')
+                  f'（{step.get_task_type_display()} · {step.scope_label} {len(servers)} 台'
+                  f'{step.service_type_label}{mark}{retry_mark}）═══')
         error = _guard(servers)
         if error:
             rc, out = 1, error

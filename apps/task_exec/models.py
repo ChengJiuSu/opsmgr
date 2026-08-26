@@ -2,17 +2,24 @@ from django.conf import settings
 from django.db import models
 
 
-def match_executable_servers(project_group_id=None, channel_id=None, environment_id=None):
+def match_executable_servers(project_group_id=None, channel_id=None, environment_id=None,
+                             service_type_id=None):
     """按维度匹配可执行主机（已规划/已部署服务，维度为 None=不限）。
 
     任务全局范围与模块自定义范围共用；与服务器接口 executable=true 及
-    runner 执行权限校验保持同一口径。
+    runner 执行权限校验保持同一口径。service_type_id 非空时再按服务类型
+    收窄：服务类型与状态必须命中同一条 ServerService 记录，故合并进单次
+    filter（分开 filter 会各自 JOIN，「A 已规划 + B 已下线」的主机会被
+    误判为 B 可执行）。
     """
     from apps.asset_mgr.models import Server
 
+    service_cond = {'services__status__in': ('planned', 'deployed')}
+    if service_type_id:
+        service_cond['services__service_type_id'] = service_type_id
     qs = (
         Server.objects
-        .filter(services__status__in=('planned', 'deployed'))
+        .filter(**service_cond)
         .distinct()
         .select_related('project_group', 'channel', 'environment', 'cloud_provider')
         .prefetch_related('services__service_type')
@@ -25,6 +32,26 @@ def match_executable_servers(project_group_id=None, channel_id=None, environment
     if environment_id:
         qs = qs.filter(environment_id=environment_id)
     return qs
+
+
+def filter_by_service_type(servers, service_type_id):
+    """从给定主机中筛出已规划/已部署指定服务类型的主机（保持入参顺序）。
+
+    用于「跟随全局」的模块：全局范围主机由执行表单勾选决定，服务类型只能
+    在这批主机上二次收窄，不能重走维度匹配。
+    """
+    from apps.asset_mgr.models import ServerService
+
+    servers = list(servers)
+    if not service_type_id or not servers:
+        return servers
+    hit = set(
+        ServerService.objects.filter(
+            server__in=servers, service_type_id=service_type_id,
+            status__in=('planned', 'deployed'),
+        ).values_list('server_id', flat=True)
+    )
+    return [s for s in servers if s.id in hit]
 
 
 class ExecVariable(models.Model):
@@ -292,6 +319,13 @@ class TaskStep(models.Model):
 
     # ── 主机范围：默认跟随任务全局，自定义时按模块维度独立匹配 ──
     use_custom_scope = models.BooleanField('自定义主机范围', default=False)
+    # 服务类型过滤：与 use_custom_scope 正交，对「跟随全局」与「自定义」两种
+    # 范围都生效（在解析出的主机上再收窄到已规划/已部署该服务的主机）。
+    # 留空=不按服务类型过滤。同一任务流据此对不同服务类型跑不同模块。
+    service_type = models.ForeignKey(
+        'asset_mgr.ServiceType', verbose_name='服务类型', on_delete=models.PROTECT,
+        null=True, blank=True, related_name='task_steps',
+    )
     project_group = models.ForeignKey(
         'asset_mgr.ProjectGroup', verbose_name='项目组', on_delete=models.PROTECT,
         null=True, blank=True, related_name='task_steps',
@@ -326,7 +360,28 @@ class TaskStep(models.Model):
 
     def matched_servers(self):
         """自定义范围：按模块维度实时匹配可执行主机（仅 use_custom_scope 时使用）。"""
-        return match_executable_servers(self.project_group_id, self.channel_id, self.environment_id)
+        return match_executable_servers(
+            self.project_group_id, self.channel_id, self.environment_id, self.service_type_id,
+        )
+
+    def resolve_servers(self, global_servers):
+        """模块最终执行主机：自定义范围实时匹配，否则取传入的全局范围主机，
+        两者都再按模块服务类型收窄。执行入口与 runner 共用同一口径。"""
+        if self.use_custom_scope:
+            return list(self.matched_servers())
+        return filter_by_service_type(global_servers, self.service_type_id)
+
+    @property
+    def scope_label(self):
+        """主机范围来源文案（日志头与错误提示共用）。"""
+        return '自定义范围' if self.use_custom_scope else '全局范围'
+
+    @property
+    def service_type_label(self):
+        """服务类型过滤文案，未选服务类型时为空串。"""
+        if not self.service_type_id:
+            return ''
+        return f' · 服务类型「{self.service_type.name}」'
 
 
 class TaskExecutionLog(models.Model):

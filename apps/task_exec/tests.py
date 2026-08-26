@@ -314,6 +314,57 @@ class ExecutionAPITests(TestCase):
         self.assertEqual(data['steps'][1]['custom'], True)
         self.assertEqual([s['name'] for s in data['steps'][1]['servers']], ['dim-01'])
 
+    def test_matched_servers_service_type_filter(self):
+        """模块服务类型过滤：跟随全局模块返回命中主机 id 与台数，自定义模块直接收窄匹配集。"""
+        from apps.asset_mgr.models import ServerService, ServiceType
+
+        c = self._client()
+        gateway = ServiceType.objects.create(name='网关', code='gateway')
+        gw_srv = Server.objects.create(
+            name='gw-01', private_ip='10.0.3.1',
+            project_group=self.pg, channel=self.ch, environment=self.env,
+        )
+        ServerService.objects.create(server=gw_srv, service_type=gateway, status='deployed')
+
+        task_id = self._create_task(c, steps=[
+            self._step(name='全局全部'),
+            self._step(order=2, name='仅网关', service_type=gateway.id),
+            self._step(order=3, name='自定义仅网关', use_custom_scope=True, service_type=gateway.id,
+                       project_group=self.pg.id, channel=self.ch.id, environment=self.env.id),
+        ])
+        data = c.get(f'/api/exec/tasks/{task_id}/matched_servers/').json()['data']
+        self.assertEqual({s['name'] for s in data['global']['results']}, {'local', 'gw-01'})
+        # 未选服务类型：全局全量，不下发命中集
+        self.assertEqual(data['steps'][0]['total'], 2)
+        self.assertNotIn('server_ids', data['steps'][0])
+        # 跟随全局 + 服务类型：台数收窄，命中集供前端与勾选取交集
+        self.assertEqual(data['steps'][1]['total'], 1)
+        self.assertEqual(data['steps'][1]['server_ids'], [gw_srv.id])
+        self.assertEqual(data['steps'][1]['service_type_name'], '网关')
+        # 自定义范围 + 服务类型
+        self.assertEqual([s['name'] for s in data['steps'][2]['servers']], ['gw-01'])
+
+    def test_service_type_filter_ignores_offline_service(self):
+        """服务类型与状态须命中同一条服务记录：该类型已下线的主机不算可执行。"""
+        from apps.asset_mgr.models import ServerService, ServiceType
+
+        c = self._client()
+        gateway = ServiceType.objects.create(name='网关', code='gateway')
+        # local 已规划 base、已下线 gateway → 按 gateway 过滤应为空
+        ServerService.objects.create(server=self.server, service_type=gateway, status='offline')
+        task_id = self._create_task(c, steps=[self._step(name='仅网关', service_type=gateway.id)])
+        data = c.get(f'/api/exec/tasks/{task_id}/matched_servers/').json()['data']
+        self.assertEqual(data['steps'][0]['total'], 0)
+
+    def test_pause_step_rejects_service_type(self):
+        c = self._client()
+        r = c.post('/api/exec/tasks/', {
+            'name': 'bad', 'project_group': self.pg.id, 'channel': self.ch.id, 'environment': self.env.id,
+            'steps': [self._step(task_type='pause', command='', service_type=self.base_service.id)],
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('不涉及主机，不能选服务类型', str(r.json()))
+
     # ── 执行入口校验 ──────────────────────────────────────
 
     def test_execute_selection_only_affects_global_steps(self):
@@ -366,6 +417,38 @@ class ExecutionAPITests(TestCase):
         r = c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
         self.assertEqual(r.status_code, 400)
         self.assertIn('自定义范围维度未匹配到可执行主机', str(r.json()))
+
+    def test_execute_service_type_narrows_and_rejects_empty(self):
+        """执行时按模块服务类型收窄主机；过滤后为空则拒绝执行。"""
+        from apps.asset_mgr.models import ServerService, ServiceType
+
+        c = self._client()
+        gateway = ServiceType.objects.create(name='网关', code='gateway')
+        gw_srv = Server.objects.create(
+            name='gw-01', private_ip='10.0.3.1',
+            project_group=self.pg, channel=self.ch, environment=self.env,
+        )
+        ServerService.objects.create(server=gw_srv, service_type=gateway, status='planned')
+
+        task_id = self._create_task(c, steps=[
+            self._step(name='全部'),
+            self._step(order=2, name='仅网关', service_type=gateway.id),
+        ])
+        with mock.patch('apps.task_exec.runner.run_stream', return_value=(0, 'ok')):
+            r = c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        log = ExecutionTask.objects.get(pk=task_id).logs.get()
+        # 未选服务类型的模块跑全局 2 台，选了网关的模块只剩 gw-01
+        self.assertEqual([(s['name'], s['server_count']) for s in log.steps_result],
+                         [('全部', 2), ('仅网关', 1)])
+        self.assertIn('服务类型「网关」', log.output)
+
+        # 服务类型在全局范围内无主机 → 拒绝执行
+        empty_type = ServiceType.objects.create(name='数据库', code='db')
+        task_id2 = self._create_task(c, steps=[self._step(name='仅DB', service_type=empty_type.id)])
+        r = c.post(f'/api/exec/tasks/{task_id2}/execute/', {}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('服务类型「数据库」过滤后为空', str(r.json()))
 
     def test_execute_blocked_while_running(self):
         c = self._client()
