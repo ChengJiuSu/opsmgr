@@ -6,7 +6,15 @@ from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
-from .models import CertDeployment, Certificate, CloudAccount, DnsChangeLog, DnsRecord, Domain
+from .models import (
+    CertDeployment,
+    Certificate,
+    CloudAccount,
+    DnsChangeLog,
+    DnsChangeRequest,
+    DnsRecord,
+    Domain,
+)
 
 # 域名整体校验（简化 RFC 1035：小写字母/数字/连字符，点分，末级 ≥2 位字母）
 DOMAIN_RE = re.compile(r'^(?!-)[a-z0-9-]{1,63}(?<!-)(\.(?!-)[a-z0-9-]{1,63}(?<!-))+$')
@@ -79,6 +87,8 @@ class DnsRecordSerializer(serializers.ModelSerializer):
     domain_name = serializers.CharField(source='domain.name', read_only=True)
     server_name = serializers.CharField(source='server.name', read_only=True, default=None)
     fqdn = serializers.CharField(read_only=True)
+    # 该记录当前是否受保护、以及命中的高危理由（前端据此提示「本次变更需审批」）
+    risk_reasons = serializers.SerializerMethodField()
     # 绑定服务器时 value 由后端按主机 IP 生成，字段级不强制
     value = serializers.CharField(required=False, allow_blank=True, max_length=512)
 
@@ -88,12 +98,19 @@ class DnsRecordSerializer(serializers.ModelSerializer):
             'id', 'domain', 'domain_name', 'rr', 'fqdn', 'type', 'value', 'ttl',
             'line', 'target_type', 'server', 'server_name',
             'remote_record_id', 'sync_status', 'sync_error',
-            'enabled', 'remark', 'created_at', 'updated_at',
+            'protected', 'risk_reasons', 'enabled', 'remark', 'created_at', 'updated_at',
         ]
         read_only_fields = ['remote_record_id', 'sync_status', 'sync_error']
         # 关闭自动生成的 UniqueTogetherValidator（会强制 value 必填，
         # 与"绑定服务器时 value 由后端填充"冲突），唯一性在 validate() 手动校验
         validators = []
+
+    @extend_schema_field(serializers.ListField(child=serializers.CharField()))
+    def get_risk_reasons(self, obj):
+        """改/删该记录会命中的高危理由（空 = 低危，可直接改）。"""
+        from . import dns_risk
+
+        return dns_risk.risk_reasons(obj, 'update')
 
     def validate_rr(self, value):
         value = value.strip()
@@ -265,5 +282,32 @@ class DnsChangeLogSerializer(serializers.ModelSerializer):
             'before', 'before_source', 'before_source_label', 'after',
             'reason', 'operator', 'operator_name', 'restorable',
             'restored_at', 'restored_by', 'restored_by_name', 'created_at',
+        ]
+        read_only_fields = fields
+
+
+class DnsChangeRequestSerializer(serializers.ModelSerializer):
+    """DNS 高危变更单（只读；建单由记录接口拦截高危变更时自动完成）。"""
+
+    requested_by_name = serializers.CharField(
+        source='requested_by.username', read_only=True, default='')
+    reviewed_by_name = serializers.CharField(
+        source='reviewed_by.username', read_only=True, default='')
+    action_label = serializers.CharField(source='get_action_display', read_only=True)
+    status_label = serializers.CharField(source='get_status_display', read_only=True)
+    domain_name = serializers.CharField(source='domain.name', read_only=True)
+    target_rr = serializers.CharField(read_only=True)
+    # expired 是计算属性：pending 且已过期。列表里要能一眼看出「批也批不了了」
+    expired = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = DnsChangeRequest
+        fields = [
+            'id', 'domain', 'domain_name', 'record', 'action', 'action_label',
+            'target_rr', 'payload', 'before', 'before_source', 'risk_reasons',
+            'reason', 'status', 'status_label', 'expired',
+            'requested_by', 'requested_by_name', 'reviewed_by', 'reviewed_by_name',
+            'reviewed_at', 'review_comment', 'emergency',
+            'expires_at', 'change_log', 'created_at', 'updated_at',
         ]
         read_only_fields = fields

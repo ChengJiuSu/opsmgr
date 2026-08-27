@@ -1,14 +1,22 @@
 """cloud_mgr 接口测试：云账号/主域名/解析记录 CRUD、推送同步（mock 厂商）、权限。"""
+from datetime import timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, override_settings
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from common.testing import grant_sudo
 
 from apps.asset_mgr.models import CloudProvider, Server
-from apps.cloud_mgr.models import CloudAccount, DnsChangeLog, DnsRecord, Domain
+from apps.cloud_mgr.models import (
+    CloudAccount,
+    DnsChangeLog,
+    DnsChangeRequest,
+    DnsRecord,
+    Domain,
+)
 from apps.cloud_mgr.providers.base import BaseDnsProvider, DnsProviderError, DnsRecordData
 
 
@@ -246,7 +254,10 @@ class DomainApiTests(BaseApiTest):
         self.assertIsNotNone(self.domain.last_synced_at)
 
 
+@override_settings(DNS_APPROVAL_ENABLED=False)
 class DnsRecordApiTests(BaseApiTest):
+    """解析记录推送机制。关掉审批直测执行链路——审批策略由 DnsApprovalTests 覆盖。"""
+
     @patch('apps.cloud_mgr.views.get_dns_provider')
     def test_create_pushes_to_provider(self, mock_get):
         fake = FakeDnsProvider()
@@ -712,8 +723,13 @@ class CloudSecretEncryptionTests(TestCase):
         self.assertEqual(Certificate.objects.get(pk=cert.pk).private_key_pem, self.KEY_PEM)
 
 
+@override_settings(DNS_APPROVAL_ENABLED=False)
 class DnsChangeLogTests(BaseApiTest):
-    """DNS 变更留痕与回滚：前值来源、改删留痕、一键还原、闸门。"""
+    """DNS 变更留痕与回滚：前值来源、改删留痕、一键还原、闸门。
+
+    关掉审批：这里测的是「改完之后能不能查、能不能撤」，走审批路径会把每个用例
+    都变成两步。审批路径同样落留痕，由 DnsApprovalTests 断言。
+    """
 
     def setUp(self):
         super().setUp()
@@ -886,3 +902,253 @@ class DnsChangeLogTests(BaseApiTest):
     def test_non_admin_read_only(self):
         member = self._client(is_staff=False, username='dns_member')
         self.assertEqual(member.get('/api/cloud/dns-changes/').status_code, 200)
+
+
+class DriftDnsProvider(FakeDnsProvider):
+    """云端值可变的假厂商：模拟「申请之后线上值被别人改了」。"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.current_value = '1.2.3.4'
+
+    def list_records(self, domain):
+        return [DnsRecordData(rr='www', type='A', value=self.current_value,
+                              ttl=600, remote_record_id='r1')]
+
+
+class DnsApprovalTests(BaseApiTest):
+    """DNS 高危变更审批：分级、建单、审批资格、紧急通道、过期、漂移比对。"""
+
+    def setUp(self):
+        super().setUp()
+        self.record = DnsRecord.objects.create(
+            domain=self.domain, rr='www', type='A', value='1.2.3.4',
+            ttl=600, line='default', remote_record_id='r1', sync_status='synced',
+        )
+
+    def _with(self, provider, func):
+        with patch('apps.cloud_mgr.views.get_dns_provider', return_value=provider), \
+                patch('apps.cloud_mgr.dns_history.get_dns_provider', return_value=provider), \
+                patch('apps.cloud_mgr.dns_approval.get_dns_provider', return_value=provider):
+            return func()
+
+    def _patch_record(self, client, payload, provider=None):
+        return self._with(provider or FakeDnsProvider(), lambda: client.patch(
+            f'/api/cloud/dns-records/{self.record.id}/', payload, format='json'))
+
+    # ── 分级 ──────────────────────────────────────────────
+    def test_low_risk_create_executes_directly(self):
+        """加一条新的测试子域名不该被拦——全都拦会让人想办法躲开流程。"""
+        admin = self._client()
+        r = self._with(FakeDnsProvider(), lambda: admin.post('/api/cloud/dns-records/', {
+            'domain': self.domain.id, 'rr': 'lowrisk', 'type': 'A', 'value': '9.9.9.9',
+        }, format='json'))
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertEqual(DnsChangeRequest.objects.count(), 0)
+
+    def test_high_risk_create_needs_approval(self):
+        """根域 / NS / MX 即使是新增也要审批。"""
+        admin = self._client()
+        r = self._with(FakeDnsProvider(), lambda: admin.post('/api/cloud/dns-records/', {
+            'domain': self.domain.id, 'rr': '@', 'type': 'A', 'value': '9.9.9.9',
+            'reason': '上线主域名',
+        }, format='json'))
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertTrue(r.json()['data']['pending_approval'])
+        self.assertFalse(DnsRecord.objects.filter(rr='@').exists())
+        cr = DnsChangeRequest.objects.get()
+        self.assertIn('根域 @ 记录', cr.risk_reasons)
+
+    def test_update_requires_reason(self):
+        """高危必须填原因：审批人据此判断，事后排障也靠它。"""
+        admin = self._client()
+        r = self._patch_record(admin, {'value': '9.9.9.9'})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('变更原因', r.json()['msg'])
+
+    def test_update_creates_request_without_touching_record(self):
+        admin = self._client()
+        r = self._patch_record(admin, {'value': '9.9.9.9', 'reason': '切流量'})
+        self.assertEqual(r.status_code, 200, r.content)
+        self.record.refresh_from_db()
+        self.assertEqual(self.record.value, '1.2.3.4')  # 未审批不落地
+        cr = DnsChangeRequest.objects.get()
+        self.assertEqual(cr.action, 'update')
+        self.assertEqual(cr.payload['value'], '9.9.9.9')
+        self.assertEqual(cr.before['value'], '1.2.3.4')
+        self.assertEqual(cr.before_source, 'provider')
+        self.assertEqual(cr.reason, '切流量')
+
+    def test_delete_creates_request(self):
+        admin = self._client()
+        r = self._with(FakeDnsProvider(), lambda: admin.delete(
+            f'/api/cloud/dns-records/{self.record.id}/',
+            {'reason': '下线服务'}, format='json'))
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertTrue(DnsRecord.objects.filter(pk=self.record.pk).exists())
+        self.assertEqual(DnsChangeRequest.objects.get().action, 'delete')
+
+    def test_protected_flag_makes_low_risk_high(self):
+        DnsRecord.objects.filter(pk=self.record.pk).update(remote_record_id='', protected=True)
+        admin = self._client()
+        r = self._patch_record(admin, {'value': '9.9.9.9', 'reason': 'x'})
+        self.assertIn('记录被标记为受保护', DnsChangeRequest.objects.get().risk_reasons)
+        self.assertEqual(r.status_code, 200)
+
+    def test_sync_auto_protects_root_ns_mx(self):
+        """等人工去标就会漏，所以 @ / NS / MX 同步时自动标。"""
+        class RootProvider(FakeDnsProvider):
+            def list_records(self, domain):
+                return [
+                    DnsRecordData(rr='@', type='A', value='1.1.1.1', remote_record_id='p1'),
+                    DnsRecordData(rr='mail', type='MX', value='mx.x.com', remote_record_id='p2'),
+                    DnsRecordData(rr='blog', type='A', value='2.2.2.2', remote_record_id='p3'),
+                ]
+
+        admin = self._client()
+        self._with(RootProvider(), lambda: admin.post(
+            f'/api/cloud/domains/{self.domain.id}/sync_records/'))
+        self.assertTrue(DnsRecord.objects.get(rr='@').protected)
+        self.assertTrue(DnsRecord.objects.get(rr='mail').protected)
+        self.assertFalse(DnsRecord.objects.get(rr='blog').protected)
+
+    # ── 审批资格 ──────────────────────────────────────────
+    def _make_request(self, client=None):
+        client = client or self._client()
+        self._patch_record(client, {'value': '9.9.9.9', 'reason': '切流量'})
+        return DnsChangeRequest.objects.get()
+
+    def test_requester_cannot_self_approve(self):
+        """10 人团队里最容易被绕过的就是这条，所以判定在后端而不是隐藏按钮。"""
+        admin = self._client()
+        cr = self._make_request(admin)
+        r = self._with(FakeDnsProvider(), lambda: admin.post(
+            f'/api/cloud/dns-change-requests/{cr.id}/approve/'))
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('不能审批自己提交的变更单', r.json()['msg'])
+
+    def test_other_admin_approves_and_applies(self):
+        cr = self._make_request(self._client(username='requester_a'))
+        reviewer = self._client(username='reviewer_a')
+        r = self._with(FakeDnsProvider(), lambda: reviewer.post(
+            f'/api/cloud/dns-change-requests/{cr.id}/approve/'))
+        self.assertEqual(r.status_code, 200, r.content)
+        self.record.refresh_from_db()
+        self.assertEqual(self.record.value, '9.9.9.9')
+        cr.refresh_from_db()
+        self.assertEqual(cr.status, 'applied')
+        self.assertEqual(cr.reviewed_by.username, 'reviewer_a')
+        # 审批路径同样落留痕（回滚入口在那边）
+        self.assertIsNotNone(cr.change_log)
+        self.assertEqual(cr.change_log.before['value'], '1.2.3.4')
+
+    def test_emergency_self_approve_requires_comment(self):
+        """紧急通道必须留原因，否则它会变成日常绕过审批的后门。"""
+        admin = self._client()
+        cr = self._make_request(admin)
+        r = self._with(FakeDnsProvider(), lambda: admin.post(
+            f'/api/cloud/dns-change-requests/{cr.id}/approve/',
+            {'emergency': True}, format='json'))
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('必须填写原因', r.json()['msg'])
+
+        r = self._with(FakeDnsProvider(), lambda: admin.post(
+            f'/api/cloud/dns-change-requests/{cr.id}/approve/',
+            {'emergency': True, 'comment': '线上故障，需立刻切流量'}, format='json'))
+        self.assertEqual(r.status_code, 200, r.content)
+        cr.refresh_from_db()
+        self.assertTrue(cr.emergency)
+        self.assertEqual(cr.status, 'applied')
+
+    def test_approve_requires_admin_and_sudo(self):
+        cr = self._make_request(self._client(username='requester_b'))
+        member = self._client(is_staff=False, username='member_b')
+        self.assertEqual(
+            member.post(f'/api/cloud/dns-change-requests/{cr.id}/approve/').status_code, 403)
+
+        nosudo = self._client_without_sudo('nosudo_reviewer')
+        r = nosudo.post(f'/api/cloud/dns-change-requests/{cr.id}/approve/')
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()['error_code'], 'sudo_required')
+
+    # ── 驳回 / 撤销 / 过期 / 漂移 ─────────────────────────
+    def test_reject_keeps_record(self):
+        cr = self._make_request(self._client(username='requester_c'))
+        reviewer = self._client(username='reviewer_c')
+        r = reviewer.post(f'/api/cloud/dns-change-requests/{cr.id}/reject/',
+                          {'comment': '先别动'}, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        cr.refresh_from_db()
+        self.assertEqual(cr.status, 'rejected')
+        self.record.refresh_from_db()
+        self.assertEqual(self.record.value, '1.2.3.4')
+
+    def test_cancel_by_requester_only(self):
+        requester = self._client(username='requester_d')
+        cr = self._make_request(requester)
+        member = self._client(is_staff=False, username='member_d')
+        r = member.post(f'/api/cloud/dns-change-requests/{cr.id}/cancel/')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('只能撤销自己', r.json()['msg'])
+
+        r = requester.post(f'/api/cloud/dns-change-requests/{cr.id}/cancel/')
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(DnsChangeRequest.objects.get().status, 'cancelled')
+
+    def test_expired_request_cannot_be_approved(self):
+        """陈旧变更单被误批推上去是这类系统的典型事故。"""
+        cr = self._make_request(self._client(username='requester_e'))
+        DnsChangeRequest.objects.filter(pk=cr.pk).update(
+            expires_at=timezone.now() - timedelta(minutes=1))
+        reviewer = self._client(username='reviewer_e')
+        r = self._with(FakeDnsProvider(), lambda: reviewer.post(
+            f'/api/cloud/dns-change-requests/{cr.id}/approve/'))
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('已过期', r.json()['msg'])
+        self.assertEqual(DnsChangeRequest.objects.get().status, 'expired')
+
+    def test_drift_blocks_apply(self):
+        """24 小时内线上值被别人改过：闭眼推陈旧目标值等于做了一次没人审过的变更。"""
+        provider = DriftDnsProvider()
+        requester = self._client(username='requester_f')
+        self._patch_record(requester, {'value': '9.9.9.9', 'reason': '切流量'},
+                           provider=provider)
+        cr = DnsChangeRequest.objects.get()
+
+        provider.current_value = '7.7.7.7'  # 别人改了线上值
+        reviewer = self._client(username='reviewer_f')
+        r = self._with(provider, lambda: reviewer.post(
+            f'/api/cloud/dns-change-requests/{cr.id}/approve/'))
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('已被改动', r.json()['msg'])
+        cr.refresh_from_db()
+        self.assertEqual(cr.status, 'pending')  # 保持待审批，供撤销后重提
+
+    def test_delete_request_applied_removes_record(self):
+        requester = self._client(username='requester_g')
+        self._with(FakeDnsProvider(), lambda: requester.delete(
+            f'/api/cloud/dns-records/{self.record.id}/',
+            {'reason': '下线'}, format='json'))
+        cr = DnsChangeRequest.objects.get()
+        reviewer = self._client(username='reviewer_g')
+        r = self._with(FakeDnsProvider(), lambda: reviewer.post(
+            f'/api/cloud/dns-change-requests/{cr.id}/approve/'))
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertFalse(DnsRecord.objects.filter(pk=self.record.pk).exists())
+        self.assertTrue(DnsChangeLog.objects.filter(action='delete').exists())
+
+    def test_pending_filter_excludes_expired(self):
+        cr = self._make_request(self._client(username='requester_h'))
+        admin = self._client(username='lister')
+        self.assertEqual(
+            admin.get('/api/cloud/dns-change-requests/?status=pending').json()['data']['total'], 1)
+        DnsChangeRequest.objects.filter(pk=cr.pk).update(
+            expires_at=timezone.now() - timedelta(minutes=1))
+        self.assertEqual(
+            admin.get('/api/cloud/dns-change-requests/?status=pending').json()['data']['total'], 0)
+
+    def test_risk_reasons_exposed_on_record(self):
+        """前端据此在改之前就提示「本次变更需审批」。"""
+        admin = self._client()
+        data = admin.get(f'/api/cloud/dns-records/{self.record.id}/').json()
+        self.assertIn('修改/删除已生效的线上解析', data['risk_reasons'])

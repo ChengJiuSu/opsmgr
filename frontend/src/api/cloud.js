@@ -33,6 +33,16 @@ export const retrySyncDnsRecord = (id) => request.post(`/api/cloud/dns-records/$
 export const getDnsChanges = (params) => request.get('/api/cloud/dns-changes/', { params })
 export const restoreDnsChange = (id) => request.post(`/api/cloud/dns-changes/${id}/restore/`)
 
+// DNS 高危变更审批：建单由记录接口拦截高危变更时自动完成，这里只做查看与审批
+export const getDnsChangeRequests = (params) =>
+  request.get('/api/cloud/dns-change-requests/', { params })
+export const approveDnsChangeRequest = (id, data = {}) =>
+  request.post(`/api/cloud/dns-change-requests/${id}/approve/`, data)
+export const rejectDnsChangeRequest = (id, comment = '') =>
+  request.post(`/api/cloud/dns-change-requests/${id}/reject/`, { comment })
+export const cancelDnsChangeRequest = (id) =>
+  request.post(`/api/cloud/dns-change-requests/${id}/cancel/`)
+
 // 证书
 export const getCertificates = (params) => request.get('/api/cloud/certificates/', { params })
 export const createCertificate = (data) => request.post('/api/cloud/certificates/', data)

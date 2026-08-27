@@ -5,6 +5,7 @@
 """
 from django.conf import settings
 from django.db import models
+from django.utils import timezone
 
 from common.fields import EncryptedTextField
 
@@ -55,6 +56,8 @@ class Domain(models.Model):
         related_name='domains',
     )
     status = models.CharField('状态', max_length=20, choices=STATUS_CHOICES, default='normal')
+    # 受保护域名：其下所有解析变更一律按高危处理（走审批），用于生产主域名
+    protected = models.BooleanField('受保护域名', default=False)
     remark = models.TextField('备注', blank=True)
     last_synced_at = models.DateTimeField('最近同步时间', null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -125,6 +128,9 @@ class DnsRecord(models.Model):
         null=True, blank=True, related_name='dns_records',
     )
     remote_record_id = models.CharField('厂商记录ID', max_length=64, blank=True)
+    # 受保护记录：改/删按高危处理（走审批）。同步与新建时自动给 @/NS/MX 打上，
+    # 也可人工标记（见 dns_risk.auto_protected）
+    protected = models.BooleanField('受保护记录', default=False)
     sync_status = models.CharField('同步状态', max_length=20, choices=SYNC_STATUS_CHOICES, default='pending')
     sync_error = models.TextField('同步错误', blank=True)
     enabled = models.BooleanField('是否启用', default=True)
@@ -351,3 +357,113 @@ class DnsChangeLog(models.Model):
         if self.action == 'create':
             return self.record_id is not None
         return bool(self.before) and self.before_source == 'provider'
+
+
+class DnsChangeRequest(models.Model):
+    """解析记录的高危变更单（申请 → 审批 → 系统执行）。
+
+    只对**高危**变更强制（判定见 dns_risk.py）：加一条新的测试子域名不必审批，
+    改根域 A 记录或删 MX 才要。全都拦会让人把审批当障碍去想办法躲，全都不拦
+    等于没有防线。
+
+    三个决定成败的细节，都在这里落死：
+
+    - **申请人不能自批**（`emergency=False` 时）。10 人团队里最容易被绕过的
+      就是这一条；
+    - **必须有紧急通道**（`emergency=True`：自批 + 强制填原因 + 审计高亮 + 日志
+      warning）。没有它，半夜故障没人审批，最后的结果是大家互相开超级管理账号
+      ——审批流反而降低了安全性；
+    - **过期作废**（settings.DNS_APPROVAL_TTL_HOURS，默认 24 小时）。陈旧变更单
+      被误批推上去是这类系统的典型事故。
+
+    再加一道：**执行前重新拉云端值比对**。申请时的前值与执行时的现值不一致
+    （期间有人改过）就拒绝执行，要求重新提交——这正是「陈旧变更单」真正危险的
+    地方，光靠过期时间挡不住 24 小时内的漂移。
+    """
+
+    STATUS_PENDING = 'pending'
+    STATUS_APPLIED = 'applied'
+    STATUS_REJECTED = 'rejected'
+    STATUS_CANCELLED = 'cancelled'
+    STATUS_EXPIRED = 'expired'
+    STATUS_CHOICES = [
+        (STATUS_PENDING, '待审批'),
+        (STATUS_APPLIED, '已执行'),
+        (STATUS_REJECTED, '已驳回'),
+        (STATUS_CANCELLED, '已撤销'),
+        (STATUS_EXPIRED, '已过期'),
+    ]
+    ACTION_CHOICES = [
+        ('create', '新增'),
+        ('update', '修改'),
+        ('delete', '删除'),
+    ]
+
+    domain = models.ForeignKey(
+        Domain, verbose_name='主域名', on_delete=models.CASCADE,
+        related_name='change_requests',
+    )
+    # 改/删指向现有记录；新增时为空。记录被别处删掉后变更单自动失去目标（执行时报错）
+    record = models.ForeignKey(
+        DnsRecord, verbose_name='解析记录', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='change_requests',
+    )
+    action = models.CharField('变更动作', max_length=16, choices=ACTION_CHOICES)
+    # 目标值：{rr,type,value,ttl,line,enabled,target_type,server_id}；删除时为空
+    payload = models.JSONField('目标值', default=dict, blank=True)
+    # 申请时的云端现值（供审批人看 diff，也是执行前漂移比对的基准）
+    before = models.JSONField('申请时线上值', default=dict, blank=True)
+    before_source = models.CharField('前值来源', max_length=16, default='none')
+    # 命中的高危理由（dns_risk.risk_reasons），审批人据此判断
+    risk_reasons = models.JSONField('高危理由', default=list, blank=True)
+
+    reason = models.CharField('申请原因', max_length=200)
+    status = models.CharField('状态', max_length=16, choices=STATUS_CHOICES,
+                              default=STATUS_PENDING)
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, verbose_name='申请人', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='dns_change_requests',
+    )
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, verbose_name='审批人', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='dns_change_reviews',
+    )
+    reviewed_at = models.DateTimeField('审批时间', null=True, blank=True)
+    review_comment = models.CharField('审批意见', max_length=200, blank=True)
+    # 紧急自批：申请人自己批准。审计与列表里高亮，事后必查
+    emergency = models.BooleanField('紧急自批', default=False)
+    expires_at = models.DateTimeField('失效时间')
+    # 执行后关联的变更留痕（回滚入口在那边）
+    change_log = models.ForeignKey(
+        'DnsChangeLog', verbose_name='变更留痕', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='+',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'DNS 变更单'
+        verbose_name_plural = 'DNS 变更单'
+        db_table = 'cloud_dns_change_request'
+        ordering = ['-created_at']
+        indexes = [models.Index(fields=['status', '-created_at'])]
+
+    def __str__(self):
+        rr = self.payload.get('rr') or getattr(self.record, 'rr', '?')
+        return f'{self.get_action_display()} {rr}.{self.domain.name}（{self.get_status_display()}）'
+
+    @property
+    def expired(self):
+        return self.status == self.STATUS_PENDING and self.expires_at <= timezone.now()
+
+    @property
+    def pending(self):
+        return self.status == self.STATUS_PENDING and not self.expired
+
+    @property
+    def target_rr(self):
+        return self.payload.get('rr') or getattr(self.record, 'rr', '')
+
+    @property
+    def target_type_label(self):
+        return self.payload.get('type') or getattr(self.record, 'type', '')

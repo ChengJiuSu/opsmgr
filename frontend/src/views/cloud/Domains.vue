@@ -17,6 +17,9 @@
         </el-select>
       </div>
       <div>
+        <el-badge :value="pendingCount" :hidden="!pendingCount" type="warning">
+          <el-button :icon="Finished" @click="openRequests()">变更审批</el-button>
+        </el-badge>
         <el-button :icon="Clock" @click="openChanges()">变更留痕</el-button>
         <template v-if="authStore.isStaff">
           <el-button :icon="Download" @click="openImport">导入域名</el-button>
@@ -65,6 +68,11 @@
               <el-table-column label="子域名" min-width="200">
                 <template #default="{ row: rec }">
                   <span class="fqdn">{{ rec.fqdn }}</span>
+                  <el-tooltip
+                    v-if="rec.protected" content="受保护记录：改 / 删需走审批" placement="top"
+                  >
+                    <el-tag size="small" type="warning" class="tag-gap">保护</el-tag>
+                  </el-tooltip>
                 </template>
               </el-table-column>
               <el-table-column prop="type" label="类型" width="80">
@@ -253,9 +261,16 @@
       <el-form-item label="备注">
         <el-input v-model="recordForm.remark" type="textarea" :rows="2" />
       </el-form-item>
-      <el-form-item v-if="editRecord" label="变更原因">
+      <el-form-item v-if="editRecord" label="变更原因" :required="editRiskReasons.length > 0">
         <el-input v-model="recordForm.reason" placeholder="如「切流量到新机」，会记入变更留痕" />
-        <div class="tip">
+        <el-alert
+          v-if="editRiskReasons.length" type="warning" :closable="false" show-icon
+          style="margin-top:8px"
+        >
+          本次变更属<b>高危</b>（{{ editRiskReasons.join('；') }}），
+          提交后进入<b>审批</b>，需另一位管理员批准才会生效。变更原因必填。
+        </el-alert>
+        <div v-else class="tip">
           修改会即时推送厂商、立即生效；变更前的云端真实值已留痕，可在「变更留痕」中一键回滚
         </div>
       </el-form-item>
@@ -265,6 +280,71 @@
       <el-button type="primary" :loading="recordSubmitting" @click="handleRecordSubmit">确定</el-button>
     </template>
   </el-dialog>
+
+  <!-- DNS 高危变更审批抽屉 -->
+  <el-drawer v-model="requestsVisible" title="DNS 高危变更审批" size="70%">
+    <el-alert type="warning" :closable="false" show-icon style="margin-bottom:12px">
+      只有高危变更需要审批（改 / 删已生效解析、根域 @、NS/MX/CAA/TXT、受保护记录、
+      指向生产主机）。<b>不能审批自己提交的变更单</b>；确需自行执行请走紧急通道
+      —— 必须填原因，会高亮记入审计。变更单
+      {{ approvalTtlHint }} 后失效；执行前还会重新比对线上值，期间被别人改过则拒绝执行。
+    </el-alert>
+    <div class="toolbar" style="margin-bottom:8px">
+      <el-radio-group v-model="requestFilter" @change="loadRequests">
+        <el-radio-button value="pending">待审批</el-radio-button>
+        <el-radio-button value="">全部</el-radio-button>
+      </el-radio-group>
+      <el-button :icon="Refresh" @click="loadRequests">刷新</el-button>
+    </div>
+    <el-table v-loading="requestsLoading" :data="requests" stripe size="small">
+      <el-table-column label="时间" width="150">
+        <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
+      </el-table-column>
+      <el-table-column label="变更" min-width="230">
+        <template #default="{ row }">
+          <el-tag size="small" :type="actionType(row.action)">{{ row.action_label }}</el-tag>
+          <span class="fqdn" style="margin-left:6px">{{ row.target_rr }}.{{ row.domain_name }}</span>
+          <div class="mono">
+            {{ row.before?.value || '（新增）' }} → {{ row.payload?.value || '（删除）' }}
+          </div>
+        </template>
+      </el-table-column>
+      <el-table-column label="高危理由" min-width="200">
+        <template #default="{ row }">
+          <el-tag
+            v-for="reason in row.risk_reasons" :key="reason"
+            size="small" type="danger" class="tag-gap"
+          >{{ reason }}</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column prop="reason" label="申请原因" min-width="130" show-overflow-tooltip />
+      <el-table-column prop="requested_by_name" label="申请人" width="90" />
+      <el-table-column label="状态" width="110">
+        <template #default="{ row }">
+          <el-tag size="small" :type="requestStatusType(row)">
+            {{ row.expired ? '已过期' : row.status_label }}
+          </el-tag>
+          <el-tag v-if="row.emergency" size="small" type="danger" class="tag-gap">紧急自批</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="操作" width="210" fixed="right">
+        <template #default="{ row }">
+          <template v-if="row.status === 'pending' && !row.expired">
+            <el-button
+              v-if="authStore.isStaff" size="small" type="success"
+              :loading="reviewingId === row.id" @click="handleApprove(row)"
+            >批准</el-button>
+            <el-button
+              v-if="authStore.isStaff" size="small" type="danger"
+              :loading="reviewingId === row.id" @click="handleReject(row)"
+            >驳回</el-button>
+            <el-button size="small" @click="handleCancel(row)">撤销</el-button>
+          </template>
+          <span v-else class="muted">—</span>
+        </template>
+      </el-table-column>
+    </el-table>
+  </el-drawer>
 
   <!-- DNS 变更留痕抽屉：改/删前的云端真实值 + 一键回滚 -->
   <el-drawer v-model="changesVisible" :title="changesTitle" size="70%">
@@ -323,8 +403,8 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, onUnmounted } from 'vue'
-import { Plus, Edit, Delete, Download, Clock } from '@element-plus/icons-vue'
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
+import { Plus, Edit, Delete, Download, Clock, Finished, Refresh } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../../stores/auth'
 import { debounce } from '../../utils/debounce'
@@ -334,6 +414,8 @@ import {
   importDomains, syncDomainRecords,
   getDnsRecords, createDnsRecord, updateDnsRecord, deleteDnsRecord, retrySyncDnsRecord,
   getDnsChanges, restoreDnsChange,
+  getDnsChangeRequests, approveDnsChangeRequest, rejectDnsChangeRequest,
+  cancelDnsChangeRequest,
 } from '../../api/cloud'
 
 const authStore = useAuthStore()
@@ -530,12 +612,13 @@ async function handleRecordSubmit() {
   recordSubmitting.value = true
   try {
     const payload = { ...recordForm, domain: recordDomain.value.id }
+    // 高危变更后端不会直接执行，而是回一张变更单（data.pending_approval）
     if (editRecord.value) {
-      await updateDnsRecord(editRecord.value.id, payload)
-      ElMessage.success('更新成功')
+      const res = await updateDnsRecord(editRecord.value.id, payload)
+      _notifySubmit(res, '更新成功')
     } else {
-      await createDnsRecord(payload)
-      ElMessage.success('新增成功')
+      const res = await createDnsRecord(payload)
+      _notifySubmit(res, '新增成功')
     }
     recordDialogVisible.value = false
     await loadRecords(recordDomain.value.id, true)
@@ -543,6 +626,15 @@ async function handleRecordSubmit() {
   } finally {
     recordSubmitting.value = false
   }
+}
+
+function _notifySubmit(res, okMessage) {
+  if (res?.data?.pending_approval) {
+    ElMessage.warning(res.msg || '该变更属高危操作，已提交审批')
+    loadPendingCount()
+    return
+  }
+  ElMessage.success(okMessage)
 }
 
 async function handleRecordDelete(domainRow, rec) {
@@ -559,10 +651,101 @@ async function handleRecordDelete(domainRow, rec) {
       inputValue: '',
     },
   )
-  await deleteDnsRecord(rec.id, reason || '')
-  ElMessage.success('删除成功（可在「变更留痕」中回滚）')
+  const res = await deleteDnsRecord(rec.id, reason || '')
+  _notifySubmit(res, '删除成功（可在「变更留痕」中回滚）')
   await loadRecords(domainRow.id, true)
   fetchData()
+}
+
+// ── DNS 高危变更审批 ──────────────────────────────────
+const requestsVisible = ref(false)
+const requestsLoading = ref(false)
+const requests = ref([])
+const requestFilter = ref('pending')
+const pendingCount = ref(0)
+const reviewingId = ref(null)
+// 与后端 DNS_APPROVAL_TTL_HOURS 对齐的提示文案（只是提示，判定在后端）
+const approvalTtlHint = '24 小时'
+
+// 编辑弹窗里当前记录命中的高危理由（后端在记录序列化里算好）
+const editRiskReasons = computed(() => editRecord.value?.risk_reasons || [])
+
+const requestStatusType = (row) => {
+  if (row.expired) return 'info'
+  return { pending: 'warning', applied: 'success', rejected: 'danger' }[row.status] || 'info'
+}
+
+async function openRequests() {
+  requestsVisible.value = true
+  await loadRequests()
+}
+
+async function loadRequests() {
+  requestsLoading.value = true
+  try {
+    const params = { page_size: 100 }
+    if (requestFilter.value) params.status = requestFilter.value
+    const res = await getDnsChangeRequests(params)
+    requests.value = res.data?.results || []
+    if (requestFilter.value === 'pending') pendingCount.value = res.data?.total || 0
+  } finally {
+    requestsLoading.value = false
+  }
+}
+
+async function loadPendingCount() {
+  try {
+    const res = await getDnsChangeRequests({ status: 'pending', page_size: 1 })
+    pendingCount.value = res.data?.total || 0
+  } catch {
+    pendingCount.value = 0  // 没权限或接口异常时不显示角标，不影响主流程
+  }
+}
+
+async function handleApprove(row) {
+  // 自批会被后端拒（不能审批自己提交的变更单），这里先问清楚是否走紧急通道
+  const { value: comment } = await ElMessageBox.prompt(
+    `批准后立即推送厂商并生效：${row.target_rr}.${row.domain_name} → `
+    + `${row.payload?.value || '（删除）'}。`
+    + '若这是你自己提交的变更单，需填写原因走紧急通道（会高亮记入审计）。',
+    '批准变更',
+    { confirmButtonText: '批准并执行', inputPlaceholder: '审批意见 / 紧急原因（自批必填）' },
+  )
+  reviewingId.value = row.id
+  try {
+    const isSelf = row.requested_by_name === authStore.user?.username
+    const res = await approveDnsChangeRequest(row.id, {
+      comment: comment || '', emergency: isSelf && !!comment,
+    })
+    ElMessage.success(res.msg || '已执行')
+    await loadRequests()
+    fetchData()
+  } finally {
+    reviewingId.value = null
+  }
+}
+
+async function handleReject(row) {
+  const { value: comment } = await ElMessageBox.prompt(
+    `驳回「${row.action_label} ${row.target_rr}.${row.domain_name}」？`,
+    '驳回变更',
+    { type: 'warning', confirmButtonText: '驳回', inputPlaceholder: '驳回理由' },
+  )
+  reviewingId.value = row.id
+  try {
+    await rejectDnsChangeRequest(row.id, comment || '')
+    ElMessage.success('已驳回')
+    await loadRequests()
+  } finally {
+    reviewingId.value = null
+  }
+}
+
+async function handleCancel(row) {
+  await ElMessageBox.confirm('确定撤销该变更单吗？', '撤销', { type: 'warning' })
+  await cancelDnsChangeRequest(row.id)
+  ElMessage.success('已撤销')
+  await loadRequests()
 }
 
 // ── DNS 变更留痕 ──────────────────────────────────────
@@ -628,6 +811,7 @@ async function handleRetry(domainRow, rec) {
 
 onMounted(async () => {
   fetchData()
+  loadPendingCount()  // 工具栏「变更审批」角标：有待审的单子要能一眼看见
   // 云账号下拉（域名归属/导入用）；服务器下拉（记录绑定用，page_size=0 全量）
   if (authStore.isStaff) {
     const [accRes, svrRes] = await Promise.all([

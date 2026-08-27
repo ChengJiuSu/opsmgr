@@ -431,6 +431,13 @@ ARTIFACT_KEEP_LATEST = config('ARTIFACT_KEEP_LATEST', default=3, cast=int)
 ANSIBLE_PROJECT_DIR = config('ANSIBLE_PROJECT_DIR', default=str(BASE_DIR / 'ansible'))
 ANSIBLE_INVENTORY = config('ANSIBLE_INVENTORY', default='')
 
+# ── DNS 高危变更审批（cloud_mgr）──────────────────────────
+# 关掉后高危变更直接执行（仍留痕、仍可回滚）。生产建议开启。
+DNS_APPROVAL_ENABLED = config('DNS_APPROVAL_ENABLED', default=True, cast=bool)
+# 变更单有效期（小时）：陈旧变更单被误批推上去是这类系统的典型事故。
+# 另有一道执行前的漂移比对——光靠过期时间挡不住 24 小时内线上值已被别人改过的情况
+DNS_APPROVAL_TTL_HOURS = config('DNS_APPROVAL_TTL_HOURS', default=24, cast=int)
+
 # ── 证书管理（cloud_mgr，acme.sh DNS 验证签发）─────────────
 # acme.sh 可执行文件路径（默认取 ~/.acme.sh/acme.sh，官方 curl 安装位置）
 ACME_BIN = config('ACME_BIN', default=str(Path.home() / '.acme.sh' / 'acme.sh'))

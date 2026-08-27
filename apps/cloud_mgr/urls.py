@@ -5,6 +5,7 @@ from .views import (
     CertificateViewSet,
     CloudAccountViewSet,
     DnsChangeLogViewSet,
+    DnsChangeRequestViewSet,
     DnsRecordViewSet,
     DomainViewSet,
 )
@@ -14,6 +15,8 @@ router.register('accounts', CloudAccountViewSet, basename='cloud-account')
 router.register('domains', DomainViewSet, basename='cloud-domain')
 router.register('dns-records', DnsRecordViewSet, basename='cloud-dns-record')
 router.register('dns-changes', DnsChangeLogViewSet, basename='cloud-dns-change')
+router.register('dns-change-requests', DnsChangeRequestViewSet,
+                basename='cloud-dns-change-request')
 router.register('certificates', CertificateViewSet, basename='cloud-certificate')
 router.register('cert-deployments', CertDeploymentViewSet, basename='cloud-cert-deployment')
 

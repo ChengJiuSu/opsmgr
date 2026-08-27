@@ -7,6 +7,7 @@
 - 域名 sync_records 从厂商侧全量拉取镜像到本地（忽略 _acme-challenge 记录）；
 - 证书：acme.sh DNS 验证签发/续签（后台异步）、zip 下载、分发目标管理与推送。
 """
+import copy
 import io
 import logging
 import re
@@ -19,24 +20,35 @@ from django.http import HttpResponse
 from django.utils import timezone
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema
-from rest_framework import mixins, viewsets
+from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.response import Response
 
 from common.pagination import StandardPagination
 from common.permissions import IsAdmin, IsAdminOrReadOnly
+from rest_framework.permissions import IsAuthenticated
 from common.response import fail, ok
 from common.sudo import SudoRequired, required_for
 
-from . import dns_history
+from . import dns_approval, dns_history, dns_risk
 from .acme import supported_provider_codes
 from .deploy import supported_target_types
-from .models import CertDeployment, Certificate, CloudAccount, DnsChangeLog, DnsRecord, Domain
+from .models import (
+    CertDeployment,
+    Certificate,
+    CloudAccount,
+    DnsChangeLog,
+    DnsChangeRequest,
+    DnsRecord,
+    Domain,
+)
 from .providers import DnsProviderError, DnsRecordData, get_dns_provider
 from .serializers import (
     CertDeploymentSerializer,
     CertificateSerializer,
     CloudAccountSerializer,
     DnsChangeLogSerializer,
+    DnsChangeRequestSerializer,
     DnsRecordSerializer,
     DomainSerializer,
 )
@@ -199,6 +211,10 @@ class DomainViewSet(viewsets.ModelViewSet):
                     'line': r.line, 'enabled': r.enabled,
                     'sync_status': 'synced', 'sync_error': '',
                 }
+                # 同步时自动给根域 / NS / MX 打保护标记（已标记的不取消，
+                # 人工标上的保护不该被一次同步抹掉）
+                if dns_risk.auto_protected(r.rr, r.type):
+                    fields['protected'] = True
                 obj = domain.records.filter(remote_record_id=r.remote_record_id).first()
                 if obj is None:
                     # 本地手工建但尚未推送成功的同内容记录：认领厂商侧 ID
@@ -277,8 +293,67 @@ class DnsRecordViewSet(viewsets.ModelViewSet):
     def _reason(self):
         return (self.request.data.get('reason') or '') if hasattr(self.request, 'data') else ''
 
+    def _approval_gate(self, target, action, existing=None):
+        """高危变更转变更单，返回 Response（已拦下）或 None（可直接执行）。
+
+        高危判定见 dns_risk.py：加一条新的测试子域名直接放行，改根域 A 记录或
+        删 MX 才走审批。全都拦会让人把审批当障碍去想办法躲。
+
+        高危时**强制填变更原因**：审批人要据此判断，而事后排障最省事的线索也是它。
+        """
+        if not dns_approval.approval_enabled():
+            return None
+        domain = target.domain or getattr(existing, 'domain', None)
+        reasons = dns_risk.risk_reasons(target, action, domain=domain)
+        if not reasons:
+            return None
+        reason = self._reason().strip()
+        if not reason:
+            return fail('该变更命中高危规则，需填写变更原因（reason）后提交审批：'
+                        + '；'.join(reasons))
+        change_request = dns_approval.create_request(
+            domain, target, action, self.request.user, reason, existing=existing)
+        logger.warning('DNS 高危变更已转审批：#%s %s %s.%s（%s）',
+                       change_request.pk, action, change_request.target_rr,
+                       domain.name, '；'.join(reasons))
+        return ok(
+            {'pending_approval': True,
+             'change_request': DnsChangeRequestSerializer(change_request).data},
+            msg='该变更属高危操作，已提交审批（' + '；'.join(reasons) + '），待管理员批准后生效。',
+        )
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        target = DnsRecord(**serializer.validated_data)
+        # 新建的记录若命中高危（根域、NS/MX/CAA/TXT、指向生产主机…）也要审批
+        gate = self._approval_gate(target, 'create')
+        if gate is not None:
+            return gate
+        self.perform_create(serializer)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        # 目标状态 = 现有记录叠上本次改动；用副本算，别把未审批的值写进 instance
+        target = copy.copy(instance)
+        for field, value in serializer.validated_data.items():
+            setattr(target, field, value)
+        gate = self._approval_gate(target, 'update', existing=instance)
+        if gate is not None:
+            return gate
+        self.perform_update(serializer)
+        return Response(serializer.data)
+
     def perform_create(self, serializer):
-        record = serializer.save()
+        # 根域 / NS / MX 自动打保护标记：这几类最没有争议，等人工去标就会漏
+        record = serializer.save(
+            protected=serializer.validated_data.get('protected')
+            or dns_risk.auto_protected(serializer.validated_data.get('rr', ''),
+                                       serializer.validated_data.get('type', '')))
         self._push(record, is_new=True)
         dns_history.log_change(
             record, 'create', self.request.user,
@@ -305,6 +380,9 @@ class DnsRecordViewSet(viewsets.ModelViewSet):
 
     def destroy(self, request, *args, **kwargs):
         record = self.get_object()
+        gate = self._approval_gate(record, 'delete', existing=record)
+        if gate is not None:
+            return gate
         # 前值在删之前取：删完本地行就没了，云端也查不到
         before, source = dns_history.remote_snapshot(record)
         domain = record.domain
@@ -575,3 +653,70 @@ class DnsChangeLogViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin,
                        request.user.username, change.pk, change.action,
                        change.record_rr, change.domain_name)
         return ok(self.get_serializer(change).data, msg=message)
+
+
+class DnsChangeRequestViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin,
+                              viewsets.GenericViewSet):
+    """DNS 高危变更单：查看 + 审批 / 驳回 / 撤销。
+
+    建单不走这里——高危变更由解析记录接口自动拦下转单（见
+    DnsRecordViewSet._approval_gate），避免出现「绕过记录接口直接建单」的入口。
+    """
+
+    queryset = DnsChangeRequest.objects.select_related(
+        'domain', 'record', 'requested_by', 'reviewed_by')
+    serializer_class = DnsChangeRequestSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = StandardPagination
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        params = self.request.query_params
+        status_param = params.get('status')
+        if status_param == 'pending':
+            # 「待我审」口径：只列还能批的，过期的不算（批也批不了）
+            qs = qs.filter(status=DnsChangeRequest.STATUS_PENDING,
+                           expires_at__gt=timezone.now())
+        elif status_param:
+            qs = qs.filter(status=status_param)
+        domain = params.get('domain')
+        if domain and domain.isdigit():
+            qs = qs.filter(domain_id=domain)
+        return qs
+
+    @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
+    @action(detail=True, methods=['post'], permission_classes=[IsAdmin, SudoRequired])
+    def approve(self, request, pk=None):
+        """审批通过并立即执行。
+
+        `emergency=true` 走紧急通道（申请人可自批，必须填 comment）——没有它，
+        半夜故障没人审批，最后结果是大家互相开超级管理账号，审批流反而降低安全性。
+        """
+        change_request = self.get_object()
+        emergency = request.data.get('emergency') is True
+        success, message = dns_approval.apply_request(
+            change_request, request.user, emergency=emergency,
+            comment=request.data.get('comment') or '')
+        if not success:
+            return fail(message)
+        return ok(self.get_serializer(change_request).data, msg=message)
+
+    @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
+    @action(detail=True, methods=['post'], permission_classes=[IsAdmin, SudoRequired])
+    def reject(self, request, pk=None):
+        change_request = self.get_object()
+        success, message = dns_approval.reject(
+            change_request, request.user, comment=request.data.get('comment') or '')
+        if not success:
+            return fail(message)
+        return ok(self.get_serializer(change_request).data, msg=message)
+
+    @extend_schema(request=None, responses=OpenApiTypes.OBJECT)
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        """撤销自己提交的变更单（管理员可撤任意单）。"""
+        change_request = self.get_object()
+        success, message = dns_approval.cancel(change_request, request.user)
+        if not success:
+            return fail(message)
+        return ok(self.get_serializer(change_request).data, msg=message)

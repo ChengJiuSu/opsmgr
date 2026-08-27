@@ -57,6 +57,10 @@ apps/cloud_mgr/
 | `/api/cloud/certificates/{id}/renew/` | POST | 管理员 | 强制重签（--force），仅 issued 状态 |
 | `/api/cloud/certificates/{id}/download/` | GET | 仅管理员 | zip 包，内含一层 `<名称>/` 目录（`.crt` / `.key` / `.fullchain.pem` + README.txt），`Cache-Control: no-store` |
 | `/api/cloud/certificates/{id}/deploy_all/` | POST | 管理员 | 分发到全部已登记目标，跳过分发中与未接入类型（返回 dispatched / skipped） |
+| `/api/cloud/dns-change-requests/?status=pending&domain=` | GET | 登录用户 | 高危变更单列表（`status=pending` 只列还能批的，过期的不算）|
+| `/api/cloud/dns-change-requests/{id}/approve/` | POST | 管理员 + **sudo** | 审批通过并立即执行；`emergency=true` + `comment` 走紧急自批 |
+| `/api/cloud/dns-change-requests/{id}/reject/` | POST | 管理员 + **sudo** | 驳回 |
+| `/api/cloud/dns-change-requests/{id}/cancel/` | POST | 申请人或管理员 | 撤销 |
 | `/api/cloud/dns-changes/?domain=&record=&action=&keyword=` | GET | 管理员写/登录读 | DNS 变更留痕列表（只读不可删）|
 | `/api/cloud/dns-changes/{id}/restore/` | POST | 管理员 + **sudo** | 按前值一键回滚；仅 `before_source='provider'` 的改/删与未撤销的新增可回滚 |
 | `/api/cloud/cert-deployments/?certificate=` | CRUD | 管理员写 + **sudo** / 登录读 | 分发目标登记；deploying 禁止删除。`reload_cmd` 是目标主机上执行的任意 shell 命令，登记一条目标等于拿到该主机的远程命令执行面——与「连接凭据」同性质，故写操作要求二次验证 |
@@ -199,3 +203,52 @@ DELETE 请求**没有 body**，等于「被删的是什么值」在系统里查�
 
 回滚自身也落一条 `action='restore'` 的留痕，否则「谁把它改回去的」又查不到。
 留痕表**只读不可删**：能被操作人删掉的留痕等于没有留痕。
+
+---
+
+## DNS 高危分级与审批（`dns_risk.py` / `dns_approval.py`）
+
+### 为什么要分级
+
+不是所有 DNS 操作都值得同等对待：加一条新的测试子域名风险很低，改根域 A 记录或
+删 MX 是另一个量级。**全都拦会让人把审批当障碍去想办法躲，全都不拦等于没有防线。**
+
+### 高危 = 命中任一条
+
+| 条件 | 理由 |
+|------|------|
+| 改 / 删已同步的记录 | 新增不算——加一条新记录不会动到线上现有解析 |
+| 根域 `@` 记录 | 主域名本身的解析，影响面最大 |
+| `NS` / `MX` / `CAA` / `TXT` | NS 改错整个域名失控；MX 改错邮件静默丢失；CAA 影响证书签发；TXT 里躺着 SPF、DKIM 与域名所有权验证。这几类改错的表现都是「过几天才发现」 |
+| 记录或域名被标记 `protected` | 人工指定；同步与新建时自动给 `@`/NS/MX 打上 |
+| 指向生产主机 | `target_type='server'` 且该主机环境 `is_prod` |
+
+TXT **不自动**打保护标记：它数量多且大量是临时验证记录，自动标会让「保护」这个
+标记失去信号价值——它仍然因类型命中高危。
+
+### 流程
+
+高危变更由**解析记录接口自动拦下转单**（`DnsRecordViewSet._approval_gate`），
+不另开建单入口，避免出现「绕过记录接口直接建单」的口子。响应是 200 +
+`data.pending_approval=true`，前端据此提示「已提交审批」。
+
+高危时**强制填 `reason`**：审批人要据此判断，事后排障最省事的线索也是它。
+
+### 三个决定成败的细节
+
+| 细节 | 落法 |
+|------|------|
+| **申请人不能自批** | `dns_approval.can_review` 判定，不是靠页面隐藏按钮。10 人团队里最容易被绕过的就是这条 |
+| **必须有紧急通道** | `emergency=true` + 必填 `comment`：申请人可自批，日志 `warning` + 列表高亮 + 进审计。没有它，半夜故障没人审批，最后结果是大家互相开超级管理账号——审批流反而降低了安全性 |
+| **过期作废** | `DNS_APPROVAL_TTL_HOURS`（默认 24h）。审批时就地标记过期；`expire_dns_requests` 命令批量清理，让列表口径干净 |
+
+### 执行前的漂移比对
+
+申请时记下的线上值与执行时的现值不一致（期间有人改过）就**拒绝执行**，要求撤销
+重提。光靠过期时间挡不住 24 小时内的漂移，而闭着眼睛把陈旧目标值推上去，等于用
+审批流的名义做了一次没人审过的变更。
+
+比对只在申请时拿到过 `provider` 前值时进行；拉不到当前值时也拒绝执行（宁可等，
+不猜）。
+
+执行链路复用 `dns_history`：审批通过后同样落一条变更留痕，回滚入口仍在留痕那边。
