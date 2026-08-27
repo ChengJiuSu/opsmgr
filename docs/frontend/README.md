@@ -18,3 +18,4 @@
 | [系统配置](views/system-configs.md) | 键值对 CRUD、key 禁用逻辑 |
 | [日志文件](views/task-log-files.md) | 日志目录浏览、分段读取、下载 |
 | [API 凭证](views/api-credentials.md) | 机读凭证 CRUD、一次性明文、IP 白名单校验 |
+| [角色权限](views/roles.md) | 模块权限矩阵、执行能力位、用户绑角色 |

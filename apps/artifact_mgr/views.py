@@ -21,7 +21,7 @@ from apps.auth_mgr.apikey import (
 )
 from apps.auth_mgr.authentication import MfaJWTAuthentication
 from common.ansible import resolve_within
-from common.permissions import IsAdminOrReadOnly
+from apps.auth_mgr.permissions import module_perm
 from common.response import fail, ok
 
 from .models import Artifact
@@ -37,7 +37,7 @@ class ArtifactViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin,
 
     queryset = Artifact.objects.select_related('project_group', 'channel', 'environment')
     serializer_class = ArtifactSerializer
-    permission_classes = [IsAdminOrReadOnly]
+    permission_classes = [module_perm('artifact')]
 
     DICT_FILTERS = (
         ('project_group', 'project_group'),

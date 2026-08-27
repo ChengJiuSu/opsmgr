@@ -41,6 +41,11 @@ class TaskTriggerView(APIView):
         if task is None:
             return fail('任务不存在', status=404)
 
+        credential = request.auth
+        if not credential.allows_dims(task.project_group_id, task.environment_id):
+            return fail(f'凭证「{credential.name}」的数据范围不含该任务'
+                        f'（当前范围：{credential.scope_label}）', status=403)
+
         if not task.default_select_all:
             return fail(f'任务「{task.name}」已关闭「默认全选主机」，'
                         f'需在页面上人工勾选主机后执行，不支持接口触发')
@@ -56,7 +61,6 @@ class TaskTriggerView(APIView):
 
         steps = list(task.steps.all())
         selected_global = list(task.matched_servers())
-        credential = request.auth
         log, error = trigger.launch(
             task, steps, selected_global, picked={},
             triggered_by=request.user, trigger_type='api',

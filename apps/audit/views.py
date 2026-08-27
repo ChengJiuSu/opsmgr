@@ -1,5 +1,6 @@
 from rest_framework import mixins, viewsets
-from rest_framework.permissions import IsAuthenticated
+
+from apps.auth_mgr.permissions import module_perm
 
 from .models import AuditLog
 from .serializers import AuditLogSerializer
@@ -8,7 +9,7 @@ from .serializers import AuditLogSerializer
 class AuditLogViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):
     queryset = AuditLog.objects.select_related('user').all()
     serializer_class = AuditLogSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [module_perm('audit')]
 
     def get_queryset(self):
         qs = super().get_queryset()

@@ -22,7 +22,7 @@ from common.response import ok
 from common.testing import grant_sudo
 
 from .apikey import ApiKeyAuthentication, ApiKeyThrottle, ensure_service_user, scope_required
-from .models import ApiCredential, MFARecoveryCode, UserMFA
+from .models import ApiCredential, MFARecoveryCode, Role, UserMFA
 
 User = get_user_model()
 PASSWORD = 'Pass!2345xyz'
@@ -1319,3 +1319,263 @@ class CredentialDimScopeTests(TestCase):
         }, format='json')
         self.assertEqual(r.status_code, 200, r.content)
         self.assertEqual(r.json()['data']['scope_label'], f'项目组 [{self.pg_a.id}]')
+
+
+class RoleMatrixTests(TestCase):
+    """角色矩阵：档位映射、无角色回退、能力位、内置角色保护。"""
+
+    def setUp(self):
+        cache.clear()
+        self.super_role = Role.objects.get(code='super')
+        self.ops_admin = Role.objects.get(code='ops_admin')
+        self.ops_member = Role.objects.get(code='ops_member')
+
+    def tearDown(self):
+        cache.clear()
+
+    def _user(self, name, role=None, is_staff=False):
+        user = User.objects.create(username=name, is_staff=is_staff, role=role)
+        user.set_password(PASSWORD)
+        user.save()
+        return user
+
+    def _client(self, user):
+        client = APIClient()
+        r = client.post('/api/auth/login/',
+                        {'username': user.username, 'password': PASSWORD}, format='json')
+        client.credentials(HTTP_AUTHORIZATION='Bearer ' + r.json()['access'])
+        return client
+
+    # ── 档位映射 ──────────────────────────────────────────
+    def test_method_level_mapping(self):
+        from apps.auth_mgr import roles as roles_mod
+
+        self.assertEqual(roles_mod.required_level('GET'), 'read')
+        self.assertEqual(roles_mod.required_level('POST'), 'read_create')
+        self.assertEqual(roles_mod.required_level('PATCH'), 'write')
+        # 未知方法当 write（fail-closed）
+        self.assertEqual(roles_mod.required_level('FROBNICATE'), 'write')
+
+    def test_read_create_level_allows_post_not_patch(self):
+        """保留 read_create 这一档：CMDB 现在就是「可查可增不可改删」。"""
+        member = self._user('rm_member', role=self.ops_member)
+        client = self._client(member)
+        self.assertEqual(client.get('/api/assets/servers/').status_code, 200)
+        r = client.post('/api/assets/servers/',
+                        {'name': 'rm-host', 'private_ip': '10.7.7.7'}, format='json')
+        self.assertEqual(r.status_code, 201, r.content)
+        server_id = r.json()['id']
+        self.assertEqual(client.patch(f'/api/assets/servers/{server_id}/',
+                                      {'os': 'ubuntu'}, format='json').status_code, 403)
+
+    def test_none_level_hides_module(self):
+        """普通运维对连接凭据是 none：连读都不给（凭据的读本身就泄露信息）。"""
+        member = self._user('rm_member2', role=self.ops_member)
+        self.assertEqual(self._client(member).get('/api/exec/credentials/').status_code, 403)
+
+    def test_ops_admin_reads_credentials_but_cannot_write(self):
+        """这正是二档模型缺的那一层：能干日常运维，但拿不到密钥与系统管理。"""
+        admin = self._user('rm_opsadmin', role=self.ops_admin)
+        client = self._client(admin)
+        self.assertEqual(client.get('/api/exec/credentials/').status_code, 200)
+        r = client.post('/api/exec/credentials/',
+                        {'name': 'c1', 'username': 'root', 'auth_type': 'password',
+                         'password': 'x'}, format='json')
+        self.assertEqual(r.status_code, 403)
+        # 系统管理不可见
+        self.assertEqual(client.get('/api/auth/users/').status_code, 403)
+        self.assertEqual(client.get('/api/system/configs/').status_code, 403)
+
+    def test_super_role_full_access(self):
+        boss = self._user('rm_super', role=self.super_role, is_staff=True)
+        client = self._client(boss)
+        grant_sudo(client, PASSWORD)
+        self.assertEqual(client.get('/api/auth/users/').status_code, 200)
+        self.assertEqual(client.get('/api/exec/credentials/').status_code, 200)
+
+    # ── 无角色回退 ────────────────────────────────────────
+    def test_no_role_staff_behaves_as_before(self):
+        """存量账号不必一次性配角色：staff 仍是全权。"""
+        legacy = self._user('rm_legacy_staff', role=None, is_staff=True)
+        client = self._client(legacy)
+        grant_sudo(client, PASSWORD)
+        self.assertEqual(client.get('/api/auth/users/').status_code, 200)
+
+    def test_no_role_member_behaves_as_before(self):
+        legacy = self._user('rm_legacy_member', role=None, is_staff=False)
+        client = self._client(legacy)
+        self.assertEqual(client.get('/api/assets/servers/').status_code, 200)
+        self.assertEqual(client.get('/api/exec/credentials/').status_code, 403)
+
+    # ── 权限快照 ──────────────────────────────────────────
+    def test_me_exposes_permission_snapshot(self):
+        member = self._user('rm_snapshot', role=self.ops_member)
+        data = self._client(member).get('/api/auth/me/').json()['data']
+        self.assertEqual(data['permissions']['role'], 'ops_member')
+        self.assertEqual(data['permissions']['modules']['credential'], 'none')
+        self.assertFalse(data['permissions']['can_exec_prod'])
+
+    def test_jwt_carries_permission_snapshot(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        member = self._user('rm_jwt', role=self.ops_member)
+        client = APIClient()
+        r = client.post('/api/auth/login/',
+                        {'username': 'rm_jwt', 'password': PASSWORD}, format='json')
+        payload = AccessToken(r.json()['access']).payload
+        self.assertEqual(payload['perms']['role'], 'ops_member')
+
+    # ── 内置角色保护 ──────────────────────────────────────
+    def test_builtin_super_cannot_be_weakened(self):
+        """一次手滑把超级管理降档，可能把所有人锁在系统之外。"""
+        boss = self._user('rm_boss', role=self.super_role, is_staff=True)
+        client = self._client(boss)
+        grant_sudo(client, PASSWORD)
+        weakened = dict(self.super_role.permissions, system='read')
+        r = client.patch(f'/api/auth/roles/{self.super_role.id}/',
+                         {'permissions': weakened}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('必须对所有模块保持读写', r.json()['msg'])
+
+    def test_builtin_role_cannot_be_deleted(self):
+        boss = self._user('rm_boss2', role=self.super_role, is_staff=True)
+        client = self._client(boss)
+        grant_sudo(client, PASSWORD)
+        r = client.delete(f'/api/auth/roles/{self.ops_member.id}/')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('不可删除', r.json()['msg'])
+
+    def test_role_in_use_cannot_be_deleted(self):
+        boss = self._user('rm_boss3', role=self.super_role, is_staff=True)
+        client = self._client(boss)
+        grant_sudo(client, PASSWORD)
+        r = client.post('/api/auth/roles/', {
+            'name': '发布员', 'code': 'releaser',
+            'permissions': {'exec': 'read', 'artifact': 'read'},
+            'can_execute': True, 'can_exec_prod': False,
+        }, format='json')
+        self.assertEqual(r.status_code, 201, r.content)
+        role_id = r.json()['id']
+        # 未配置的模块补 none，避免「没配就继承了什么」的歧义
+        self.assertEqual(r.json()['permissions']['system'], 'none')
+
+        self._user('rm_releaser', role=Role.objects.get(pk=role_id))
+        r = client.delete(f'/api/auth/roles/{role_id}/')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('仍有 1 个用户在用', r.json()['msg'])
+
+    def test_unknown_module_or_level_rejected(self):
+        boss = self._user('rm_boss4', role=self.super_role, is_staff=True)
+        client = self._client(boss)
+        grant_sudo(client, PASSWORD)
+        for permissions in ({'nope': 'read'}, {'exec': 'superuser'}):
+            r = client.post('/api/auth/roles/', {
+                'name': f'bad-{list(permissions)[0]}', 'code': f'bad_{list(permissions)[0]}',
+                'permissions': permissions,
+            }, format='json')
+            self.assertEqual(r.status_code, 400, permissions)
+
+    def test_role_meta_endpoint(self):
+        boss = self._user('rm_boss5', role=self.super_role, is_staff=True)
+        client = self._client(boss)
+        data = client.get('/api/auth/roles/meta/').json()['data']
+        self.assertIn('cmdb', [m['value'] for m in data['modules']])
+        self.assertIn('read_create', [level['value'] for level in data['levels']])
+
+
+class ExecCapabilityTests(TestCase):
+    """执行能力位与生产限制：能跑不能改、不能碰生产、范围外的任务碰不到。"""
+
+    def setUp(self):
+        from apps.asset_mgr.models import (
+            Channel, Environment, ProjectGroup, Server, ServerService, ServiceType,
+        )
+        from apps.task_exec.models import ExecutionTask, TaskStep
+
+        cache.clear()
+        self.member_role = Role.objects.get(code='ops_member')
+        self.pg = ProjectGroup.objects.create(name='项目A', code='ec-a')
+        self.pg_other = ProjectGroup.objects.create(name='项目B', code='ec-b')
+        self.ch = Channel.objects.create(name='官服', code='ec-official')
+        self.env_test = Environment.objects.create(name='测试', code='ec-test')
+        self.env_prod = Environment.objects.create(name='生产', code='ec-prod', is_prod=True)
+        service = ServiceType.objects.create(name='基础', code='ec-base')
+        server = Server.objects.create(
+            name='ec-host', private_ip='10.5.5.5',
+            project_group=self.pg, channel=self.ch, environment=self.env_test)
+        ServerService.objects.create(server=server, service_type=service, status='planned')
+
+        def make_task(name, env, pg=None):
+            task = ExecutionTask.objects.create(
+                name=name, project_group=pg or self.pg, channel=self.ch, environment=env)
+            TaskStep.objects.create(task=task, order=1, name='m1', task_type='command',
+                                    command='echo hi', service_type=service)
+            return task
+
+        self.task_test = make_task('测试任务', self.env_test)
+        self.task_prod = make_task('生产任务', self.env_prod)
+        self.task_other = make_task('别的项目', self.env_test, pg=self.pg_other)
+
+    def tearDown(self):
+        cache.clear()
+
+    def _client(self, username, role=None, groups=()):
+        user = User.objects.create(username=username, is_staff=False, role=role)
+        user.set_password(PASSWORD)
+        user.save()
+        if groups:
+            user.allowed_project_groups.set(groups)
+        client = APIClient()
+        r = client.post('/api/auth/login/',
+                        {'username': username, 'password': PASSWORD}, format='json')
+        client.credentials(HTTP_AUTHORIZATION='Bearer ' + r.json()['access'])
+        return client
+
+    def test_member_can_execute_but_not_edit(self):
+        """「能跑不能改」：execute 是 POST，但不该按 read_create 档拦。"""
+        client = self._client('ec_member', role=self.member_role)
+        with mock.patch('apps.task_exec.trigger.dispatch', return_value=mock.Mock(id=1)):
+            r = client.post(f'/api/exec/tasks/{self.task_test.id}/execute/', {}, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+
+        r = client.patch(f'/api/exec/tasks/{self.task_test.id}/',
+                         {'name': '改个名'}, format='json')
+        self.assertEqual(r.status_code, 403)
+
+    def test_member_cannot_execute_prod(self):
+        """最高频的真实诉求：不能碰生产。错了就是已经推上去了。"""
+        client = self._client('ec_member2', role=self.member_role)
+        r = client.post(f'/api/exec/tasks/{self.task_prod.id}/execute/', {}, format='json')
+        self.assertEqual(r.status_code, 403)
+        self.assertIn('不允许对生产环境', r.json()['msg'])
+
+    def test_role_without_execute_capability(self):
+        role = Role.objects.create(
+            name='只读观察', code='viewer',
+            permissions={'exec': 'read'}, can_execute=False, can_exec_prod=False)
+        client = self._client('ec_viewer', role=role)
+        r = client.post(f'/api/exec/tasks/{self.task_test.id}/execute/', {}, format='json')
+        self.assertEqual(r.status_code, 403)
+        self.assertIn('没有发起任务执行的权限', r.json()['msg'])
+
+    def test_data_scope_blocks_other_project(self):
+        client = self._client('ec_scoped', role=self.member_role, groups=[self.pg])
+        with mock.patch('apps.task_exec.trigger.dispatch', return_value=mock.Mock(id=2)):
+            r = client.post(f'/api/exec/tasks/{self.task_test.id}/execute/', {}, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+
+        r = client.post(f'/api/exec/tasks/{self.task_other.id}/execute/', {}, format='json')
+        self.assertEqual(r.status_code, 403)
+        self.assertIn('数据范围', r.json()['msg'])
+
+    def test_confirm_uses_same_gate(self):
+        """只在 execute 上拦等于留后门：continue/retry/skip 都会让剩余模块跑起来。"""
+        from apps.task_exec.models import ExecutionTask
+
+        ExecutionTask.objects.filter(pk=self.task_prod.pk).update(
+            status='paused', pause_type='confirm')
+        client = self._client('ec_member3', role=self.member_role)
+        r = client.post(f'/api/exec/tasks/{self.task_prod.id}/confirm/',
+                        {'action': 'continue'}, format='json')
+        self.assertEqual(r.status_code, 403)
+        self.assertIn('不允许对生产环境', r.json()['msg'])

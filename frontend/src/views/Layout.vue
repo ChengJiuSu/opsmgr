@@ -32,7 +32,7 @@
             <el-icon><Cloudy /></el-icon>
             <span>云控管理</span>
           </template>
-          <el-menu-item v-if="authStore.isStaff" index="/cloud/accounts">云账号</el-menu-item>
+          <el-menu-item v-if="authStore.can('cloud', 'write')" index="/cloud/accounts">云账号</el-menu-item>
           <el-menu-item index="/cloud/domains">域名管理</el-menu-item>
           <el-menu-item index="/cloud/certificates">证书管理</el-menu-item>
         </el-sub-menu>
@@ -53,14 +53,14 @@
             <el-icon><Promotion /></el-icon>
             <span>任务执行</span>
           </template>
-          <el-menu-item v-if="authStore.isStaff" index="/task/methods">方法管理</el-menu-item>
+          <el-menu-item v-if="authStore.can('exec', 'write')" index="/task/methods">方法管理</el-menu-item>
           <el-menu-item index="/task/variables">变量管理</el-menu-item>
           <el-menu-item index="/task/executions">任务列表</el-menu-item>
-          <el-menu-item v-if="authStore.isStaff" index="/task/log-files">日志文件</el-menu-item>
+          <el-menu-item v-if="authStore.can('exec', 'write')" index="/task/log-files">日志文件</el-menu-item>
           <el-menu-item index="/task/artifacts">制品管理</el-menu-item>
-          <el-menu-item v-if="authStore.isStaff" index="/task/credentials">连接凭据</el-menu-item>
+          <el-menu-item v-if="authStore.can('credential')" index="/task/credentials">连接凭据</el-menu-item>
         </el-sub-menu>
-        <el-menu-item index="/audit/logs">
+        <el-menu-item v-if="authStore.can('audit')" index="/audit/logs">
           <el-icon><Document /></el-icon>
           <template #title>操作审计</template>
         </el-menu-item>
@@ -69,10 +69,11 @@
             <el-icon><Setting /></el-icon>
             <span>系统管理</span>
           </template>
-          <el-menu-item v-if="authStore.isStaff" index="/system/users">用户管理</el-menu-item>
-          <el-menu-item v-if="authStore.isStaff" index="/system/agents">Agent 管理</el-menu-item>
-          <el-menu-item v-if="authStore.isStaff" index="/system/api-credentials">API 凭证</el-menu-item>
-          <el-menu-item index="/system/configs">系统配置</el-menu-item>
+          <el-menu-item v-if="authStore.can('system', 'write')" index="/system/users">用户管理</el-menu-item>
+          <el-menu-item v-if="authStore.can('system', 'write')" index="/system/roles">角色权限</el-menu-item>
+          <el-menu-item v-if="authStore.can('agent')" index="/system/agents">Agent 管理</el-menu-item>
+          <el-menu-item v-if="authStore.can('system', 'write')" index="/system/api-credentials">API 凭证</el-menu-item>
+          <el-menu-item v-if="authStore.can('system', 'write')" index="/system/configs">系统配置</el-menu-item>
         </el-sub-menu>
       </el-menu>
     </el-aside>

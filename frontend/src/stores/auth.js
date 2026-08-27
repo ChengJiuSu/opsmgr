@@ -22,6 +22,31 @@ export const useAuthStore = defineStore('auth', () => {
   const isLoggedIn = computed(() => !!accessToken.value)
   const isStaff = computed(() => !!user.value?.is_staff)
 
+  // ── 角色权限快照（后端 roles.permission_snapshot）──
+  // 只用来决定按钮/菜单可见性：真正的判定始终在后端，快照过期最多让人多看到一个
+  // 按钮，点下去照样被拒。
+  const perms = computed(() => user.value?.permissions || null)
+  const LEVELS = ['none', 'read', 'read_create', 'write']
+  const METHOD_LEVEL = { read: 'read', create: 'read_create', write: 'write' }
+
+  /**
+   * 是否具备某模块的某档权限。
+   * @param {string} module 模块标识（cmdb / exec / credential / artifact / cloud / agent / system / audit）
+   * @param {'read'|'create'|'write'} action 默认 read
+   */
+  function can(module, action = 'read') {
+    // 快照缺失（老 token / 未取到 me）时回退 is_staff，避免整站按钮全灰
+    if (!perms.value) return isStaff.value
+    const level = perms.value.modules?.[module] || 'none'
+    return LEVELS.indexOf(level) >= LEVELS.indexOf(METHOD_LEVEL[action] || 'read')
+  }
+
+  /** 独立能力位：can_execute / can_exec_prod。 */
+  function capability(name) {
+    if (!perms.value) return isStaff.value
+    return !!perms.value[name]
+  }
+
   function persistTokens(access, refresh) {
     accessToken.value = access
     refreshToken.value = refresh
@@ -114,7 +139,7 @@ export const useAuthStore = defineStore('auth', () => {
   return {
     accessToken, refreshToken, username, user,
     mfaEnrollmentRequired, mfaToken,
-    isLoggedIn, isStaff,
+    isLoggedIn, isStaff, perms, can, capability,
     login, verifyMfa, cancelMfa, logout, fetchMe,
     persistTokens, setEnrollmentRequired,
   }

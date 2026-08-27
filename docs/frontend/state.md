@@ -57,3 +57,30 @@ const accessToken = ref(localStorage.getItem('access_token') || '')
 ```
 
 > 当前未使用 `pinia-plugin-persistedstate`，如需自动持久化可后续引入。
+
+---
+
+## 角色权限快照（本期新增）
+
+`authStore.perms` 来自后端 `roles.permission_snapshot`（`/api/auth/me/` 与 JWT 的
+`perms` 声明），形如：
+
+```json
+{
+  "role": "ops_member", "role_name": "普通运维",
+  "modules": {"cmdb": "read_create", "exec": "read", "credential": "none"},
+  "can_execute": true, "can_exec_prod": false
+}
+```
+
+两个辅助方法：
+
+| 方法 | 用法 | 说明 |
+|------|------|------|
+| `can(module, action)` | `authStore.can('cloud', 'write')` | `action` 取 `read`（默认）/ `create` / `write`，映射到权限档 read / read_create / write |
+| `capability(name)` | `authStore.capability('can_exec_prod')` | 独立能力位 |
+
+**快照缺失时回退 `isStaff`**（老 token、`/me/` 还没取到）：否则整站按钮会先全灰一下。
+
+它只用来决定菜单与按钮可见性——**真正的判定始终在后端**，快照过期最多让人多看到
+一个按钮，点下去照样被拒。

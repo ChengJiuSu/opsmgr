@@ -6,7 +6,6 @@ from django.db import transaction
 from django.utils import timezone
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema
-from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
 
 from apps.asset_mgr.models import (
@@ -18,7 +17,7 @@ from apps.asset_mgr.models import (
     ServerService,
     ServiceType,
 )
-from common.permissions import IsAdmin
+from apps.auth_mgr.permissions import module_perm
 from common.response import fail, ok
 
 # 可批量分配的字典外键：请求键 → (模型, 展示名)
@@ -47,7 +46,7 @@ class BatchAssignView(APIView):
         }
     """
 
-    permission_classes = [IsAdmin]
+    permission_classes = [module_perm('cmdb', min_level='write')]
 
     @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
     def post(self, request):
@@ -116,7 +115,7 @@ class ServicePlanView(APIView):
     - 幂等：主机已存在该服务类型记录（任意状态）时跳过，不报错
     """
 
-    permission_classes = [IsAdmin]
+    permission_classes = [module_perm('cmdb', min_level='write')]
 
     @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
     def post(self, request):
@@ -167,7 +166,7 @@ class ServiceMarkView(APIView):
         {"server_ids": [1, 2], "service_type_id": 3, "status": "deployed"}
     """
 
-    permission_classes = [IsAdmin]
+    permission_classes = [module_perm('cmdb', min_level='write')]
 
     @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
     def post(self, request):
@@ -211,7 +210,7 @@ class ServiceUnplanView(APIView):
         {"server_ids": [1, 2], "service_type_id": 3}
     """
 
-    permission_classes = [IsAdmin]
+    permission_classes = [module_perm('cmdb', min_level='write')]
 
     @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
     def post(self, request):
@@ -240,7 +239,7 @@ class ServiceProcessView(APIView):
     - 进程名不在此修改：进程名由规划时自动生成，保持稳定不随进程数变化
     """
 
-    permission_classes = [IsAdmin]
+    permission_classes = [module_perm('cmdb', min_level='write')]
 
     @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
     def post(self, request):
@@ -269,7 +268,7 @@ class ServiceProcessView(APIView):
 class AllocationOverviewView(APIView):
     """分配概览：各维度未分配数量与分布，供配置管理页顶部卡片展示。"""
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [module_perm('cmdb')]
 
     @extend_schema(responses=OpenApiTypes.OBJECT)
     def get(self, request):

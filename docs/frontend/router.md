@@ -44,6 +44,11 @@ router.beforeEach((to) => {
 |------|------|------|
 | `public` | boolean | `true` 表示无需认证，默认需要认证 |
 | `title` | string | 面包屑标题（Layout.vue 中读取）|
+| `perm` | `[模块, 动作]` | 页面权限，按角色矩阵判定（如 `['cloud', 'write']`）。动作取 `read` / `create` / `write`。权限快照缺失时回退 `is_staff` |
+
+`perm` 取代了原来的 `staff: true`：`is_staff` 只有两档，表达不出「运维管理能改云账号
+但不是超级管理」。判定口径与 `stores/auth.js` 的 `can()` 一致，**只是少一次必然 403 的
+跳转**，真正的判定始终在后端。
 
 ---
 

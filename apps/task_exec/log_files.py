@@ -28,7 +28,7 @@ from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework.views import APIView
 
 from common.ansible import resolve_within
-from common.permissions import IsAdmin
+from apps.auth_mgr.permissions import module_perm
 from common.response import fail, ok
 
 # 单个目录返回的条目上限（日志目录条目本就不多，纯属兜底防御）
@@ -143,7 +143,7 @@ def _annotate_logs(task_id, entries):
 class TaskLogFileListView(APIView):
     """任务日志目录浏览：列出 TASK_LOG_DIR 内某层目录的子目录与文件。"""
 
-    permission_classes = [IsAdmin]
+    permission_classes = [module_perm('exec', min_level='write')]
 
     @extend_schema(
         parameters=[OpenApiParameter('path', str, description='相对 TASK_LOG_DIR 的目录路径，缺省为根')],
@@ -172,7 +172,7 @@ class TaskLogFileListView(APIView):
 class TaskLogFileContentView(APIView):
     """任务日志文件内容：按字节区间返回文本（大日志分段读，或直接读末尾）。"""
 
-    permission_classes = [IsAdmin]
+    permission_classes = [module_perm('exec', min_level='write')]
 
     @extend_schema(
         parameters=[
@@ -219,7 +219,7 @@ class TaskLogFileContentView(APIView):
 class TaskLogFileDownloadView(APIView):
     """任务日志文件下载：原文件流式下载（大日志不进内存、不受内容接口上限限制）。"""
 
-    permission_classes = [IsAdmin]
+    permission_classes = [module_perm('exec', min_level='write')]
 
     @extend_schema(
         parameters=[OpenApiParameter('path', str, description='相对 TASK_LOG_DIR 的文件路径，必填')],

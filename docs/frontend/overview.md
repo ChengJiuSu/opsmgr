@@ -156,3 +156,4 @@ npm run build        # 输出到 dist/
 - [审计日志](views/audit-logs.md)
 - [系统配置](views/system-configs.md)
 - [API 凭证](views/api-credentials.md)
+- [角色权限](views/roles.md)

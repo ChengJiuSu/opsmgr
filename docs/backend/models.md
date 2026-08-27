@@ -228,3 +228,37 @@ system_cfg.SystemConfig 独立
 
 **外键策略：** `bound_user` 用 `PROTECT`——删用户前必须先处理引用它的凭证，
 避免凭证悄悄失去行权身份；`created_by` 是弱关联，用 `SET_NULL`。
+
+---
+
+## Role（角色）
+
+**App：** `auth_mgr` | **表名：** `auth_role`
+
+模块权限矩阵 + 执行能力位。档位、模块清单与「为什么不做成 CAM 策略语言」见
+`docs/backend/modules/auth.md` 的「角色与权限矩阵」。
+
+| 字段 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `id` | BigAutoField | PK | 主键 |
+| `name` | CharField(50) | — | 角色名称，唯一 |
+| `code` | CharField(30) | — | 角色标识，唯一（小写字母/数字/下划线）|
+| `permissions` | JSONField | `{}` | `{模块: 权限档}`，缺失模块视为 `none`（fail-closed）|
+| `can_execute` | BooleanField | `False` | 可发起任务流执行、可处理暂停 |
+| `can_exec_prod` | BooleanField | `False` | 可对生产环境发起执行 |
+| `is_builtin` | BooleanField | `False` | 内置角色：可改矩阵、不可删 |
+| `enabled` | BooleanField | `True` | 停用后绑定用户回退 `is_staff` 语义 |
+| `remark` | CharField(200) | '' | 说明 |
+| `created_at` / `updated_at` | DateTimeField | auto | 时间戳 |
+
+**默认排序：** `id`（内置角色按播种顺序在前）
+
+**User 侧新增字段**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `role` | FK(Role) SET_NULL | 空 = 回退 `is_staff` 语义，存量账号行为不变 |
+| `allowed_project_groups` / `allowed_environments` | M2M | 数据范围，空 = 不限。只在主机列表、任务执行、变量解析三处生效 |
+
+矩阵是**枚举**（模块 × 四档），配不出通配符、配不出「过宽」——写错最多是某个模块
+给多给少了一档，不会一行 `*` 把整个平台交出去。这是它比策略语言安全的根本原因。

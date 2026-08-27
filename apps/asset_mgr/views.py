@@ -21,7 +21,7 @@ from apps.auth_mgr.apikey import (
 )
 from apps.auth_mgr.authentication import MfaJWTAuthentication
 from common.jumpserver import register_servers
-from common.permissions import IsAdmin, IsAdminOrReadCreate
+from apps.auth_mgr.permissions import module_perm
 from common.sudo import SudoRequired
 from common.sudo import required_for as sudo_required_for
 from common.response import fail, ok
@@ -62,7 +62,7 @@ class BaseDictViewSet(viewsets.ModelViewSet):
     权限：已认证用户可查看/新增，修改与删除仅管理员。
     """
 
-    permission_classes = [IsAdminOrReadCreate]
+    permission_classes = [module_perm('cmdb')]
     # 删除保护提示中的引用对象单位（如「台服务器」「条主机服务记录」）
     protected_hint = '台服务器'
 
@@ -129,7 +129,7 @@ class ServerViewSet(viewsets.ModelViewSet):
     # 且可见范围由凭证的项目组/环境收窄（见 get_queryset）
     authentication_classes = [ApiKeyAuthentication, MfaJWTAuthentication]
     permission_classes = [
-        user_or_scope(IsAdminOrReadCreate, 'asset:read'),
+        user_or_scope(module_perm('cmdb'), 'asset:read'),
         sudo_required_for('PUT', 'PATCH', 'DELETE'),
     ]
     throttle_classes = [ApiKeyThrottle]
@@ -150,6 +150,12 @@ class ServerViewSet(viewsets.ModelViewSet):
         credential = request_credential(self.request)
         if credential is not None:
             qs = credential.narrow(qs)
+        elif hasattr(self.request.user, 'narrow'):
+            # 登录用户同一套数据范围口径（common/dimscope）：范围为空 = 不限，
+            # 所以给绝大多数人不配范围时行为与从前一致。
+            # hasattr 判定是给 AnonymousUser 留的：schema 生成（drf-spectacular）
+            # 会在没有登录态的情况下走一遍 get_queryset
+            qs = self.request.user.narrow(qs)
         params = self.request.query_params
         status = params.get('status')
         keyword = params.get('keyword')
@@ -245,7 +251,7 @@ class ServerViewSet(viewsets.ModelViewSet):
 class ServerImportTemplateView(APIView):
     """下载服务器导入 CSV 模板：表头 + 一行示例，字典列填编码（code）。"""
 
-    permission_classes = [IsAdminOrReadCreate]
+    permission_classes = [module_perm('cmdb')]
 
     @extend_schema(responses=OpenApiTypes.BINARY)
     def get(self, request):
@@ -274,7 +280,7 @@ class ServerBatchUpdateView(APIView):
     """
 
     # 批量改/删与导入同样要 sudo：一次能动一批主机的执行通道
-    permission_classes = [IsAdmin, SudoRequired]
+    permission_classes = [module_perm('cmdb', min_level='write'), SudoRequired]
 
     @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
     def post(self, request):
@@ -347,7 +353,7 @@ class ServerBatchDeleteView(APIView):
     """
 
     # 批量改/删与导入同样要 sudo：一次能动一批主机的执行通道
-    permission_classes = [IsAdmin, SudoRequired]
+    permission_classes = [module_perm('cmdb', min_level='write'), SudoRequired]
 
     @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
     def post(self, request):
@@ -387,7 +393,7 @@ class ServerImportView(APIView):
     """
 
     # 批量改/删与导入同样要 sudo：一次能动一批主机的执行通道
-    permission_classes = [IsAdmin, SudoRequired]
+    permission_classes = [module_perm('cmdb', min_level='write'), SudoRequired]
 
     @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
     def post(self, request):
@@ -562,7 +568,7 @@ class ServerRegisterJumpServerView(APIView):
     连接信息读系统配置 jumpserver.url / jumpserver.token（详见 common.jumpserver）。
     """
 
-    permission_classes = [IsAdmin]
+    permission_classes = [module_perm('cmdb', min_level='write')]
 
     @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
     def post(self, request):

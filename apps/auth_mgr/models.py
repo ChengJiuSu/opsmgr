@@ -11,10 +11,67 @@ from common.request import ip_matches_rules
 from common.secrets import generate_secret, hash_secret
 
 
+class Role(models.Model):
+    """角色：模块权限矩阵 + 独立能力位。
+
+    档位与模块清单见 apps/auth_mgr/roles.py，那里也写了「为什么不做成 CAM 那种
+    策略语言」。矩阵放库里而不是写死在代码常量：「运维管理能不能改连接凭据」这类
+    边界一定会反复调整，硬编码意味着每次调整都要发版。
+
+    矩阵是**枚举**（模块 × 四档），配不出通配符、配不出「过宽」——这是它比策略
+    语言安全的根本原因：写错最多是某个模块给多给少了一档，不会一行 `*` 把整个平台
+    交出去。
+    """
+
+    name = models.CharField('角色名称', max_length=50, unique=True)
+    code = models.CharField('角色标识', max_length=30, unique=True)
+    # {模块: 权限档}，档位取值见 roles.LEVELS；缺失的模块视为 none
+    permissions = models.JSONField('权限矩阵', default=dict)
+    can_execute = models.BooleanField('可发起任务执行', default=False)
+    can_exec_prod = models.BooleanField('可对生产环境执行', default=False)
+    # 内置角色不可删（可改矩阵）：删掉「超级管理」会把所有人锁在门外
+    is_builtin = models.BooleanField('内置角色', default=False)
+    enabled = models.BooleanField('启用', default=True)
+    remark = models.CharField('说明', max_length=200, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = '角色'
+        verbose_name_plural = '角色'
+        db_table = 'auth_role'
+        ordering = ['id']
+
+    def __str__(self):
+        return self.name
+
+    def level_for(self, module):
+        """该模块的权限档；未配置视为 none（fail-closed）。"""
+        return (self.permissions or {}).get(module, 'none')
+
+
 class User(AbstractUser):
     phone = models.CharField('手机号', max_length=20, blank=True)
     department = models.CharField('部门', max_length=100, blank=True)
     is_ldap = models.BooleanField('LDAP 用户', default=False)
+    # 角色为空时回退 is_staff 语义（见 roles.user_level）：存量账号行为不变，
+    # 不需要一次性给所有人配角色
+    role = models.ForeignKey(
+        Role, verbose_name='角色', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='users',
+    )
+    # ── 数据范围（空 = 不限）──
+    # 与 API 凭证共用同一套语义（ApiCredential.allowed_*）。**只在三处生效**：
+    # 主机列表收窄、任务执行发起校验、变量解析维度校验。其余列表不过滤——那是
+    # 成本与漏检风险最大的一块，10 人无多租户不需要，字段留好将来要收紧再接。
+    allowed_project_groups = models.ManyToManyField(
+        'asset_mgr.ProjectGroup', verbose_name='可访问项目组', blank=True,
+        related_name='allowed_users',
+    )
+    allowed_environments = models.ManyToManyField(
+        'asset_mgr.Environment', verbose_name='可访问环境', blank=True,
+        related_name='allowed_users',
+    )
 
     class Meta:
         verbose_name = '用户'
@@ -23,6 +80,31 @@ class User(AbstractUser):
 
     def __str__(self):
         return self.username
+
+    # ── 数据范围（与 ApiCredential 同一套口径，实现见 common/dimscope.py）──
+    def allowed_dims(self):
+        if not hasattr(self, '_dim_cache'):
+            groups = set(self.allowed_project_groups.values_list('id', flat=True))
+            envs = set(self.allowed_environments.values_list('id', flat=True))
+            self._dim_cache = (groups or None, envs or None)
+        return self._dim_cache
+
+    def allows_dims(self, project_group_id=None, environment_id=None):
+        from common.dimscope import allows_dims
+
+        return allows_dims(self.allowed_dims(), project_group_id, environment_id)
+
+    def narrow(self, queryset, project_group_field='project_group_id',
+               environment_field='environment_id'):
+        from common.dimscope import narrow
+
+        return narrow(queryset, self.allowed_dims(), project_group_field, environment_field)
+
+    @property
+    def scope_label(self):
+        from common.dimscope import scope_label
+
+        return scope_label(self.allowed_dims())
 
 
 class UserMFA(models.Model):
@@ -253,43 +335,23 @@ class ApiCredential(models.Model):
         return self._dim_cache
 
     def allows_dims(self, project_group_id=None, environment_id=None):
-        """该维度组合是否在凭证范围内（未配置范围一律放行）。
+        """该维度组合是否在凭证范围内（实现与登录用户共用 common/dimscope）。"""
+        from common.dimscope import allows_dims
 
-        入参为 None 表示「本次不涉及该维度」，不做限制——比如按项目组查主机时
-        没带环境，不该因为凭证限了环境就整体拒绝；真正的收窄由 narrow() 做。
-        """
-        groups, envs = self.allowed_dims()
-        if groups is not None and project_group_id is not None \
-                and project_group_id not in groups:
-            return False
-        if envs is not None and environment_id is not None and environment_id not in envs:
-            return False
-        return True
+        return allows_dims(self.allowed_dims(), project_group_id, environment_id)
 
     def narrow(self, queryset, project_group_field='project_group_id',
                environment_field='environment_id'):
-        """按凭证范围收窄查询集（列表接口用）。
+        """按凭证范围收窄查询集（列表接口用）。"""
+        from common.dimscope import narrow
 
-        收窄可见集而不是返回 403：调用方不必传筛选参数也只看得到自己那部分，
-        既好用又更难出错——忘了带筛选参数时拿到的是「我的全部」，不是「全公司」。
-        """
-        groups, envs = self.allowed_dims()
-        if groups is not None:
-            queryset = queryset.filter(**{f'{project_group_field}__in': groups})
-        if envs is not None:
-            queryset = queryset.filter(**{f'{environment_field}__in': envs})
-        return queryset
+        return narrow(queryset, self.allowed_dims(), project_group_field, environment_field)
 
     @property
     def scope_label(self):
-        """数据范围的可读描述（日志与报错里指名道姓，省一次翻页面）。"""
-        groups, envs = self.allowed_dims()
-        parts = []
-        if groups is not None:
-            parts.append(f'项目组 {sorted(groups)}')
-        if envs is not None:
-            parts.append(f'环境 {sorted(envs)}')
-        return ' + '.join(parts) if parts else '不限'
+        from common.dimscope import scope_label
+
+        return scope_label(self.allowed_dims())
 
     # ── Webhook 签名密钥 ──────────────────────────────────
     def set_signing_secret(self, raw):

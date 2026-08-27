@@ -8,9 +8,13 @@ from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 from common.request import parse_ip_rules
 
+from . import roles
 from .apikey import HIGH_RISK_SCOPES, SCOPES
-from .models import ApiCredential
+from .models import ApiCredential, Role
 from .services import AMR_PASSWORD
+
+#: 角色标识：小写字母、数字、下划线
+CODE_RE = re.compile(r'^[a-z][a-z0-9_]*$')
 
 #: DRF 限速语法：`次数/周期`，周期只看首字母（s/m/h/d），min/hour/day 都合法
 RATE_RE = re.compile(r'^\d+/(s|sec|second|m|min|minute|h|hour|d|day)$')
@@ -25,13 +29,24 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
         token['username'] = user.username
         token['department'] = user.department
         token['is_staff'] = user.is_staff
+        # 权限快照：前端据此决定按钮可见性。**只是少让人点到必然 403 的按钮**，
+        # 真正判定始终在后端——快照过期最多多显示一个按钮，点下去照样被拒
+        token['perms'] = roles.permission_snapshot(user)
         # 这条路径只过了密码；过了第二因子的令牌由 tokens.issue_after_mfa 签发
         token['amr'] = [AMR_PASSWORD]
         return token
 
 
 class UserSerializer(serializers.ModelSerializer):
-    """用户读写序列化器。创建/更新时可选传入 password。"""
+    """用户读写序列化器。创建/更新时可选传入 password。
+
+    role 为空时权限回退 is_staff 语义（见 roles.user_level）：存量账号在角色落地
+    前后行为不变，不需要一次性给所有人配角色。
+    """
+
+    role_name = serializers.CharField(source='role.name', read_only=True, default='')
+    permissions = serializers.SerializerMethodField()
+    scope_label = serializers.CharField(read_only=True)
 
     password = serializers.CharField(
         write_only=True, required=False, allow_blank=True, style={'input_type': 'password'}
@@ -46,8 +61,14 @@ class UserSerializer(serializers.ModelSerializer):
             'id', 'username', 'password', 'email', 'phone', 'department',
             'is_active', 'is_staff', 'is_ldap', 'mfa_enabled',
             'last_login', 'date_joined',
+            'role', 'role_name', 'permissions',
+            'allowed_project_groups', 'allowed_environments', 'scope_label',
         ]
         read_only_fields = ['id', 'last_login', 'date_joined', 'is_ldap', 'mfa_enabled']
+
+    def get_permissions(self, obj):
+        """该用户的实际权限快照（含无角色时的回退结果）。"""
+        return roles.permission_snapshot(obj)
 
     def get_mfa_enabled(self, obj):
         mfa = getattr(obj, 'mfa', None)
@@ -60,12 +81,19 @@ class UserSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         password = validated_data.pop('password', None)
+        # M2M 不能进构造函数，必须存完再 set
+        groups = validated_data.pop('allowed_project_groups', None)
+        envs = validated_data.pop('allowed_environments', None)
         user = User(**validated_data)
         if password:
             user.set_password(password)
         else:
             user.set_unusable_password()
         user.save()
+        if groups is not None:
+            user.allowed_project_groups.set(groups)
+        if envs is not None:
+            user.allowed_environments.set(envs)
         return user
 
     def update(self, instance, validated_data):
@@ -303,3 +331,58 @@ class ApiCredentialSerializer(serializers.ModelSerializer):
         # 范围改了要让缓存失效，否则同请求内后续判定还用旧值
         instance.__dict__.pop('_dim_cache', None)
         return instance
+
+
+class RoleSerializer(serializers.ModelSerializer):
+    """角色（模块权限矩阵 + 能力位）。
+
+    矩阵是枚举（模块 × 四档），校验只放行已登记的模块与档位——配不出通配符、
+    配不出「过宽」，写错最多是某个模块给多给少了一档。
+    """
+
+    user_count = serializers.IntegerField(source='users.count', read_only=True)
+
+    class Meta:
+        model = Role
+        fields = [
+            'id', 'name', 'code', 'permissions', 'can_execute', 'can_exec_prod',
+            'is_builtin', 'enabled', 'remark', 'user_count', 'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'is_builtin', 'created_at', 'updated_at']
+
+    def validate_code(self, value):
+        value = (value or '').strip()
+        if not CODE_RE.match(value):
+            raise serializers.ValidationError('角色标识只能含小写字母、数字与下划线')
+        if self.instance and self.instance.is_builtin and self.instance.code != value:
+            raise serializers.ValidationError('内置角色的标识不可修改')
+        return value
+
+    def validate_permissions(self, value):
+        if not isinstance(value, dict):
+            raise serializers.ValidationError('权限矩阵必须是对象 {模块: 权限档}')
+        unknown_modules = sorted(set(value) - set(roles.MODULES))
+        if unknown_modules:
+            raise serializers.ValidationError(
+                f'未知模块：{"、".join(unknown_modules)}；可选：{"、".join(roles.MODULES)}')
+        bad = sorted({level for level in value.values() if level not in roles.LEVELS})
+        if bad:
+            raise serializers.ValidationError(
+                f'未知权限档：{"、".join(bad)}；可选：{"、".join(roles.LEVELS)}')
+        # 缺失模块补 none，避免「没配就继承了什么」的歧义
+        return {module: value.get(module, 'none') for module in roles.MODULES}
+
+    def validate(self, attrs):
+        """内置「超级管理」必须保持全 write：否则一次手滑能把所有人锁在门外。"""
+        instance = self.instance
+        if instance and instance.is_builtin and instance.code == 'super':
+            permissions = attrs.get('permissions', instance.permissions)
+            weak = sorted(m for m in roles.MODULES if permissions.get(m) != 'write')
+            if weak:
+                raise serializers.ValidationError(
+                    f'内置角色「超级管理」必须对所有模块保持读写（当前不足：{"、".join(weak)}），'
+                    f'否则可能把所有人锁在系统之外。需要受限角色请新建一个。')
+            if not (attrs.get('can_exec_prod', instance.can_exec_prod)
+                    and attrs.get('can_execute', instance.can_execute)):
+                raise serializers.ValidationError('内置角色「超级管理」必须保留执行与生产执行能力。')
+        return attrs

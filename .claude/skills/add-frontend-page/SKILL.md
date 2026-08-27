@@ -20,8 +20,11 @@ JS 变量/函数 camelCase，注释中文。
    - 弹窗 `el-dialog` 放模板末尾；批量操作按钮 `:disabled="!selection.length"`
      并在按钮文案中带已选数量
 3. **路由** `src/router/index.js`：加 children 项，`meta.title` 中文标题；
-   仅管理员页面加 `meta: { staff: true }`（路由守卫已处理）。
-4. **菜单** `src/views/Layout.vue`：加 `el-menu-item`，index 与路由 path 一致。
+   受权限限制的页面加 `meta: { perm: ['<模块>', 'read'|'create'|'write'] }`
+   （路由守卫按角色矩阵判定，模块清单见 `apps/auth_mgr/roles.py`）。
+   `meta.staff` 已弃用——`is_staff` 只有两档。
+4. **菜单** `src/views/Layout.vue`：加 `el-menu-item`，index 与路由 path 一致；
+   可见性用 `v-if="authStore.can('<模块>', '<动作>')"`，不要再用 `authStore.isStaff`。
    「配置管理」菜单顺序：项目组 → 渠道 → 云厂商 → 环境 → 服务类型 → 服务概要。
 
 ## 交互约定

@@ -31,7 +31,7 @@ const router = createRouter({
           path: 'cloud/accounts',
           name: 'CloudAccounts',
           component: () => import('../views/cloud/CloudAccounts.vue'),
-          meta: { title: '云账号', staff: true },
+          meta: { title: '云账号', perm: ['cloud', 'write'] },
         },
         {
           path: 'cloud/domains',
@@ -91,7 +91,7 @@ const router = createRouter({
           path: 'task/methods',
           name: 'TaskMethods',
           component: () => import('../views/task/Methods.vue'),
-          meta: { title: '方法管理', staff: true },
+          meta: { title: '方法管理', perm: ['exec', 'write'] },
         },
         {
           path: 'task/variables',
@@ -116,7 +116,7 @@ const router = createRouter({
           path: 'task/log-files',
           name: 'TaskLogFiles',
           component: () => import('../views/task/LogFiles.vue'),
-          meta: { title: '日志文件', staff: true },
+          meta: { title: '日志文件', perm: ['exec', 'write'] },
         },
         {
           path: 'task/artifacts',
@@ -128,7 +128,7 @@ const router = createRouter({
           path: 'task/credentials',
           name: 'TaskCredentials',
           component: () => import('../views/task/Credentials.vue'),
-          meta: { title: '连接凭据', staff: true },
+          meta: { title: '连接凭据', perm: ['credential', 'read'] },
         },
         {
           path: 'audit/logs',
@@ -140,19 +140,25 @@ const router = createRouter({
           path: 'system/users',
           name: 'Users',
           component: () => import('../views/system/Users.vue'),
-          meta: { title: '用户管理', staff: true },
+          meta: { title: '用户管理', perm: ['system', 'write'] },
         },
         {
           path: 'system/agents',
           name: 'SystemAgents',
           component: () => import('../views/system/Agents.vue'),
-          meta: { title: 'Agent 管理', staff: true },
+          meta: { title: 'Agent 管理', perm: ['agent', 'read'] },
+        },
+        {
+          path: 'system/roles',
+          name: 'SystemRoles',
+          component: () => import('../views/system/Roles.vue'),
+          meta: { title: '角色权限', perm: ['system', 'write'] },
         },
         {
           path: 'system/api-credentials',
           name: 'SystemApiCredentials',
           component: () => import('../views/system/ApiCredentials.vue'),
-          meta: { title: 'API 凭证', staff: true },
+          meta: { title: 'API 凭证', perm: ['system', 'write'] },
         },
         {
           path: 'system/configs',
@@ -172,7 +178,18 @@ const router = createRouter({
   ],
 })
 
-// 路由守卫：未登录跳转登录页；非管理员禁止访问 staff 页面
+const LEVELS = ['none', 'read', 'read_create', 'write']
+const ACTION_LEVEL = { read: 'read', create: 'read_create', write: 'write' }
+
+/** 页面权限判定：与 stores/auth.js 的 can() 同一套口径。 */
+function hasRoutePerm(user, perm) {
+  const modules = user?.permissions?.modules
+  if (!modules || !perm) return !!user?.is_staff
+  const level = modules[perm[0]] || 'none'
+  return LEVELS.indexOf(level) >= LEVELS.indexOf(ACTION_LEVEL[perm[1]] || 'read')
+}
+
+// 路由守卫：未登录跳转登录页；页面权限按角色矩阵判定（meta.perm）
 router.beforeEach((to) => {
   const token = localStorage.getItem('access_token')
   if (!to.meta.public && !token) {
@@ -181,9 +198,12 @@ router.beforeEach((to) => {
   if (to.name === 'Login' && token) {
     return { name: 'Dashboard' }
   }
-  if (to.meta.staff) {
+  // 页面权限：meta.perm = [模块, 动作]，按角色权限快照判定。
+  // 快照缺失（老 token / me 还没取到）时回退 is_staff，避免把有权限的人挡在门外。
+  // 这里只是「少一次必然 403 的跳转」，真正的判定始终在后端。
+  if (to.meta.perm || to.meta.staff) {
     const user = JSON.parse(localStorage.getItem('user') || 'null')
-    if (!user?.is_staff) {
+    if (!hasRoutePerm(user, to.meta.perm)) {
       return { name: 'Dashboard' }
     }
   }

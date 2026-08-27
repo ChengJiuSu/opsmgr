@@ -28,10 +28,10 @@
       <el-table-column prop="email" label="邮箱" min-width="160" show-overflow-tooltip />
       <el-table-column prop="phone" label="手机号" width="130" />
       <el-table-column prop="department" label="部门" width="120" />
-      <el-table-column label="角色" width="90">
+      <el-table-column label="角色" width="130">
         <template #default="{ row }">
-          <el-tag size="small" :type="row.is_staff ? 'danger' : 'info'">
-            {{ row.is_staff ? '管理员' : '普通用户' }}
+          <el-tag size="small" :type="row.role ? 'warning' : (row.is_staff ? 'danger' : 'info')">
+            {{ row.role_name || (row.is_staff ? '管理员（未配角色）' : '普通用户（未配角色）') }}
           </el-tag>
         </template>
       </el-table-column>
@@ -106,8 +106,35 @@
       <el-form-item label="部门">
         <el-input v-model="form.department" />
       </el-form-item>
+      <el-form-item label="角色">
+        <el-select v-model="form.role" clearable placeholder="未配置（按「管理员」开关回退）" style="width:100%">
+          <el-option
+            v-for="r in roleOptions" :key="r.id"
+            :label="`${r.name}（${r.code}）`" :value="r.id"
+          />
+        </el-select>
+        <div class="tip">
+          角色决定各模块的读写档位与执行能力。留空时按下面的「管理员」开关回退
+          —— 存量账号不必立刻配角色。
+        </div>
+      </el-form-item>
       <el-form-item label="管理员">
         <el-switch v-model="form.is_staff" />
+        <span class="tip">Django 后台入口与「未配角色时」的权限回退依据</span>
+      </el-form-item>
+      <el-form-item label="数据范围">
+        <el-select v-model="form.allowed_project_groups" multiple placeholder="项目组（留空 = 不限）" style="width:100%">
+          <el-option v-for="o in dictOptions.projects" :key="o.id" :label="o.name" :value="o.id" />
+        </el-select>
+        <el-select
+          v-model="form.allowed_environments" multiple placeholder="环境（留空 = 不限）"
+          style="width:100%; margin-top:8px"
+        >
+          <el-option v-for="o in dictOptions.envs" :key="o.id" :label="o.name" :value="o.id" />
+        </el-select>
+        <div class="tip">
+          留空 = 不限。当前在三处生效：主机列表收窄可见集、发起任务执行校验、变量解析维度校验。
+        </div>
       </el-form-item>
       <el-form-item label="状态">
         <el-switch v-model="form.is_active" active-text="启用" inactive-text="停用" />
@@ -140,8 +167,9 @@ import { Plus, Edit, Delete, Search, Key } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   getUsers, createUser, updateUser, deleteUser,
-  toggleUserActive, resetUserPassword, resetUserMfa,
+  toggleUserActive, resetUserPassword, resetUserMfa, getRoles,
 } from '../../api/users'
+import { fetchDictOptions, projectGroupApi, environmentApi } from '../../api/assets'
 
 const loading = ref(false)
 const submitting = ref(false)
@@ -157,7 +185,10 @@ const formRef = ref()
 const emptyForm = () => ({
   username: '', password: '', email: '', phone: '',
   department: '', is_staff: false, is_active: true,
+  role: null, allowed_project_groups: [], allowed_environments: [],
 })
+const roleOptions = ref([])
+const dictOptions = reactive({ projects: [], envs: [] })
 const form = reactive(emptyForm())
 const rules = {
   username: [{ required: true, message: '请输入用户名' }],
@@ -201,7 +232,12 @@ onUnmounted(() => searchDebounced.cancel())
 
 function openDialog(row = null) {
   editRow.value = row
-  Object.assign(form, row ? { ...emptyForm(), ...row, password: '' } : emptyForm())
+  Object.assign(form, row ? {
+    ...emptyForm(), ...row, password: '',
+    // 后端返回的是 id 数组，展开后要保证是新数组，避免多行共用同一个引用
+    allowed_project_groups: [...(row.allowed_project_groups || [])],
+    allowed_environments: [...(row.allowed_environments || [])],
+  } : emptyForm())
   dialogVisible.value = true
   formRef.value?.clearValidate()
 }
@@ -269,10 +305,23 @@ async function handleDelete(row) {
   fetchData()
 }
 
-onMounted(fetchData)
+async function loadOptions() {
+  const [roleRes, proj, env] = await Promise.all([
+    getRoles(), fetchDictOptions(projectGroupApi), fetchDictOptions(environmentApi),
+  ])
+  roleOptions.value = Array.isArray(roleRes) ? roleRes : roleRes.data || []
+  dictOptions.projects = proj.data?.results || []
+  dictOptions.envs = env.data?.results || []
+}
+
+onMounted(() => {
+  fetchData()
+  loadOptions()
+})
 </script>
 
 <style scoped>
 .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .toolbar-left { display: flex; gap: 8px; }
+.tip { color: #909399; font-size: 12px; line-height: 1.6; }
 </style>

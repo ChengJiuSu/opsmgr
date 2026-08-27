@@ -20,14 +20,14 @@ from rest_framework_simplejwt.views import TokenObtainPairView
 from rest_framework_simplejwt.exceptions import TokenError as SimpleJWTTokenError
 
 from common import sudo
-from common.permissions import IsAdmin
 from common.ratelimit import blocked_seconds, record_failure, reset
 from common.request import client_ip
 from common.response import fail, ok
 
-from . import services
+from . import roles, services
+from .permissions import module_perm
 from .apikey import SCOPES, ensure_service_user
-from .models import ApiCredential
+from .models import ApiCredential, Role
 from .serializers import (
     ApiCredentialSerializer,
     ChangePasswordSerializer,
@@ -35,6 +35,7 @@ from .serializers import (
     MfaCodeSerializer,
     MfaSensitiveSerializer,
     MfaVerifySerializer,
+    RoleSerializer,
     SudoSerializer,
     UserSerializer,
 )
@@ -416,7 +417,7 @@ class UserViewSet(viewsets.ModelViewSet):
     # 配置面写操作要求 sudo 二次验证（common/sudo.py）：改了就能拿到更多东西，
     # 而登录那次 MFA 可能是 60 分钟前的事
     # 建号/改权限/重置他人密码或 MFA——权限扩大面里最直接的一条
-    permission_classes = [IsAdmin, sudo.SudoRequired]
+    permission_classes = [module_perm('system', min_level='write'), sudo.SudoRequired]
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -491,7 +492,7 @@ class ApiCredentialViewSet(viewsets.ModelViewSet):
 
     queryset = ApiCredential.objects.select_related('bound_user', 'created_by')
     serializer_class = ApiCredentialSerializer
-    permission_classes = [IsAdmin, sudo.SudoRequired]
+    permission_classes = [module_perm('system', min_level='write'), sudo.SudoRequired]
     pagination_class = None  # 凭证数量与脚本数同量级，全量返回便于一眼看完
 
     def get_queryset(self):
@@ -512,7 +513,8 @@ class ApiCredentialViewSet(viewsets.ModelViewSet):
         return qs
 
     @extend_schema(responses=OpenApiResponse(description='可授权的作用域字典'))
-    @action(detail=False, methods=['get'], permission_classes=[IsAdmin])
+    @action(detail=False, methods=['get'],
+            permission_classes=[module_perm('system', min_level='write')])
     def scopes(self, request):
         """可授权作用域清单（前端建凭证时的多选来源）。"""
         return ok([{'value': key, 'label': label} for key, label in SCOPES.items()])
@@ -563,3 +565,42 @@ class ApiCredentialViewSet(viewsets.ModelViewSet):
         logger.warning('管理员 %s %s API 凭证 %s', request.user.username,
                        '启用' if credential.enabled else '停用', credential.key_id)
         return ok({'enabled': credential.enabled})
+
+
+class RoleViewSet(viewsets.ModelViewSet):
+    """角色管理（system 模块 write + sudo 二次验证）。
+
+    与用户管理同级：改矩阵等于改所有绑定该角色的人的权限面，属「改了就能拿到更多
+    东西」的操作。
+
+    内置角色（super / ops_admin / ops_member）可改矩阵、不可删——删掉「超级管理」
+    会把所有人锁在门外。
+    """
+
+    queryset = Role.objects.all()
+    serializer_class = RoleSerializer
+    permission_classes = [module_perm('system', min_level='write'), sudo.SudoRequired]
+    pagination_class = None  # 角色数量与团队规模同量级，全量返回便于一眼看完
+
+    @extend_schema(responses=OpenApiResponse(description='模块清单与权限档定义'))
+    @action(detail=False, methods=['get'])
+    def meta(self, request):
+        """模块清单 + 权限档定义（前端渲染矩阵表格的数据源，避免前端硬编码）。"""
+        return ok({
+            'modules': [{'value': key, 'label': label} for key, label in roles.MODULES.items()],
+            'levels': [{'value': key, 'label': roles.LEVEL_LABELS[key]} for key in roles.LEVELS],
+            'capabilities': [
+                {'value': 'can_execute', 'label': '可发起任务流执行'},
+                {'value': 'can_exec_prod', 'label': '可对生产环境执行'},
+            ],
+        })
+
+    def destroy(self, request, *args, **kwargs):
+        role = self.get_object()
+        if role.is_builtin:
+            return fail(f'内置角色「{role.name}」不可删除（可改矩阵或停用）。')
+        if role.users.exists():
+            return fail(f'角色「{role.name}」仍有 {role.users.count()} 个用户在用，'
+                        f'请先改这些用户的角色。')
+        role.delete()
+        return ok(msg='已删除。')

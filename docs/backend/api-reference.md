@@ -492,6 +492,50 @@ POST /api/assets/servers/batch/update/
 
 ---
 
+## 角色权限 `/api/auth/roles/`
+
+仅 `system` 模块 write 档，写操作要求 sudo；列表不分页。语义见
+`docs/backend/modules/auth.md` 的「角色与权限矩阵」。
+
+| 方法与地址 | 说明 |
+|------|------|
+| `GET /api/auth/roles/` | 角色列表（含 `user_count`）|
+| `GET /api/auth/roles/meta/` | 模块清单 + 权限档定义 + 能力位定义 |
+| `POST /api/auth/roles/` | 新建角色 |
+| `PATCH /api/auth/roles/{id}/` | 改矩阵 / 能力位 / 启停（内置角色可改，`super` 不可降档）|
+| `DELETE /api/auth/roles/{id}/` | 删除（内置角色与仍有用户在用的角色被拒）|
+
+**请求体：**
+
+```json
+{
+  "name": "发布员",
+  "code": "releaser",
+  "permissions": {"cmdb": "read", "exec": "read", "artifact": "read"},
+  "can_execute": true,
+  "can_exec_prod": false,
+  "enabled": true,
+  "remark": "只发测试环境"
+}
+```
+
+`permissions` 未列出的模块自动补 `none`（避免「没配就继承了什么」的歧义）。
+未登记的模块名或权限档返回 400。
+
+**用户的权限快照**（`GET /api/auth/me/` 与 JWT 的 `perms` 声明）：
+
+```json
+{
+  "role": "ops_member", "role_name": "普通运维",
+  "modules": {"cmdb": "read_create", "exec": "read", "credential": "none", "...": "..."},
+  "can_execute": true, "can_exec_prod": false
+}
+```
+
+前端据此渲染菜单与按钮——只是少让人点到必然 403 的按钮，判定始终在后端。
+
+---
+
 ## API 凭证（机读接口访问控制） `/api/auth/api-credentials/`
 
 管理接口仅管理员且写操作要求 sudo 二次验证，列表不分页。完整语义见

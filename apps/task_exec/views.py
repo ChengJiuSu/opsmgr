@@ -19,10 +19,11 @@ from apps.auth_mgr.apikey import (
     request_credential,
     user_or_scope,
 )
+from apps.auth_mgr import roles
 from apps.auth_mgr.authentication import MfaJWTAuthentication
 from common.ansible import resolve_within
 from common.crypto import DecryptError
-from common.permissions import IsAdmin, IsAdminOrReadOnly
+from apps.auth_mgr.permissions import module_perm
 from common.response import fail, ok
 from common.sudo import SudoRequired
 
@@ -39,6 +40,25 @@ from . import trigger
 
 
 logger = logging.getLogger('apps.task_exec')
+
+
+def _exec_permission_error(user, task):
+    """发起/处理任务执行的权限校验，返回中文错误消息；None 表示放行。
+
+    三道：能力位（可否发起执行）→ 生产环境（可否碰生产）→ 数据范围（能碰哪些项目）。
+
+    生产单独立一个能力位而不是塞进模块矩阵：「能改任务定义」与「能往生产推」是两件
+    事，前者错了可以改回来，后者错了已经推上去了。这也是最高频的真实诉求。
+    """
+    if not roles.user_capability(user, 'can_execute'):
+        return '当前角色没有发起任务执行的权限。'
+    environment = task.environment
+    if environment is not None and environment.is_prod \
+            and not roles.user_capability(user, 'can_exec_prod'):
+        return f'当前角色不允许对生产环境（{environment.name}）发起执行。'
+    if not user.allows_dims(task.project_group_id, task.environment_id):
+        return f'该任务不在你的数据范围内（当前范围：{user.scope_label}）。'
+    return None
 
 
 def _secret_keys(dims):
@@ -63,7 +83,7 @@ PLAYBOOK_EXCLUDE_DIRS = {
 class PlaybookListView(APIView):
     """列出 ANSIBLE_PROJECT_DIR 内可选的剧本文件（相对路径，供任务表单下拉）。"""
 
-    permission_classes = [IsAdmin]
+    permission_classes = [module_perm('exec', min_level='write')]
 
     @extend_schema(responses=OpenApiTypes.OBJECT)
     def get(self, request):
@@ -87,7 +107,10 @@ class CredentialViewSet(viewsets.ModelViewSet):
     serializer_class = CredentialSerializer
     # 配置面写操作要求 sudo 二次验证（common/sudo.py）：改了就能拿到更多东西，
     # 而登录那次 MFA 可能是 60 分钟前的事
-    permission_classes = [IsAdmin, SudoRequired]
+    # 按方法推导档位：凭据的**读**只暴露名称/登录用户/认证方式（密码与私钥是
+    # write_only，只回 has_xxx 布尔），给「运维管理」只读是有意义的——能在任务里
+    # 选凭据、看得到有哪些，但改不了。改/删仍需 write + sudo
+    permission_classes = [module_perm('credential'), SudoRequired]
 
 
 class ExecVariableViewSet(viewsets.ModelViewSet):
@@ -98,7 +121,7 @@ class ExecVariableViewSet(viewsets.ModelViewSet):
 
     queryset = ExecVariable.objects.select_related('project_group', 'channel', 'environment')
     serializer_class = ExecVariableSerializer
-    permission_classes = [IsAdminOrReadOnly]
+    permission_classes = [module_perm('exec')]
 
     # 查询参数 → 维度外键映射（纯数字按 id、否则按 code，与服务器接口一致）
     DICT_FILTERS = (
@@ -142,7 +165,7 @@ class ExecVariableViewSet(viewsets.ModelViewSet):
         # 只在这个动作上开机读通道：脚本要的是「按维度解析好的变量字典」，
         # 不是整张变量表，把 list 也开出去只是白扩大暴露面
         authentication_classes=[ApiKeyAuthentication, MfaJWTAuthentication],
-        permission_classes=[user_or_scope(IsAdminOrReadOnly, 'variable:read')],
+        permission_classes=[user_or_scope(module_perm('exec'), 'variable:read')],
         throttle_classes=[ApiKeyThrottle],
     )
     def resolved(self, request):
@@ -166,6 +189,12 @@ class ExecVariableViewSet(viewsets.ModelViewSet):
                 dims['project_group'].id, dims['environment'].id):
             return fail(f'凭证「{credential.name}」的数据范围不含该维度'
                         f'（当前范围：{credential.scope_label}）', status=403)
+        # 登录用户的数据范围同一套口径（common/dimscope）：变量里可能有密码，
+        # 不该让某个项目的人拉到别的项目的变量
+        if credential is None and not request.user.allows_dims(
+                dims['project_group'].id, dims['environment'].id):
+            return fail(f'你的数据范围不含该维度（当前范围：{request.user.scope_label}）',
+                        status=403)
 
         # 敏感变量默认不下发：这个接口普通登录用户也能调，全量返回等于任何账号
         # 拉一次就把密码全拿走。要真值必须显式 include_secrets=true，且
@@ -226,7 +255,7 @@ class ExecVariableViewSet(viewsets.ModelViewSet):
         return dims, None
 
     @extend_schema(request=None, responses=OpenApiTypes.OBJECT)
-    @action(detail=True, methods=['post'], permission_classes=[IsAdmin, SudoRequired])
+    @action(detail=True, methods=['post'], permission_classes=[module_perm('exec', min_level='write'), SudoRequired])
     def reveal(self, request, pk=None):
         """查看敏感变量真值（管理员 + sudo 二次验证）。
 
@@ -250,7 +279,7 @@ class ExecVariableViewSet(viewsets.ModelViewSet):
         qs = variable.versions.select_related('created_by', 'project_group', 'channel', 'environment')
         return ok(ExecVariableVersionSerializer(qs, many=True).data)
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAdmin])
+    @action(detail=True, methods=['post'], permission_classes=[module_perm('exec', min_level='write')])
     def rollback(self, request, pk=None):
         """回滚到指定历史版本：套用快照内容并生成一条新版本记录。"""
         from .models import snapshot_variable
@@ -291,7 +320,7 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
         )
     )
     serializer_class = ExecutionTaskSerializer
-    permission_classes = [IsAdminOrReadOnly]
+    permission_classes = [module_perm('exec')]
     http_method_names = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options']
 
     def get_queryset(self):
@@ -350,13 +379,23 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
             'steps': steps,
         })
 
-    @action(detail=True, methods=['post'])
+    @action(
+        detail=True, methods=['post'],
+        # 「发起执行」不该按 POST 推导成 read_create 档：执行不是改任务定义。
+        # 「普通运维」的设计正是 exec 只读 + 可执行 —— 能跑不能改。
+        # 能力位、生产环境与数据范围三道由 _exec_permission_error 判，
+        # 它给的是具体原因（哪一道没过），比权限类的通用 403 好排查。
+        permission_classes=[module_perm('exec', min_level='read')],
+    )
     def execute(self, request, pk=None):
         """执行任务流。body.step_servers={模块id: [主机id]} 逐模块勾选（跟随全局的
         模块各自独立），body.server_ids 为未单独勾选模块的兜底（缺省=全部全局匹配
         主机，任务关闭 default_select_all 时缺省会被拒绝）；
         自定义范围模块按其维度全量执行。逐模块校验主机非空与方法服务规划。"""
         task = self.get_object()
+        error = _exec_permission_error(request.user, task)
+        if error:
+            return fail(error, status=403)
         error = trigger.preflight(task)
         if error:
             return fail(error)
@@ -422,15 +461,27 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
         'failed': ('retry', 'skip', 'abort'),
     }
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAdmin])
+    @action(
+        detail=True, methods=['post'],
+        # 与 execute 同一道口径：处理暂停会让剩余模块真的跑起来，属「执行」而非
+        # 「改定义」，用能力位判而不是要求 exec 写权限
+        permission_classes=[module_perm('exec', min_level='read')],
+    )
     def confirm(self, request, pk=None):
         """人工处理暂停中的任务流。
+
+        与发起执行同一道能力位与范围校验：continue / retry / skip 都会让剩余模块
+        真的跑起来，只在 execute 上拦等于留了个后门。
 
         暂停确认模块（pause_type=confirm）：continue 继续 / abort 中止；
         模块失败等待（pause_type=failed）：retry 重试失败模块 / skip 跳过
         继续后续模块 / abort 中止。仅 paused 状态可操作；动作写入
         pause_action 由 runner 轮询消费。
         """
+        task = self.get_object()
+        error = _exec_permission_error(request.user, task)
+        if error:
+            return fail(error, status=403)
         action_value = request.data.get('action')
         if action_value not in ('continue', 'abort', 'retry', 'skip'):
             return fail('action 必须为 continue/abort（暂停确认）或 retry/skip/abort（失败处理）')
@@ -498,7 +549,7 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
         responses=OpenApiTypes.OBJECT,
     )
     @action(detail=True, methods=['get'], url_path=r'logs/(?P<log_id>\d+)/scene',
-            permission_classes=[IsAdmin])
+            permission_classes=[module_perm('exec', min_level='write')])
     def log_scene(self, request, pk=None, log_id=None):
         """执行现场归档（inventory / 变量 / 命令）：缺省列清单，带 file 返回内容。
 

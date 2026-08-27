@@ -18,9 +18,26 @@ description: 为 devops-manager 新增后端 Django app 或 API 接口时的项�
 | 组件 | 用途 |
 |------|------|
 | `common.response.ok / fail` | 统一响应 `{code, msg, data}`；fail 默认 400 |
-| `common.permissions.IsAdmin` | 仅管理员（写操作、批量操作） |
-| `common.permissions.IsAdminOrReadOnly` | 管理员可写、登录用户只读（字典/资源类） |
+| `apps.auth_mgr.permissions.module_perm('<模块>')` | **业务接口一律用这个**：按角色矩阵判档（GET→read、POST→read_create、改删→write）|
+| `module_perm('<模块>', min_level='write')` | 连读都只给最高档（凭据、系统配置、API 凭证这类读本身就敏感的）|
+| `common.permissions.IsAdmin` / `IsAdminOrReadOnly` | **已弃用**，只认 `is_staff` 二档。新代码不要用 |
 | `common.pagination` | 分页，前端固定读 `data.results` / `data.total` |
+
+## 权限（角色矩阵）
+
+模块清单在 `apps/auth_mgr/roles.py: MODULES`（cmdb / exec / credential / artifact /
+cloud / agent / system / audit）。新增接口时挑一个已有模块，不要随手加新模块——
+模块粒度是「一块菜单」，加模块要同时更新内置角色矩阵与前端菜单判定。
+
+- 配置面写操作叠 `common.sudo.SudoRequired`（或 `required_for('PUT','PATCH','DELETE')`）；
+- 「执行类」动作（发起执行、处理暂停）用 `module_perm(m, min_level='read')` +
+  在方法体里判能力位（`roles.user_capability`），**不要**按 POST 推导成 read_create
+  ——执行不是改定义；
+- 机读接口（脚本/Webhook）见 `apps/auth_mgr/apikey.py`：认证类 + `scope_required()`
+  + `ApiKeyThrottle`；与登录用户共存的接口用 `user_or_scope(module_perm(m), '<scope>')`，
+  **不能**写成 `module_perm(m) | scope_required(...)`（凭证绑真实服务账号，或语义会漏放行）;
+- 数据范围（项目组/环境）用 `common/dimscope.py`：列表收窄用 `narrow()`，
+  单点校验用 `allows_dims()`。
 
 ## API 设计约定
 

@@ -1,6 +1,6 @@
 from rest_framework import viewsets
 
-from common.permissions import IsAdminOrReadOnly
+from apps.auth_mgr.permissions import module_perm
 
 from .models import Method
 from .serializers import MethodSerializer
@@ -11,7 +11,7 @@ class MethodViewSet(viewsets.ModelViewSet):
 
     queryset = Method.objects.select_related('service_type')
     serializer_class = MethodSerializer
-    permission_classes = [IsAdminOrReadOnly]
+    permission_classes = [module_perm('exec')]
 
     def get_queryset(self):
         qs = super().get_queryset()

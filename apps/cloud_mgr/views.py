@@ -25,8 +25,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from common.pagination import StandardPagination
-from common.permissions import IsAdmin, IsAdminOrReadOnly
-from rest_framework.permissions import IsAuthenticated
+from apps.auth_mgr.permissions import module_perm
 from common.response import fail, ok
 from common.sudo import SudoRequired, required_for
 
@@ -93,7 +92,7 @@ class CloudAccountViewSet(viewsets.ModelViewSet):
     serializer_class = CloudAccountSerializer
     # 配置面写操作要求 sudo 二次验证（common/sudo.py）：改了就能拿到更多东西，
     # 而登录那次 MFA 可能是 60 分钟前的事
-    permission_classes = [IsAdmin, SudoRequired]
+    permission_classes = [module_perm('cloud', min_level='write'), SudoRequired]
     pagination_class = StandardPagination
 
     def get_queryset(self):
@@ -131,7 +130,7 @@ class DomainViewSet(viewsets.ModelViewSet):
     queryset = Domain.objects.select_related('cloud_account', 'cloud_account__provider').all()
     serializer_class = DomainSerializer
     # 删除会连带删掉该域名下全部本地解析镜像（厂商侧不动），要二次验证
-    permission_classes = [IsAdminOrReadOnly, required_for('DELETE')]
+    permission_classes = [module_perm('cloud'), required_for('DELETE')]
     pagination_class = StandardPagination
 
     def get_queryset(self):
@@ -257,7 +256,7 @@ class DnsRecordViewSet(viewsets.ModelViewSet):
 
     queryset = DnsRecord.objects.select_related('domain', 'domain__cloud_account', 'server').all()
     serializer_class = DnsRecordSerializer
-    permission_classes = [IsAdminOrReadOnly, required_for('PUT', 'PATCH', 'DELETE')]
+    permission_classes = [module_perm('cloud'), required_for('PUT', 'PATCH', 'DELETE')]
     pagination_class = StandardPagination
 
     def get_queryset(self):
@@ -422,7 +421,7 @@ class CertificateViewSet(viewsets.ModelViewSet):
 
     queryset = Certificate.objects.select_related('cloud_account', 'cloud_account__provider').all()
     serializer_class = CertificateSerializer
-    permission_classes = [IsAdminOrReadOnly]
+    permission_classes = [module_perm('cloud')]
     pagination_class = StandardPagination
 
     def get_queryset(self):
@@ -473,7 +472,7 @@ class CertificateViewSet(viewsets.ModelViewSet):
         return ok(self.get_serializer(cert).data, msg='已提交续签，请稍后刷新查看。')
 
     @extend_schema(responses={200: OpenApiTypes.BINARY})
-    @action(detail=True, methods=['get'], permission_classes=[IsAdmin])
+    @action(detail=True, methods=['get'], permission_classes=[module_perm('cloud', min_level='write')])
     def download(self, request, pk=None):
         """完整证书材料打包 zip 下载（含私钥），仅管理员。
 
@@ -555,7 +554,7 @@ class CertDeploymentViewSet(viewsets.ModelViewSet):
     命令，登记一条分发目标等于拿到该主机的远程命令执行面——和「连接凭据」同性质，
     闸门必须同级。原来只有 IsAdminOrReadOnly，是这套配置面里唯一漏配 sudo 的地方。
 
-    `deploy` 动作单独放行（只要 IsAdmin）：它执行的是**已经登记好**的配置，
+    `deploy` 动作单独放行（只要 cloud 模块 write，不要求 sudo）：它执行的是**已经登记好**的配置，
     真正需要复核的是配置本身；每次分发都弹验证框会把签发后自动分发的日常流程
     变成人工卡点。
     """
@@ -564,7 +563,7 @@ class CertDeploymentViewSet(viewsets.ModelViewSet):
         'certificate', 'server', 'credential',
     ).all()
     serializer_class = CertDeploymentSerializer
-    permission_classes = [IsAdminOrReadOnly, SudoRequired]
+    permission_classes = [module_perm('cloud'), SudoRequired]
     pagination_class = StandardPagination
 
     def get_queryset(self):
@@ -593,7 +592,7 @@ class CertDeploymentViewSet(viewsets.ModelViewSet):
         return None
 
     @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
-    @action(detail=True, methods=['post'], permission_classes=[IsAdmin])
+    @action(detail=True, methods=['post'], permission_classes=[module_perm('cloud', min_level='write')])
     def deploy(self, request, pk=None):
         """分发证书到该目标（后台异步执行 ansible 推送 + 重载）。
 
@@ -623,7 +622,7 @@ class DnsChangeLogViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin,
 
     queryset = DnsChangeLog.objects.select_related('domain', 'record', 'operator', 'restored_by')
     serializer_class = DnsChangeLogSerializer
-    permission_classes = [IsAdminOrReadOnly]
+    permission_classes = [module_perm('cloud')]
     pagination_class = StandardPagination
 
     def get_queryset(self):
@@ -642,7 +641,7 @@ class DnsChangeLogViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin,
         return qs
 
     @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
-    @action(detail=True, methods=['post'], permission_classes=[IsAdmin, SudoRequired])
+    @action(detail=True, methods=['post'], permission_classes=[module_perm('cloud', min_level='write'), SudoRequired])
     def restore(self, request, pk=None):
         """按前值回滚该次变更（云端先动、本地后动，云端失败则整体放弃）。"""
         change = self.get_object()
@@ -666,7 +665,7 @@ class DnsChangeRequestViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin,
     queryset = DnsChangeRequest.objects.select_related(
         'domain', 'record', 'requested_by', 'reviewed_by')
     serializer_class = DnsChangeRequestSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [module_perm('cloud')]
     pagination_class = StandardPagination
 
     def get_queryset(self):
@@ -685,7 +684,7 @@ class DnsChangeRequestViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin,
         return qs
 
     @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
-    @action(detail=True, methods=['post'], permission_classes=[IsAdmin, SudoRequired])
+    @action(detail=True, methods=['post'], permission_classes=[module_perm('cloud', min_level='write'), SudoRequired])
     def approve(self, request, pk=None):
         """审批通过并立即执行。
 
@@ -702,7 +701,7 @@ class DnsChangeRequestViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin,
         return ok(self.get_serializer(change_request).data, msg=message)
 
     @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
-    @action(detail=True, methods=['post'], permission_classes=[IsAdmin, SudoRequired])
+    @action(detail=True, methods=['post'], permission_classes=[module_perm('cloud', min_level='write'), SudoRequired])
     def reject(self, request, pk=None):
         change_request = self.get_object()
         success, message = dns_approval.reject(
@@ -712,7 +711,12 @@ class DnsChangeRequestViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin,
         return ok(self.get_serializer(change_request).data, msg=message)
 
     @extend_schema(request=None, responses=OpenApiTypes.OBJECT)
-    @action(detail=True, methods=['post'])
+    @action(
+        detail=True, methods=['post'],
+        # 撤销自己的申请只需 cloud 读档：能提申请的人就该能撤回。
+        # 「只能撤自己的」由 dns_approval.cancel 判（管理员可撤任意单）
+        permission_classes=[module_perm('cloud', min_level='read')],
+    )
     def cancel(self, request, pk=None):
         """撤销自己提交的变更单（管理员可撤任意单）。"""
         change_request = self.get_object()

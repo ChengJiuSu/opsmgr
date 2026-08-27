@@ -11,6 +11,7 @@
 - JWT 登录（颁发 Access + Refresh Token）+ 登录失败限速
 - MFA（TOTP 二次认证）：绑定、两步登录、恢复码、强制策略
 - Token 刷新与验证
+- **角色与权限矩阵**：模块 × 权限档 + 执行能力位 + 数据范围（替代二档 `is_staff`）
 - **API 凭证**：内部脚本 / Webhook 的机读接口访问控制（key + IP 白名单 + 作用域 + 签名）
 
 ---
@@ -27,6 +28,8 @@ apps/auth_mgr/
 ├── services.py      # MFA 业务：绑定、激活、校验、恢复码、强制范围
 ├── tokens.py        # 挑战票据（token_type='mfa'）+ 令牌签发（amr 声明）
 ├── authentication.py # MfaJWTAuthentication：全局 MFA 强制检查
+├── roles.py         # 模块清单 / 权限档 / 内置角色矩阵 / 权限快照
+├── permissions.py   # module_perm / capability_required：基于角色矩阵的权限类
 ├── apikey.py        # 机读访问控制：认证 + IP 白名单 + 验签 + 作用域 + 限速
 ├── views.py         # LoginView（限速+两步）/ MFA 六个接口 / UserViewSet / ApiCredentialViewSet
 ├── management/commands/mfa_reset.py            # 服务器 shell 兜底重置
@@ -279,6 +282,115 @@ MFA 相关请求都是写操作，由审计中间件记录；`code` / `secret` /
 
 ---
 
+## 角色与权限矩阵
+
+原来只有二档：`is_staff` 真 / 假。这撑不住真实诉求——想让某人只管 CMDB 不能执行
+任务、只能对测试环境执行不能碰生产、外包只读，一个都做不到。
+
+### 为什么不做成 CAM 那种策略语言
+
+评估过腾讯云访问管理那套（action 注册表 + 资源 ARN + 通配符 + 求值引擎 + 策略
+模拟器）：完整形态约 35~45 人日，且长期成本更高——每新增一个接口从「写两行
+`permission_classes`」变成「登记 action + 想清 resource + 更新预设策略」，排障从
+读一行权限类变成读一堆 glob 加跑模拟器，而**写错通配符静默扩权没有任何报错**。
+
+那套是为「一个平台服务成千上万互不信任的租户」设计的。这里是 10 人内部平台、
+无多租户，上它等于用多租户的复杂度解决一个班的权限问题。
+
+矩阵能表达的东西够用，而且矩阵本身可读——不需要模拟器才能回答「这个角色能干
+什么」。模块矩阵是策略文档的退化形式：将来真要上 CAM 可以机械翻译过去，不白做。
+
+### 权限档（`roles.LEVELS`）
+
+| 档 | 含义 | 替代原来的 |
+|----|------|-----------|
+| `none` | 该模块完全不可见 | — |
+| `read` | 只读 | `IsAdminOrReadOnly` 的读侧 |
+| `read_create` | 可读、可新增，不可改删 | `IsAdminOrReadCreate` |
+| `write` | 全量读写 | `IsAdmin` |
+
+保留 `read_create` 而不是简化成三档：CMDB 现在就是「常规用户可查可增不可改删」，
+砍掉这一档会造成行为回退。
+
+HTTP 方法 → 所需档位：GET/HEAD/OPTIONS → `read`，POST → `read_create`，
+PUT/PATCH/DELETE → `write`；未知方法当 `write`（fail-closed）。
+
+### 模块（`roles.MODULES`）
+
+`cmdb` / `exec` / `credential` / `artifact` / `cloud` / `agent` / `system` / `audit`
+——粒度就是「一个业务 app / 一块菜单」，8 个，不是 150 个 action。
+
+### 独立能力位
+
+按模块档位表达不了、又是最高频诉求的，单独立字段：
+
+| 能力位 | 含义 |
+|--------|------|
+| `can_execute` | 可发起任务流执行、可处理暂停中的任务 |
+| `can_exec_prod` | 可对生产环境（`Environment.is_prod`）发起执行 |
+
+生产单独立一位而不是塞进矩阵：「能改任务定义」与「能往生产推」是两件事——前者
+错了可以改回来，后者错了已经推上去了。
+
+`confirm`（处理暂停）与 `execute` 走同一道校验：continue / retry / skip 都会让剩余
+模块真的跑起来，只在 execute 上拦等于留了个后门。
+
+### 内置角色
+
+| code | 名称 | 定位 |
+|------|------|------|
+| `super` | 超级管理 | 全模块 write + 全能力位（等于原来的 `is_staff=True`）|
+| `ops_admin` | 运维管理 | 日常运维读写；连接凭据与 Agent 只读，系统管理不可见 |
+| `ops_member` | 普通运维 | 资产可查可增；任务可执行但不能改定义、**不能碰生产** |
+
+`ops_admin` 正是二档模型缺的那一层。内置角色**可改矩阵、不可删**——删掉「超级管理」
+会把所有人锁在门外；序列化器还额外禁止把 `super` 降档，一次手滑就能锁死所有人。
+
+### 无角色的用户（存量兼容）
+
+`role` 为空时**严格回退**到原来的 `is_staff` 语义，做到「谁的权限都没变」：
+
+- staff → 全模块 write + 全能力位；
+- 非 staff → 内置「普通运维」的**模块矩阵**（CMDB 可查可增、其余只读），
+  但**不含执行能力**。
+
+最后这条容易写错：内置「普通运维」角色本身是 `can_execute=True`，但**回退不能套用它**
+——角色落地前发起执行与处理暂停都是管理员专属，回退时把执行能力给出去等于这条迁移
+悄悄给所有存量普通账号开了执行权。要给执行能力就显式配一个角色。
+
+真正的收紧由管理员在页面上逐个改角色完成，而不是一次迁移悄悄改掉所有人的权限。
+
+### 数据范围（`User.allowed_project_groups` / `allowed_environments`）
+
+与 API 凭证共用同一套实现（`common/dimscope.py`）——两份实现迟早分叉，分叉的表现是
+「页面上看不到的主机，用 API key 却能读到」。空 = 不限。
+
+**只在三处生效**，都是能造成实际影响的入口：
+
+| 生效点 | 方式 |
+|--------|------|
+| 主机列表 | 收窄可见集（`ServerViewSet.get_queryset`）|
+| 发起任务执行 / 处理暂停 | 校验任务维度，越界拒绝 |
+| 变量解析 `resolved` | 校验请求维度，越界拒绝（变量里可能有密码）|
+
+其余列表**不做**过滤。那是整个评估里成本与漏检风险最大的一块（漏一处就是越权可见），
+10 人无多租户不需要；字段与 `narrow()` 都留好了，将来要收紧只需在对应
+`get_queryset` 上接一行。
+
+### 权限快照
+
+`roles.permission_snapshot(user)` 进 JWT 声明（`perms`）与 `/api/auth/me/`，前端据此
+决定菜单与按钮可见性。它**只是少让人点到必然 403 的按钮**——真正判定始终在后端，
+快照过期最多多显示一个按钮，点下去照样被拒。
+
+### 顺带修掉的一个漏配
+
+系统配置接口原来是 `IsAuthenticated + SudoRequired`——**任何登录用户过了 sudo 就能改**
+`jenkins.api_token` / `artifact.api_key` / `mfa.enforce_scope`。随矩阵一并收到
+`system` 模块 write。
+
+---
+
 ## API 凭证（机读接口访问控制）
 
 给**内部脚本与 Webhook** 用的免登录通道。它们没有浏览器、不做 MFA、也不该拿一条能干
@@ -466,6 +578,9 @@ SIMPLE_JWT = {
 | POST | `/api/auth/mfa/recovery-codes/` | 重发恢复码（密码 + 当前验证码，旧码作废）|
 | POST | `/api/auth/users/{id}/reset_mfa/` | 管理员清除他人绑定（丢手机兜底）|
 | GET/POST | `/api/auth/mfa/sudo/` | 敏感操作二次验证窗口：查状态 / 开窗口 |
+| GET | `/api/auth/roles/` | 角色列表（system write，不分页）|
+| GET | `/api/auth/roles/meta/` | 模块清单 + 权限档定义（前端渲染矩阵的数据源）|
+| POST/PATCH/DELETE | `/api/auth/roles/` `…/{id}/` | 角色增改删（system write + sudo；内置不可删）|
 | GET | `/api/auth/api-credentials/` | API 凭证列表（管理员，不分页）|
 | GET | `/api/auth/api-credentials/scopes/` | 可授权作用域清单 |
 | POST | `/api/auth/api-credentials/` | 新建凭证，响应 `data.api_key` 为明文（仅此一次）|

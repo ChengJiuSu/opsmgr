@@ -312,7 +312,7 @@ def request_credential(request):
 class UserOrScope(BasePermission):
     """按认证方式分流：凭证认证判作用域，JWT/匿名交给原有权限类。
 
-    **为什么不能写成 `IsAdminOrReadOnly | scope_required(...)`**：凭证绑定的是
+    **为什么不能写成 `module_perm('x') | scope_required(...)`**：凭证绑定的是
     真实服务账号，`request.user.is_authenticated` 为真，OR 的左边（只读放行）会
     直接命中——等于任何凭证不带任何作用域也能读。或语义在这里是个安全漏洞，
     必须按认证方式分流。
@@ -346,7 +346,7 @@ def user_or_scope(user_permission, *scopes, read_only=True):
     """生成「登录用户走 user_permission、机读凭证走作用域」的权限类。
 
         permission_classes = [
-            user_or_scope(IsAdminOrReadCreate, 'asset:read'),
+            user_or_scope(module_perm('cmdb'), 'asset:read'),
             sudo_required_for('PUT', 'PATCH', 'DELETE'),
         ]
     """

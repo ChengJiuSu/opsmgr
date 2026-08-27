@@ -16,6 +16,7 @@ from django.core.cache import cache
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken, Token
 
+from . import roles
 from .services import AMR_OTP, AMR_PASSWORD
 
 logger = logging.getLogger(__name__)
@@ -83,6 +84,9 @@ def issue_access(user, amr=None):
     refresh['username'] = user.username
     refresh['department'] = user.department
     refresh['is_staff'] = user.is_staff
+    # 与密码登录路径（CustomTokenObtainPairSerializer）保持同样的声明，
+    # 否则走两步登录的会话前端拿不到权限快照，按钮全按最小权限渲染
+    refresh['perms'] = roles.permission_snapshot(user)
     refresh['amr'] = list(amr or [AMR_PASSWORD])
     return {'refresh': str(refresh), 'access': str(refresh.access_token)}
 

@@ -14,12 +14,14 @@ from .views import (
     MfaSetupView,
     MfaStatusView,
     MfaVerifyView,
+    RoleViewSet,
     SudoView,
     UserViewSet,
 )
 
 router = DefaultRouter()
 router.register('users', UserViewSet, basename='user')
+router.register('roles', RoleViewSet, basename='role')
 router.register('api-credentials', ApiCredentialViewSet, basename='api-credential')
 
 urlpatterns = [
