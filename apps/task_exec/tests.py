@@ -2562,3 +2562,57 @@ class SecretVariableTests(TestCase):
         values = runner.collect_dim_secret_values(self.pg.id, self.ch.id, self.env.id)
         self.assertIn('long-enough-secret', values)
         self.assertNotIn('ab', values)
+
+
+class CredentialEncryptionTests(TestCase):
+    """连接凭据密钥加密存储：库里是密文，ORM 与 inventory 拿到的是明文。"""
+
+    PASSWORD = 'ssh-r00t-pass'
+    KEY_PEM = '-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----'
+
+    def test_stored_as_ciphertext(self):
+        from django.db import connection
+
+        cred = Credential.objects.create(
+            name='enc-cred', username='root', auth_type='password',
+            password=self.PASSWORD, become=True, become_password='sudo-pass-1234',
+            private_key=self.KEY_PEM,
+        )
+        with connection.cursor() as cursor:
+            cursor.execute(
+                'SELECT password, private_key, become_password FROM task_credential WHERE id = %s',
+                [cred.id])
+            raw = cursor.fetchone()
+        for stored in raw:
+            self.assertTrue(stored.startswith('gAAAAA'), stored[:30])
+        self.assertNotIn(self.PASSWORD, ' '.join(raw))
+        self.assertNotIn('BEGIN OPENSSH', ' '.join(raw))
+
+        # ORM 读回明文（读取点零改动的前提）
+        fresh = Credential.objects.get(pk=cred.pk)
+        self.assertEqual(fresh.password, self.PASSWORD)
+        self.assertEqual(fresh.private_key, self.KEY_PEM)
+        self.assertEqual(fresh.become_password, 'sudo-pass-1234')
+
+    def test_inventory_gets_plaintext(self):
+        """ansible 建连要的是明文——这是「加密后还能用」的落点。"""
+        cred = Credential.objects.create(
+            name='enc-cred-2', username='root', auth_type='password', password=self.PASSWORD)
+        server = Server.objects.create(name='enc-host', private_ip='10.9.9.9')
+        text = _inventory_content([server], cred, None, include_secrets=True)
+        self.assertIn(self.PASSWORD, text)
+
+    def test_empty_secret_stays_empty(self):
+        """空值不加密：序列化器的 has_password 布尔依赖「空即未设置」。"""
+        cred = Credential.objects.create(name='enc-cred-3', username='root', auth_type='key')
+        self.assertEqual(raw_column('task_credential', 'password', cred.id), '')
+        self.assertFalse(Credential.objects.get(pk=cred.pk).password)
+
+
+def raw_column(table, column, pk):
+    """读某行某列的原始库值（绕过字段解密），供加密断言使用。"""
+    from django.db import connection
+
+    with connection.cursor() as cursor:
+        cursor.execute(f'SELECT {column} FROM {table} WHERE id = %s', [pk])
+        return cursor.fetchone()[0]

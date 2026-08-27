@@ -641,3 +641,47 @@ class CertDeploymentApiTests(BaseApiTest):
         normal = self._client(is_staff=False)
         self.assertEqual(normal.get('/api/cloud/cert-deployments/').status_code, 200)
         self.assertEqual(normal.post(f'/api/cloud/cert-deployments/{dep.id}/deploy/').status_code, 403)
+
+
+class CloudSecretEncryptionTests(TestCase):
+    """云账号 AccessKey Secret 与证书私钥加密存储：库里密文，ORM 明文。"""
+
+    SECRET = 'ak-secret-value-0001'
+    KEY_PEM = '-----BEGIN PRIVATE KEY-----\nzzz\n-----END PRIVATE KEY-----'
+
+    def setUp(self):
+        self.provider, _ = CloudProvider.objects.get_or_create(
+            code='aliyun', defaults={'name': '阿里云'})
+
+    @staticmethod
+    def _raw(table, column, pk):
+        from django.db import connection
+
+        with connection.cursor() as cursor:
+            cursor.execute(f'SELECT {column} FROM {table} WHERE id = %s', [pk])
+            return cursor.fetchone()[0]
+
+    def test_account_secret_encrypted(self):
+        account = CloudAccount.objects.create(
+            name='enc-account', provider=self.provider,
+            access_key='AK123', secret_key=self.SECRET)
+        stored = self._raw('cloud_account', 'secret_key', account.pk)
+        self.assertTrue(stored.startswith('gAAAAA'))
+        self.assertNotIn(self.SECRET, stored)
+        # provider 调厂商 API 要用原值，所以 ORM 必须读回明文
+        self.assertEqual(CloudAccount.objects.get(pk=account.pk).secret_key, self.SECRET)
+
+    def test_certificate_private_key_encrypted(self):
+        from apps.cloud_mgr.models import Certificate
+
+        account = CloudAccount.objects.create(
+            name='enc-account-2', provider=self.provider,
+            access_key='AK123', secret_key=self.SECRET)
+        cert = Certificate.objects.create(
+            name='enc-cert', domains=['a.example.com'], cloud_account=account,
+            status='issued', cert_pem='CERT', private_key_pem=self.KEY_PEM)
+        stored = self._raw('cloud_certificate', 'private_key_pem', cert.pk)
+        self.assertTrue(stored.startswith('gAAAAA'))
+        self.assertNotIn('BEGIN PRIVATE KEY', stored)
+        # 分发到主机与打包下载都要原值
+        self.assertEqual(Certificate.objects.get(pk=cert.pk).private_key_pem, self.KEY_PEM)

@@ -128,7 +128,7 @@ ansible-playbook site.yml -e @vars.yml
 
 ```
 apps/task_exec/
-├── models.py        # ExecVariable（执行变量）/ Credential / ExecutionTask（任务流）
+├── models.py        # ExecVariable（执行变量，支持 is_secret 加密）/ Credential（密钥加密存储）/ ExecutionTask（任务流）
 │                    #   / TaskStep（任务模块）/ TaskExecutionLog
 │                    #   match_executable_servers：全局/模块维度匹配共用口径
 ├── serializers.py   # 变量 key 校验、凭据脱敏、嵌套模块整体读写与内容校验、方法 service_type 执行校验

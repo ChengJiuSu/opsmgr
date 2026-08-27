@@ -123,3 +123,21 @@ cert-deployments `certificate`、`target_type`、`status`。
 - **lb/ga/cdn**：`DEPLOYERS` 中各自桩函数抛中文 `CertDeployError`；
   `supported_target_types()` 返回已实现类型，视图与前端据此拦截/置灰。
 - **路径安全**：部署目录须绝对路径，`/etc`、`/usr`、`/bin` 等系统关键目录直接拒绝。
+
+---
+
+## 秘密存储
+
+`CloudAccount.secret_key`（AccessKey Secret）与 `Certificate.private_key_pem`
+（证书私钥）用 `EncryptedTextField` **加密存储**（`common/fields.py`）。
+
+两者都必须可还原——前者要用原值调厂商 API，后者要推到目标主机并打包下载——
+所以不能只存哈希；而明文入库意味着「库泄露即云资源被接管 / 域名 HTTPS 可被伪造」。
+字段层透明加解密，providers 与 deploy 的读取点零改动。
+
+序列化器层照旧只写不回显（`has_secret_key` / `has_private_key` 布尔）；证书私钥
+仅 `download` 动作（管理员）以 zip 形式给出。
+
+**加密迁移** `cloud_mgr/0004_encrypt_cloud_secrets`：幂等且可回滚，口径见
+`docs/backend/modules/common.md` 的「透明加密字段」。生产上线前先配
+`SECRET_ENC_KEY` 再 migrate。

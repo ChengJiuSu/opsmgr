@@ -6,13 +6,17 @@
 from django.conf import settings
 from django.db import models
 
+from common.fields import EncryptedTextField
+
 from apps.asset_mgr.models import CloudProvider, Server
 
 
 class CloudAccount(models.Model):
     """云账号：云厂商 API 凭据（AK/SK）。DNS 解析、证书 DNS 验证及后续云资源模块共用。
 
-    secret_key 只写不回显（序列化器层控制），沿用 Credential 模式。
+    secret_key 只写不回显（序列化器层控制），沿用 Credential 模式，并用
+    EncryptedTextField 加密存储——它是云账号的完整控制权，明文入库等于库泄露
+    即云资源被接管。
     """
 
     name = models.CharField('账号名称', max_length=100, unique=True)
@@ -21,7 +25,7 @@ class CloudAccount(models.Model):
         related_name='cloud_accounts',
     )
     access_key = models.CharField('AccessKey ID', max_length=128)
-    secret_key = models.CharField('AccessKey Secret', max_length=256)
+    secret_key = EncryptedTextField('AccessKey Secret')
     enabled = models.BooleanField('是否启用', default=True)
     remark = models.TextField('备注', blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -172,7 +176,7 @@ class Certificate(models.Model):
     )
     status = models.CharField('状态', max_length=20, choices=STATUS_CHOICES, default='pending')
     cert_pem = models.TextField('证书(PEM)', blank=True)
-    private_key_pem = models.TextField('私钥(PEM)', blank=True)
+    private_key_pem = EncryptedTextField('私钥(PEM)', blank=True)
     chain_pem = models.TextField('证书链(PEM)', blank=True)
     issued_at = models.DateTimeField('签发时间', null=True, blank=True)
     expires_at = models.DateTimeField('过期时间', null=True, blank=True)

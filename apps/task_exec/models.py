@@ -2,6 +2,7 @@ from django.conf import settings
 from django.db import models
 
 from common.crypto import decrypt, encrypt
+from common.fields import EncryptedTextField
 
 
 def match_executable_servers(project_group_id=None, channel_id=None, environment_id=None,
@@ -198,7 +199,12 @@ def snapshot_variable(variable, user=None):
 
 
 class Credential(models.Model):
-    """主机连接凭据。密钥/密码字段仅用于下发 Ansible 执行，API 不回显。"""
+    """主机连接凭据。密钥/密码字段仅用于下发 Ansible 执行，API 不回显。
+
+    密码/私钥/提权密码用 EncryptedTextField（common/fields.py）**加密存储**：
+    这些值必须可还原（要写进 ansible inventory 建连），只存哈希做不到；而明文
+    入库等于「库泄露即拿到全部主机的 root」。字段层透明加解密，读取点零改动。
+    """
 
     AUTH_CHOICES = [
         ('password', '密码'),
@@ -208,10 +214,10 @@ class Credential(models.Model):
     name = models.CharField('凭据名称', max_length=100, unique=True)
     username = models.CharField('登录用户', max_length=50, default='root')
     auth_type = models.CharField('认证方式', max_length=20, choices=AUTH_CHOICES, default='password')
-    password = models.CharField('密码', max_length=255, blank=True)
-    private_key = models.TextField('私钥', blank=True)
+    password = EncryptedTextField('密码', blank=True)
+    private_key = EncryptedTextField('私钥', blank=True)
     become = models.BooleanField('提权 (sudo)', default=False)
-    become_password = models.CharField('提权密码', max_length=255, blank=True)
+    become_password = EncryptedTextField('提权密码', blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

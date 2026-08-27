@@ -152,3 +152,36 @@ IP 规则匹配：`parse_ip_rules(text)`（逗号/空格/换行/分号混排 →
 
 解不开时抛 `DecryptError`，调用方一律**报错中止**而不是回退空值：注入空密码去
 连生产比中止危险得多。
+
+---
+
+## 透明加密字段（`common/fields.py`）
+
+`EncryptedTextField`：库里存密文，Python 侧照常当字符串读写。
+
+使用者：`Credential.password / private_key / become_password`、
+`CloudAccount.secret_key`、`Certificate.private_key_pem`。
+
+为什么用自定义字段而不是 `get_xxx()/set_xxx()` 方法：这些值在 runner、
+providers、deploy、序列化器里有几十处读取点，改成方法调用等于把每一处都摸一遍，
+漏一处的表现是「密码变成 `gAAAAA...` 然后 SSH 认证失败」。字段层做掉，调用方零改动。
+
+**边界与代价**
+
+| 项 | 说明 |
+|----|------|
+| 不能查询 | 这些列不能 `filter` / `order_by` / `icontains`——库里是密文。这几个字段本来也没有按值查询的语义 |
+| 列类型 | 一律 TEXT 而非 VARCHAR：密文比明文长得多（32 字符密码加密后约 130 字符），沿用原 `max_length` 会被数据库截断成解不开的半截密文 |
+| 存量明文 | `from_db_value` 认不出 Fernet 特征（`gAAAAA` 前缀）时原样返回，让加密迁移可以分步跑、也允许回滚 |
+| 像密文却解不开 | 抛 `DecryptError`。那是 key 变了，静默把密文当密码用会得到极难排查的认证失败 |
+| 不叠壳 | `get_prep_value` 遇到已是密文的值直接返回，同实例反复保存与迁移重跑都安全 |
+| 空值 | 原样存取，保留「未设置」语义（序列化器的 `has_xxx` 布尔依赖它）|
+
+**加密迁移**（`task_exec/0021`、`cloud_mgr/0004`）用原生 SQL + 显式加解密，
+不走 ORM——字段本身已带加解密，走 ORM 会叠一层，正反方向都难以推理。两个方向
+都实现了：`forwards` 只加密「不像密文」的值（幂等），`backwards` 把密文解回明文
+（否则回滚代码后库里留着解不开的密文，凭据等于全部作废）。
+
+**部署顺序要求**：生产首次上线必须**先配好 `SECRET_ENC_KEY` 再 `migrate`**。
+留空会回退用 `SECRET_KEY` 派生密钥，之后一旦轮换 `SECRET_KEY`，所有凭据、云账号
+密钥、证书私钥、敏感变量、MFA 绑定同时失效。

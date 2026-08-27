@@ -7,7 +7,7 @@ from unittest import mock
 from django.core.cache import cache
 from django.test import SimpleTestCase, TestCase, override_settings
 
-from . import crypto, ratelimit, totp
+from . import crypto, fields, ratelimit, totp
 from . import request as request_utils
 
 # RFC 6238 附录 B 的 SHA1 测试向量（密钥 "12345678901234567890"）
@@ -205,3 +205,35 @@ class IpRuleTests(SimpleTestCase):
 
     def test_empty_rules_never_match(self):
         self.assertFalse(request_utils.ip_matches_rules('10.0.0.1', ''))
+
+
+class EncryptedFieldTests(SimpleTestCase):
+    """透明加密字段：存密文取明文，存量明文兼容，密文解不开要报错。"""
+
+    def setUp(self):
+        self.field = fields.EncryptedTextField()
+
+    def test_round_trip(self):
+        stored = self.field.get_prep_value('s3cr3t-password')
+        self.assertTrue(fields.looks_encrypted(stored))
+        self.assertNotIn('s3cr3t-password', stored)
+        self.assertEqual(self.field.from_db_value(stored, None, None), 's3cr3t-password')
+
+    def test_not_double_wrapped(self):
+        """同一实例反复保存、迁移重跑都不该套第二层壳。"""
+        once = self.field.get_prep_value('abc')
+        self.assertEqual(self.field.get_prep_value(once), once)
+
+    def test_legacy_plaintext_passes_through(self):
+        """加密迁移尚未跑到的存量行原样返回，让迁移能分步跑、也允许回滚。"""
+        self.assertEqual(self.field.from_db_value('legacy-plain', None, None), 'legacy-plain')
+
+    def test_empty_preserved(self):
+        """空值保留「未设置」语义：序列化器的 has_xxx 布尔依赖它。"""
+        self.assertEqual(self.field.get_prep_value(''), '')
+        self.assertEqual(self.field.from_db_value('', None, None), '')
+
+    def test_broken_ciphertext_raises(self):
+        """像密文却解不开 = key 变了。静默当明文用会得到极难排查的认证失败。"""
+        with self.assertRaises(crypto.DecryptError):
+            self.field.from_db_value(fields.FERNET_PREFIX + 'broken', None, None)
