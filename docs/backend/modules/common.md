@@ -125,3 +125,30 @@ IP 规则匹配：`parse_ip_rules(text)`（逗号/空格/换行/分号混排 →
 刻意不用 PBKDF2/bcrypt：凭证是随机串而非人选密码，不存在字典攻击面，而机读接口每个
 请求都要校验一次，慢哈希会变成瓶颈。需要**可还原**的秘密（Webhook 签名密钥要用原值
 重算 HMAC）走 `common/crypto.py` 的对称加密，不走这里。
+
+---
+
+## 可还原秘密的加密存储（`common/crypto.py`）
+
+只存哈希做不到的场景——每次用都要拿原值——统一走 Fernet 对称加密：
+
+| 使用者 | 为什么必须可还原 |
+|--------|-----------------|
+| MFA 的 TOTP 密钥 | 每次校验都要用原值重算验证码 |
+| 执行变量的敏感值（`ExecVariable.is_secret`）| 要原样注入 ansible |
+| 主机连接凭据的密码/私钥/提权密码 | 要下发给 ansible 建连 |
+| 云账号 AccessKey Secret | 要用原值调厂商 API |
+| API 凭证的 Webhook 签名密钥 | 要用原值重算 HMAC |
+
+只存哈希的凭证（Agent 令牌、API 凭证 secret）走 `common/secrets.py`，不走这里。
+
+**key 来源按序回退**：`SECRET_ENC_KEY` → `MFA_SECRET_KEY` → `SECRET_KEY`。
+`MFA_SECRET_KEY` 是历史名字（那时唯一使用者是 MFA），保留以免存量部署换名后
+密文全部解不开。
+
+**换 key 会让已入库的密文全部解不开** —— 表现为 MFA 校验一律失败、任务执行报
+变量解密失败、ansible 建连失败。生产必须显式配置并与 `SECRET_KEY` 分开轮换，
+换 key 前先导出重新加密。
+
+解不开时抛 `DecryptError`，调用方一律**报错中止**而不是回退空值：注入空密码去
+连生产比中止危险得多。

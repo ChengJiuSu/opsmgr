@@ -23,20 +23,35 @@ SENSITIVE_KEYS = frozenset({
 REDACTED = '***'
 # 认证相关路径：非 JSON 体无法按键定位敏感值，整体丢弃而不是截断留半截密码
 AUTH_PATHS = ('/api/auth/',)
+# 按路径追加打码的键：变量接口的 value 可能是密码（ExecVariable.is_secret），
+# 但键名就叫 value，加进全局 SENSITIVE_KEYS 会把大量有用的审计内容一起打掉
+PATH_SENSITIVE_KEYS = (
+    ('/api/exec/variables/', frozenset({'value'})),
+)
 DROPPED = '<非 JSON 请求体，已丢弃>'
 NOT_RECORDED = '<multipart 请求体未记录>'
 
 
-def redact(value):
+def redact(value, extra_keys=frozenset()):
     """递归按键名打码；非容器原样返回。"""
+    sensitive = SENSITIVE_KEYS | extra_keys
     if isinstance(value, dict):
         return {
-            key: (REDACTED if str(key).lower() in SENSITIVE_KEYS else redact(item))
+            key: (REDACTED if str(key).lower() in sensitive else redact(item, extra_keys))
             for key, item in value.items()
         }
     if isinstance(value, list):
-        return [redact(item) for item in value]
+        return [redact(item, extra_keys) for item in value]
     return value
+
+
+def path_sensitive_keys(path):
+    """该路径需要额外打码的键名集合。"""
+    keys = frozenset()
+    for prefix, extra in PATH_SENSITIVE_KEYS:
+        if str(path).startswith(prefix):
+            keys |= extra
+    return keys
 
 
 def redact_body(raw, path):
@@ -50,7 +65,8 @@ def redact_body(raw, path):
         if path.startswith(AUTH_PATHS):
             return DROPPED
         return raw[:BODY_LIMIT]
-    return json.dumps(redact(data), ensure_ascii=False)[:BODY_LIMIT]
+    return json.dumps(redact(data, path_sensitive_keys(path)),
+                      ensure_ascii=False)[:BODY_LIMIT]
 
 
 class AuditLogMiddleware:

@@ -1,3 +1,4 @@
+import logging
 import os
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from rest_framework.decorators import action
 from rest_framework.views import APIView
 
 from common.ansible import resolve_within
+from common.crypto import DecryptError
 from common.permissions import IsAdmin, IsAdminOrReadOnly
 from common.response import fail, ok
 from common.sudo import SudoRequired
@@ -27,6 +29,21 @@ from .serializers import (
     TaskExecutionLogSerializer,
 )
 from . import trigger
+
+
+logger = logging.getLogger('apps.task_exec')
+
+
+def _secret_keys(dims):
+    """该维度下被排除的敏感变量名（resolved 接口告知外部系统）。"""
+    return list(
+        ExecVariable.objects.filter(
+            enabled=True, is_secret=True,
+            project_group_id=dims['project_group'].id,
+            channel_id=dims['channel'].id,
+            environment_id=dims['environment'].id,
+        ).order_by('key').values_list('key', flat=True)
+    )
 
 
 # 剧本扫描时跳过的目录：Ansible 工程的非剧本组成部分
@@ -128,8 +145,15 @@ class ExecVariableViewSet(viewsets.ModelViewSet):
         dims, err = self._resolve_dims(request.query_params)
         if err:
             return fail(err)
+        # 敏感变量默认不下发：这个接口普通登录用户也能调，全量返回等于任何账号
+        # 拉一次就把密码全拿走。要真值必须显式 include_secrets=true 且是管理员
+        include_secrets = request.query_params.get('include_secrets') == 'true'
+        if include_secrets and not request.user.is_staff:
+            return fail('include_secrets 仅管理员可用', status=403)
         variables = collect_dim_variables(dims['project_group'].id, dims['channel'].id,
-                                          dims['environment'].id)
+                                          dims['environment'].id,
+                                          include_secrets=include_secrets)
+        excluded = [] if include_secrets else _secret_keys(dims)
         if request.query_params.get('include_artifact') == 'true':
             try:
                 variables.update(collect_artifact_vars(
@@ -146,6 +170,9 @@ class ExecVariableViewSet(viewsets.ModelViewSet):
                      for name, obj in dims.items()},
             'count': len(variables),
             'vars': variables,
+            # 告知被排除的敏感变量名：外部系统据此知道要自己补，而不是拿着
+            # 缺变量的字典去跑然后在剧本里报 undefined
+            'secret_keys_excluded': excluded,
         })
 
     @staticmethod
@@ -170,6 +197,24 @@ class ExecVariableViewSet(viewsets.ModelViewSet):
             dims[field] = obj
         return dims, None
 
+    @extend_schema(request=None, responses=OpenApiTypes.OBJECT)
+    @action(detail=True, methods=['post'], permission_classes=[IsAdmin, SudoRequired])
+    def reveal(self, request, pk=None):
+        """查看敏感变量真值（管理员 + sudo 二次验证）。
+
+        运维现实里确实需要能核对密码，所以不做成「写进去就再也看不到」。
+        但要过 sudo、且这条 POST 会进审计表（谁在什么时候看了哪个变量）——
+        用 POST 而非 GET 正是为了让它进审计的写操作记录。
+        """
+        variable = self.get_object()
+        try:
+            value = variable.get_value()
+        except DecryptError as exc:
+            return fail(f'变量值无法解密：{exc}')
+        logger.warning('管理员 %s 查看了敏感变量 %s 的真值',
+                       request.user.username, variable.key)
+        return ok({'key': variable.key, 'value': value})
+
     @action(detail=True, methods=['get'])
     def versions(self, request, pk=None):
         """历史版本列表（新→旧，最多保留 EXEC_VARIABLE_VERSION_LIMIT 版）。"""
@@ -187,7 +232,10 @@ class ExecVariableViewSet(viewsets.ModelViewSet):
         version = variable.versions.filter(version=version_no).first()
         if version is None:
             return fail(f'版本 {version_no} 不存在（超出保留范围或参数有误）')
+        # 原样搬存储值与敏感标记：快照里 is_secret 的值本就是密文，
+        # 只搬 value 不搬 is_secret 会得到「标记说明文、内容是密文」的变量
         variable.value = version.value
+        variable.is_secret = version.is_secret
         variable.description = version.description
         variable.enabled = version.enabled
         # 维度快照为弱关联：字典项已被删除的维度保持当前值不动

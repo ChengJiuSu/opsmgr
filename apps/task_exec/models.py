@@ -1,6 +1,8 @@
 from django.conf import settings
 from django.db import models
 
+from common.crypto import decrypt, encrypt
+
 
 def match_executable_servers(project_group_id=None, channel_id=None, environment_id=None,
                              service_type_id=None):
@@ -62,10 +64,23 @@ class ExecVariable(models.Model):
     每次保存/回滚落一条版本快照（ExecVariableVersion，默认保留 10 版）。
     同时作为对外数据源：后续 Jenkins 等外部系统可经 API 获取变量列表，
     配合服务器接口（executable=true）自行拼装 ansible 调用（规划中）。
+
+    **敏感变量（is_secret）**：变量里确实会放密码，而这张表原来是明文存、
+    且列表接口对所有登录用户只读——等于任何账号都能读到全部密码。标记为敏感后：
+
+    - `value` 存 Fernet 密文（common/crypto.py），只有取值方法能还原；
+    - 接口不回显值（给 `has_value` 布尔），要看真值走 reveal 动作（管理员 + sudo，打审计）；
+    - 值按**字面字符串**注入，不过 YAML 解析——密码里的 `#` 会被 YAML 当注释
+      截断、`k: v` 会被解析成字典，这类静默改值比报错难查得多；
+    - 执行输出与现场归档里对该值打码（见 live.LiveSink.set_secrets）。
+
+    ansible 侧拿到的仍是明文，剧本无需任何改动。
     """
 
     key = models.CharField('变量名', max_length=100, unique=True)
+    # 明文 YAML；is_secret=True 时存 Fernet 密文，一律经 get_value/set_value 存取
     value = models.TextField('变量值（YAML）', blank=True)
+    is_secret = models.BooleanField('敏感变量（加密存储、不回显）', default=False)
     description = models.CharField('说明', max_length=255, blank=True)
     # 生效条件：与任务/模块的有效维度精确匹配才注入（三维度必选）
     project_group = models.ForeignKey(
@@ -93,6 +108,25 @@ class ExecVariable(models.Model):
     def __str__(self):
         return self.key
 
+    def set_value(self, raw, is_secret=None):
+        """写入变量值；is_secret 显式传入时同时切换敏感标记。
+
+        切换方向都要重新编码：明文 → 敏感要加密，敏感 → 明文要先解开，
+        否则库里会留下一个「标记说是明文、内容其实是密文」的值，之后注入
+        给 ansible 的就是 `gAAAAA...` 那串东西。
+        """
+        if is_secret is not None:
+            self.is_secret = is_secret
+        self.value = encrypt(raw) if self.is_secret else (raw or '')
+
+    def get_value(self):
+        """取变量明文值；密文解不开抛 common.crypto.DecryptError。
+
+        刻意不吞异常：解不开时注入空值会让剧本拿着空密码去连生产，
+        报错中止是唯一安全的处理。
+        """
+        return decrypt(self.value) if self.is_secret else (self.value or '')
+
 
 class ExecVariableVersion(models.Model):
     """执行变量版本快照：每次保存/回滚落一条，按变量保留最近 N 版
@@ -105,7 +139,9 @@ class ExecVariableVersion(models.Model):
         ExecVariable, on_delete=models.CASCADE, related_name='versions', verbose_name='所属变量',
     )
     version = models.PositiveIntegerField('版本号')
+    # 与 ExecVariable 同口径：is_secret 的快照存密文，历史版本也不落明文
     value = models.TextField('变量值（YAML）', blank=True)
+    is_secret = models.BooleanField('敏感变量', default=False)
     description = models.CharField('说明', max_length=255, blank=True)
     enabled = models.BooleanField('启用', default=True)
     project_group = models.ForeignKey(
@@ -146,7 +182,9 @@ def snapshot_variable(variable, user=None):
     ExecVariableVersion.objects.create(
         variable=variable,
         version=(last.version + 1) if last else 1,
+        # 原样搬存储值：is_secret 时是密文，不在这里解密再加密（少一次解密失败面）
         value=variable.value,
+        is_secret=variable.is_secret,
         description=variable.description,
         enabled=variable.enabled,
         project_group_id=variable.project_group_id,

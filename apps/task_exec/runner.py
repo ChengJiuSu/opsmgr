@@ -31,7 +31,7 @@ from django.conf import settings
 
 from common.ansible import resolve_within, run_stream
 
-from .live import PREVIEW_LIMIT, LiveSink, push_status
+from .live import PREVIEW_LIMIT, SECRET_MASK_MIN_LEN, LiveSink, mask_secrets, push_status
 
 logger = logging.getLogger('apps.task_exec')
 
@@ -148,10 +148,13 @@ def step_archive_dir(sink, step, attempt=1):
     return os.path.join(settings.TASK_LOG_DIR, str(task_id), f'{log_id}.d', name)
 
 
-def archive_scene(archive_dir, channel, inventory_text, variables, cmd=None, cwd=None):
+def archive_scene(archive_dir, channel, inventory_text, variables, cmd=None, cwd=None,
+                  secrets=None):
     """归档一次实际执行的现场：inventory / 变量 / 命令，供事后 debug 原样复现。
 
     - inventory 一律用**无密钥**版本（不落盘密码与私钥路径），复现时自行补凭据；
+    - 敏感变量值打码后落盘：归档是给人排障看的，不需要真值，而这个目录的
+      保留期比一次执行长得多（clean_task_logs 默认 30 天）；
     - 命令中的临时工作目录路径改写为归档目录内的同名文件，复制即可重跑；
     - 归档失败只告警，绝不影响执行本体。
     """
@@ -163,9 +166,11 @@ def archive_scene(archive_dir, channel, inventory_text, variables, cmd=None, cwd
         if inventory_text:
             _write_scene_file(target, INVENTORY_FILENAME, inventory_text)
         if variables:
-            _write_scene_file(target, VARS_FILENAME, dump_vars_text(variables))
+            _write_scene_file(target, VARS_FILENAME,
+                              mask_secrets(dump_vars_text(variables), secrets))
         if cmd:
-            _write_scene_file(target, COMMAND_FILENAME, _replay_command(cmd, target, cwd))
+            _write_scene_file(target, COMMAND_FILENAME,
+                              mask_secrets(_replay_command(cmd, target, cwd), secrets))
     except OSError as exc:
         logger.warning('执行现场归档失败：%s（%s）', target, exc)
         return None
@@ -209,11 +214,18 @@ class ArtifactLookupError(Exception):
     """制品查询失败（如锁定版本不存在），模块应直接失败。"""
 
 
-def collect_dim_variables(project_group_id, channel_id, environment_id):
+def collect_dim_variables(project_group_id, channel_id, environment_id, include_secrets=True):
     """按维度（项目组/渠道/环境精确匹配）收集「变量管理」启用变量。
 
     一条变量记录 = 一个 ansible 变量：变量名取 key，变量值取 YAML 解析结果
     （值为空 → 空串；解析失败 → 原文兜底，保存时已校验，此处仅防御）。
+
+    **敏感变量（is_secret）按字面字符串注入，不过 YAML 解析**：密码里的 `#`
+    会被 YAML 当注释截断、`k: v` 会被解析成字典，这类静默改值比报错难查太多。
+    解密失败直接抛 DecryptError——注入空密码去连生产比中止危险得多。
+
+    include_secrets=False 时跳过敏感变量（对外 resolved 接口的默认口径，
+    避免任何登录用户拉一次接口就把密码全拿走）。
 
     执行器与对外的 resolved 接口共用本函数，保证外部系统自行拼装 ansible
     调用时与平台内部注入语义完全一致。
@@ -226,6 +238,11 @@ def collect_dim_variables(project_group_id, channel_id, environment_id):
         channel_id=channel_id, environment_id=environment_id,
     )
     for var in qs:
+        if var.is_secret:
+            if not include_secrets:
+                continue
+            variables[var.key] = var.get_value()
+            continue
         raw = var.value or ''
         if not raw.strip():
             variables[var.key] = ''
@@ -235,6 +252,31 @@ def collect_dim_variables(project_group_id, channel_id, environment_id):
         except yaml.YAMLError:
             variables[var.key] = raw
     return variables
+
+
+def collect_dim_secret_values(project_group_id, channel_id, environment_id):
+    """该维度下敏感变量的明文集合，供输出与归档打码（见 live.LiveSink.set_secrets）。
+
+    单独一个函数而不是让 collect_dim_variables 多返回一个值：那样所有调用方
+    （含对外接口）都要改签名，而只有执行路径需要这份明文。
+    解不开的变量跳过——打码用不上它，真正的报错留给注入路径去抛。
+    """
+    from common.crypto import DecryptError
+    from .models import ExecVariable
+
+    values = set()
+    qs = ExecVariable.objects.filter(
+        enabled=True, is_secret=True, project_group_id=project_group_id,
+        channel_id=channel_id, environment_id=environment_id,
+    )
+    for var in qs:
+        try:
+            plain = var.get_value()
+        except DecryptError:
+            continue
+        if plain and len(str(plain)) >= SECRET_MASK_MIN_LEN:
+            values.add(str(plain))
+    return values
 
 
 def collect_artifact_vars(project_group_id, channel_id, environment_id, locked=''):
@@ -285,6 +327,15 @@ def step_vars(step):
     variables = collect_dim_variables(pg, ch, env)
     variables.update(_artifact_vars(step))
     return variables
+
+
+def step_secret_values(step):
+    """该模块生效的敏感变量明文集合，供输出与归档打码。
+
+    与 step_vars 同一套维度口径；制品变量不含秘密，不必纳入。
+    """
+    pg, ch, env = _effective_dims(step)
+    return collect_dim_secret_values(pg, ch, env)
 
 
 def dump_vars_text(variables):
@@ -392,7 +443,8 @@ def _run_channels(step, task, servers, run_direct, agent_payload, on_data=None, 
         header = f'───── [经 Agent {agent.name} · {len(group)} 台] ─────'
         emit(('\n\n' if parts else '') + header + '\n')
         payload = agent_payload(group)
-        archive_scene(archive_dir, f'agent-{agent.pk}', payload.get('inventory'), step_vars(step))
+        archive_scene(archive_dir, f'agent-{agent.pk}', payload.get('inventory'),
+                      step_vars(step), secrets=step_secret_values(step))
         rc, out = run_via_agent(
             agent, payload, timeout=step.timeout or 300,
             task_id=task.pk, step_order=step.order, on_data=on_data)
@@ -414,7 +466,7 @@ def _run_command_step(step, task, servers, on_data=None, archive_dir=None):
             archive_scene(
                 archive_dir, 'direct',
                 _inventory_content(direct_servers, task.credential, None, include_secrets=False),
-                step_vars(step), cmd=cmd)
+                step_vars(step), cmd=cmd, secrets=step_secret_values(step))
             return run_stream(cmd, timeout=step.timeout or 300, on_data=on_data)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
@@ -450,7 +502,7 @@ def _run_playbook_step(step, task, servers, on_data=None, archive_dir=None):
             archive_scene(
                 archive_dir, 'direct',
                 _inventory_content(direct_servers, task.credential, None, include_secrets=False),
-                step_vars(step), cmd=cmd, cwd=project_dir)
+                step_vars(step), cmd=cmd, cwd=project_dir, secrets=step_secret_values(step))
             return run_stream(cmd, timeout=step.timeout or 300, cwd=project_dir, on_data=on_data)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
@@ -528,7 +580,7 @@ def _run_method_step(step, task, servers, on_data=None, archive_dir=None):
         archive_scene(
             archive_dir, 'direct',
             _inventory_content(servers, task.credential, None, include_secrets=False),
-            step_vars(step))
+            step_vars(step), secrets=step_secret_values(step))
         # 执行器按 step 读取 tags/extra_vars/timeout（模块级）与 exec_mode（透传任务级）；
         # servers 供不走 Ansible 的 provider（如 jumpserver）直接消费主机对象；
         # on_data 供走 ansible 的 provider 实时回传输出（其余 provider 忽略）
@@ -784,6 +836,11 @@ def _exec_step(step, task, idx, total, sink, parallel, attempt=1):
     started = time.monotonic()
     retry_mark = f' · 重试#{attempt - 1}' if attempt > 1 else ''
     live_key = (step.id, attempt)
+    # 敏感变量明文：注册给 sink 过滤实时输出，并在下面对完整输出兜一遍。
+    # 两处都要——实时块与模块完整输出走的是不同的持久化路径。
+    secrets = set() if step.task_type == 'pause' else step_secret_values(step)
+    if secrets:
+        sink.add_secrets(secrets)
     if step.task_type == 'pause':
         # 暂停确认模块：不涉及目标主机，等待人工继续/中止
         header = f'═══ 模块 {idx}/{total}：{step.name}（暂停确认 · 等待人工处理）═══'
@@ -817,7 +874,7 @@ def _exec_step(step, task, idx, total, sink, parallel, attempt=1):
                 sink.end(live_key)
         server_count = len(servers)
     duration = round(time.monotonic() - started, 2)
-    return step, header, rc, out, duration, server_count
+    return step, header, rc, mask_secrets(out, secrets), duration, server_count
 
 
 def _exec_parallel_stage(pairs, task, total, sink, attempt=1):

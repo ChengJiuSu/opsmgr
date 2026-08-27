@@ -323,6 +323,11 @@ CHANNEL_LAYERS = channel_layers_for(CHANNEL_LAYER_BACKEND)
 # 换 key 会让已绑定用户的密钥全部解不开（需管理员重置绑定），生产建议显式
 # 配置并与 SECRET_KEY 分开轮换。
 MFA_SECRET_KEY = config('MFA_SECRET_KEY', default='')
+# 库内可还原秘密的统一加密 key（common/crypto.py）：执行变量敏感值、连接凭据
+# 密码/私钥、云账号 AccessKey Secret、Webhook 签名密钥、TOTP 密钥共用。
+# 留空回退 MFA_SECRET_KEY（历史名字）再回退 SECRET_KEY。**换 key 会让已入库
+# 密文全部解不开**，换前必须先导出重新加密。
+SECRET_ENC_KEY = config('SECRET_ENC_KEY', default='')
 # 扫码后在验证器 App 里显示的归属名
 MFA_ISSUER = config('MFA_ISSUER', default='OpsManager')
 # 二次认证挑战票据（登录第一步返回）的有效期（秒）：够输一次码即可

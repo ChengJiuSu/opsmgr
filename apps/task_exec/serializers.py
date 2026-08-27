@@ -21,33 +21,47 @@ VARIABLE_KEY_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
 
 class ExecVariableSerializer(serializers.ModelSerializer):
     """执行变量序列化器：key 须为合法 ansible 变量名，值须为合法 YAML，
-    生效维度三选必填；每次保存落一条版本快照。"""
+    生效维度三选必填；每次保存落一条版本快照。
+
+    敏感变量（is_secret）：值加密存储且**任何读接口都不回显**（给 has_value
+    布尔），要看真值走 reveal 动作（管理员 + sudo，打审计）。校验也跳过 YAML
+    ——敏感值按字面字符串注入，密码里的 `#` 不该被当注释。
+    """
 
     project_group_name = serializers.CharField(source='project_group.name', read_only=True, default=None)
     channel_name = serializers.CharField(source='channel.name', read_only=True, default=None)
     environment_name = serializers.CharField(source='environment.name', read_only=True, default=None)
+    has_value = serializers.SerializerMethodField()
 
     class Meta:
         model = ExecVariable
         fields = [
-            'id', 'key', 'value', 'description',
+            'id', 'key', 'value', 'is_secret', 'has_value', 'description',
             'project_group', 'project_group_name', 'channel', 'channel_name',
             'environment', 'environment_name',
             'enabled', 'created_at', 'updated_at',
         ]
+
+    @extend_schema_field(OpenApiTypes.BOOL)
+    def get_has_value(self, obj):
+        return bool(obj.value)
+
+    def to_representation(self, instance):
+        """敏感变量不回显值。
+
+        放 to_representation 而不是把 value 设成 write_only：普通变量的值页面上
+        要正常显示与编辑，只有敏感的那些要藏。
+        """
+        data = super().to_representation(instance)
+        if instance.is_secret:
+            data['value'] = ''
+        return data
 
     def validate_key(self, value):
         if not VARIABLE_KEY_RE.match(value):
             raise serializers.ValidationError('变量名须以字母/下划线开头，仅含字母、数字、下划线')
         return value
 
-    def validate_value(self, value):
-        if (value or '').strip():
-            try:
-                yaml.safe_load(value)
-            except yaml.YAMLError as exc:
-                raise serializers.ValidationError(f'变量值不是合法 YAML：{exc}')
-        return value
 
     def validate(self, attrs):
         # 生效条件三维度必选：执行时按任务/模块有效维度精确匹配加载
@@ -55,7 +69,24 @@ class ExecVariableSerializer(serializers.ModelSerializer):
             value = attrs.get(field, getattr(self.instance, field, None) if self.instance else None)
             if value is None:
                 raise serializers.ValidationError({field: f'必须选择{label}（变量生效条件三维度必选）'})
+        self._validate_value(attrs)
         return attrs
+
+    def _validate_value(self, attrs):
+        """值校验按 is_secret 分流（不能放 validate_value：那时拿不到 is_secret）。"""
+        is_secret = attrs.get(
+            'is_secret', getattr(self.instance, 'is_secret', False) if self.instance else False)
+        value = attrs.get('value')
+        # 敏感值不过 YAML 校验：按字面字符串注入，`#`/`:` 不该被 YAML 解释
+        if not is_secret and (value or '').strip():
+            try:
+                yaml.safe_load(value)
+            except yaml.YAMLError as exc:
+                raise serializers.ValidationError({'value': f'变量值不是合法 YAML：{exc}'})
+        # 新建敏感变量必须给值：留空会产出「标记为敏感但其实是空」的变量，
+        # 执行时注入的是空密码
+        if is_secret and self.instance is None and not (value or '').strip():
+            raise serializers.ValidationError({'value': '敏感变量必须填写变量值'})
 
     def _user(self):
         request = self.context.get('request')
@@ -63,19 +94,42 @@ class ExecVariableSerializer(serializers.ModelSerializer):
 
     @transaction.atomic
     def create(self, validated_data):
-        variable = super().create(validated_data)
+        raw = validated_data.pop('value', '')
+        variable = ExecVariable(**validated_data)
+        variable.set_value(raw)
+        variable.save()
         snapshot_variable(variable, user=self._user())
         return variable
 
     @transaction.atomic
     def update(self, instance, validated_data):
-        variable = super().update(instance, validated_data)
-        snapshot_variable(variable, user=self._user())
-        return variable
+        """更新值/敏感标记。
+
+        三种情况都要正确编码，否则库里会留下「标记与内容不一致」的值：
+        - 传了新值 → 按新的 is_secret 编码；
+        - 只切 is_secret（不传值）→ 拿现有明文重新编码（明文→加密 / 密文→解开）；
+        - 都没传 → 原样不动。
+        """
+        has_new_value = 'value' in validated_data
+        raw = validated_data.pop('value', None)
+        switching = 'is_secret' in validated_data \
+            and validated_data['is_secret'] != instance.is_secret
+        if switching and not has_new_value:
+            raw, has_new_value = instance.get_value(), True
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        if has_new_value:
+            instance.set_value(raw)
+        instance.save()
+        snapshot_variable(instance, user=self._user())
+        return instance
 
 
 class ExecVariableVersionSerializer(serializers.ModelSerializer):
-    """变量版本序列化器：历史快照列表与回滚数据源。"""
+    """变量版本序列化器：历史快照列表与回滚数据源。
+
+    敏感版本同样不回显值——否则「当前值藏起来、翻一下历史就看到了」。
+    """
 
     created_by_name = serializers.CharField(source='created_by.username', read_only=True, default='')
     project_group_name = serializers.CharField(source='project_group.name', read_only=True, default=None)
@@ -85,10 +139,16 @@ class ExecVariableVersionSerializer(serializers.ModelSerializer):
     class Meta:
         model = ExecVariableVersion
         fields = [
-            'id', 'version', 'value', 'description', 'enabled',
+            'id', 'version', 'value', 'is_secret', 'description', 'enabled',
             'project_group_name', 'channel_name', 'environment_name',
             'created_by_name', 'created_at',
         ]
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if instance.is_secret:
+            data['value'] = ''
+        return data
 
 
 class CredentialSerializer(serializers.ModelSerializer):

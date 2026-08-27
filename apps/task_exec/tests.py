@@ -31,8 +31,8 @@ from apps.method_mgr.models import Method
 from common import ansible as common_ansible
 from common.testing import grant_sudo
 
-from .models import Credential, ExecutionTask, TaskExecutionLog, TaskStep
-from . import runner
+from .models import Credential, ExecutionTask, ExecVariable, TaskExecutionLog, TaskStep
+from . import live, runner
 from .live import PREVIEW_LIMIT, LiveSink
 from .runner import _inventory_content
 from .tasks import OUTPUT_PREVIEW_LIMIT
@@ -2382,3 +2382,183 @@ class TaskTriggerApiTests(TestCase):
         self.assertEqual(r.status_code, 200, r.content)
         self.assertEqual(self.task.logs.first().trigger_type, 'api')
         self.assertEqual(self.task.logs.first().triggered_by, self.credential.bound_user)
+
+
+class SecretVariableTests(TestCase):
+    """敏感变量：加密存储、任何读接口不回显、注入 ansible 仍是明文、输出打码。"""
+
+    URL = '/api/exec/variables/'
+    SECRET = 'p@ss#word:with-yaml-traps'
+
+    def setUp(self):
+        from apps.asset_mgr.models import Channel, Environment, ProjectGroup
+
+        cache.clear()
+        self.admin = User.objects.create(username='var_admin', is_staff=True)
+        self.admin.set_password('Pass!2345xyz')
+        self.admin.save()
+        self.member = User.objects.create(username='var_member', is_staff=False)
+        self.member.set_password('Pass!2345xyz')
+        self.member.save()
+        self.pg = ProjectGroup.objects.create(name='主项目', code='sv-proj')
+        self.ch = Channel.objects.create(name='官服', code='sv-official')
+        self.env = Environment.objects.create(name='测试', code='sv-env')
+        self.client = self._client('var_admin')
+
+    def tearDown(self):
+        cache.clear()
+
+    def _client(self, username):
+        c = APIClient()
+        r = c.post('/api/auth/login/', {'username': username, 'password': 'Pass!2345xyz'},
+                   format='json')
+        c.credentials(HTTP_AUTHORIZATION='Bearer ' + r.json()['access'])
+        return c
+
+    def _payload(self, **kwargs):
+        data = {'key': 'db_password', 'value': self.SECRET, 'is_secret': True,
+                'project_group': self.pg.id, 'channel': self.ch.id, 'environment': self.env.id}
+        data.update(kwargs)
+        return data
+
+    def _create(self, **kwargs):
+        r = self.client.post(self.URL, self._payload(**kwargs), format='json')
+        self.assertEqual(r.status_code, 201, r.content)
+        return ExecVariable.objects.get(pk=r.json()['id'])
+
+    # ── 存储 ──────────────────────────────────────────────
+    def test_stored_encrypted(self):
+        var = self._create()
+        self.assertTrue(var.is_secret)
+        self.assertNotIn(self.SECRET, var.value)   # 库里没有明文
+        self.assertTrue(var.value.startswith('gAAAAA'))  # Fernet 密文特征
+        self.assertEqual(var.get_value(), self.SECRET)
+
+    def test_secret_requires_value_on_create(self):
+        r = self.client.post(self.URL, self._payload(value=''), format='json')
+        self.assertEqual(r.status_code, 400)
+
+    def test_plain_variable_still_validates_yaml(self):
+        r = self.client.post(self.URL,
+                             self._payload(is_secret=False, value='a: [unclosed'),
+                             format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('YAML', str(r.json()))
+
+    def test_secret_skips_yaml_validation(self):
+        """敏感值按字面串处理，`#`/`:` 不该被当 YAML 语法拒绝或改写。"""
+        var = self._create(value='a: [unclosed # trap')
+        self.assertEqual(var.get_value(), 'a: [unclosed # trap')
+
+    # ── 不回显 ────────────────────────────────────────────
+    def test_value_not_returned_in_list_or_detail(self):
+        var = self._create()
+        for url in (self.URL, f'{self.URL}{var.id}/'):
+            body = self.client.get(url).json()
+            text = str(body)
+            self.assertNotIn(self.SECRET, text, url)
+        detail = self.client.get(f'{self.URL}{var.id}/').json()
+        self.assertEqual(detail['value'], '')
+        self.assertTrue(detail['has_value'])
+
+    def test_value_not_returned_in_versions(self):
+        """当前值藏起来、翻历史就看到了 —— 这条要堵住。"""
+        var = self._create()
+        body = self.client.get(f'{self.URL}{var.id}/versions/').json()
+        self.assertNotIn(self.SECRET, str(body))
+
+    def test_member_cannot_read_secret(self):
+        self._create()
+        member = self._client('var_member')
+        self.assertNotIn(self.SECRET, str(member.get(self.URL).json()))
+
+    # ── reveal ────────────────────────────────────────────
+    def test_reveal_requires_admin_and_sudo(self):
+        var = self._create()
+        member = self._client('var_member')
+        self.assertEqual(member.post(f'{self.URL}{var.id}/reveal/').status_code, 403)
+
+        fresh = self._client('var_admin')  # 新会话，未开 sudo 窗口
+        r = fresh.post(f'{self.URL}{var.id}/reveal/')
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()['error_code'], 'sudo_required')
+
+        grant_sudo(fresh, 'Pass!2345xyz')
+        r = fresh.post(f'{self.URL}{var.id}/reveal/')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()['data']['value'], self.SECRET)
+
+    # ── 切换标记 ──────────────────────────────────────────
+    def test_toggle_plain_to_secret_encrypts_existing_value(self):
+        var = self._create(key='plain_key', value='hello', is_secret=False)
+        r = self.client.patch(f'{self.URL}{var.id}/', {'is_secret': True}, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        var.refresh_from_db()
+        self.assertTrue(var.is_secret)
+        self.assertNotIn('hello', var.value)
+        self.assertEqual(var.get_value(), 'hello')
+
+    def test_toggle_secret_to_plain_decrypts(self):
+        var = self._create()
+        r = self.client.patch(f'{self.URL}{var.id}/', {'is_secret': False}, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        var.refresh_from_db()
+        self.assertFalse(var.is_secret)
+        self.assertEqual(var.value, self.SECRET)
+
+    def test_rollback_keeps_secret_flag(self):
+        var = self._create()
+        self.client.patch(f'{self.URL}{var.id}/', {'value': 'newsecret-value'}, format='json')
+        r = self.client.post(f'{self.URL}{var.id}/rollback/', {'version': 1}, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        var.refresh_from_db()
+        self.assertTrue(var.is_secret)
+        self.assertEqual(var.get_value(), self.SECRET)
+
+    # ── 注入与对外接口 ────────────────────────────────────
+    def test_injected_as_literal_string(self):
+        """ansible 侧要拿到明文原样值：这是「加密后我还得能用」的落点。"""
+        self._create()
+        variables = runner.collect_dim_variables(self.pg.id, self.ch.id, self.env.id)
+        self.assertEqual(variables['db_password'], self.SECRET)
+
+    def test_resolved_excludes_secrets_by_default(self):
+        self._create()
+        r = self.client.get(f'/api/exec/variables/resolved/'
+                            f'?project_group={self.pg.code}&channel={self.ch.code}&env={self.env.code}')
+        data = r.json()['data']
+        self.assertNotIn('db_password', data['vars'])
+        self.assertEqual(data['secret_keys_excluded'], ['db_password'])
+
+    def test_resolved_include_secrets_admin_only(self):
+        self._create()
+        query = (f'?project_group={self.pg.code}&channel={self.ch.code}'
+                 f'&env={self.env.code}&include_secrets=true')
+        r = self.client.get(f'/api/exec/variables/resolved/{query}')
+        self.assertEqual(r.json()['data']['vars']['db_password'], self.SECRET)
+
+        member = self._client('var_member')
+        self.assertEqual(member.get(f'/api/exec/variables/resolved/{query}').status_code, 403)
+
+    # ── 输出打码 ──────────────────────────────────────────
+    def test_mask_secrets_longest_first(self):
+        """短明文是长明文子串时，先换短的会把长的切成拼不回的片段。"""
+        text = 'value=abcdef and value=abc'
+        masked = live.mask_secrets(text, {'abc', 'abcdef'})
+        self.assertNotIn('abcdef', masked)
+        self.assertEqual(masked, 'value=*** and value=***')
+
+    def test_live_sink_masks_feed(self):
+        sink = live.LiveSink(task_id=1)
+        sink.add_secrets({self.SECRET})
+        sink.bind([])
+        sink.begin(('k', 1), 'header', order=1)
+        sink.feed(('k', 1), f'connecting with {self.SECRET}\n')
+        self.assertNotIn(self.SECRET, str(sink._live[('k', 1)]['buf']))
+
+    def test_collect_secret_values_skips_short(self):
+        self._create(key='short_secret', value='ab')
+        self._create(key='long_secret', value='long-enough-secret')
+        values = runner.collect_dim_secret_values(self.pg.id, self.ch.id, self.env.id)
+        self.assertIn('long-enough-secret', values)
+        self.assertNotIn('ab', values)

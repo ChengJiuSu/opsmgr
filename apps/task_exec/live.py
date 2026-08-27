@@ -9,6 +9,11 @@ runner 每个模块把 ansible 子进程输出分片喂给 LiveSink，由它负�
 
 落盘以「已完成模块」为粒度（append-only 前缀，天然去重且不会因并行组交错），
 实时性由写库预览提供；两者内容一致，文件为全量、库内为尾部截断。
+
+**敏感变量打码**（mask_secrets / LiveSink.add_secrets）：变量管理里标记为
+is_secret 的值会被原样注入 ansible，而 debug 任务、失败回显很容易把它吐到
+stdout。剧本不是我们写的，指望作者都记得加 `no_log` 不现实，所以在输出进入
+库/文件/WebSocket 之前统一过滤——这是唯一不依赖别人配合的位置。
 """
 import logging
 import os
@@ -24,6 +29,27 @@ logger = logging.getLogger('apps.task_exec')
 
 # 数据库内输出预览上限（字符），与 tasks.OUTPUT_PREVIEW_LIMIT 同口径
 PREVIEW_LIMIT = 60000
+
+# 打码的最短明文长度：太短的值（"1"、"on"）在输出里到处都是，全替换会把日志
+# 打成马赛克，反而看不出执行做了什么
+SECRET_MASK_MIN_LEN = 4
+SECRET_MASK = '***'
+
+
+def mask_secrets(text, secrets):
+    """把已知敏感明文替换为 ***。
+
+    局限（刻意接受）：分片喂入时，一个明文如果正好被切在两个分片之间就漏过
+    这一层。但模块结束时 runner 会对**完整输出**再整体打码一遍，且实时块在
+    end() 时被丢弃换成完整输出，所以落库/落盘的最终内容一定是干净的——漏的
+    只可能是正在看实时日志的那一瞬间，而那是发起执行的登录用户自己。
+    """
+    if not text or not secrets:
+        return text
+    # 长的先替换：短明文可能是长明文的子串，先换短的会把长的切成拼不回的片段
+    for value in sorted(secrets, key=len, reverse=True):
+        text = text.replace(value, SECRET_MASK)
+    return text
 # 写库节流：距上次写库满 FLUSH_INTERVAL 秒、或新增满 FLUSH_BYTES 字符才落库
 FLUSH_INTERVAL = 0.5
 FLUSH_BYTES = 2048
@@ -90,6 +116,9 @@ class LiveSink:
         self.task_id = task_id
         self.log_id = log_id
         self.log_path = log_path
+        # 本次执行涉及的敏感变量明文（累积）：runner 每个模块开跑前登记。
+        # 累积而非按模块清空——并行组多模块共用一个 sink，跨模块多打码无害
+        self._secrets = set()
         self._outputs = []      # runner 的 outputs 列表（append-only）
         self._live = {}         # key -> {'order','header','buf'}
         self._lock = threading.RLock()
@@ -117,10 +146,18 @@ class LiveSink:
         """返回绑定到该模块的 on_data 回调。"""
         return lambda text: self.feed(key, text)
 
+    def add_secrets(self, values):
+        """登记需要在输出里打码的明文（runner 按模块生效变量调用）。"""
+        if not values:
+            return
+        with self._lock:
+            self._secrets.update(values)
+
     def feed(self, key, text):
-        """喂入一段输出分片（节流写库）。"""
+        """喂入一段输出分片（节流写库），敏感明文先打码。"""
         if not text:
             return
+        text = mask_secrets(text, self._secrets)
         with self._lock:
             entry = self._live.get(key)
             if entry is None:  # 未 begin（或已 end）时兜底为独立实时块

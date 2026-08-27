@@ -88,6 +88,36 @@ ansible-playbook site.yml -e @vars.yml
 占用，传 `format=yaml` 会 404。变量不做跨记录 flatten（顶层键合并会因同名互相
 覆盖且与执行器行为不一致），需要顶层变量就按 `key` 建独立记录。
 
+### 敏感变量（`ExecVariable.is_secret`）
+
+变量里确实会放密码。而这张表原来是明文存、列表接口对**所有登录用户只读**——
+等于任何账号 `GET /api/exec/variables/` 就能把全部密码拿走。标记为敏感后：
+
+| 环节 | 行为 |
+|------|------|
+| 存储 | `value` 存 Fernet 密文（`common/crypto.py`），只有 `get_value()` 能还原 |
+| 读接口 | 列表/详情/**历史版本**一律不回显值，给 `has_value` 布尔 |
+| 看真值 | `POST /api/exec/variables/{id}/reveal/`，**管理员 + sudo 二次验证**；用 POST 而非 GET 正是为了让它进审计的写操作记录 |
+| 注入 ansible | **明文**，剧本无需任何改动——这是「加密后还得能用」的落点 |
+| 值语义 | 按**字面字符串**注入，不过 YAML 解析。密码里的 `#` 会被 YAML 当注释截断、`k: v` 会被解析成字典，这类静默改值比报错难查得多 |
+| 执行输出 | 已知明文在进库/落盘/WebSocket 前替换为 `***`（`live.mask_secrets`）|
+| 现场归档 | `vars.yml` 与 `command.txt` 打码后落盘（归档保留期比一次执行长得多）|
+| 对外 resolved | **默认排除**；`include_secrets=true` 仅管理员可用，响应里 `secret_keys_excluded` 告知被排除的变量名 |
+| 审计请求体 | `/api/exec/variables/` 的 `value` 一律打码（`audit.middleware.PATH_SENSITIVE_KEYS`）|
+
+打码为什么放在输出汇聚层而不是靠剧本写 `no_log`：剧本不是平台写的，指望每个
+作者都记得加不现实。`LiveSink.feed` 是所有执行输出的唯一收口，在那里过滤是唯一
+不依赖别人配合的位置。
+
+**已接受的局限**：分片喂入时，明文正好被切在两个分片之间会漏过实时那一层。但
+模块结束时 runner 会对完整输出整体再打一遍，且实时块在 `end()` 时被丢弃换成完整
+输出——落库/落盘的最终内容一定是干净的，漏的只是发起人自己正在看实时日志的
+那一瞬间。
+
+切换 `is_secret` 时值会重新编码（明文→加密 / 密文→解开）：只改标记不改内容会
+留下「标记说是明文、内容其实是密文」的变量，之后注入给 ansible 的就是
+`gAAAAA...` 那串东西。
+
 **保存与执行分离**：新建/编辑仅保存定义（嵌套模块整体替换）；执行为独立
 动作，每次执行落一条执行日志（含全局主机快照与逐模块结果 steps_result），
 任务本体字段仅为「最近一次执行」快照。
@@ -107,6 +137,7 @@ apps/task_exec/
 ├── webhook.py       # TaskTriggerView：API 凭证鉴权的机读触发入口
 ├── log_files.py     # 日志文件浏览：TASK_LOG_DIR 只读目录树 / 文本分段读 / 原文件下载（仅管理员）
 ├── runner.py        # 任务流执行：逐模块解析主机 + 动态 inventory + 变量注入 + ansible 调用，失败中止
+├── live.py          # 实时输出汇聚 + 敏感变量打码（mask_secrets / LiveSink.add_secrets）
 ├── live.py          # LiveSink：流式日志汇聚（节流写库预览 + 落盘 + WebSocket 推送）
 ├── consumers.py     # TaskLogConsumer：/ws/task-logs/<task_id>/ 日志推送（子协议 JWT 鉴权）
 ├── routing.py       # WebSocket 路由（ops_manager/asgi.py 挂载）

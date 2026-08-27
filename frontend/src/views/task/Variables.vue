@@ -29,11 +29,19 @@
     </el-alert>
 
     <el-table v-loading="loading" :data="tableData" stripe>
-      <el-table-column prop="key" label="变量名" min-width="130" show-overflow-tooltip>
-        <template #default="{ row }"><code>{{ row.key }}</code></template>
+      <el-table-column prop="key" label="变量名" min-width="150" show-overflow-tooltip>
+        <template #default="{ row }">
+          <code>{{ row.key }}</code>
+          <el-tag v-if="row.is_secret" size="small" type="warning" class="tag-gap">敏感</el-tag>
+        </template>
       </el-table-column>
       <el-table-column label="变量值（YAML）" min-width="200" show-overflow-tooltip>
-        <template #default="{ row }"><span class="mono">{{ (row.value || '').slice(0, 80) || '—' }}</span></template>
+        <template #default="{ row }">
+          <span v-if="row.is_secret" class="mono muted">
+            ●●●●●●（加密存储，不回显{{ row.has_value ? '' : ' · 未设置' }}）
+          </span>
+          <span v-else class="mono">{{ (row.value || '').slice(0, 80) || '—' }}</span>
+        </template>
       </el-table-column>
       <el-table-column label="项目组 / 渠道 / 环境" min-width="170" show-overflow-tooltip>
         <template #default="{ row }">
@@ -51,9 +59,13 @@
       <el-table-column prop="updated_at" label="更新时间" width="160">
         <template #default="{ row }">{{ formatTime(row.updated_at) }}</template>
       </el-table-column>
-      <el-table-column label="操作" width="230" fixed="right">
+      <el-table-column label="操作" width="310" fixed="right">
         <template #default="{ row }">
           <el-button size="small" :icon="Clock" @click="openHistory(row)">历史</el-button>
+          <el-button
+            v-if="row.is_secret && authStore.isStaff && row.has_value"
+            size="small" :icon="View" @click="handleReveal(row)"
+          >查看真值</el-button>
           <el-button v-if="authStore.isStaff" size="small" :icon="EditPen" @click="openDialog(row)">编辑</el-button>
           <el-button v-if="authStore.isStaff" size="small" type="danger" :icon="Delete" @click="handleDelete(row)" />
         </template>
@@ -85,12 +97,25 @@
             <el-input v-model="form.description" placeholder="用途说明，可留空" />
           </el-form-item>
         </el-col>
-        <el-col :span="6">
+        <el-col :span="3">
           <el-form-item label="启用">
             <el-switch v-model="form.enabled" />
           </el-form-item>
         </el-col>
+        <el-col :span="3">
+          <el-form-item label="敏感">
+            <el-switch v-model="form.is_secret" />
+          </el-form-item>
+        </el-col>
       </el-row>
+      <el-alert
+        v-if="form.is_secret" type="warning" :closable="false" show-icon
+        style="margin-bottom:12px"
+      >
+        敏感变量：值加密存储、接口与历史版本均不回显，执行输出与现场归档中自动打码。
+        值按<b>字面字符串</b>注入（不做 YAML 解析，密码里的 <code>#</code>、<code>:</code> 原样保留），
+        ansible 侧拿到的仍是明文，剧本无需改动。
+      </el-alert>
       <el-form-item label="生效条件" required>
         <div class="dim-filter">
           <el-select v-model="form.project_group" placeholder="项目组（必选）" filterable>
@@ -107,7 +132,11 @@
       </el-form-item>
       <el-form-item label="变量值" prop="value">
         <el-input
-          v-model="form.value" type="textarea" :rows="30" class="yaml-input"
+          v-if="form.is_secret" v-model="form.value" type="password" show-password
+          :placeholder="form.id ? '留空表示不修改现有值' : '敏感值（如数据库密码），原样注入'"
+        />
+        <el-input
+          v-else v-model="form.value" type="textarea" :rows="30" class="yaml-input"
           placeholder="YAML 格式，如：
 mode: prod
 db:
@@ -117,7 +146,10 @@ ports:
   - 80
   - 443"
         />
-        <div class="form-tip">YAML 格式（保存时校验）；解析后的结构在剧本/命令中以 <code v-pre>{{ 变量名.子键 }}</code> 引用</div>
+        <div v-if="form.is_secret" class="form-tip">
+          剧本/命令中以 <code v-pre>{{ 变量名 }}</code> 引用（值是字符串，无子键）
+        </div>
+        <div v-else class="form-tip">YAML 格式（保存时校验）；解析后的结构在剧本/命令中以 <code v-pre>{{ 变量名.子键 }}</code> 引用</div>
       </el-form-item>
     </el-form>
     <template #footer>
@@ -157,7 +189,9 @@ ports:
             {{ currentVersion.channel_name || '—' }} / {{ currentVersion.environment_name || '—' }}
             <span v-if="currentVersion.description"> · {{ currentVersion.description }}</span>
           </div>
-          <pre class="yaml-preview">{{ currentVersion.value || '（空值）' }}</pre>
+          <pre v-if="currentVersion.is_secret" class="yaml-preview muted">
+●●●●●●（敏感变量，历史版本同样不回显）</pre>
+          <pre v-else class="yaml-preview">{{ currentVersion.value || '（空值）' }}</pre>
         </template>
         <el-empty v-else description="点击左侧版本查看内容" :image-size="60" />
       </div>
@@ -168,13 +202,13 @@ ports:
 <script setup>
 import { ref, reactive, onMounted, onUnmounted } from 'vue'
 import { debounce } from '../../utils/debounce'
-import { Plus, Delete, Search, Refresh, EditPen, Clock } from '@element-plus/icons-vue'
+import { Plus, Delete, Search, Refresh, EditPen, Clock, View } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../../stores/auth'
 import { fetchDictOptions, projectGroupApi, channelApi, environmentApi } from '../../api/assets'
 import {
   getVariables, createVariable, updateVariable, deleteVariable,
-  getVariableVersions, rollbackVariable,
+  getVariableVersions, rollbackVariable, revealVariable,
 } from '../../api/tasks'
 
 const authStore = useAuthStore()
@@ -192,7 +226,7 @@ const formatTime = (t) => (t ? t.slice(0, 19).replace('T', ' ') : '')
 const dialogVisible = ref(false)
 const formRef = ref()
 const emptyForm = () => ({
-  id: null, key: '', value: '', description: '', enabled: true,
+  id: null, key: '', value: '', description: '', enabled: true, is_secret: false,
   project_group: null, channel: null, environment: null,
 })
 const form = reactive(emptyForm())
@@ -240,11 +274,25 @@ onUnmounted(() => searchDebounced.cancel())
 
 function openDialog(row) {
   Object.assign(form, emptyForm(), row ? {
+    // 敏感变量的 value 后端不回显（这里恒为空串），留空提交表示不修改现有值
     id: row.id, key: row.key, value: row.value, description: row.description, enabled: row.enabled,
+    is_secret: row.is_secret,
     project_group: row.project_group || null, channel: row.channel || null, environment: row.environment || null,
   } : {})
   dialogVisible.value = true
   formRef.value?.clearValidate()
+}
+
+async function handleReveal(row) {
+  await ElMessageBox.confirm(
+    `确定查看「${row.key}」的真值吗？该操作需二次验证，并会记入操作审计。`,
+    '查看敏感变量', { type: 'warning' },
+  )
+  const res = await revealVariable(row.id)
+  await ElMessageBox.alert(res.data?.value || '（空值）', `${row.key} 的真值`, {
+    confirmButtonText: '已知悉',
+    customClass: 'reveal-box',
+  })
 }
 
 async function handleSubmit() {
@@ -257,8 +305,11 @@ async function handleSubmit() {
   try {
     const payload = {
       key: form.key, value: form.value, description: form.description, enabled: form.enabled,
+      is_secret: form.is_secret,
       project_group: form.project_group, channel: form.channel, environment: form.environment,
     }
+    // 编辑敏感变量时值留空 = 保持原值：不删掉这个字段会把密码清成空串
+    if (form.id && form.is_secret && !form.value) delete payload.value
     if (form.id) {
       await updateVariable(form.id, payload)
       ElMessage.success('变量已保存（已留存历史版本）')
@@ -320,6 +371,8 @@ onMounted(() => {
 .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .toolbar-left { display: flex; gap: 8px; flex-wrap: wrap; }
 .unset { color: #c0c4cc; }
+.tag-gap { margin-left: 6px; }
+.muted { color: #c0c4cc; }
 .mono { font-family: 'Courier New', monospace; font-size: 12px; }
 code { background: #f5f7fa; padding: 1px 6px; border-radius: 3px; font-size: 12px; }
 .form-tip { color: #909399; font-size: 12px; line-height: 1.5; margin-top: 4px; }

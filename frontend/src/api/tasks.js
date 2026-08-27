@@ -35,6 +35,8 @@ export const updateVariable = (id, data) => request.patch(`/api/exec/variables/$
 export const deleteVariable = (id) => request.delete(`/api/exec/variables/${id}/`)
 export const getVariableVersions = (id) => request.get(`/api/exec/variables/${id}/versions/`)
 export const rollbackVariable = (id, version) => request.post(`/api/exec/variables/${id}/rollback/`, { version })
+// 敏感变量查看真值（管理员 + sudo 二次验证，走 POST 以进审计写操作记录）
+export const revealVariable = (id) => request.post(`/api/exec/variables/${id}/reveal/`)
 
 // 凭据
 export const getCredentials = (params) => request.get('/api/exec/credentials/', { params })
