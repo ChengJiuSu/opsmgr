@@ -416,6 +416,14 @@ TASK_LOG_COLOR = config('TASK_LOG_COLOR', default=True, cast=bool)
 ARTIFACT_ROOT = config('ARTIFACT_ROOT', default=str(MEDIA_ROOT / 'artifacts'))
 # 平台对外基础地址：拼接制品带签名下载 URL（CD 目标主机经此拉包），生产必须配置
 SITE_BASE_URL = config('SITE_BASE_URL', default='http://127.0.0.1:8000')
+# 制品保留期（天）：clean_artifacts 命令据此清理过期制品记录与文件。
+# 制品是「一条记录一个几百 MB 的包」，只增不减会把盘写满，而写满的表现是
+# 上报 500 与任务执行一起挂（同一个磁盘），所以这个清理不是可选项。
+ARTIFACT_RETENTION_DAYS = config('ARTIFACT_RETENTION_DAYS', default=90, cast=int)
+# 每个 项目组/渠道/环境 组合保底保留的最新版本数，不受保留期限制。
+# 为什么要保底：长期不发版的环境（如预发）里所有制品都会超期，全清掉之后
+# 该环境连「回滚到上一个版本」都做不到了
+ARTIFACT_KEEP_LATEST = config('ARTIFACT_KEEP_LATEST', default=3, cast=int)
 
 # ── Ansible 集中管理项目 ──────────────────────────────────
 # 平台方法（ansible_playbook provider）在此目录内执行既有剧本并通过 --tags 触发；

@@ -7,6 +7,7 @@ CD 执行时 task_exec.runner 按模块有效维度取最新（或锁定版本�
 """
 import hashlib
 import hmac
+import logging
 import os
 import re
 
@@ -16,6 +17,9 @@ from django.db import models
 # 版本号与文件名白名单：仅字母数字 . _ -，从源头排除路径穿越
 VERSION_RE = re.compile(r'^[A-Za-z0-9._-]{1,100}$')
 FILENAME_RE = re.compile(r'^[A-Za-z0-9._-]{1,255}$')
+
+
+logger = logging.getLogger('apps.artifact_mgr')
 
 
 def _api_key():
@@ -78,6 +82,29 @@ class Artifact(models.Model):
 
     def abs_path(self):
         return os.path.join(settings.ARTIFACT_ROOT, self.file_path)
+
+    def remove_file(self):
+        """删掉落盘文件与随之变空的版本目录，返回是否真的删到了文件。
+
+        页面删除与保留期清理共用一份实现：制品是「一条记录一个大文件」，两处
+        各写一遍迟早分叉，分叉的表现是「记录删了文件还在」——磁盘慢慢被这些
+        没人知道的孤儿文件吃掉。
+
+        删不掉只告警：记录已经（或即将）删除，为一个文件系统错误把整个清理中断
+        会让后面所有过期制品都留着。孤儿文件由清理命令的扫盘环节兜。
+        """
+        path = self.abs_path()
+        removed = False
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+                removed = True
+            version_dir = os.path.dirname(path)
+            if os.path.isdir(version_dir) and not os.listdir(version_dir):
+                os.rmdir(version_dir)
+        except OSError as exc:
+            logger.warning('删除制品文件失败：%s（%s）', path, exc)
+        return removed
 
     def download_sig(self):
         """下载签名：hmac_sha256(api_key, "{id}:{md5}")。

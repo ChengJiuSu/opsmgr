@@ -3,11 +3,15 @@ import hashlib
 import os
 import shutil
 import tempfile
+import time
+from datetime import timedelta
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.management import call_command
 from django.test import TestCase, override_settings
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from apps.asset_mgr.models import Channel, Environment, ProjectGroup
@@ -273,3 +277,104 @@ class ArtifactApiCredentialTests(ArtifactTestBase):
         self.assertEqual(APIClient().get(url).status_code, 403)
         self.assertEqual(
             APIClient().get(f'{url}?sig={artifact.download_sig()}').status_code, 200)
+
+
+@override_settings(ARTIFACT_ROOT=ARTIFACT_TMP)
+class CleanArtifactsCommandTests(ArtifactTestBase):
+    """制品保留期清理：过期删除、保底版本与锁定版本必须留下、孤儿文件扫盘。"""
+
+    def _artifact(self, version, days_ago=0, content=b'pkg'):
+        """建一条制品记录并落一个真实文件（清理要验文件也删掉了）。"""
+        rel = os.path.join(self.pg.code, self.ch.code, self.env.code, version, 'app.tar.gz')
+        dest = os.path.join(ARTIFACT_TMP, rel)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, 'wb') as f:
+            f.write(content)
+        art = Artifact.objects.create(
+            project_group=self.pg, channel=self.ch, environment=self.env, version=version,
+            file_path=rel, original_name='app.tar.gz', md5='0' * 32, size=len(content),
+        )
+        if days_ago:
+            # reported_at 是 auto_now_add，只能绕过 save 直接改
+            Artifact.objects.filter(pk=art.pk).update(
+                reported_at=timezone.now() - timedelta(days=days_ago))
+            art.refresh_from_db()
+        return art
+
+    def _run(self, **kwargs):
+        call_command('clean_artifacts', **kwargs)
+
+    def test_expired_removed_with_file(self):
+        old = self._artifact('1.0.0', days_ago=200)
+        path = old.abs_path()
+        self._run(keep_latest=0)
+        self.assertFalse(Artifact.objects.filter(pk=old.pk).exists())
+        self.assertFalse(os.path.exists(path))
+
+    def test_fresh_kept(self):
+        fresh = self._artifact('2.0.0')
+        self._run(keep_latest=0)
+        self.assertTrue(Artifact.objects.filter(pk=fresh.pk).exists())
+
+    def test_keep_latest_survives_expiry(self):
+        """长期不发版的环境里所有制品都会超期，全清掉之后连回滚都做不到。"""
+        older = self._artifact('1.0.0', days_ago=300)
+        newer = self._artifact('1.1.0', days_ago=200)
+        self._run(keep_latest=1)
+        self.assertFalse(Artifact.objects.filter(pk=older.pk).exists())
+        self.assertTrue(Artifact.objects.filter(pk=newer.pk).exists())
+
+    def test_locked_version_survives(self):
+        """被任务模块锁定的版本清掉后，下次执行会直接失败。"""
+        from apps.asset_mgr.models import ServiceType
+        from apps.task_exec.models import ExecutionTask, TaskStep
+
+        locked = self._artifact('1.0.0', days_ago=300)
+        self._artifact('1.1.0', days_ago=300)
+        service = ServiceType.objects.create(name='基础', code='ca-base')
+        task = ExecutionTask.objects.create(
+            name='CD', project_group=self.pg, channel=self.ch, environment=self.env)
+        TaskStep.objects.create(
+            task=task, order=1, name='部署', task_type='command', command='echo hi',
+            service_type=service, params={'artifact_version': '1.0.0'})
+
+        self._run(keep_latest=0)
+        self.assertTrue(Artifact.objects.filter(pk=locked.pk).exists())
+        self.assertFalse(Artifact.objects.filter(version='1.1.0').exists())
+
+    def test_dry_run_deletes_nothing(self):
+        old = self._artifact('1.0.0', days_ago=200)
+        path = old.abs_path()
+        self._run(keep_latest=0, dry_run=True)
+        self.assertTrue(Artifact.objects.filter(pk=old.pk).exists())
+        self.assertTrue(os.path.exists(path))
+
+    def test_orphan_file_cleaned_when_expired(self):
+        """记录已删、文件还在：兜住历史上删除失败的残留。"""
+        orphan_dir = os.path.join(ARTIFACT_TMP, self.pg.code, self.ch.code, self.env.code, 'orphan')
+        os.makedirs(orphan_dir, exist_ok=True)
+        orphan = os.path.join(orphan_dir, 'left-behind.tar.gz')
+        with open(orphan, 'wb') as f:
+            f.write(b'junk')
+        old_mtime = time.time() - 200 * 86400
+        os.utime(orphan, (old_mtime, old_mtime))
+
+        self._run()
+        self.assertFalse(os.path.exists(orphan))
+
+    def test_orphan_file_kept_when_fresh(self):
+        """刚上报、记录还在事务里的文件不能被当孤儿删掉。"""
+        fresh_dir = os.path.join(ARTIFACT_TMP, 'fresh-orphan')
+        os.makedirs(fresh_dir, exist_ok=True)
+        fresh = os.path.join(fresh_dir, 'new.tar.gz')
+        with open(fresh, 'wb') as f:
+            f.write(b'new')
+        self._run()
+        self.assertTrue(os.path.exists(fresh))
+
+    def test_tracked_file_never_treated_as_orphan(self):
+        art = self._artifact('3.0.0')
+        old_mtime = time.time() - 300 * 86400
+        os.utime(art.abs_path(), (old_mtime, old_mtime))
+        self._run(keep_latest=0)  # 记录本身未过期，文件也不该被当孤儿
+        self.assertTrue(os.path.exists(art.abs_path()))

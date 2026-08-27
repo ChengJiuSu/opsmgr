@@ -167,3 +167,30 @@ curl -sf -H "X-API-KEY: ${OPS_API_KEY}" \
 - 大压缩包上传需调大反向代理限制（nginx `client_max_body_size`）。
 - `SITE_BASE_URL` 未配置时 `package_url` 为 `http://127.0.0.1:8000`，CD 主机拉包会失败。
 - 制品目录随版本增长，暂无自动清理（管理员可在制品管理页删除旧版本）。
+
+---
+
+## 保留策略（`clean_artifacts`）
+
+制品只增不减会把盘写满，而磁盘写满的表现是**制品上报 500 与任务执行一起挂**
+（同一个磁盘），所以这个清理不是可选项。建议挂 cron / celery beat 每日执行：
+
+```bash
+python manage.py clean_artifacts --dry-run   # 先看清单
+python manage.py clean_artifacts             # 实际清理
+```
+
+三条保护规则，任一命中即保留：
+
+| 规则 | 配置 | 为什么 |
+|------|------|--------|
+| 未超保留期 | `ARTIFACT_RETENTION_DAYS`（`--days`）| — |
+| 每个 项目组/渠道/环境 组合的最新 N 版 | `ARTIFACT_KEEP_LATEST`（`--keep-latest`）| 长期不发版的环境里所有制品都会超期，全清掉之后连「回滚到上一个版本」都做不到 |
+| 被任务模块锁定的版本 | — | `TaskStep.params.artifact_version` 是有人显式指定要用的版本，清掉它下次执行会直接失败。生效维度按模块自定义范围或任务全局维度解析，与执行时同一口径 |
+
+**孤儿文件**（记录已删、文件还在）按 mtime 单独扫盘清理，兜住历史上删除失败的
+残留；保留期沿用同一阈值，避免把刚上报的文件当孤儿删掉。`--skip-orphans` 可跳过。
+
+文件删除口径统一在 `Artifact.remove_file()`：页面删除与保留期清理共用一份实现。
+两处各写一遍迟早分叉，分叉的表现是「记录删了文件还在」——磁盘被没人知道的孤儿
+文件慢慢吃掉。

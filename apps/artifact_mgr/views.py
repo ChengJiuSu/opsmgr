@@ -60,16 +60,10 @@ class ArtifactViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin,
 
     def perform_destroy(self, instance):
         """删除记录并同步清理磁盘文件（所在版本目录清空后一并移除）。"""
-        path = instance.abs_path()
+        # 文件删除口径与保留期清理共用 Artifact.remove_file（两处各写一遍迟早分叉，
+        # 分叉的表现是「记录删了文件还在」，磁盘被没人知道的孤儿文件慢慢吃掉）
         instance.delete()
-        try:
-            if os.path.isfile(path):
-                os.remove(path)
-            version_dir = os.path.dirname(path)
-            if os.path.isdir(version_dir) and not os.listdir(version_dir):
-                os.rmdir(version_dir)
-        except OSError as exc:
-            logger.warning('删除制品文件失败（记录已删除）：%s (%s)', path, exc)
+        instance.remove_file()
 
 
 class ArtifactReportView(APIView):
