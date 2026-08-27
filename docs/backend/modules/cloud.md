@@ -57,6 +57,8 @@ apps/cloud_mgr/
 | `/api/cloud/certificates/{id}/renew/` | POST | 管理员 | 强制重签（--force），仅 issued 状态 |
 | `/api/cloud/certificates/{id}/download/` | GET | 仅管理员 | zip 包，内含一层 `<名称>/` 目录（`.crt` / `.key` / `.fullchain.pem` + README.txt），`Cache-Control: no-store` |
 | `/api/cloud/certificates/{id}/deploy_all/` | POST | 管理员 | 分发到全部已登记目标，跳过分发中与未接入类型（返回 dispatched / skipped） |
+| `/api/cloud/dns-changes/?domain=&record=&action=&keyword=` | GET | 管理员写/登录读 | DNS 变更留痕列表（只读不可删）|
+| `/api/cloud/dns-changes/{id}/restore/` | POST | 管理员 + **sudo** | 按前值一键回滚；仅 `before_source='provider'` 的改/删与未撤销的新增可回滚 |
 | `/api/cloud/cert-deployments/?certificate=` | CRUD | 管理员写 + **sudo** / 登录读 | 分发目标登记；deploying 禁止删除。`reload_cmd` 是目标主机上执行的任意 shell 命令，登记一条目标等于拿到该主机的远程命令执行面——与「连接凭据」同性质，故写操作要求二次验证 |
 | `/api/cloud/cert-deployments/{id}/deploy/` | POST | 管理员（**不要求 sudo**）| 单目标分发（后台异步）；证书未签发 / agent 通道主机 / 未接入类型均拒绝。执行的是已登记配置，需要复核的是配置本身；每次分发都验一次会把「签发后自动分发」变成人工卡点 |
 
@@ -141,3 +143,59 @@ cert-deployments `certificate`、`target_type`、`status`。
 **加密迁移** `cloud_mgr/0004_encrypt_cloud_secrets`：幂等且可回滚，口径见
 `docs/backend/modules/common.md` 的「透明加密字段」。生产上线前先配
 `SECRET_ENC_KEY` 再 migrate。
+
+---
+
+## DNS 变更留痕与回滚（`dns_history.py` / `DnsChangeLog`）
+
+### 为什么要有
+
+删记录原来是「先删云端，再 `record.delete()`」——删完本地行没了，而 audit 表里
+DELETE 请求**没有 body**，等于「被删的是什么值」在系统里查不到，只能去云控台翻
+厂商操作日志。改也一样：audit 有新值、没有旧值。
+
+审批防的是「改错」，这张表防的是「改错之后」——而且回滚不需要任何人在线。
+
+### 闸门
+
+| 操作 | 权限 |
+|------|------|
+| 新增解析记录 | 管理员（**不要求 sudo**）——加一条新子域名不会动到现有解析 |
+| 改 / 删解析记录 | 管理员 + **sudo 二次验证** |
+| 删除主域名 | 管理员 + **sudo**（会连带删掉该域名下全部本地解析镜像，厂商侧不动）|
+| 回滚变更 | 管理员 + **sudo** |
+
+改一条 A 记录的影响面（全站流量瞬间被引走）比改一条系统配置大得多，而这里原来
+是整个配置面里唯一没有二次验证的写入口。
+
+### 前值从哪来
+
+**一律先从厂商侧拉当前值**，不用本地值：`sync_status=failed` 的记录本地与云端
+本就不一致，拉云端才是真实前值。`before_source` 记下来源：
+
+| 来源 | 含义 | 可回滚 |
+|------|------|--------|
+| `provider` | 云厂商实时值 | ✅ |
+| `local` | 拉取失败，退回本地值 | ❌ |
+| `missing` | 云端已无此记录（别处删过），本身就是排障线索 | ❌ |
+| `none` | 新增（无前值）| 撤销新增可以 |
+
+只信 `provider` 来源：拿本地值去「回滚」可能把一个从未在云端生效过的值推上线。
+
+取前值失败**不打断业务操作**（宽泛兜底 + 告警）——为了一份快照把用户的 DNS 修改
+整个打断是本末倒置。同理，留痕写库失败也只告警：DNS 已经改完了，这时抛异常只会
+让调用方以为没改成功然后重试一次。
+
+### 回滚语义
+
+| 原动作 | 回滚做什么 |
+|--------|-----------|
+| `create` | 删掉这条记录（撤销误加）|
+| `update` | 把前值写回；记录后来被删了则按前值重建 |
+| `delete` | 按前值重建（云端新增会拿到新的 `remote_record_id`）|
+
+**云端先动、本地后动**：云端失败就整体放弃，避免出现「本地显示已回滚、线上还是
+错值」——那比不回滚更危险，因为看页面的人会以为已经好了。
+
+回滚自身也落一条 `action='restore'` 的留痕，否则「谁把它改回去的」又查不到。
+留痕表**只读不可删**：能被操作人删掉的留痕等于没有留痕。

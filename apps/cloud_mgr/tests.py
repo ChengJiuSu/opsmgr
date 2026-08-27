@@ -8,7 +8,7 @@ from rest_framework.test import APIClient
 from common.testing import grant_sudo
 
 from apps.asset_mgr.models import CloudProvider, Server
-from apps.cloud_mgr.models import CloudAccount, DnsRecord, Domain
+from apps.cloud_mgr.models import CloudAccount, DnsChangeLog, DnsRecord, Domain
 from apps.cloud_mgr.providers.base import BaseDnsProvider, DnsProviderError, DnsRecordData
 
 
@@ -50,6 +50,20 @@ class FailingDnsProvider(FakeDnsProvider):
         raise DnsProviderError('厂商接口超时')
 
 
+class FailingListProvider(FakeDnsProvider):
+    """拉列表失败：留痕取不到云端前值时的退路（退回本地值 + 标注来源）。"""
+
+    def list_records(self, domain):
+        raise DnsProviderError('厂商接口超时')
+
+
+class FailingUpdateProvider(FakeDnsProvider):
+    """更新失败：回滚时云端先动，失败必须整体放弃。"""
+
+    def update_record(self, domain, record):
+        raise DnsProviderError('厂商接口超时')
+
+
 class BaseApiTest(TestCase):
     def _client(self, is_staff=True, username=None):
         username = username or ('admin_c' if is_staff else 'user_c')
@@ -62,6 +76,17 @@ class BaseApiTest(TestCase):
         # 云账号写操作要求 sudo 二次验证（common/sudo.py）
         if is_staff:
             grant_sudo(c)
+        return c
+
+    def _client_without_sudo(self, username):
+        """管理员但未开 sudo 窗口：验「写操作要二次验证」用。"""
+        user = get_user_model().objects.create(username=username, is_staff=True)
+        user.set_password('Pass!2345xyz')
+        user.save()
+        c = APIClient()
+        r = c.post('/api/auth/login/',
+                   {'username': username, 'password': 'Pass!2345xyz'}, format='json')
+        c.credentials(HTTP_AUTHORIZATION='Bearer ' + r.json()['access'])
         return c
 
     def setUp(self):
@@ -685,3 +710,179 @@ class CloudSecretEncryptionTests(TestCase):
         self.assertNotIn('BEGIN PRIVATE KEY', stored)
         # 分发到主机与打包下载都要原值
         self.assertEqual(Certificate.objects.get(pk=cert.pk).private_key_pem, self.KEY_PEM)
+
+
+class DnsChangeLogTests(BaseApiTest):
+    """DNS 变更留痕与回滚：前值来源、改删留痕、一键还原、闸门。"""
+
+    def setUp(self):
+        super().setUp()
+        self.record = DnsRecord.objects.create(
+            domain=self.domain, rr='www', type='A', value='1.2.3.4',
+            ttl=600, line='default', remote_record_id='r1', sync_status='synced',
+        )
+
+    @staticmethod
+    def _patches(provider):
+        """views 与 dns_history 各自导入了 get_dns_provider，两处都要打。"""
+        return (
+            patch('apps.cloud_mgr.views.get_dns_provider', return_value=provider),
+            patch('apps.cloud_mgr.dns_history.get_dns_provider', return_value=provider),
+        )
+
+    def _with_provider(self, provider, func):
+        p1, p2 = self._patches(provider)
+        with p1, p2:
+            return func()
+
+    # ── 留痕 ──────────────────────────────────────────────
+    def test_update_logs_provider_before_value(self):
+        """前值取自厂商实时值：本地与云端可能不一致（sync_status=failed 就是）。"""
+        admin = self._client()
+        fake = FakeDnsProvider()
+        r = self._with_provider(fake, lambda: admin.patch(
+            f'/api/cloud/dns-records/{self.record.id}/',
+            {'value': '9.9.9.9', 'reason': '切流量到新机'}, format='json'))
+        self.assertEqual(r.status_code, 200, r.content)
+
+        log = DnsChangeLog.objects.get(action='update')
+        self.assertEqual(log.before_source, 'provider')
+        self.assertEqual(log.before['value'], '1.2.3.4')  # FakeDnsProvider 的 r1
+        self.assertEqual(log.after['value'], '9.9.9.9')
+        self.assertEqual(log.reason, '切流量到新机')
+        self.assertEqual(log.operator.username, 'admin_c')
+        self.assertTrue(log.restorable)
+
+    def test_delete_logs_before_value(self):
+        """核心用例：删完本地行没了、DELETE 请求又没 body，只有这张表能回答删了什么。"""
+        admin = self._client()
+        fake = FakeDnsProvider()
+        r = self._with_provider(fake, lambda: admin.delete(
+            f'/api/cloud/dns-records/{self.record.id}/'))
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertFalse(DnsRecord.objects.filter(pk=self.record.pk).exists())
+
+        log = DnsChangeLog.objects.get(action='delete')
+        self.assertEqual(log.record_rr, 'www')
+        self.assertEqual(log.domain_name, self.domain.name)
+        self.assertEqual(log.before['value'], '1.2.3.4')
+        self.assertTrue(log.restorable)
+
+    def test_create_logs_after_only(self):
+        admin = self._client()
+        fake = FakeDnsProvider()
+        self._with_provider(fake, lambda: admin.post('/api/cloud/dns-records/', {
+            'domain': self.domain.id, 'rr': 'new', 'type': 'A', 'value': '5.5.5.5',
+        }, format='json'))
+        log = DnsChangeLog.objects.get(action='create')
+        self.assertEqual(log.before, {})
+        self.assertEqual(log.before_source, 'none')
+        self.assertEqual(log.after['value'], '5.5.5.5')
+
+    def test_provider_failure_falls_back_to_local_and_blocks_restore(self):
+        """拉不到云端前值时退回本地并标注 —— 且这种快照不允许回滚。"""
+        admin = self._client()
+        r = self._with_provider(FailingListProvider(), lambda: admin.patch(
+            f'/api/cloud/dns-records/{self.record.id}/', {'value': '8.8.8.8'}, format='json'))
+        self.assertEqual(r.status_code, 200, r.content)
+        log = DnsChangeLog.objects.get(action='update')
+        self.assertEqual(log.before_source, 'local')
+        self.assertFalse(log.restorable)
+
+    # ── 回滚 ──────────────────────────────────────────────
+    def test_restore_update(self):
+        admin = self._client()
+        fake = FakeDnsProvider()
+        self._with_provider(fake, lambda: admin.patch(
+            f'/api/cloud/dns-records/{self.record.id}/', {'value': '9.9.9.9'}, format='json'))
+        log = DnsChangeLog.objects.get(action='update')
+
+        r = self._with_provider(fake, lambda: admin.post(
+            f'/api/cloud/dns-changes/{log.id}/restore/'))
+        self.assertEqual(r.status_code, 200, r.content)
+        self.record.refresh_from_db()
+        self.assertEqual(self.record.value, '1.2.3.4')
+        log.refresh_from_db()
+        self.assertIsNotNone(log.restored_at)
+        self.assertFalse(log.restorable)  # 回滚过的不能再回滚
+        # 回滚本身也留痕，否则「谁把它改回去的」又查不到
+        self.assertTrue(DnsChangeLog.objects.filter(action='restore').exists())
+
+    def test_restore_delete_recreates_record(self):
+        admin = self._client()
+        fake = FakeDnsProvider()
+        self._with_provider(fake, lambda: admin.delete(
+            f'/api/cloud/dns-records/{self.record.id}/'))
+        log = DnsChangeLog.objects.get(action='delete')
+
+        r = self._with_provider(fake, lambda: admin.post(
+            f'/api/cloud/dns-changes/{log.id}/restore/'))
+        self.assertEqual(r.status_code, 200, r.content)
+        rebuilt = DnsRecord.objects.get(domain=self.domain, rr='www')
+        self.assertEqual(rebuilt.value, '1.2.3.4')
+        self.assertEqual(rebuilt.remote_record_id, 'new-id')  # 云端新增给的新 id
+        self.assertEqual(rebuilt.sync_status, 'synced')
+
+    def test_restore_create_deletes_record(self):
+        admin = self._client()
+        fake = FakeDnsProvider()
+        self._with_provider(fake, lambda: admin.post('/api/cloud/dns-records/', {
+            'domain': self.domain.id, 'rr': 'oops', 'type': 'A', 'value': '5.5.5.5',
+        }, format='json'))
+        log = DnsChangeLog.objects.get(action='create')
+
+        r = self._with_provider(fake, lambda: admin.post(
+            f'/api/cloud/dns-changes/{log.id}/restore/'))
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertFalse(DnsRecord.objects.filter(rr='oops').exists())
+        self.assertIn(('delete', 'new-id'), fake.calls)
+
+    def test_restore_provider_failure_changes_nothing(self):
+        """云端先动、本地后动：云端失败不能留下「页面显示已回滚、线上还是错值」。"""
+        admin = self._client()
+        fake = FakeDnsProvider()
+        self._with_provider(fake, lambda: admin.patch(
+            f'/api/cloud/dns-records/{self.record.id}/', {'value': '9.9.9.9'}, format='json'))
+        log = DnsChangeLog.objects.get(action='update')
+
+        r = self._with_provider(FailingUpdateProvider(), lambda: admin.post(
+            f'/api/cloud/dns-changes/{log.id}/restore/'))
+        self.assertEqual(r.status_code, 400)
+        self.record.refresh_from_db()
+        self.assertEqual(self.record.value, '9.9.9.9')
+        log.refresh_from_db()
+        self.assertIsNone(log.restored_at)
+
+    # ── 闸门 ──────────────────────────────────────────────
+    def test_update_and_delete_require_sudo(self):
+        fresh = self._client_without_sudo('dns_nosudo')
+        fake = FakeDnsProvider()
+        r = self._with_provider(fake, lambda: fresh.patch(
+            f'/api/cloud/dns-records/{self.record.id}/', {'value': '7.7.7.7'}, format='json'))
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()['error_code'], 'sudo_required')
+
+        r = self._with_provider(fake, lambda: fresh.delete(
+            f'/api/cloud/dns-records/{self.record.id}/'))
+        self.assertEqual(r.status_code, 403)
+
+    def test_create_does_not_require_sudo(self):
+        """加一条新子域名不会动到现有解析，不该被拦。"""
+        fresh = self._client_without_sudo('dns_nosudo2')
+        r = self._with_provider(FakeDnsProvider(), lambda: fresh.post(
+            '/api/cloud/dns-records/', {
+                'domain': self.domain.id, 'rr': 'fresh', 'type': 'A', 'value': '6.6.6.6',
+            }, format='json'))
+        self.assertEqual(r.status_code, 201, r.content)
+
+    def test_change_log_is_read_only(self):
+        """能被操作人删掉的留痕等于没有留痕。"""
+        admin = self._client()
+        log = DnsChangeLog.objects.create(
+            domain=self.domain, domain_name=self.domain.name, action='update',
+            before={'value': 'x'}, before_source='provider')
+        self.assertEqual(admin.delete(f'/api/cloud/dns-changes/{log.id}/').status_code, 405)
+
+    def test_non_admin_read_only(self):
+        member = self._client(is_staff=False, username='dns_member')
+        self.assertEqual(member.get('/api/cloud/dns-changes/').status_code, 200)

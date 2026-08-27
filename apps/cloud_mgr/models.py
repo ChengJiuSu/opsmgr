@@ -261,3 +261,93 @@ class CertDeployment(models.Model):
 
     def __str__(self):
         return f'{self.certificate.name} -> {self.get_target_type_display()}'
+
+
+class DnsChangeLog(models.Model):
+    """解析记录变更留痕：改/删**之前**的云端真实值 + 一键回滚依据。
+
+    为什么必须有：原来删记录是「先删云端，再 record.delete()」——删完本地行没了，
+    而 audit 表里 DELETE 请求没有 body，等于「被删的是什么值」在系统里查不到，
+    只能去云控台翻厂商操作日志。改也一样：audit 有新值没有旧值。
+
+    审批防的是「改错」，这张表防的是「改错之后」——而且回滚不需要任何人在线。
+
+    前值一律**从厂商侧拉**而不是用本地值：`sync_status=failed` 的记录本地与云端
+    本就不一致，拉云端才是真实前值。拉不到时退回本地值并在 `before_source` 里
+    标注，否则回滚时分不清这份快照可不可信。
+
+    域名/记录用 SET_NULL 弱关联并同时存名称快照：记录删了、域名删了，这条历史
+    仍要能回答「删掉的是哪条」。
+    """
+
+    ACTION_CHOICES = [
+        ('create', '新增'),
+        ('update', '修改'),
+        ('delete', '删除'),
+        ('restore', '回滚'),
+    ]
+    SOURCE_CHOICES = [
+        ('provider', '云厂商实时值'),
+        ('local', '本地值（厂商拉取失败）'),
+        ('missing', '云端无此记录'),
+        ('none', '无前值（新增）'),
+    ]
+
+    domain = models.ForeignKey(
+        Domain, verbose_name='主域名', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='change_logs',
+    )
+    domain_name = models.CharField('主域名快照', max_length=253)
+    record = models.ForeignKey(
+        DnsRecord, verbose_name='解析记录', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='change_logs',
+    )
+    # 记录标识快照：record 被删/被 SET_NULL 后靠这几个字段辨识
+    record_rr = models.CharField('主机记录', max_length=128, blank=True)
+    record_type = models.CharField('记录类型', max_length=10, blank=True)
+    remote_record_id = models.CharField('厂商记录ID', max_length=64, blank=True)
+
+    action = models.CharField('变更动作', max_length=16, choices=ACTION_CHOICES)
+    # {rr,type,value,ttl,line,enabled,remote_record_id}；新增时为空
+    before = models.JSONField('变更前值', default=dict, blank=True)
+    before_source = models.CharField('前值来源', max_length=16,
+                                     choices=SOURCE_CHOICES, default='none')
+    after = models.JSONField('变更后值', default=dict, blank=True)
+    reason = models.CharField('变更原因', max_length=200, blank=True)
+    operator = models.ForeignKey(
+        settings.AUTH_USER_MODEL, verbose_name='操作人', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='dns_change_logs',
+    )
+    restored_at = models.DateTimeField('回滚时间', null=True, blank=True)
+    restored_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, verbose_name='回滚人', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='dns_restores',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'DNS 变更留痕'
+        verbose_name_plural = 'DNS 变更留痕'
+        db_table = 'cloud_dns_change_log'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['domain', '-created_at']),
+            models.Index(fields=['record', '-created_at']),
+        ]
+
+    def __str__(self):
+        return f'{self.get_action_display()} {self.record_rr}.{self.domain_name}'
+
+    @property
+    def restorable(self):
+        """能否回滚。
+
+        - 新增：回滚 = 删掉这条记录，需要记录还在；
+        - 改/删：回滚 = 把前值写回去，需要有可信前值（云端拉到过）；
+        - 回滚本身不再回滚（要撤销回滚就回滚它对应的那条新留痕）。
+        """
+        if self.restored_at or self.action == 'restore':
+            return False
+        if self.action == 'create':
+            return self.record_id is not None
+        return bool(self.before) and self.before_source == 'provider'

@@ -24,8 +24,14 @@ export const syncDomainRecords = (id) =>
 export const getDnsRecords = (params) => request.get('/api/cloud/dns-records/', { params })
 export const createDnsRecord = (data) => request.post('/api/cloud/dns-records/', data)
 export const updateDnsRecord = (id, data) => request.put(`/api/cloud/dns-records/${id}/`, data)
-export const deleteDnsRecord = (id) => request.delete(`/api/cloud/dns-records/${id}/`)
+// 删除带变更原因：改/删会落一条变更留痕（DnsChangeLog），原因随请求体一起记下
+export const deleteDnsRecord = (id, reason = '') =>
+  request.delete(`/api/cloud/dns-records/${id}/`, { data: { reason } })
 export const retrySyncDnsRecord = (id) => request.post(`/api/cloud/dns-records/${id}/retry_sync/`)
+
+// DNS 变更留痕：改/删前的云端真实值 + 一键回滚（只读，不可删）
+export const getDnsChanges = (params) => request.get('/api/cloud/dns-changes/', { params })
+export const restoreDnsChange = (id) => request.post(`/api/cloud/dns-changes/${id}/restore/`)
 
 // 证书
 export const getCertificates = (params) => request.get('/api/cloud/certificates/', { params })

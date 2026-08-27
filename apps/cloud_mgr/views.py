@@ -19,22 +19,24 @@ from django.http import HttpResponse
 from django.utils import timezone
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema
-from rest_framework import viewsets
+from rest_framework import mixins, viewsets
 from rest_framework.decorators import action
 
 from common.pagination import StandardPagination
 from common.permissions import IsAdmin, IsAdminOrReadOnly
 from common.response import fail, ok
-from common.sudo import SudoRequired
+from common.sudo import SudoRequired, required_for
 
+from . import dns_history
 from .acme import supported_provider_codes
 from .deploy import supported_target_types
-from .models import CertDeployment, Certificate, CloudAccount, DnsRecord, Domain
+from .models import CertDeployment, Certificate, CloudAccount, DnsChangeLog, DnsRecord, Domain
 from .providers import DnsProviderError, DnsRecordData, get_dns_provider
 from .serializers import (
     CertDeploymentSerializer,
     CertificateSerializer,
     CloudAccountSerializer,
+    DnsChangeLogSerializer,
     DnsRecordSerializer,
     DomainSerializer,
 )
@@ -116,7 +118,8 @@ class CloudAccountViewSet(viewsets.ModelViewSet):
 class DomainViewSet(viewsets.ModelViewSet):
     queryset = Domain.objects.select_related('cloud_account', 'cloud_account__provider').all()
     serializer_class = DomainSerializer
-    permission_classes = [IsAdminOrReadOnly]
+    # 删除会连带删掉该域名下全部本地解析镜像（厂商侧不动），要二次验证
+    permission_classes = [IsAdminOrReadOnly, required_for('DELETE')]
     pagination_class = StandardPagination
 
     def get_queryset(self):
@@ -225,9 +228,20 @@ class DomainViewSet(viewsets.ModelViewSet):
 
 
 class DnsRecordViewSet(viewsets.ModelViewSet):
+    """解析记录 CRUD，写操作即时推送厂商。
+
+    **改 / 删要求 sudo 二次验证**：改一条 A 记录的影响面（全站流量瞬间被引走）
+    比改一条系统配置大得多，而原来这里是全场唯一没有二次验证的写入口。新增不拦
+    ——加一条新子域名不会动到现有解析。
+
+    **每次写操作落一条变更留痕**（DnsChangeLog），改/删前先从厂商拉当前值。
+    原来删记录是「先删云端，再 record.delete()」，删完本地行没了、audit 的 DELETE
+    请求又没有 body，等于「被删的是什么值」在系统里查不到。
+    """
+
     queryset = DnsRecord.objects.select_related('domain', 'domain__cloud_account', 'server').all()
     serializer_class = DnsRecordSerializer
-    permission_classes = [IsAdminOrReadOnly]
+    permission_classes = [IsAdminOrReadOnly, required_for('PUT', 'PATCH', 'DELETE')]
     pagination_class = StandardPagination
 
     def get_queryset(self):
@@ -260,11 +274,19 @@ class DnsRecordViewSet(viewsets.ModelViewSet):
             record.sync_status, record.sync_error = 'failed', str(e)
         record.save(update_fields=['remote_record_id', 'sync_status', 'sync_error', 'updated_at'])
 
+    def _reason(self):
+        return (self.request.data.get('reason') or '') if hasattr(self.request, 'data') else ''
+
     def perform_create(self, serializer):
         record = serializer.save()
         self._push(record, is_new=True)
+        dns_history.log_change(
+            record, 'create', self.request.user,
+            after=dns_history.local_snapshot(record), reason=self._reason())
 
     def perform_update(self, serializer):
+        # 前值必须在推送之前取：推完再拉就是新值了
+        before, source = dns_history.remote_snapshot(serializer.instance)
         old_enabled = serializer.instance.enabled
         record = serializer.save()
         self._push(record, is_new=False)
@@ -277,9 +299,15 @@ class DnsRecordViewSet(viewsets.ModelViewSet):
             except DnsProviderError as e:
                 record.sync_status, record.sync_error = 'failed', str(e)
                 record.save(update_fields=['sync_status', 'sync_error', 'updated_at'])
+        dns_history.log_change(
+            record, 'update', self.request.user, before=before, before_source=source,
+            after=dns_history.local_snapshot(record), reason=self._reason())
 
     def destroy(self, request, *args, **kwargs):
         record = self.get_object()
+        # 前值在删之前取：删完本地行就没了，云端也查不到
+        before, source = dns_history.remote_snapshot(record)
+        domain = record.domain
         if record.remote_record_id:
             try:
                 get_dns_provider(record.domain.cloud_account).delete_record(
@@ -288,7 +316,10 @@ class DnsRecordViewSet(viewsets.ModelViewSet):
             except DnsProviderError as e:
                 return fail(f'厂商侧删除失败，本地记录保留：{e}')
         record.delete()
-        return ok(msg='已删除。')
+        dns_history.log_change(
+            record, 'delete', request.user, before=before, before_source=source,
+            reason=self._reason(), domain=domain)
+        return ok(msg='已删除（变更前值已留痕，可在「变更留痕」中一键回滚）。')
 
     @action(detail=True, methods=['post'])
     def retry_sync(self, request, pk=None):
@@ -503,3 +534,44 @@ class CertDeploymentViewSet(viewsets.ModelViewSet):
             return fail('该目标正在分发中，禁止删除。')
         deployment.delete()
         return ok(msg='已删除分发目标（目标机上已部署的证书文件不受影响）。')
+
+
+class DnsChangeLogViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin,
+                          viewsets.GenericViewSet):
+    """解析记录变更留痕：只读列表 + 一键回滚。
+
+    只读不可删：能被操作人删掉的留痕等于没有留痕。清理交给按时间的运维脚本。
+    """
+
+    queryset = DnsChangeLog.objects.select_related('domain', 'record', 'operator', 'restored_by')
+    serializer_class = DnsChangeLogSerializer
+    permission_classes = [IsAdminOrReadOnly]
+    pagination_class = StandardPagination
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        params = self.request.query_params
+        for param, field in (('domain', 'domain_id'), ('record', 'record_id')):
+            value = params.get(param)
+            if value and value.isdigit():
+                qs = qs.filter(**{field: value})
+        action_param = params.get('action')
+        if action_param:
+            qs = qs.filter(action=action_param)
+        keyword = params.get('keyword')
+        if keyword:
+            qs = qs.filter(Q(record_rr__icontains=keyword) | Q(domain_name__icontains=keyword))
+        return qs
+
+    @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
+    @action(detail=True, methods=['post'], permission_classes=[IsAdmin, SudoRequired])
+    def restore(self, request, pk=None):
+        """按前值回滚该次变更（云端先动、本地后动，云端失败则整体放弃）。"""
+        change = self.get_object()
+        success, message = dns_history.restore(change, request.user)
+        if not success:
+            return fail(message)
+        logger.warning('管理员 %s 回滚了 DNS 变更 #%s（%s %s.%s）',
+                       request.user.username, change.pk, change.action,
+                       change.record_rr, change.domain_name)
+        return ok(self.get_serializer(change).data, msg=message)

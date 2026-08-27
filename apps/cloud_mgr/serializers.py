@@ -6,7 +6,7 @@ from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
-from .models import CertDeployment, Certificate, CloudAccount, DnsRecord, Domain
+from .models import CertDeployment, Certificate, CloudAccount, DnsChangeLog, DnsRecord, Domain
 
 # 域名整体校验（简化 RFC 1035：小写字母/数字/连字符，点分，末级 ≥2 位字母）
 DOMAIN_RE = re.compile(r'^(?!-)[a-z0-9-]{1,63}(?<!-)(\.(?!-)[a-z0-9-]{1,63}(?<!-))+$')
@@ -240,3 +240,30 @@ class CertDeploymentSerializer(serializers.ModelSerializer):
         else:
             attrs['server'] = None
         return attrs
+
+
+class DnsChangeLogSerializer(serializers.ModelSerializer):
+    """解析记录变更留痕（只读）。
+
+    `restorable` 由模型计算：只有云端拉到过真实前值（before_source='provider'）
+    的改/删才允许回滚——拿本地值去「回滚」可能把一个从来没在云端生效过的值推上线。
+    """
+
+    operator_name = serializers.CharField(source='operator.username', read_only=True, default='')
+    restored_by_name = serializers.CharField(
+        source='restored_by.username', read_only=True, default='')
+    action_label = serializers.CharField(source='get_action_display', read_only=True)
+    before_source_label = serializers.CharField(
+        source='get_before_source_display', read_only=True)
+    restorable = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = DnsChangeLog
+        fields = [
+            'id', 'domain', 'domain_name', 'record', 'record_rr', 'record_type',
+            'remote_record_id', 'action', 'action_label',
+            'before', 'before_source', 'before_source_label', 'after',
+            'reason', 'operator', 'operator_name', 'restorable',
+            'restored_at', 'restored_by', 'restored_by_name', 'created_at',
+        ]
+        read_only_fields = fields

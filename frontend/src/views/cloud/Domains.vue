@@ -16,9 +16,12 @@
           <el-option v-for="a in accountOptions" :key="a.id" :label="a.name" :value="a.id" />
         </el-select>
       </div>
-      <div v-if="authStore.isStaff">
-        <el-button :icon="Download" @click="openImport">导入域名</el-button>
-        <el-button type="primary" :icon="Plus" @click="openDialog()">新增域名</el-button>
+      <div>
+        <el-button :icon="Clock" @click="openChanges()">变更留痕</el-button>
+        <template v-if="authStore.isStaff">
+          <el-button :icon="Download" @click="openImport">导入域名</el-button>
+          <el-button type="primary" :icon="Plus" @click="openDialog()">新增域名</el-button>
+        </template>
       </div>
     </div>
 
@@ -99,7 +102,7 @@
                   <el-tag v-else size="small" type="success">已同步</el-tag>
                 </template>
               </el-table-column>
-              <el-table-column v-if="authStore.isStaff" label="操作" width="220">
+              <el-table-column v-if="authStore.isStaff" label="操作" width="300">
                 <template #default="{ row: rec }">
                   <el-button
                     v-if="rec.sync_status !== 'synced'"
@@ -109,6 +112,7 @@
                     @click="handleRetry(row, rec)"
                   >重推</el-button>
                   <el-button size="small" :icon="Edit" @click="openRecordDialog(row, rec)">编辑</el-button>
+                  <el-button size="small" :icon="Clock" @click="openChanges(rec)">留痕</el-button>
                   <el-button size="small" type="danger" :icon="Delete" @click="handleRecordDelete(row, rec)">删除</el-button>
                 </template>
               </el-table-column>
@@ -249,17 +253,78 @@
       <el-form-item label="备注">
         <el-input v-model="recordForm.remark" type="textarea" :rows="2" />
       </el-form-item>
+      <el-form-item v-if="editRecord" label="变更原因">
+        <el-input v-model="recordForm.reason" placeholder="如「切流量到新机」，会记入变更留痕" />
+        <div class="tip">
+          修改会即时推送厂商、立即生效；变更前的云端真实值已留痕，可在「变更留痕」中一键回滚
+        </div>
+      </el-form-item>
     </el-form>
     <template #footer>
       <el-button @click="recordDialogVisible = false">取消</el-button>
       <el-button type="primary" :loading="recordSubmitting" @click="handleRecordSubmit">确定</el-button>
     </template>
   </el-dialog>
+
+  <!-- DNS 变更留痕抽屉：改/删前的云端真实值 + 一键回滚 -->
+  <el-drawer v-model="changesVisible" :title="changesTitle" size="70%">
+    <el-alert type="info" :closable="false" show-icon style="margin-bottom:12px">
+      改 / 删解析前会先从云厂商拉取当前真实值存档。只有「云厂商实时值」来源的留痕可回滚
+      —— 拿本地值去回滚可能把一个从未在云端生效过的值推上线。回滚时云端先动、本地后动，
+      云端失败则整体放弃。
+    </el-alert>
+    <el-table v-loading="changesLoading" :data="changes" stripe size="small">
+      <el-table-column label="时间" width="150">
+        <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
+      </el-table-column>
+      <el-table-column label="记录" min-width="170" show-overflow-tooltip>
+        <template #default="{ row }">
+          <span class="fqdn">{{ row.record_rr }}.{{ row.domain_name }}</span>
+          <el-tag size="small" type="info" class="tag-gap">{{ row.record_type }}</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="动作" width="80">
+        <template #default="{ row }">
+          <el-tag size="small" :type="actionType(row.action)">{{ row.action_label }}</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="变更前 → 变更后" min-width="230">
+        <template #default="{ row }">
+          <span class="mono">{{ row.before?.value || '—' }}</span>
+          <span class="muted"> → </span>
+          <span class="mono">{{ row.after?.value || '（已删除）' }}</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="前值来源" width="130">
+        <template #default="{ row }">
+          <el-tag size="small" :type="row.before_source === 'provider' ? 'success' : 'warning'">
+            {{ row.before_source_label }}
+          </el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column prop="operator_name" label="操作人" width="90">
+        <template #default="{ row }"><span :class="{ muted: !row.operator_name }">{{ row.operator_name || '—' }}</span></template>
+      </el-table-column>
+      <el-table-column prop="reason" label="原因" min-width="120" show-overflow-tooltip>
+        <template #default="{ row }"><span :class="{ muted: !row.reason }">{{ row.reason || '—' }}</span></template>
+      </el-table-column>
+      <el-table-column v-if="authStore.isStaff" label="操作" width="110" fixed="right">
+        <template #default="{ row }">
+          <el-button
+            v-if="row.restorable" size="small" type="warning"
+            :loading="restoringId === row.id" @click="handleRestore(row)"
+          >回滚</el-button>
+          <span v-else-if="row.restored_at" class="muted">已回滚</span>
+          <span v-else class="muted">—</span>
+        </template>
+      </el-table-column>
+    </el-table>
+  </el-drawer>
 </template>
 
 <script setup>
 import { ref, reactive, onMounted, onUnmounted } from 'vue'
-import { Plus, Edit, Delete, Download } from '@element-plus/icons-vue'
+import { Plus, Edit, Delete, Download, Clock } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../../stores/auth'
 import { debounce } from '../../utils/debounce'
@@ -268,6 +333,7 @@ import {
   getCloudAccounts, getDomains, createDomain, updateDomain, deleteDomain,
   importDomains, syncDomainRecords,
   getDnsRecords, createDnsRecord, updateDnsRecord, deleteDnsRecord, retrySyncDnsRecord,
+  getDnsChanges, restoreDnsChange,
 } from '../../api/cloud'
 
 const authStore = useAuthStore()
@@ -441,6 +507,7 @@ const retryingId = ref(null)
 const emptyRecordForm = () => ({
   rr: '', type: 'A', value: '', ttl: 600, line: 'default',
   target_type: 'none', server: null, enabled: true, remark: '',
+  reason: '',  // 变更原因，随改/删请求记入变更留痕
 })
 const recordForm = reactive(emptyRecordForm())
 const recordRules = {
@@ -453,7 +520,7 @@ const recordRules = {
 function openRecordDialog(domainRow, rec = null) {
   recordDomain.value = domainRow
   editRecord.value = rec
-  Object.assign(recordForm, rec ? { ...rec } : emptyRecordForm())
+  Object.assign(recordForm, emptyRecordForm(), rec ? { ...rec, reason: '' } : {})
   recordDialogVisible.value = true
   recordFormRef.value?.clearValidate()
 }
@@ -479,15 +546,73 @@ async function handleRecordSubmit() {
 }
 
 async function handleRecordDelete(domainRow, rec) {
-  await ElMessageBox.confirm(
-    `确定删除解析记录「${rec.fqdn} ${rec.type}」吗？将同步删除厂商侧解析，立即生效。`,
-    '警告',
-    { type: 'warning' },
+  // 用 prompt 而非 confirm：删除会即时生效在线上，留一句原因是事后排障最省事的线索
+  const { value: reason } = await ElMessageBox.prompt(
+    `确定删除解析记录「${rec.fqdn} ${rec.type} → ${rec.value}」吗？`
+    + '将同步删除厂商侧解析，立即生效。变更前的云端真实值会留痕，可一键回滚。',
+    '删除解析记录',
+    {
+      type: 'warning',
+      confirmButtonText: '删除',
+      confirmButtonClass: 'el-button--danger',
+      inputPlaceholder: '变更原因（可留空，建议填写）',
+      inputValue: '',
+    },
   )
-  await deleteDnsRecord(rec.id)
-  ElMessage.success('删除成功')
+  await deleteDnsRecord(rec.id, reason || '')
+  ElMessage.success('删除成功（可在「变更留痕」中回滚）')
   await loadRecords(domainRow.id, true)
   fetchData()
+}
+
+// ── DNS 变更留痕 ──────────────────────────────────────
+const changesVisible = ref(false)
+const changesLoading = ref(false)
+const changes = ref([])
+const changesTitle = ref('DNS 变更留痕')
+const changesFilter = ref({})
+const restoringId = ref(null)
+
+const actionType = (action) => ({
+  create: 'success', update: 'warning', delete: 'danger', restore: 'info',
+}[action] || 'info')
+
+async function openChanges(rec = null) {
+  changesFilter.value = rec ? { record: rec.id } : {}
+  changesTitle.value = rec
+    ? `变更留痕 — ${rec.fqdn} ${rec.type}`
+    : 'DNS 变更留痕（全部域名）'
+  changesVisible.value = true
+  await loadChanges()
+}
+
+async function loadChanges() {
+  changesLoading.value = true
+  try {
+    const res = await getDnsChanges({ ...changesFilter.value, page_size: 100 })
+    changes.value = res.data?.results || []
+  } finally {
+    changesLoading.value = false
+  }
+}
+
+async function handleRestore(row) {
+  const target = row.before?.value ?? '（重建记录）'
+  await ElMessageBox.confirm(
+    `确定回滚这次${row.action_label}吗？`
+    + `「${row.record_rr}.${row.domain_name}」将恢复为 ${target}，即时推送厂商并立即生效。`,
+    '回滚 DNS 变更',
+    { type: 'warning', confirmButtonText: '回滚' },
+  )
+  restoringId.value = row.id
+  try {
+    const res = await restoreDnsChange(row.id)
+    ElMessage.success(res.msg || '已回滚')
+    await loadChanges()
+    fetchData()
+  } finally {
+    restoringId.value = null
+  }
 }
 
 async function handleRetry(domainRow, rec) {
@@ -524,4 +649,6 @@ onMounted(async () => {
 .records-panel { padding: 4px 16px 12px 48px; background: #fafafa; }
 .records-head { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; }
 .records-title { font-size: 13px; color: #606266; font-weight: 600; }
+.tag-gap { margin-left: 6px; }
+.mono { font-family: Consolas, Monaco, monospace; font-size: 12px; }
 </style>
