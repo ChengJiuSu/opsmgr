@@ -13,6 +13,9 @@ from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import AllowAny
 from rest_framework.views import APIView
 
+from apps.auth_mgr.apikey import ApiKeyAuthentication, ApiKeyThrottle, scope_required
+from apps.auth_mgr.authentication import MfaJWTAuthentication
+from apps.auth_mgr.models import ApiCredential
 from common.ansible import resolve_within
 from common.permissions import IsAdminOrReadOnly
 from common.response import fail, ok
@@ -74,10 +77,16 @@ class ArtifactReportView(APIView):
 
     流式写盘同时计算 md5；上报 md5 不一致时删除文件并报错；
     同 项目组/渠道/环境/版本 已存在则拒绝（409），避免制品被静默覆盖。
+
+    鉴权：优先走 API 凭证（key + IP 白名单 + `artifact:report` 作用域）；
+    带的是旧的全局 `artifact.api_key` 时回退到 HasArtifactAPIKey，便于存量
+    Jenkins 任务平滑换 key（回退命中会打 warning，据此盘点剩余调用方）。
+    废弃期结束后删掉 HasArtifactAPIKey 与系统配置项即可。
     """
 
-    authentication_classes = []
-    permission_classes = [HasArtifactAPIKey]
+    authentication_classes = [ApiKeyAuthentication]
+    permission_classes = [scope_required('artifact:report') | HasArtifactAPIKey]
+    throttle_classes = [ApiKeyThrottle]
     parser_classes = [MultiPartParser, FormParser]
 
     @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
@@ -124,9 +133,21 @@ class ArtifactReportView(APIView):
 
 
 class ArtifactDownloadView(APIView):
-    """制品下载：登录用户直接下载；CD 目标主机凭 URL 签名参数免登录拉包。"""
+    """制品下载：三种身份任一即可，按「谁在拉包」分开判。
 
+    - 登录用户（JWT）：页面上点下载；
+    - API 凭证 + `artifact:download` 作用域：内部脚本拉包，受 IP 白名单约束；
+    - URL 签名参数：CD 目标主机免登录拉包（签名口径见 Artifact.download_sig），
+      原始 key 不出现在 URL 与执行日志里。
+
+    permission_classes 保持 AllowAny，三条身份在方法体里判：签名这条没有
+    「认证类」可挂（凭据在 query 里），混进权限类会让另外两条的失败原因变成
+    同一个 403，排障时分不清是 key 不对还是签名不对。
+    """
+
+    authentication_classes = [ApiKeyAuthentication, MfaJWTAuthentication]
     permission_classes = [AllowAny]
+    throttle_classes = [ApiKeyThrottle]
 
     @extend_schema(responses=OpenApiTypes.BINARY)
     def get(self, request, pk):
@@ -134,7 +155,11 @@ class ArtifactDownloadView(APIView):
         if artifact is None:
             return fail('制品不存在', status=404)
 
-        if not (request.user and request.user.is_authenticated):
+        credential = request.auth if isinstance(request.auth, ApiCredential) else None
+        if credential is not None:
+            if not credential.has_scope('artifact:download'):
+                return fail(f'凭证「{credential.name}」缺少作用域：artifact:download', status=403)
+        elif not (request.user and request.user.is_authenticated):
             sig = request.query_params.get('sig', '')
             expected = artifact.download_sig()
             if not (expected and sig and hmac.compare_digest(sig, expected)):

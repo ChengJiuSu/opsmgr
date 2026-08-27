@@ -47,4 +47,5 @@ cd frontend && npm run build
   新种子只对全新环境生效。
 - 字典项被外键 PROTECT 引用时删除会 400，先解除引用或停用。
 - ExecutionTask 创建即调度执行（perform_create → dispatch），
-  测试中需 `mock.patch('apps.task_exec.views.dispatch')` 避免真实执行。
+  测试中需 `mock.patch('apps.task_exec.trigger.dispatch')` 避免真实执行
+  （发起逻辑已抽到 `apps/task_exec/trigger.py`，页面执行与接口触发共用）。

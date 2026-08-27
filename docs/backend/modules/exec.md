@@ -103,6 +103,8 @@ apps/task_exec/
 │                    #   match_executable_servers：全局/模块维度匹配共用口径
 ├── serializers.py   # 变量 key 校验、凭据脱敏、嵌套模块整体读写与内容校验、方法 service_type 执行校验
 ├── views.py         # 变量/凭据/任务 ViewSet + matched_servers/execute/output/logs 动作 + 剧本列表
+├── trigger.py       # 发起前置校验 + 主机快照固化 + 调度（页面执行与接口触发共用）
+├── webhook.py       # TaskTriggerView：API 凭证鉴权的机读触发入口
 ├── log_files.py     # 日志文件浏览：TASK_LOG_DIR 只读目录树 / 文本分段读 / 原文件下载（仅管理员）
 ├── runner.py        # 任务流执行：逐模块解析主机 + 动态 inventory + 变量注入 + ansible 调用，失败中止
 ├── live.py          # LiveSink：流式日志汇聚（节流写库预览 + 落盘 + WebSocket 推送）
@@ -349,6 +351,10 @@ GET                 /api/exec/playbooks/          剧本列表（仅管理员；
 GET/POST/PUT/PATCH/DELETE /api/exec/tasks/        任务流 CRUD（steps 嵌套整体读写；保存不执行；执行中禁止编辑）
 GET                 /api/exec/tasks/{id}/matched_servers/  执行表单数据源：{global: {...}, steps: [{order,name,custom,total,servers?}]}
 POST                /api/exec/tasks/{id}/execute/ 发起执行，body {server_ids:[...]} 仅作用于全局范围模块（缺省=全部全局匹配主机）
+POST                /api/exec/tasks/{id}/trigger/ 接口/Webhook 触发（API 凭证 task:trigger，免登录）：
+                                                  仅接受 default_select_all=True 的任务（接口无法逐模块勾选主机）；
+                                                  生产环境任务须带 body {confirm_production:true}；
+                                                  主机范围恒为「维度匹配到的全部主机」，日志 trigger_type='api'
 POST                /api/exec/tasks/{id}/confirm/ 人工处理暂停：确认模块 continue/abort；失败等待 retry/skip/abort（仅管理员）
 GET                 /api/exec/tasks/{id}/output/  轻量轮询：状态与输出；?offset=N 只回增量（delta=true 时前端追加，返回新 offset）
 GET                 /api/exec/tasks/{id}/logs/    执行历史列表（含主机数/执行方式/逐模块结果 steps_result）

@@ -17,6 +17,7 @@ SENSITIVE_KEYS = frozenset({
     'password', 'old_password', 'new_password', 'confirm_password',
     'passwd', 'become_password', 'private_key', 'secret', 'secret_key',
     'token', 'access', 'refresh', 'api_token', 'api_key', 'apikey',
+    'signing_secret',
     'code', 'otp', 'mfa_code', 'recovery_code', 'crumb',
 })
 REDACTED = '***'

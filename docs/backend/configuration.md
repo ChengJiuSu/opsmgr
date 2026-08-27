@@ -25,6 +25,12 @@
 | `MFA_MAX_ATTEMPTS` | `5` | 单张票据允许的验证码错误次数，超限作废票据 |
 | `MFA_RECOVERY_CODES` | `10` | 每次生成的恢复码数量 |
 | `SUDO_TTL` | `600` | 敏感操作二次验证窗口（秒）：验一次后这段时间内的配置类写操作免重验 |
+| `TRUSTED_PROXIES` | `127.0.0.1,::1` | 本服务前置的反向代理地址（CIDR 或单 IP，逗号分隔）。**API 凭证的 IP 白名单只信这些地址转发来的 `X-Forwarded-For`**；nginx 与应用不同机、或前面还有 SLB/WAF 时必须把每一层都写进来，否则白名单全部失配 |
+| `API_KEY_DEFAULT_RATE` | `60/min` | API 凭证默认限速（DRF 速率语法），单个凭证可在页面覆盖 |
+| `API_KEY_FAIL_LIMIT` | `20` | 凭证校验失败次数上限（按 key_id 计数），超限锁定 |
+| `API_KEY_FAIL_WINDOW` | `300` | 凭证失败计数窗口（秒）|
+| `API_KEY_FAIL_BLOCK` | `300` | 凭证触发后的锁定时长（秒）|
+| `API_KEY_TOUCH_INTERVAL` | `60` | 凭证「最近使用」写库的最小间隔（秒），避免每请求一次 UPDATE |
 
 ---
 

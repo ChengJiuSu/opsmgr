@@ -10,16 +10,15 @@ task_id/log_id 弱关联（整型字段，不建外键），避免 app 间耦合
 AgentRoute：按维度（项目组 + 可选环境）把主机默认路由到某个 agent，供
 Server.channel_mode='auto' 的主机继承；解析口径见 channel.py。
 """
-import hashlib
-import secrets
 import uuid
 
 from django.db import models
 
+from common.secrets import generate_secret, hash_secret
 
-def hash_token(raw):
-    """token 哈希口径：sha256 hex，全项目唯一实现。"""
-    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+#: token 哈希口径：sha256 hex。实现在 common/secrets.py（与 API 凭证共用一份），
+#: 这里保留别名是因为 consumers/serializers/tests 都在按这个名字导入。
+hash_token = hash_secret
 
 
 class AgentNode(models.Model):
@@ -59,7 +58,7 @@ class AgentNode(models.Model):
     @classmethod
     def generate_token(cls):
         """生成明文 token（仅展示一次）与入库哈希。"""
-        raw = secrets.token_urlsafe(32)
+        raw = generate_secret()
         return raw, hash_token(raw)
 
 

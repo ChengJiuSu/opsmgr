@@ -149,6 +149,12 @@ const router = createRouter({
           meta: { title: 'Agent 管理', staff: true },
         },
         {
+          path: 'system/api-credentials',
+          name: 'SystemApiCredentials',
+          component: () => import('../views/system/ApiCredentials.vue'),
+          meta: { title: 'API 凭证', staff: true },
+        },
+        {
           path: 'system/configs',
           name: 'SystemConfigs',
           component: () => import('../views/system/Configs.vue'),

@@ -11,6 +11,7 @@
 - JWT 登录（颁发 Access + Refresh Token）+ 登录失败限速
 - MFA（TOTP 二次认证）：绑定、两步登录、恢复码、强制策略
 - Token 刷新与验证
+- **API 凭证**：内部脚本 / Webhook 的机读接口访问控制（key + IP 白名单 + 作用域 + 签名）
 
 ---
 
@@ -21,20 +22,23 @@ apps/auth_mgr/
 ├── __init__.py
 ├── apps.py          # AppConfig
 ├── models.py        # User 模型
-├── models.py        # User / UserMFA / MFARecoveryCode
-├── serializers.py   # CustomTokenObtainPairSerializer / MFA 入参
+├── models.py        # User / UserMFA / MFARecoveryCode / ApiCredential
+├── serializers.py   # CustomTokenObtainPairSerializer / MFA 入参 / ApiCredential
 ├── services.py      # MFA 业务：绑定、激活、校验、恢复码、强制范围
 ├── tokens.py        # 挑战票据（token_type='mfa'）+ 令牌签发（amr 声明）
 ├── authentication.py # MfaJWTAuthentication：全局 MFA 强制检查
-├── views.py         # LoginView（限速+两步）/ MFA 六个接口 / UserViewSet
-├── management/commands/mfa_reset.py  # 服务器 shell 兜底重置
-├── tests.py         # 限速 / 绑定 / 两步登录 / 强制策略 / 管理员重置
+├── apikey.py        # 机读访问控制：认证 + IP 白名单 + 验签 + 作用域 + 限速
+├── views.py         # LoginView（限速+两步）/ MFA 六个接口 / UserViewSet / ApiCredentialViewSet
+├── management/commands/mfa_reset.py            # 服务器 shell 兜底重置
+├── management/commands/create_api_credential.py # 命令行签发凭证
+├── tests.py         # 限速 / 绑定 / 两步登录 / 强制策略 / 管理员重置 / API 凭证
 └── urls.py          # 路由
 
-common/ratelimit.py  # 失败计数限速（登录与 MFA 校验共用）
-common/request.py    # client_ip：X-Forwarded-For 首段 → REMOTE_ADDR
+common/ratelimit.py  # 失败计数限速（登录、MFA 校验、凭证校验共用）
+common/request.py    # client_ip（审计展示）/ auth_client_ip（鉴权，可信代理链）/ IP 规则匹配
+common/secrets.py    # 机读凭证的明文生成与 sha256 哈希口径（与 agent 令牌共用）
 common/totp.py       # TOTP（RFC 6238，标准库实现，RFC 官方向量守着）
-common/crypto.py     # Fernet 对称加密（TOTP 密钥必须可还原，不能只存哈希）
+common/crypto.py     # Fernet 对称加密（TOTP 密钥、Webhook 签名密钥必须可还原）
 ```
 
 ---
@@ -275,6 +279,124 @@ MFA 相关请求都是写操作，由审计中间件记录；`code` / `secret` /
 
 ---
 
+## API 凭证（机读接口访问控制）
+
+给**内部脚本与 Webhook** 用的免登录通道。它们没有浏览器、不做 MFA、也不该拿一条能干
+所有事的 JWT。
+
+替代的是原来那把全局 `artifact.api_key`：一把 key 被所有脚本共用，轮换要同时改所有
+调用方，泄露了也无法定位是哪个脚本漏的，且没有来源限制。
+
+### 四道门（apps/auth_mgr/apikey.py）
+
+| 门 | 内容 | 不过时 |
+|----|------|--------|
+| Key | `ak_<16位hex>.<43位随机串>`，前半段 `key_id` 建索引定位记录，后半段只存 sha256 | 401 `api_key_invalid` |
+| IP 白名单 | 按凭证维护 CIDR 列表，客户端 IP 走 `auth_client_ip` 解析 | 403 `api_key_ip_denied` |
+| 作用域 | `scope_required('artifact:report')`，一把 key 只能调授权的接口 | 403 `api_key_scope_denied` |
+| Webhook 签名 | HMAC-SHA256（签原始请求体）或共享 Token，凭证上配了就强制 | 403 `api_key_signature_invalid` |
+
+**IP 白名单与验签放在认证类里，不放权限类。** 项目里几乎每个 ViewSet 都自己声明了
+`permission_classes`，把来源校验放权限层，新增一个机读视图时漏挂一个类就等于全开；
+认证类是「用这把 key 就必过」的位置，漏不掉。
+
+**白名单留空 ≠ 不限制**：必须显式把 `ip_unrestricted` 置 True，否则认证直接拒。留空
+放行会让「忘了填」与「故意不填」外观一致，一次手滑就产出一把全网可用的 key。
+
+### 真实客户端 IP：`common.request.auth_client_ip`
+
+`X-Forwarded-For` 是普通请求头，客户端想写什么写什么。所以取 IP 有**两个口径**，
+不能混用：
+
+- `client_ip` —— 取 XFF 首段，可被伪造，只用于审计展示与限速分桶；
+- `auth_client_ip` —— 鉴权用。`REMOTE_ADDR` 不在 `settings.TRUSTED_PROXIES` 内就
+  整条 XFF 丢掉；在可信代理内则从 XFF **最右往左**剥掉连续的可信代理，取第一个非
+  可信地址（右端是代理追加的，客户端伪造不到）。
+
+剥完只剩代理自身时返回代理地址——它几乎不会在业务白名单里，于是校验失败。这是刻意的
+fail-closed：配置不对时拒绝，而不是放过去。
+
+部署要点：nginx 必须 `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`
+（追加，不是覆盖），且 `TRUSTED_PROXIES` 要包含每一层代理/SLB/WAF 的地址。
+
+### 与网络层防火墙的分工
+
+两层都要，管的不是同一件事，不可互相替代：
+
+| 维度 | 防火墙 / nginx allow-deny / 安全组 | 后台 per-key 白名单 |
+|------|-----------------------------------|--------------------|
+| 粒度 | 端口/路径级，全部 key 共用一套 | 每把 key 一套 CIDR |
+| 改动成本 | SSH / 云控台 / reload，无自助 | 页面改，即时生效 |
+| 审计 | 无系统内记录 | 进 audit 表，谁改的可查 |
+| Webhook 源 IP | 段大且会变，手工同步易漏 | 按 key 单独维护，互不影响 |
+| 抗扫描 | 强，流量进不来应用 | 弱，已经打到 Django |
+
+实践：内部脚本（出口 IP 固定）两层都配；公网 Webhook 只配 per-key 白名单，别在
+防火墙上限制（否则每加一个 Webhook 就要动网络）。nginx 侧示例见 `deploy/nginx.conf`
+末尾的注释块。
+
+### 模型 ApiCredential（表 `auth_api_credential`）
+
+| 字段 | 说明 |
+|------|------|
+| `name` / `key_id` / `secret_hash` | 名称唯一；`key_id` 公开可查，secret 只存 sha256 |
+| `scopes` | JSON 数组，取值见 `apikey.SCOPES` |
+| `ip_unrestricted` / `ip_whitelist` | 不限制开关 + CIDR 文本（逗号/换行分隔）|
+| `sig_mode` / `sig_header` / `sig_prefix` / `signing_secret_enc` | 验签配置；密钥需原值重算 HMAC，故走 Fernet 加密而非哈希 |
+| `rate_limit` | DRF 速率语法，留空用 `API_KEY_DEFAULT_RATE` |
+| `bound_user` | 服务账号（`svc-<名称>`，密码不可用、非 staff）。返回真实 User 让审计按 FK 落调用方，既有权限类也原样生效 |
+| `enabled` / `expires_at` | 停用比删除更可逆，泄露时的第一动作 |
+| `last_used_at` / `last_used_ip` | 使用痕迹，按 `API_KEY_TOUCH_INTERVAL` 节流写库 |
+
+明文只在创建 / 轮换的响应里出现一次，任何后续接口都取不到。
+
+### 已登记作用域
+
+| scope | 说明 | 挂在哪 |
+|-------|------|--------|
+| `artifact:report` | 上报构建制品 | `POST /api/artifacts/report/` |
+| `artifact:download` | 下载构建制品 | `GET /api/artifacts/{id}/download/` |
+| `task:trigger` | 触发任务流执行 | `POST /api/exec/tasks/{id}/trigger/` |
+
+新增机读接口时先在 `apikey.SCOPES` 登记，`scope_required()` 会校验拼写（拼错启动即报错）。
+
+### 暴破与限速
+
+- 校验失败按 `key_id` 计数（`common/ratelimit.py`），窗口内达 `API_KEY_FAIL_LIMIT`
+  即锁定，锁定期内即使 key 正确也返回 429；
+- `ApiKeyThrottle` 按 `key_id` 分桶限速。key 泄露且泄露方就在白名单里（比如 CI 机
+  被人登上去）时，只有限速能限制损害速率。
+
+### 调用示例
+
+```bash
+# 上报制品
+curl -H "X-API-KEY: ak_xxx.yyy" -F file=@app.tar.gz \
+     -F project_group=proj -F channel=official -F environment=prod -F version=1.2.3 \
+     https://ops.example.com/api/artifacts/report/
+
+# 触发任务流（生产环境必须显式确认）
+curl -H "X-API-KEY: ak_xxx.yyy" -H 'Content-Type: application/json' \
+     -d '{"confirm_production": true}' \
+     https://ops.example.com/api/exec/tasks/12/trigger/
+```
+
+命令行签发（上线当天没人登得进来时的通道）：
+
+```bash
+./venv/bin/python manage.py create_api_credential \
+    --name ci-jenkins --scopes artifact:report --ip 10.0.1.0/24
+```
+
+### 存量迁移
+
+`artifact.api_key` 保留一个废弃期：`ArtifactReportView` 的权限类是
+`scope_required('artifact:report') | HasArtifactAPIKey`，带旧 key 仍能上报，但会打
+`WARNING`（据此盘点还有谁没换）。存量清零后删掉 `apps/artifact_mgr/permissions.py`、
+系统配置项与视图上的兜底权限类即可。
+
+---
+
 ## JWT 配置
 
 ```python
@@ -304,3 +426,9 @@ SIMPLE_JWT = {
 | POST | `/api/auth/mfa/recovery-codes/` | 重发恢复码（密码 + 当前验证码，旧码作废）|
 | POST | `/api/auth/users/{id}/reset_mfa/` | 管理员清除他人绑定（丢手机兜底）|
 | GET/POST | `/api/auth/mfa/sudo/` | 敏感操作二次验证窗口：查状态 / 开窗口 |
+| GET | `/api/auth/api-credentials/` | API 凭证列表（管理员，不分页）|
+| GET | `/api/auth/api-credentials/scopes/` | 可授权作用域清单 |
+| POST | `/api/auth/api-credentials/` | 新建凭证，响应 `data.api_key` 为明文（仅此一次）|
+| PATCH/DELETE | `/api/auth/api-credentials/{id}/` | 改 / 删（sudo 二次验证）|
+| POST | `/api/auth/api-credentials/{id}/rotate_key/` | 轮换 key，旧 key 立即失效 |
+| POST | `/api/auth/api-credentials/{id}/toggle_enabled/` | 停用 / 启用 |

@@ -43,7 +43,7 @@ settings：`ARTIFACT_ROOT`（制品落盘根目录，默认 `media/artifacts`）
 apps/artifact_mgr/
 ├── models.py        # Artifact：三维度+version 唯一；latest_for 取最新/锁定版本；
 │                    #   download_sig/download_url：HMAC 签名下载地址
-├── permissions.py   # HasArtifactAPIKey：X-API-KEY 与 artifact.api_key 恒定时间比较
+├── permissions.py   # HasArtifactAPIKey：**已废弃**，全局 artifact.api_key 的废弃期兜底
 ├── serializers.py   # 展示 + 上报入参校验（维度按 code/id 解析、版本/文件名白名单防穿越）
 ├── views.py         # ArtifactViewSet（查/删）+ ArtifactReportView（上报）+ ArtifactDownloadView（下载）
 └── urls.py
@@ -122,8 +122,12 @@ manager（需要 Jenkins 所在内网能出公网；不能出网时得另做 age
 | GET | `/api/artifacts/` | 登录用户 | 列表；`?project_group/channel/env`（id 或 code）、`keyword`（版本/文件名/job） |
 | GET | `/api/artifacts/{id}/` | 登录用户 | 详情（含 `download_url`） |
 | DELETE | `/api/artifacts/{id}/` | 管理员 | 删除记录并清理磁盘文件 |
-| POST | `/api/artifacts/report/` | X-API-KEY | CI 上报（multipart，见下） |
-| GET | `/api/artifacts/{id}/download/?sig=…` | 登录用户或签名 | 附件下载；`sig=hmac_sha256(api_key, "{id}:{md5}")` |
+| POST | `/api/artifacts/report/` | API 凭证 `artifact:report`（旧全局 key 兜底） | CI 上报（multipart，见下） |
+| GET | `/api/artifacts/{id}/download/?sig=…` | 登录用户 / API 凭证 `artifact:download` / URL 签名 | 附件下载；`sig=hmac_sha256(api_key, "{id}:{md5}")` |
+
+> **鉴权已升级为 API 凭证**（`ak_xxx.yyy`，带 per-key IP 白名单、作用域、可轮换可停用）。
+> 全局 `artifact.api_key` 进入废弃期：仍能上报，但每次命中打 `WARNING`，用于盘点未换的
+> 调用方。签发与语义见 `docs/backend/modules/auth.md` 的「API 凭证」章节。
 
 ### 上报（multipart 字段）
 

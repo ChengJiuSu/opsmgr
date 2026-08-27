@@ -1,8 +1,14 @@
+import hmac
+import secrets
+
 from django.contrib.auth.models import AbstractUser
 from django.conf import settings
 from django.db import models
+from django.utils import timezone
 
 from common.crypto import decrypt, encrypt
+from common.request import ip_matches_rules
+from common.secrets import generate_secret, hash_secret
 
 
 class User(AbstractUser):
@@ -79,3 +85,169 @@ class MFARecoveryCode(models.Model):
 
     def __str__(self):
         return f'{self.user_id} recovery({"used" if self.used_at else "unused"})'
+
+
+class ApiCredential(models.Model):
+    """机读接口凭证：内部脚本 / Webhook 免登录调用平台接口的身份。
+
+    替代原来那把「全局唯一、明文存 SystemConfig、无过期无作用域无来源限制」
+    的 `artifact.api_key`：一把 key 被所有脚本共用时，轮换要同时改所有调用方，
+    泄露了也无法定位是哪个脚本漏的。
+
+    四道门叠加，任一不过即拒（校验实现见 apps/auth_mgr/apikey.py）：
+
+    1. **key** —— 明文形如 `ak_<16位hex>.<43位随机串>`。前半段 key_id 公开、
+       建索引用于定位记录；后半段 secret 只存 sha256（common/secrets.py），
+       明文仅在创建/轮换的响应里出现一次。
+    2. **IP 白名单** —— 按凭证维护 CIDR 列表。客户端 IP 走
+       common.request.auth_client_ip（可信代理链解析），不吃伪造的 XFF。
+    3. **作用域 scopes** —— 一把 key 只能调被授权的那几类接口，泄露面按接口切分。
+    4. **Webhook 签名** —— 第三方 webhook 的源 IP 段大且会变，只靠白名单不够；
+       配了 sig_mode 就强制验签，且校验发生在认证层——放权限层容易在新增视图
+       时漏挂，认证层是所有走这条认证的接口都必过。
+
+    `ip_whitelist` 为空**不等于**不限制：必须显式把 `ip_unrestricted` 置 True，
+    否则认证直接拒。默认拒的理由：留空放行会让「忘了填」和「故意不填」外观
+    一致，一次手滑就产出一把全网可用的 key。
+    """
+
+    SIG_NONE = 'none'
+    SIG_HMAC_SHA256 = 'hmac_sha256'
+    SIG_TOKEN = 'token'
+    SIG_MODE_CHOICES = [
+        (SIG_NONE, '不验签'),
+        (SIG_HMAC_SHA256, 'HMAC-SHA256（GitHub/Gitee 风格，签请求体）'),
+        (SIG_TOKEN, '共享 Token（GitLab 风格，比对请求头明文）'),
+    ]
+
+    KEY_PREFIX = 'ak_'
+    #: 明文里分隔 key_id 与 secret 的字符（secret 用 token_urlsafe，不含 '.'）
+    KEY_SEP = '.'
+
+    name = models.CharField('凭证名称', max_length=64, unique=True)
+    key_id = models.CharField('凭证标识', max_length=32, unique=True, editable=False)
+    secret_hash = models.CharField('密钥哈希', max_length=64, editable=False)
+    # 授权作用域，取值见 apps/auth_mgr/apikey.SCOPES
+    scopes = models.JSONField('作用域', default=list)
+
+    ip_unrestricted = models.BooleanField('不限制来源 IP', default=False)
+    ip_whitelist = models.TextField('来源 IP 白名单', blank=True,
+                                    help_text='IP 或 CIDR，逗号/换行分隔')
+
+    sig_mode = models.CharField('签名校验方式', max_length=16,
+                                choices=SIG_MODE_CHOICES, default=SIG_NONE)
+    sig_header = models.CharField('签名请求头', max_length=64, blank=True)
+    sig_prefix = models.CharField('签名值前缀', max_length=16, blank=True,
+                                  help_text='如 GitHub 的 sha256=；留空表示纯 hex')
+    # 需要用原值重算 HMAC，不能只存哈希，故走 Fernet 加密（common/crypto.py）
+    signing_secret_enc = models.TextField('签名密钥（加密）', blank=True, editable=False)
+
+    rate_limit = models.CharField('限速', max_length=16, blank=True,
+                                  help_text='DRF 速率语法，如 60/min；留空用全局默认')
+
+    # 凭证的行权身份：审计表按 user 记录调用方，权限类也照常生效。
+    # PROTECT：删用户前必须先处理引用它的凭证，避免凭证悄悄失去身份
+    bound_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, verbose_name='服务账号',
+        on_delete=models.PROTECT, related_name='api_credentials',
+    )
+    enabled = models.BooleanField('启用', default=True)
+    expires_at = models.DateTimeField('过期时间', null=True, blank=True)
+
+    last_used_at = models.DateTimeField('最近使用', null=True, blank=True)
+    last_used_ip = models.CharField('最近来源 IP', max_length=64, blank=True)
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, verbose_name='创建人', null=True, blank=True,
+        on_delete=models.SET_NULL, related_name='created_api_credentials',
+    )
+    remark = models.CharField('备注', max_length=200, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'API 凭证'
+        verbose_name_plural = 'API 凭证'
+        db_table = 'auth_api_credential'
+        ordering = ['name']
+
+    def __str__(self):
+        return f'{self.name}({self.key_id})'
+
+    # ── 明文与校验 ────────────────────────────────────────
+    @classmethod
+    def generate_key(cls):
+        """生成一把新 key，返回 (明文, key_id, secret 哈希)。
+
+        明文只在创建/轮换响应里出现一次，库里永远只有哈希。
+        """
+        key_id = cls.KEY_PREFIX + secrets.token_hex(8)
+        secret = generate_secret()
+        return f'{key_id}{cls.KEY_SEP}{secret}', key_id, hash_secret(secret)
+
+    @classmethod
+    def split_key(cls, raw):
+        """明文 → (key_id, secret)；不是本系统的 key 格式返回 (None, None)。
+
+        返回 None 让认证类原样放行给下一个认证方式/旧 key 兜底，而不是报错——
+        废弃期内老的 `artifact.api_key` 还在同一个请求头里传。
+        """
+        raw = str(raw or '').strip()
+        if not raw.startswith(cls.KEY_PREFIX) or cls.KEY_SEP not in raw:
+            return None, None
+        key_id, _, secret = raw.partition(cls.KEY_SEP)
+        return (key_id, secret) if secret else (None, None)
+
+    def verify_secret(self, secret):
+        """恒定时间比对 secret 哈希。"""
+        if not secret or not self.secret_hash:
+            return False
+        return hmac.compare_digest(hash_secret(secret), self.secret_hash)
+
+    def rotate_key(self):
+        """轮换：旧明文立即失效，返回新明文（仅此一次可见）。"""
+        raw, key_id, secret_hash = self.generate_key()
+        self.key_id = key_id
+        self.secret_hash = secret_hash
+        self.save(update_fields=['key_id', 'secret_hash', 'updated_at'])
+        return raw
+
+    # ── 状态与授权 ────────────────────────────────────────
+    def is_expired(self):
+        return bool(self.expires_at and self.expires_at <= timezone.now())
+
+    def is_usable(self):
+        return bool(self.enabled and not self.is_expired())
+
+    def has_scope(self, scope):
+        return scope in (self.scopes or [])
+
+    def ip_allowed(self, ip):
+        """来源 IP 是否放行。白名单留空且未显式勾选不限制 → 拒。"""
+        if self.ip_unrestricted:
+            return True
+        return ip_matches_rules(ip, self.ip_whitelist)
+
+    # ── Webhook 签名密钥 ──────────────────────────────────
+    def set_signing_secret(self, raw):
+        self.signing_secret_enc = encrypt(raw)
+
+    def get_signing_secret(self):
+        """返回明文签名密钥；解不开抛 common.crypto.DecryptError。"""
+        return decrypt(self.signing_secret_enc)
+
+    @property
+    def has_signing_secret(self):
+        return bool(self.signing_secret_enc)
+
+    # ── 使用痕迹 ──────────────────────────────────────────
+    def touch(self, ip):
+        """更新最近使用信息（调用方按 API_KEY_TOUCH_INTERVAL 节流）。"""
+        self.last_used_at = timezone.now()
+        self.last_used_ip = (ip or '')[:64]
+        # update_fields 限定三列：并发写不同凭证互不影响，也不会覆盖页面上的改动
+        ApiCredential.objects.filter(pk=self.pk).update(
+            last_used_at=self.last_used_at,
+            last_used_ip=self.last_used_ip,
+            updated_at=timezone.now(),  # .update() 不触发 auto_now，手动补
+        )

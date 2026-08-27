@@ -85,3 +85,43 @@ DRF 默认错误响应格式多样（字符串/列表/嵌套字典），`custom_
 | `list` | 取第一个元素递归 |
 | `dict` | 取第一个 value 递归 |
 | 其他 | `str()` 转换 |
+
+---
+
+## 请求元信息（`common/request.py`）
+
+取客户端 IP 有**两个口径，不能混用**：
+
+| 函数 | 用途 | 可信度 |
+|------|------|--------|
+| `client_ip(request)` | 审计展示、限速分桶 | 取 `X-Forwarded-For` 首段，**可被客户端伪造** |
+| `auth_client_ip(request)` | 鉴权（API 凭证 IP 白名单） | 只信 `settings.TRUSTED_PROXIES` 之内的转发 |
+
+`auth_client_ip` 的算法：
+
+1. `REMOTE_ADDR` 不在 `TRUSTED_PROXIES` 内 → 请求没经过我们的代理，XFF 全是客户端
+   自己写的，整条丢掉，直接用 `REMOTE_ADDR`；
+2. 在可信代理内 → 从 XFF **最右往左**依次剥掉连续的可信代理，返回第一个非可信地址。
+   右端是离服务最近的一跳（由代理追加，客户端伪造不到），左端才是客户端可控区；
+3. 剥完没有非可信地址 → 返回 `REMOTE_ADDR`（代理自身），业务白名单必然不匹配，
+   即 fail-closed。
+
+为什么必须分两个函数：拿 `client_ip` 做白名单，攻击者加一个
+`X-Forwarded-For: 10.0.0.5` 就伪装成内网来源，白名单等于没有；而审计侧要的恰恰是
+「客户端声称的链路原样记录」，两者需求相反。
+
+IP 规则匹配：`parse_ip_rules(text)`（逗号/空格/换行/分号混排 → 网段列表，非法条目抛
+`ValueError` 供序列化器转中文报错）、`ip_in_networks(ip, networks)`、
+`ip_matches_rules(ip, text)`（文本非法按不匹配处理）。
+
+---
+
+## 机读凭证口径（`common/secrets.py`）
+
+`generate_secret(nbytes=32)` 生成 URL 安全随机明文（256 bit 熵）；`hash_secret(raw)`
+返回 sha256 hex。Agent 令牌（`agent_mgr.models.hash_token` 是它的别名）与 API 凭证
+共用这一份实现——口径散落两处时，改了其中一处会让另一处的存量凭证静默失效。
+
+刻意不用 PBKDF2/bcrypt：凭证是随机串而非人选密码，不存在字典攻击面，而机读接口每个
+请求都要校验一次，慢哈希会变成瓶颈。需要**可还原**的秘密（Webhook 签名密钥要用原值
+重算 HMAC）走 `common/crypto.py` 的对称加密，不走这里。

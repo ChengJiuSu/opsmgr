@@ -179,6 +179,32 @@ MEDIA_ROOT = BASE_DIR / 'media'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
+# ── 机读接口访问控制（API 凭证 + IP 白名单）────────────────
+# 内部脚本 / Webhook 免登录调用的凭证见 apps/auth_mgr/models.ApiCredential，
+# 校验链见 apps/auth_mgr/apikey.py。
+#
+# TRUSTED_PROXIES：本服务前置的反向代理地址（CIDR 或单 IP，逗号分隔）。
+# IP 白名单校验只信这些地址转发来的 X-Forwarded-For，其余一律用 REMOTE_ADDR
+# （见 common/request.auth_client_ip 的算法说明）。**多层代理必须把每一层都
+# 写进来**，否则会把内层代理 IP 当成客户端，导致所有白名单失配。
+# 默认只含回环：单机 nginx 反代（proxy_pass 到 127.0.0.1）即可工作；
+# nginx 与应用不同机、或前面还有 SLB/WAF 时必须显式配置。
+TRUSTED_PROXIES = [
+    item.strip() for item in
+    config('TRUSTED_PROXIES', default='127.0.0.1,::1').split(',') if item.strip()
+]
+# API 凭证默认限速（DRF 速率语法 `次数/周期`，周期取 s/m/h/day）。
+# 单个凭证可在页面上覆盖；key 泄露时这是唯一还在拦的东西。
+API_KEY_DEFAULT_RATE = config('API_KEY_DEFAULT_RATE', default='60/min')
+# 凭证校验失败的锁定策略（复用 common/ratelimit.py，按 key_id 计数）：
+# 窗口内失败达阈值即锁定，锁定期内直接 429。防的是拿到 key_id 后暴力猜 secret。
+API_KEY_FAIL_LIMIT = config('API_KEY_FAIL_LIMIT', default=20, cast=int)
+API_KEY_FAIL_WINDOW = config('API_KEY_FAIL_WINDOW', default=300, cast=int)
+API_KEY_FAIL_BLOCK = config('API_KEY_FAIL_BLOCK', default=300, cast=int)
+# 凭证「最近使用」写库的最小间隔（秒）：每请求一次 UPDATE 会把机读接口的
+# 写压力翻倍，这里按分钟级节流，last_used_at 有分钟级误差是可接受的
+API_KEY_TOUCH_INTERVAL = config('API_KEY_TOUCH_INTERVAL', default=60, cast=int)
+
 # ── DRF 配置 ──────────────────────────────────────────────
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
@@ -196,6 +222,10 @@ REST_FRAMEWORK = {
     'DEFAULT_RENDERER_CLASSES': (
         'rest_framework.renderers.JSONRenderer',
     ),
+    # 只作用于显式声明了 ApiKeyThrottle 的机读接口（登录用户走 JWT，不限速）
+    'DEFAULT_THROTTLE_RATES': {
+        'apikey': API_KEY_DEFAULT_RATE,
+    },
 }
 
 # ── JWT 配置 ──────────────────────────────────────────────

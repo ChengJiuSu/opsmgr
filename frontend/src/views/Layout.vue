@@ -71,6 +71,7 @@
           </template>
           <el-menu-item v-if="authStore.isStaff" index="/system/users">用户管理</el-menu-item>
           <el-menu-item v-if="authStore.isStaff" index="/system/agents">Agent 管理</el-menu-item>
+          <el-menu-item v-if="authStore.isStaff" index="/system/api-credentials">API 凭证</el-menu-item>
           <el-menu-item index="/system/configs">系统配置</el-menu-item>
         </el-sub-menu>
       </el-menu>

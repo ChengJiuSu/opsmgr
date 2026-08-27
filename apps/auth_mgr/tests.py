@@ -1,18 +1,27 @@
-"""认证测试：登录限速、MFA 绑定链路、两步登录、强制策略与管理员重置。"""
+"""认证测试：登录限速、MFA 绑定链路、两步登录、强制策略与管理员重置、API 凭证。"""
+import hashlib
+import hmac
+from datetime import timedelta
 from unittest import mock
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.test import TestCase, override_settings
+from django.urls import path
+from django.utils import timezone
 from rest_framework.test import APIClient
+from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import AccessToken
 
+from apps.audit.models import AuditLog
 from apps.system_cfg.models import SystemConfig
 from common import totp
+from common.response import ok
 from common.testing import grant_sudo
 
-from .models import MFARecoveryCode, UserMFA
+from .apikey import ApiKeyAuthentication, ApiKeyThrottle, ensure_service_user, scope_required
+from .models import ApiCredential, MFARecoveryCode, UserMFA
 
 User = get_user_model()
 PASSWORD = 'Pass!2345xyz'
@@ -779,3 +788,387 @@ class SudoTests(TestCase):
             r = self.client.post('/api/system/configs/', {'key': 'k4', 'value': 'v'},
                                  format='json')
         self.assertEqual(r.status_code, 403)
+
+
+# ── API 凭证（机读接口访问控制）─────────────────────────────
+class _ProbeView(APIView):
+    """测试专用的机读接口：只挂 API 凭证这一套，用来单独验校验链。
+
+    不借用制品上报/任务触发做断言：那两个接口各自还有业务前置校验（multipart
+    上传、任务必须配好模块），失败原因会和访问控制的失败混在一起。
+    """
+
+    authentication_classes = [ApiKeyAuthentication]
+    permission_classes = [scope_required('task:trigger')]
+    throttle_classes = [ApiKeyThrottle]
+
+    def post(self, request):
+        return ok({'username': request.user.username, 'key_id': request.auth.key_id})
+
+
+#: 供 override_settings(ROOT_URLCONF=__name__) 使用
+urlpatterns = [path('probe/', _ProbeView.as_view(), name='probe')]
+
+PROBE = '/probe/'
+TRUSTED = ['127.0.0.1']
+
+
+def make_credential(name='ci', scopes=('task:trigger',), **kwargs):
+    """建一把凭证，返回 (凭证, 明文 key)。"""
+    raw, key_id, secret_hash = ApiCredential.generate_key()
+    defaults = dict(ip_whitelist='203.0.113.9', ip_unrestricted=False)
+    defaults.update(kwargs)
+    credential = ApiCredential.objects.create(
+        name=name, key_id=key_id, secret_hash=secret_hash, scopes=list(scopes),
+        bound_user=ensure_service_user(name), **defaults)
+    return credential, raw
+
+
+@override_settings(ROOT_URLCONF=__name__, TRUSTED_PROXIES=TRUSTED)
+class ApiKeyAuthTests(TestCase):
+    """凭证校验链：key、状态、过期、IP 白名单、作用域、限速。"""
+
+    def setUp(self):
+        cache.clear()  # 失败计数与限速桶在缓存里，用例间必须隔离
+        self.client = APIClient()
+        self.credential, self.key = make_credential()
+
+    def tearDown(self):
+        cache.clear()
+
+    def _post(self, key=None, ip='203.0.113.9', **extra):
+        if key is not None:
+            extra['HTTP_X_API_KEY'] = key
+        return self.client.post(PROBE, {}, format='json', REMOTE_ADDR=ip, **extra)
+
+    # ── key 本身 ──────────────────────────────────────────
+    def test_valid_key(self):
+        r = self._post(self.key)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()['data']['key_id'], self.credential.key_id)
+        self.assertEqual(r.json()['data']['username'], 'svc-ci')
+
+    def test_no_key_is_401(self):
+        self.assertEqual(self._post().status_code, 401)
+
+    def test_wrong_secret_is_401(self):
+        key_id, _ = ApiCredential.split_key(self.key)
+        r = self._post(f'{key_id}.wrong-secret')
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(r.json()['error_code'], 'api_key_invalid')
+
+    def test_unknown_key_id_same_error_as_wrong_secret(self):
+        """两者返回同一个错误码：否则枚举 key_id 就能探出哪些凭证存在。"""
+        r = self._post('ak_ffffffffffffffff.whatever')
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(r.json()['error_code'], 'api_key_invalid')
+
+    def test_legacy_format_key_not_accepted(self):
+        """不是 ak_ 开头的走不到凭证这条链（留给旧 key 的兜底权限类）。"""
+        self.assertEqual(self._post('some-legacy-global-key').status_code, 401)
+
+    def test_authorization_apikey_header(self):
+        r = self.client.post(PROBE, {}, format='json', REMOTE_ADDR='203.0.113.9',
+                             HTTP_AUTHORIZATION=f'ApiKey {self.key}')
+        self.assertEqual(r.status_code, 200)
+
+    def test_rotate_invalidates_old_key(self):
+        new_key = self.credential.rotate_key()
+        self.assertEqual(self._post(self.key).status_code, 401)
+        self.assertEqual(self._post(new_key).status_code, 200)
+
+    # ── 状态 ──────────────────────────────────────────────
+    def test_disabled_is_401(self):
+        self.credential.enabled = False
+        self.credential.save(update_fields=['enabled'])
+        self.assertEqual(self._post(self.key).status_code, 401)
+
+    def test_expired_is_401(self):
+        self.credential.expires_at = timezone.now() - timedelta(seconds=1)
+        self.credential.save(update_fields=['expires_at'])
+        r = self._post(self.key)
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(r.json()['error_code'], 'api_key_expired')
+
+    def test_disabled_service_account_is_401(self):
+        self.credential.bound_user.is_active = False
+        self.credential.bound_user.save(update_fields=['is_active'])
+        self.assertEqual(self._post(self.key).status_code, 401)
+
+    # ── IP 白名单 ─────────────────────────────────────────
+    def test_ip_outside_whitelist_is_403(self):
+        r = self._post(self.key, ip='198.51.100.7')
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()['error_code'], 'api_key_ip_denied')
+
+    def test_forged_xff_cannot_bypass_whitelist(self):
+        """直连（对端不在 TRUSTED_PROXIES）时伪造 XFF 必须无效。
+
+        这是整套白名单成立的前提：XFF 是普通请求头，客户端想写什么写什么。
+        """
+        r = self._post(self.key, ip='198.51.100.7',
+                       HTTP_X_FORWARDED_FOR='203.0.113.9')
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()['error_code'], 'api_key_ip_denied')
+
+    def test_trusted_proxy_xff_accepted(self):
+        r = self._post(self.key, ip='127.0.0.1',
+                       HTTP_X_FORWARDED_FOR='10.0.0.5, 203.0.113.9')
+        self.assertEqual(r.status_code, 200)
+
+    def test_cidr_whitelist(self):
+        self.credential.ip_whitelist = '203.0.113.0/24'
+        self.credential.save(update_fields=['ip_whitelist'])
+        self.assertEqual(self._post(self.key, ip='203.0.113.200').status_code, 200)
+
+    def test_empty_whitelist_denies_everything(self):
+        """留空不等于不限制：没勾「不限制」就一律拒。"""
+        self.credential.ip_whitelist = ''
+        self.credential.save(update_fields=['ip_whitelist'])
+        self.assertEqual(self._post(self.key, ip='203.0.113.9').status_code, 403)
+
+    def test_unrestricted_allows_any_ip(self):
+        self.credential.ip_unrestricted = True
+        self.credential.save(update_fields=['ip_unrestricted'])
+        self.assertEqual(self._post(self.key, ip='198.51.100.7').status_code, 200)
+
+    # ── 作用域 ────────────────────────────────────────────
+    def test_missing_scope_is_403(self):
+        self.credential.scopes = ['artifact:report']
+        self.credential.save(update_fields=['scopes'])
+        r = self._post(self.key)
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()['error_code'], 'api_key_scope_denied')
+
+    # ── 限速与暴破 ────────────────────────────────────────
+    @override_settings(API_KEY_FAIL_LIMIT=3, API_KEY_FAIL_WINDOW=300,
+                       API_KEY_FAIL_BLOCK=300, ROOT_URLCONF=__name__,
+                       TRUSTED_PROXIES=TRUSTED)
+    def test_brute_force_locks_key(self):
+        key_id, _ = ApiCredential.split_key(self.key)
+        for _ in range(3):
+            self.assertEqual(self._post(f'{key_id}.wrong').status_code, 401)
+        # 锁定期内即使 key 正确也不放行，否则限速只是多给攻击者一次机会
+        self.assertEqual(self._post(self.key).status_code, 429)
+
+    @override_settings(REST_FRAMEWORK_THROTTLE_UNUSED=None)
+    def test_rate_limit_from_credential(self):
+        self.credential.rate_limit = '2/min'
+        self.credential.save(update_fields=['rate_limit'])
+        self.assertEqual(self._post(self.key).status_code, 200)
+        self.assertEqual(self._post(self.key).status_code, 200)
+        self.assertEqual(self._post(self.key).status_code, 429)
+
+    # ── 使用痕迹与审计 ────────────────────────────────────
+    def test_last_used_recorded(self):
+        self._post(self.key)
+        self.credential.refresh_from_db()
+        self.assertIsNotNone(self.credential.last_used_at)
+        self.assertEqual(self.credential.last_used_ip, '203.0.113.9')
+
+    def test_audit_records_service_account(self):
+        """审计要能回答「这次机读调用是哪把凭证」——靠绑定的服务账号落 FK。"""
+        self._post(self.key)
+        entry = AuditLog.objects.filter(path=PROBE).first()
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.user, self.credential.bound_user)
+
+
+@override_settings(ROOT_URLCONF=__name__, TRUSTED_PROXIES=TRUSTED)
+class WebhookSignatureTests(TestCase):
+    """Webhook 签名：HMAC-SHA256（签原始请求体）与共享 Token 两种模式。"""
+
+    SECRET = 'webhook-signing-secret-0001'
+    BODY = b'{"ref":"refs/heads/main"}'
+
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient()
+        self.credential, self.key = make_credential(
+            name='gh-webhook', sig_mode=ApiCredential.SIG_HMAC_SHA256,
+            sig_header='X-Hub-Signature-256', sig_prefix='sha256=')
+        self.credential.set_signing_secret(self.SECRET)
+        self.credential.save(update_fields=['signing_secret_enc'])
+
+    def tearDown(self):
+        cache.clear()
+
+    def _sig(self, secret=None, body=None):
+        return 'sha256=' + hmac.new((secret or self.SECRET).encode(),
+                                    body or self.BODY, hashlib.sha256).hexdigest()
+
+    def _post(self, signature=None, body=None, header='HTTP_X_HUB_SIGNATURE_256'):
+        extra = {'HTTP_X_API_KEY': self.key, 'REMOTE_ADDR': '203.0.113.9'}
+        if signature is not None:
+            extra[header] = signature
+        return self.client.post(PROBE, data=body or self.BODY,
+                                content_type='application/json', **extra)
+
+    def test_valid_signature(self):
+        self.assertEqual(self._post(self._sig()).status_code, 200)
+
+    def test_missing_signature_header_is_403(self):
+        r = self._post()
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()['error_code'], 'api_key_signature_invalid')
+
+    def test_wrong_secret_is_403(self):
+        self.assertEqual(self._post(self._sig(secret='other')).status_code, 403)
+
+    def test_tampered_body_is_403(self):
+        """签的是原始字节：体改一个字符签名就不成立。"""
+        signature = self._sig()
+        r = self._post(signature, body=b'{"ref":"refs/heads/prod"}')
+        self.assertEqual(r.status_code, 403)
+
+    def test_signature_without_prefix_also_accepted(self):
+        """sig_prefix 只是剥前缀，纯 hex 的提供方一样能用。"""
+        raw_hex = self._sig().split('=', 1)[1]
+        self.assertEqual(self._post(raw_hex).status_code, 200)
+
+    def test_token_mode(self):
+        self.credential.sig_mode = ApiCredential.SIG_TOKEN
+        self.credential.sig_header = 'X-Gitlab-Token'
+        self.credential.save(update_fields=['sig_mode', 'sig_header'])
+        self.assertEqual(
+            self._post(self.SECRET, header='HTTP_X_GITLAB_TOKEN').status_code, 200)
+        self.assertEqual(
+            self._post('nope', header='HTTP_X_GITLAB_TOKEN').status_code, 403)
+
+    def test_signature_required_even_if_view_forgets(self):
+        """验签在认证层：视图没挂任何签名相关的权限类也照样必过。"""
+        self.assertEqual(len(_ProbeView.permission_classes), 1)
+        self.assertEqual(self._post().status_code, 403)
+
+
+class ApiCredentialAdminTests(TestCase):
+    """凭证管理接口：权限、sudo、明文只出现一次、白名单校验。"""
+
+    URL = '/api/auth/api-credentials/'
+
+    def setUp(self):
+        cache.clear()
+        self.admin = User.objects.create(username='cred_admin', is_staff=True)
+        self.admin.set_password(PASSWORD)
+        self.admin.save()
+        self.client = self._login('cred_admin')
+        grant_sudo(self.client, PASSWORD)
+
+    def tearDown(self):
+        cache.clear()
+
+    def _login(self, username):
+        client = APIClient()
+        r = client.post('/api/auth/login/', {'username': username, 'password': PASSWORD},
+                        format='json')
+        client.credentials(HTTP_AUTHORIZATION='Bearer ' + r.json()['access'])
+        return client
+
+    def _payload(self, **kwargs):
+        data = {'name': 'ci-jenkins', 'scopes': ['artifact:report'],
+                'ip_whitelist': '10.0.1.0/24'}
+        data.update(kwargs)
+        return data
+
+    # ── 创建 ──────────────────────────────────────────────
+    def test_create_returns_plaintext_once(self):
+        r = self.client.post(self.URL, self._payload(), format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        data = r.json()['data']
+        raw = data['api_key']
+        self.assertTrue(raw.startswith('ak_'))
+        # 明文不入库，只留哈希
+        credential = ApiCredential.objects.get(pk=data['id'])
+        self.assertNotIn(raw, [credential.secret_hash, credential.key_id])
+        self.assertTrue(credential.verify_secret(raw.split('.', 1)[1]))
+        # 列表与详情都不再给明文（该 ViewSet 关了分页，list 直接返回数组）
+        self.assertNotIn('api_key', self.client.get(self.URL).json()[0])
+        self.assertNotIn('api_key', self.client.get(f'{self.URL}{data["id"]}/').json())
+
+    def test_create_auto_binds_service_account(self):
+        r = self.client.post(self.URL, self._payload(), format='json')
+        self.assertEqual(r.json()['data']['bound_user_name'], 'svc-ci-jenkins')
+        service = User.objects.get(username='svc-ci-jenkins')
+        self.assertFalse(service.is_staff)
+        self.assertFalse(service.has_usable_password())  # 服务账号不能从登录页进来
+
+    def test_empty_whitelist_rejected(self):
+        """本期核心约定：留空必须显式勾选「不限制来源 IP」。"""
+        r = self.client.post(self.URL, self._payload(ip_whitelist=''), format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('白名单', r.json()['msg'])
+
+    def test_unrestricted_requires_explicit_flag(self):
+        r = self.client.post(self.URL,
+                             self._payload(ip_whitelist='', ip_unrestricted=True),
+                             format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertTrue(ApiCredential.objects.get(pk=r.json()['data']['id']).ip_unrestricted)
+
+    def test_invalid_cidr_rejected(self):
+        r = self.client.post(self.URL, self._payload(ip_whitelist='10.0.0.0/33'),
+                             format='json')
+        self.assertEqual(r.status_code, 400)
+
+    def test_unknown_scope_rejected(self):
+        r = self.client.post(self.URL, self._payload(scopes=['what:ever']), format='json')
+        self.assertEqual(r.status_code, 400)
+
+    def test_empty_scope_rejected(self):
+        r = self.client.post(self.URL, self._payload(scopes=[]), format='json')
+        self.assertEqual(r.status_code, 400)
+
+    def test_signature_mode_requires_secret(self):
+        r = self.client.post(self.URL, self._payload(
+            sig_mode='hmac_sha256', sig_header='X-Hub-Signature-256'), format='json')
+        self.assertEqual(r.status_code, 400)
+
+    def test_signing_secret_never_returned(self):
+        r = self.client.post(self.URL, self._payload(
+            sig_mode='hmac_sha256', sig_header='X-Hub-Signature-256',
+            signing_secret='a-long-enough-secret'), format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        data = r.json()['data']
+        self.assertNotIn('signing_secret', data)
+        self.assertTrue(data['has_signing_secret'])
+
+    def test_bad_rate_limit_rejected(self):
+        r = self.client.post(self.URL, self._payload(rate_limit='60 per minute'),
+                             format='json')
+        self.assertEqual(r.status_code, 400)
+
+    def test_past_expiry_rejected(self):
+        r = self.client.post(self.URL, self._payload(
+            expires_at=(timezone.now() - timedelta(days=1)).isoformat()), format='json')
+        self.assertEqual(r.status_code, 400)
+
+    # ── 动作 ──────────────────────────────────────────────
+    def test_rotate_and_toggle(self):
+        credential_id = self.client.post(self.URL, self._payload(),
+                                         format='json').json()['data']['id']
+        r = self.client.post(f'{self.URL}{credential_id}/rotate_key/')
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()['data']['api_key'].startswith('ak_'))
+
+        r = self.client.post(f'{self.URL}{credential_id}/toggle_enabled/')
+        self.assertFalse(r.json()['data']['enabled'])
+
+    def test_scopes_endpoint(self):
+        r = self.client.get(f'{self.URL}scopes/')
+        self.assertEqual(r.status_code, 200)
+        self.assertIn('artifact:report', [item['value'] for item in r.json()['data']])
+
+    # ── 权限 ──────────────────────────────────────────────
+    def test_non_admin_forbidden(self):
+        member = User.objects.create(username='cred_member', is_staff=False)
+        member.set_password(PASSWORD)
+        member.save()
+        client = self._login('cred_member')
+        self.assertEqual(client.get(self.URL).status_code, 403)
+        self.assertEqual(client.post(self.URL, self._payload(), format='json').status_code, 403)
+
+    def test_write_requires_sudo(self):
+        client = self._login('cred_admin')  # 新会话，没开 sudo 窗口
+        r = client.post(self.URL, self._payload(), format='json')
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()['error_code'], 'sudo_required')

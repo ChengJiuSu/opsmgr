@@ -19,6 +19,7 @@ from channels.routing import URLRouter
 from channels.testing import WebsocketCommunicator
 
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.core.management import call_command
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
@@ -548,7 +549,7 @@ class ExecutionAPITests(TestCase):
         self.assertIn('模块「部署」', str(r.json()))
 
         ServerService.objects.create(server=self.server, service_type=game, status='planned')
-        with mock.patch('apps.task_exec.views.dispatch', return_value=mock.Mock(id=1)):
+        with mock.patch('apps.task_exec.trigger.dispatch', return_value=mock.Mock(id=1)):
             r = c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
         self.assertEqual(r.status_code, 200)
 
@@ -2280,3 +2281,104 @@ class LogFileBrowserTests(TestCase):
                                    {'path': f'{self.task.id}/{self.log.id}.log'}).status_code, 403)
             self.assertEqual(c.get('/api/exec/log-files/download/',
                                    {'path': f'{self.task.id}/{self.log.id}.log'}).status_code, 403)
+
+
+@override_settings(TRUSTED_PROXIES=['127.0.0.1'], TASK_EXEC_BACKEND='sync',
+                   TASK_FAILURE_WAIT_TIMEOUT=0)
+class TaskTriggerApiTests(TestCase):
+    """接口/Webhook 触发任务流：凭证鉴权 + 业务约束（默认全选、生产确认）。"""
+
+    ALLOWED_IP = '203.0.113.9'
+
+    def setUp(self):
+        from apps.asset_mgr.models import Channel, Environment, ProjectGroup, ServerService, ServiceType
+        from apps.auth_mgr.apikey import ensure_service_user
+        from apps.auth_mgr.models import ApiCredential
+
+        cache.clear()
+        self.pg = ProjectGroup.objects.create(name='主项目', code='tg-proj')
+        self.ch = Channel.objects.create(name='官服渠道', code='tg-official')
+        self.env = Environment.objects.create(name='单测环境', code='tg-env')
+        self.server = Server.objects.create(
+            name='local', private_ip='127.0.0.1',
+            project_group=self.pg, channel=self.ch, environment=self.env,
+        )
+        self.service = ServiceType.objects.create(name='基础服务', code='tg-base')
+        ServerService.objects.create(server=self.server, service_type=self.service,
+                                     status='planned')
+        self.task = ExecutionTask.objects.create(
+            name='接口触发任务', project_group=self.pg, channel=self.ch, environment=self.env,
+        )
+        TaskStep.objects.create(task=self.task, order=1, name='模块1',
+                                task_type='command', command='echo hi',
+                                service_type=self.service)
+
+        raw, key_id, secret_hash = ApiCredential.generate_key()
+        self.credential = ApiCredential.objects.create(
+            name='tg-ci', key_id=key_id, secret_hash=secret_hash,
+            scopes=['task:trigger'], ip_whitelist=self.ALLOWED_IP,
+            bound_user=ensure_service_user('tg-ci'),
+        )
+        self.key = raw
+        self.client = APIClient()
+
+    def tearDown(self):
+        cache.clear()
+
+    def _trigger(self, key=None, ip=None, body=None):
+        headers = {'HTTP_X_API_KEY': key or self.key, 'REMOTE_ADDR': ip or self.ALLOWED_IP}
+        return self.client.post(f'/api/exec/tasks/{self.task.id}/trigger/',
+                                body or {}, format='json', **headers)
+
+    def test_trigger_creates_execution(self):
+        with mock.patch('apps.task_exec.trigger.dispatch', return_value=mock.Mock(id=7)):
+            r = self._trigger()
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(r.json()['data']['log_id'], 7)
+        self.assertEqual(r.json()['data']['server_count'], 1)
+        self.task.refresh_from_db()
+        self.assertEqual(list(self.task.servers.values_list('id', flat=True)), [self.server.id])
+
+    def test_trigger_requires_scope(self):
+        self.credential.scopes = ['artifact:report']
+        self.credential.save(update_fields=['scopes'])
+        r = self._trigger()
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()['error_code'], 'api_key_scope_denied')
+
+    def test_trigger_respects_ip_whitelist(self):
+        r = self._trigger(ip='198.51.100.7')
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()['error_code'], 'api_key_ip_denied')
+
+    def test_trigger_rejected_when_manual_pick_required(self):
+        """关掉默认全选的任务本就是要人工确认，接口不能绕过。"""
+        ExecutionTask.objects.filter(pk=self.task.pk).update(default_select_all=False)
+        r = self._trigger()
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('不支持接口触发', r.json()['msg'])
+
+    def test_production_requires_explicit_confirmation(self):
+        from apps.asset_mgr.models import Environment
+
+        Environment.objects.filter(pk=self.env.pk).update(is_prod=True)
+        r = self._trigger()
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('confirm_production', r.json()['msg'])
+
+        with mock.patch('apps.task_exec.trigger.dispatch', return_value=mock.Mock(id=8)):
+            r = self._trigger(body={'confirm_production': True})
+        self.assertEqual(r.status_code, 200, r.content)
+
+    def test_trigger_blocked_while_running(self):
+        ExecutionTask.objects.filter(pk=self.task.pk).update(status='running')
+        r = self._trigger()
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('正在执行中', r.json()['msg'])
+
+    def test_trigger_records_api_trigger_type(self):
+        with mock.patch('apps.task_exec.runner.run_stream', return_value=(0, 'ok')):
+            r = self._trigger()
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(self.task.logs.first().trigger_type, 'api')
+        self.assertEqual(self.task.logs.first().triggered_by, self.credential.bound_user)

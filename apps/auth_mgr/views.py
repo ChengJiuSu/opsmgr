@@ -5,6 +5,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
 from django.db.models import Q
+from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiResponse, extend_schema, inline_serializer
 from rest_framework import serializers, status, viewsets
 from rest_framework.decorators import action
@@ -25,7 +26,10 @@ from common.request import client_ip
 from common.response import fail, ok
 
 from . import services
+from .apikey import SCOPES, ensure_service_user
+from .models import ApiCredential
 from .serializers import (
+    ApiCredentialSerializer,
     ChangePasswordSerializer,
     CustomTokenObtainPairSerializer,
     MfaCodeSerializer,
@@ -473,3 +477,89 @@ class UserViewSet(viewsets.ModelViewSet):
         user.set_password(new_password)
         user.save(update_fields=['password'])
         return ok(msg='密码已重置')
+
+
+class ApiCredentialViewSet(viewsets.ModelViewSet):
+    """API 凭证管理（仅管理员 + sudo 二次验证）。
+
+    与系统配置、Agent 令牌同级：建一把凭证等于开一条免登录入口，改白名单等于
+    改这条入口能从哪来，属于「改了就能拿到更多东西」的操作，而登录那次 MFA
+    可能已经是 60 分钟前的事。
+
+    key 明文只在 create 与 rotate_key 的响应里出现一次，之后任何接口都取不到。
+    """
+
+    queryset = ApiCredential.objects.select_related('bound_user', 'created_by')
+    serializer_class = ApiCredentialSerializer
+    permission_classes = [IsAdmin, sudo.SudoRequired]
+    pagination_class = None  # 凭证数量与脚本数同量级，全量返回便于一眼看完
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        params = self.request.query_params
+        keyword = params.get('keyword')
+        if keyword:
+            qs = qs.filter(Q(name__icontains=keyword) | Q(key_id__icontains=keyword)
+                           | Q(remark__icontains=keyword))
+        enabled = params.get('enabled')
+        if enabled in ('true', 'false'):
+            qs = qs.filter(enabled=(enabled == 'true'))
+        scope = params.get('scope')
+        if scope:
+            # SQLite/MySQL 的 JSON 包含查询口径不一致，凭证量小直接内存过滤
+            ids = [obj.pk for obj in qs if obj.has_scope(scope)]
+            qs = qs.filter(pk__in=ids)
+        return qs
+
+    @extend_schema(responses=OpenApiResponse(description='可授权的作用域字典'))
+    @action(detail=False, methods=['get'], permission_classes=[IsAdmin])
+    def scopes(self, request):
+        """可授权作用域清单（前端建凭证时的多选来源）。"""
+        return ok([{'value': key, 'label': label} for key, label in SCOPES.items()])
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        raw, key_id, secret_hash = ApiCredential.generate_key()
+        bound_user = (serializer.validated_data.get('bound_user')
+                      or ensure_service_user(serializer.validated_data['name']))
+        credential = serializer.save(
+            key_id=key_id, secret_hash=secret_hash,
+            bound_user=bound_user, created_by=request.user,
+        )
+        logger.warning('管理员 %s 创建 API 凭证 %s（作用域 %s，白名单 %s）',
+                       request.user.username, credential.key_id,
+                       credential.scopes,
+                       '不限制' if credential.ip_unrestricted else credential.ip_whitelist)
+        data = self.get_serializer(credential).data
+        data['api_key'] = raw  # 明文仅此一次，库中只存哈希
+        return ok(data, msg='创建成功，请立即保存 API Key（不再展示）。')
+
+    def destroy(self, request, *args, **kwargs):
+        credential = self.get_object()
+        logger.warning('管理员 %s 删除 API 凭证 %s', request.user.username, credential.key_id)
+        credential.delete()
+        return ok(msg='已删除。')
+
+    @extend_schema(request=None, responses=OpenApiTypes.OBJECT)
+    @action(detail=True, methods=['post'])
+    def rotate_key(self, request, pk=None):
+        """轮换 key：旧明文立即失效，调用方需同步更新配置。"""
+        credential = self.get_object()
+        old_key_id = credential.key_id
+        raw = credential.rotate_key()
+        logger.warning('管理员 %s 轮换 API 凭证 %s → %s',
+                       request.user.username, old_key_id, credential.key_id)
+        return ok({'api_key': raw, 'key_id': credential.key_id},
+                  msg='已轮换，请立即保存新 API Key（不再展示）并更新调用方配置。')
+
+    @extend_schema(request=None, responses=OpenApiTypes.OBJECT)
+    @action(detail=True, methods=['post'])
+    def toggle_enabled(self, request, pk=None):
+        """停用/启用：泄露时的第一动作，比删除更可逆。"""
+        credential = self.get_object()
+        credential.enabled = not credential.enabled
+        credential.save(update_fields=['enabled', 'updated_at'])
+        logger.warning('管理员 %s %s API 凭证 %s', request.user.username,
+                       '启用' if credential.enabled else '停用', credential.key_id)
+        return ok({'enabled': credential.enabled})

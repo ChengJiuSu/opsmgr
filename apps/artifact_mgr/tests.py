@@ -5,11 +5,14 @@ import shutil
 import tempfile
 
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
 from apps.asset_mgr.models import Channel, Environment, ProjectGroup
+from apps.auth_mgr.apikey import ensure_service_user
+from apps.auth_mgr.models import ApiCredential
 from apps.system_cfg.models import SystemConfig
 
 from .models import Artifact
@@ -86,13 +89,15 @@ class ArtifactReportTests(ArtifactTestBase):
         self.assertEqual(Artifact.objects.count(), 1)
 
     def test_report_requires_api_key(self):
-        self.assertEqual(self._report(api_key=None).status_code, 403)
-        self.assertEqual(self._report(api_key='wrong-key').status_code, 403)
+        # 401 而不是 403：接口现在挂了 ApiKeyAuthentication（带 authenticate_header），
+        # 「没带/带错凭证」按未认证算，语义比原来的 403 更准
+        self.assertEqual(self._report(api_key=None).status_code, 401)
+        self.assertEqual(self._report(api_key='wrong-key').status_code, 401)
 
     def test_report_rejects_key_when_unconfigured(self):
         SystemConfig.objects.all().delete()
         os.environ.pop('ARTIFACT_API_KEY', None)
-        self.assertEqual(self._report().status_code, 403)
+        self.assertEqual(self._report().status_code, 401)
 
     def test_report_rejects_path_traversal_version(self):
         r = self._report(version='../evil')
@@ -192,3 +197,79 @@ class ArtifactModelTests(ArtifactTestBase):
         self._create('1.0.0')
         other_env = Environment.objects.create(name='生产', code='at-prod')
         self.assertIsNone(Artifact.latest_for(self.pg.id, self.ch.id, other_env.id))
+
+
+@override_settings(ARTIFACT_ROOT=ARTIFACT_TMP, TRUSTED_PROXIES=['127.0.0.1'])
+class ArtifactApiCredentialTests(ArtifactTestBase):
+    """上报/下载走新的 API 凭证：作用域与 IP 白名单都要真的拦住。
+
+    旧的全局 artifact.api_key 兜底路径由 ArtifactReportTests 覆盖，废弃期内两者并存。
+    """
+
+    ALLOWED_IP = '203.0.113.9'
+
+    def setUp(self):
+        super().setUp()
+        cache.clear()
+        self.credential, self.key = self._credential('ci-report', ['artifact:report'])
+
+    def tearDown(self):
+        cache.clear()
+
+    def _credential(self, name, scopes):
+        raw, key_id, secret_hash = ApiCredential.generate_key()
+        credential = ApiCredential.objects.create(
+            name=name, key_id=key_id, secret_hash=secret_hash, scopes=scopes,
+            ip_whitelist=self.ALLOWED_IP, bound_user=ensure_service_user(name),
+        )
+        return credential, raw
+
+    def _report_with(self, key, ip=None, version='2.0.0'):
+        data = {
+            'file': SimpleUploadedFile('app.tar.gz', b'package-bytes'),
+            'project_group': self.pg.code, 'channel': self.ch.code,
+            'environment': self.env.code, 'version': version,
+        }
+        return APIClient().post('/api/artifacts/report/', data, format='multipart',
+                                HTTP_X_API_KEY=key, REMOTE_ADDR=ip or self.ALLOWED_IP)
+
+    def test_report_with_credential(self):
+        r = self._report_with(self.key)
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertTrue(Artifact.objects.filter(version='2.0.0').exists())
+
+    def test_report_denied_outside_whitelist(self):
+        r = self._report_with(self.key, ip='198.51.100.7')
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()['error_code'], 'api_key_ip_denied')
+
+    def test_report_denied_without_scope(self):
+        credential, key = self._credential('dl-only', ['artifact:download'])
+        r = self._report_with(key)
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()['error_code'], 'api_key_scope_denied')
+
+    def test_download_with_credential_scope(self):
+        self._report_with(self.key)
+        artifact = Artifact.objects.get(version='2.0.0')
+        _, key = self._credential('dl', ['artifact:download'])
+        r = APIClient().get(f'/api/artifacts/{artifact.id}/download/',
+                            HTTP_X_API_KEY=key, REMOTE_ADDR=self.ALLOWED_IP)
+        self.assertEqual(r.status_code, 200)
+
+    def test_download_denied_without_scope(self):
+        self._report_with(self.key)
+        artifact = Artifact.objects.get(version='2.0.0')
+        r = APIClient().get(f'/api/artifacts/{artifact.id}/download/',
+                            HTTP_X_API_KEY=self.key, REMOTE_ADDR=self.ALLOWED_IP)
+        self.assertEqual(r.status_code, 403)
+        self.assertIn('artifact:download', r.json()['msg'])
+
+    def test_download_signature_path_still_works(self):
+        """CD 主机的签名下载不受影响：不带 key 时仍按签名判。"""
+        self._report_with(self.key)
+        artifact = Artifact.objects.get(version='2.0.0')
+        url = f'/api/artifacts/{artifact.id}/download/'
+        self.assertEqual(APIClient().get(url).status_code, 403)
+        self.assertEqual(
+            APIClient().get(f'{url}?sig={artifact.download_sig()}').status_code, 200)

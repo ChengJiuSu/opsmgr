@@ -3,6 +3,7 @@ from rest_framework.routers import DefaultRouter
 from rest_framework_simplejwt.views import TokenRefreshView, TokenVerifyView
 
 from .views import (
+    ApiCredentialViewSet,
     ChangePasswordView,
     LoginView,
     LogoutView,
@@ -19,6 +20,7 @@ from .views import (
 
 router = DefaultRouter()
 router.register('users', UserViewSet, basename='user')
+router.register('api-credentials', ApiCredentialViewSet, basename='api-credential')
 
 urlpatterns = [
     path('login/', LoginView.as_view(), name='login'),

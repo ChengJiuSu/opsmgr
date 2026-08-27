@@ -13,6 +13,7 @@
 | `/dashboard` | `views/Dashboard.vue` | 需认证 | 概览仪表板 |
 | `/assets/servers` | `views/assets/Servers.vue` | 需认证 | 服务器管理 |
 | `/audit/logs` | `views/audit/Logs.vue` | 需认证 | 操作审计日志 |
+| `/system/api-credentials` | `views/system/ApiCredentials.vue` | 需认证（仅管理员）| API 凭证（机读接口访问控制）|
 | `/system/configs` | `views/system/Configs.vue` | 需认证 | 系统配置 |
 
 ---

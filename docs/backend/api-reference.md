@@ -492,6 +492,62 @@ POST /api/assets/servers/batch/update/
 
 ---
 
+## API 凭证（机读接口访问控制） `/api/auth/api-credentials/`
+
+管理接口仅管理员且写操作要求 sudo 二次验证，列表不分页。完整语义见
+`docs/backend/modules/auth.md` 的「API 凭证」章节。
+
+| 方法与地址 | 说明 |
+|------|------|
+| `GET /api/auth/api-credentials/` | 凭证列表；`?keyword=&enabled=true|false&scope=` |
+| `GET /api/auth/api-credentials/scopes/` | 可授权作用域清单 `[{value,label}]` |
+| `POST /api/auth/api-credentials/` | 新建；响应 `data.api_key` 为明文，**仅此一次** |
+| `PATCH/DELETE /api/auth/api-credentials/{id}/` | 改 / 删 |
+| `POST /api/auth/api-credentials/{id}/rotate_key/` | 轮换 key，旧 key 立即失效 |
+| `POST /api/auth/api-credentials/{id}/toggle_enabled/` | 停用 / 启用（泄露时优先用停用，可逆）|
+
+**请求体：**
+
+```json
+{
+  "name": "ci-jenkins",
+  "scopes": ["artifact:report"],
+  "ip_unrestricted": false,
+  "ip_whitelist": "10.0.1.0/24, 203.0.113.9",
+  "sig_mode": "none",
+  "sig_header": "",
+  "sig_prefix": "",
+  "signing_secret": "",
+  "rate_limit": "60/min",
+  "expires_at": null,
+  "remark": "Jenkins 制品上报"
+}
+```
+
+`ip_whitelist` 留空必须同时给 `ip_unrestricted: true`，否则 400。`sig_mode` 取
+`none` / `hmac_sha256` / `token`，非 `none` 时 `sig_header` 与 `signing_secret` 必填。
+`signing_secret` 只写不回显，读接口给 `has_signing_secret` 布尔。
+
+**机读接口调用方式：**
+
+```
+X-API-KEY: ak_7f3c9d2b1e5a4068.<secret>
+# 或 Authorization: ApiKey ak_7f3c9d2b1e5a4068.<secret>
+```
+
+失败响应带 `error_code`，便于脚本区分原因：
+
+| error_code | 状态码 | 含义 |
+|------------|--------|------|
+| `api_key_invalid` | 401 | key 不存在 / secret 不对 / 已停用 |
+| `api_key_expired` | 401 | 凭证已过期 |
+| `api_key_ip_denied` | 403 | 来源 IP 不在白名单（消息里带实际观测到的 IP）|
+| `api_key_signature_invalid` | 403 | Webhook 签名校验失败 |
+| `api_key_scope_denied` | 403 | 凭证未被授权调用该接口 |
+| —（`Throttled`）| 429 | 超限速，或校验失败次数过多被锁定 |
+
+---
+
 ## 文档 & 管理
 
 | 地址 | 说明 |

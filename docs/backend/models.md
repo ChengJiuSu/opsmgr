@@ -192,3 +192,39 @@ system_cfg.SystemConfig 独立
 | `MAX_UPLOAD_SIZE` | `104857600` | 最大上传字节数 |
 | `ALERT_EMAIL` | `ops@company.com` | 告警收件邮箱 |
 | `MAINTENANCE_MODE` | `false` | 维护模式开关 |
+
+---
+
+## ApiCredential（API 凭证）
+
+**App：** `auth_mgr` | **表名：** `auth_api_credential`
+
+机读接口（内部脚本 / Webhook）的免登录身份。校验链与设计取舍见
+`docs/backend/modules/auth.md` 的「API 凭证」章节。
+
+| 字段 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `id` | BigAutoField | PK | 主键 |
+| `name` | CharField(64) | — | 凭证名称，唯一 |
+| `key_id` | CharField(32) | — | 公开标识 `ak_<16位hex>`，唯一 + 索引，用于定位记录 |
+| `secret_hash` | CharField(64) | — | secret 的 sha256（`common/secrets.py`），明文不入库 |
+| `scopes` | JSONField | `[]` | 授权作用域数组，取值见 `apikey.SCOPES` |
+| `ip_unrestricted` | BooleanField | `False` | 不限制来源 IP；**留空白名单必须显式置 True** |
+| `ip_whitelist` | TextField | '' | IP 或 CIDR，逗号/换行分隔 |
+| `sig_mode` | CharField(16) | `none` | `none` / `hmac_sha256` / `token` |
+| `sig_header` | CharField(64) | '' | 签名请求头，如 `X-Hub-Signature-256` |
+| `sig_prefix` | CharField(16) | '' | 签名值前缀，如 `sha256=`；留空表示纯 hex |
+| `signing_secret_enc` | TextField | '' | 签名密钥（Fernet 加密，需原值重算 HMAC）|
+| `rate_limit` | CharField(16) | '' | DRF 速率语法，留空用 `API_KEY_DEFAULT_RATE` |
+| `bound_user` | FK(User) PROTECT | — | 服务账号，凭证的行权与审计身份 |
+| `enabled` | BooleanField | `True` | 停用比删除可逆，泄露时的第一动作 |
+| `expires_at` | DateTimeField | null | 过期时间 |
+| `last_used_at` / `last_used_ip` | DateTime / Char(64) | null / '' | 使用痕迹（按 `API_KEY_TOUCH_INTERVAL` 节流写库）|
+| `created_by` | FK(User) SET_NULL | null | 创建人 |
+| `remark` | CharField(200) | '' | 备注 |
+| `created_at` / `updated_at` | DateTimeField | auto | 时间戳 |
+
+**默认排序：** `name`
+
+**外键策略：** `bound_user` 用 `PROTECT`——删用户前必须先处理引用它的凭证，
+避免凭证悄悄失去行权身份；`created_by` 是弱关联，用 `SET_NULL`。

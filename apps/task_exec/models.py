@@ -408,6 +408,7 @@ class TaskExecutionLog(models.Model):
         ('create', '创建执行'),  # 历史数据：曾经的「创建即执行」模式
         ('rerun', '重跑'),       # 历史数据：曾经的重跑动作
         ('execute', '手动执行'),
+        ('api', '接口触发'),  # API 凭证（内部脚本 / Webhook），见 task_exec/webhook.py
     ]
 
     task = models.ForeignKey(

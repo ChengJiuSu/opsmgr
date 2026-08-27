@@ -25,9 +25,8 @@ from .serializers import (
     ExecVariableVersionSerializer,
     TaskExecutionLogDetailSerializer,
     TaskExecutionLogSerializer,
-    validate_service_planned,
 )
-from .tasks import dispatch
+from . import trigger
 
 
 # 剧本扫描时跳过的目录：Ansible 工程的非剧本组成部分
@@ -282,14 +281,10 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
         主机，任务关闭 default_select_all 时缺省会被拒绝）；
         自定义范围模块按其维度全量执行。逐模块校验主机非空与方法服务规划。"""
         task = self.get_object()
-        if task.status in ('running', 'paused'):
-            return fail('任务正在执行中，请等待完成后再发起')
+        error = trigger.preflight(task)
+        if error:
+            return fail(error)
         steps = list(task.steps.all())
-        if not steps:
-            return fail('任务未配置任何模块，请先编辑任务添加模块')
-        # 兜底存量任务：主机范围三维度必选，未选齐不予执行
-        if not (task.project_group_id and task.channel_id and task.environment_id):
-            return fail('任务未配置完整的主机范围（项目组/渠道/环境必选），请先编辑任务补全')
 
         # 全局范围主机：维度匹配 ∩ 勾选子集
         matched = {s.id: s for s in task.matched_servers()}
@@ -334,46 +329,12 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
                 return fail(f'主机 id {invalid} 不在全局范围匹配集内，请刷新执行页面后重试')
             selected_global = [matched[i] for i in server_ids]
 
-        # 逐模块解析主机并校验执行条件（暂停确认模块不涉及主机）
-        for step in steps:
-            if step.task_type == 'pause':
-                continue
-            servers = step.resolve_servers(picked.get(step.id, selected_global))
-            if not servers:
-                scope = '自定义范围维度未匹配到可执行主机' if step.use_custom_scope \
-                    else '全局范围未匹配/未勾选任何主机'
-                if step.service_type_id:
-                    scope += f'（服务类型「{step.service_type.name}」过滤后为空）'
-                return fail(f'模块「{step.name}」{scope}，无法执行')
-            if step.task_type == 'method':
-                error = validate_service_planned(step.method, servers)
-                if error:
-                    return fail(f'模块「{step.name}」：{error}')
-
-        # 固化主机快照：模块级勾选落到各模块，任务级存并集（日志/兜底口径）
-        for step in steps:
-            if step.use_custom_scope or step.task_type == 'pause':
-                step.servers.clear()
-            else:
-                step.servers.set(picked.get(step.id, selected_global))
-        snapshot = {}
-        for step in steps:
-            if step.use_custom_scope or step.task_type == 'pause':
-                continue
-            snapshot.update({s.id: s for s in picked.get(step.id, selected_global)})
-        task.servers.set(snapshot.values())
-        task.status = 'pending'
-        task.return_code = None
-        task.output = ''
-        task.pause_action = ''  # 清残留处理信号，避免上次未消费的动作误触发
-        task.pause_type = ''
-        task.started_at = None
-        task.finished_at = None
-        task.save(update_fields=[
-            'status', 'return_code', 'output', 'pause_action', 'pause_type',
-            'started_at', 'finished_at',
-        ])
-        log = dispatch(task, triggered_by=request.user, trigger_type='execute')
+        log, error = trigger.launch(
+            task, steps, selected_global, picked,
+            triggered_by=request.user, trigger_type='execute',
+        )
+        if error:
+            return fail(error)
         return ok(
             {'task': ExecutionTaskSerializer(task).data, 'log_id': log.id, 'step_count': len(steps)},
             msg=f'已发起执行（{len(steps)} 个模块，{task.get_exec_mode_display()}）',

@@ -1,12 +1,14 @@
-"""common 工具测试：TOTP（RFC 6238 官方向量）、Fernet 加解密、限速。"""
+"""common 工具测试：TOTP（RFC 6238 官方向量）、Fernet 加解密、限速、鉴权用 IP 解析。"""
 import base64
 import time
+from types import SimpleNamespace
 from unittest import mock
 
 from django.core.cache import cache
 from django.test import SimpleTestCase, TestCase, override_settings
 
 from . import crypto, ratelimit, totp
+from . import request as request_utils
 
 # RFC 6238 附录 B 的 SHA1 测试向量（密钥 "12345678901234567890"）
 RFC_SECRET = base64.b32encode(b'12345678901234567890').decode('ascii')
@@ -131,3 +133,75 @@ class RateLimitTests(TestCase):
     def test_ident_not_stored_in_plaintext_key(self):
         ratelimit.record_failure('t', 'alice', 3, 60, 120)
         self.assertNotIn('alice', ''.join(getattr(cache, '_cache', {}).keys()))
+
+
+@override_settings(TRUSTED_PROXIES=['127.0.0.1', '10.8.0.0/24'])
+class AuthClientIpTests(SimpleTestCase):
+    """鉴权用 IP 解析：只信可信代理转发的 XFF，伪造头必须无效。"""
+
+    @staticmethod
+    def _request(remote, forwarded=None):
+        meta = {'REMOTE_ADDR': remote}
+        if forwarded is not None:
+            meta['HTTP_X_FORWARDED_FOR'] = forwarded
+        return SimpleNamespace(META=meta)
+
+    def test_direct_connection_uses_remote_addr(self):
+        req = self._request('203.0.113.9')
+        self.assertEqual(request_utils.auth_client_ip(req), '203.0.113.9')
+
+    def test_forged_xff_ignored_when_peer_untrusted(self):
+        """核心用例：直连时客户端自称内网 IP 不能生效，否则白名单等于没有。"""
+        req = self._request('203.0.113.9', '10.0.0.5')
+        self.assertEqual(request_utils.auth_client_ip(req), '203.0.113.9')
+
+    def test_trusted_proxy_takes_rightmost_untrusted(self):
+        """nginx 追加式 XFF：右端是代理看到的真实对端，左端是客户端可控区。"""
+        req = self._request('127.0.0.1', '10.0.0.5, 203.0.113.9')
+        self.assertEqual(request_utils.auth_client_ip(req), '203.0.113.9')
+
+    def test_multi_layer_proxies_stripped(self):
+        req = self._request('127.0.0.1', '203.0.113.9, 10.8.0.7')
+        self.assertEqual(request_utils.auth_client_ip(req), '203.0.113.9')
+
+    def test_all_hops_trusted_falls_back_to_remote(self):
+        """剥完只剩代理自己：返回代理地址，业务白名单必然不匹配（fail-closed）。"""
+        req = self._request('127.0.0.1', '10.8.0.7')
+        self.assertEqual(request_utils.auth_client_ip(req), '127.0.0.1')
+
+    def test_empty_xff_from_trusted_proxy(self):
+        req = self._request('127.0.0.1', '')
+        self.assertEqual(request_utils.auth_client_ip(req), '127.0.0.1')
+
+    def test_display_ip_still_takes_first_hop(self):
+        """审计展示口径不变：要的就是客户端声称的链路首段。"""
+        req = self._request('127.0.0.1', '10.0.0.5, 203.0.113.9')
+        self.assertEqual(request_utils.client_ip(req), '10.0.0.5')
+
+
+class IpRuleTests(SimpleTestCase):
+    def test_parse_mixed_separators(self):
+        rules = request_utils.parse_ip_rules('10.0.0.1, 192.168.1.0/24\n2001:db8::/32')
+        self.assertEqual(len(rules), 3)
+
+    def test_single_ip_becomes_host_network(self):
+        self.assertTrue(request_utils.ip_matches_rules('10.0.0.1', '10.0.0.1'))
+        self.assertFalse(request_utils.ip_matches_rules('10.0.0.2', '10.0.0.1'))
+
+    def test_cidr_match(self):
+        self.assertTrue(request_utils.ip_matches_rules('192.168.1.200', '192.168.1.0/24'))
+        self.assertFalse(request_utils.ip_matches_rules('192.168.2.1', '192.168.1.0/24'))
+
+    def test_ipv6_match(self):
+        self.assertTrue(request_utils.ip_matches_rules('2001:db8::1', '2001:db8::/32'))
+
+    def test_invalid_entry_raises(self):
+        with self.assertRaises(ValueError):
+            request_utils.parse_ip_rules('10.0.0.1, not-an-ip')
+
+    def test_invalid_text_is_not_a_match(self):
+        """白名单文本坏了按不匹配处理，不能因为解析失败就放行。"""
+        self.assertFalse(request_utils.ip_matches_rules('10.0.0.1', 'garbage'))
+
+    def test_empty_rules_never_match(self):
+        self.assertFalse(request_utils.ip_matches_rules('10.0.0.1', ''))
