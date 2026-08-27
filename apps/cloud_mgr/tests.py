@@ -490,6 +490,34 @@ class CertDeploymentApiTests(BaseApiTest):
         defaults.update(kwargs)
         return CertDeployment.objects.create(**defaults)
 
+    def test_write_requires_sudo(self):
+        """reload_cmd 是目标主机上执行的任意命令，登记它必须过二次验证。"""
+        admin = self._client(username='nosudo_admin')
+        admin.post('/api/auth/logout/')  # 作废会话，下面重新登录且不开 sudo 窗口
+        fresh = APIClient()
+        r = fresh.post('/api/auth/login/',
+                       {'username': 'nosudo_admin', 'password': 'Pass!2345xyz'}, format='json')
+        fresh.credentials(HTTP_AUTHORIZATION='Bearer ' + r.json()['access'])
+        r = fresh.post('/api/cloud/cert-deployments/', {
+            'certificate': self.cert.id, 'target_type': 'server', 'server': self.server.id,
+            'deploy_path': '/etc/nginx/ssl', 'reload_cmd': 'rm -rf /',
+        }, format='json')
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()['error_code'], 'sudo_required')
+
+    def test_deploy_action_does_not_require_sudo(self):
+        """分发执行的是已登记配置，需要复核的是配置本身，不该每次都弹验证框。"""
+        dep = self._create_deployment()
+        self._client(username='deploy_admin')
+        fresh = APIClient()
+        r = fresh.post('/api/auth/login/',
+                       {'username': 'deploy_admin', 'password': 'Pass!2345xyz'}, format='json')
+        fresh.credentials(HTTP_AUTHORIZATION='Bearer ' + r.json()['access'])
+        with patch('apps.cloud_mgr.deploy.run_subprocess', return_value=(0, 'ok')), \
+                self.settings(TASK_EXEC_BACKEND='sync'):
+            r = fresh.post(f'/api/cloud/cert-deployments/{dep.id}/deploy/')
+        self.assertEqual(r.status_code, 200, r.content)
+
     def test_create_requires_server_for_server_type(self):
         admin = self._client()
         r = admin.post('/api/cloud/cert-deployments/', {

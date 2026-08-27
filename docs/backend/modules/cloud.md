@@ -57,8 +57,8 @@ apps/cloud_mgr/
 | `/api/cloud/certificates/{id}/renew/` | POST | 管理员 | 强制重签（--force），仅 issued 状态 |
 | `/api/cloud/certificates/{id}/download/` | GET | 仅管理员 | zip 包，内含一层 `<名称>/` 目录（`.crt` / `.key` / `.fullchain.pem` + README.txt），`Cache-Control: no-store` |
 | `/api/cloud/certificates/{id}/deploy_all/` | POST | 管理员 | 分发到全部已登记目标，跳过分发中与未接入类型（返回 dispatched / skipped） |
-| `/api/cloud/cert-deployments/?certificate=` | CRUD | 管理员写/登录读 | 分发目标登记；deploying 禁止删除 |
-| `/api/cloud/cert-deployments/{id}/deploy/` | POST | 管理员 | 单目标分发（后台异步）；证书未签发 / agent 通道主机 / 未接入类型均拒绝 |
+| `/api/cloud/cert-deployments/?certificate=` | CRUD | 管理员写 + **sudo** / 登录读 | 分发目标登记；deploying 禁止删除。`reload_cmd` 是目标主机上执行的任意 shell 命令，登记一条目标等于拿到该主机的远程命令执行面——与「连接凭据」同性质，故写操作要求二次验证 |
+| `/api/cloud/cert-deployments/{id}/deploy/` | POST | 管理员（**不要求 sudo**）| 单目标分发（后台异步）；证书未签发 / agent 通道主机 / 未接入类型均拒绝。执行的是已登记配置，需要复核的是配置本身；每次分发都验一次会把「签发后自动分发」变成人工卡点 |
 
 筛选参数：accounts `provider`（数字 id / code）、`enabled`、`keyword`（名称 / AK）；domains
 `cloud_account`、`keyword`；dns-records `domain`、`type`、`keyword`、`sync_status`；

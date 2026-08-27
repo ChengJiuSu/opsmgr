@@ -441,13 +441,21 @@ class CertDeploymentViewSet(viewsets.ModelViewSet):
     - deploy：单目标分发；deploying 状态防重入；未接入的目标类型明确拒绝；
     - 证书签发/续签成功后 auto_deploy 目标由 tasks.run_issue 自动触发；
     - 分发前置校验：证书已签发、服务器为直连通道（agent 通道 v1 不支持）。
+
+    **写操作要求 sudo 二次验证**：`reload_cmd` 是在目标主机上执行的任意 shell
+    命令，登记一条分发目标等于拿到该主机的远程命令执行面——和「连接凭据」同性质，
+    闸门必须同级。原来只有 IsAdminOrReadOnly，是这套配置面里唯一漏配 sudo 的地方。
+
+    `deploy` 动作单独放行（只要 IsAdmin）：它执行的是**已经登记好**的配置，
+    真正需要复核的是配置本身；每次分发都弹验证框会把签发后自动分发的日常流程
+    变成人工卡点。
     """
 
     queryset = CertDeployment.objects.select_related(
         'certificate', 'server', 'credential',
     ).all()
     serializer_class = CertDeploymentSerializer
-    permission_classes = [IsAdminOrReadOnly]
+    permission_classes = [IsAdminOrReadOnly, SudoRequired]
     pagination_class = StandardPagination
 
     def get_queryset(self):
@@ -476,9 +484,12 @@ class CertDeploymentViewSet(viewsets.ModelViewSet):
         return None
 
     @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
-    @action(detail=True, methods=['post'])
+    @action(detail=True, methods=['post'], permission_classes=[IsAdmin])
     def deploy(self, request, pk=None):
-        """分发证书到该目标（后台异步执行 ansible 推送 + 重载）。"""
+        """分发证书到该目标（后台异步执行 ansible 推送 + 重载）。
+
+        不要求 sudo：执行的是已登记配置，需要复核的是配置本身（见类说明）。
+        """
         deployment = self.get_object()
         err = self._validate_deployable(deployment)
         if err:
