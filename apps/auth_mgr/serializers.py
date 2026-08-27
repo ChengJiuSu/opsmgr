@@ -59,12 +59,13 @@ class UserSerializer(serializers.ModelSerializer):
         model = User
         fields = [
             'id', 'username', 'password', 'email', 'phone', 'department',
-            'is_active', 'is_staff', 'is_ldap', 'mfa_enabled',
+            'is_active', 'is_staff', 'is_ldap', 'is_service', 'mfa_enabled',
             'last_login', 'date_joined',
             'role', 'role_name', 'permissions',
             'allowed_project_groups', 'allowed_environments', 'scope_label',
         ]
-        read_only_fields = ['id', 'last_login', 'date_joined', 'is_ldap', 'mfa_enabled']
+        read_only_fields = ['id', 'last_login', 'date_joined', 'is_ldap', 'is_service',
+                            'mfa_enabled']
 
     def get_permissions(self, obj):
         """该用户的实际权限快照（含无角色时的回退结果）。"""
@@ -78,6 +79,19 @@ class UserSerializer(serializers.ModelSerializer):
         if value:
             validate_password(value)
         return value
+
+    def validate(self, attrs):
+        """服务账号不允许设密码。
+
+        它是 API 凭证的审计身份，密码被置成不可用正是为了「登不进来」。给它设了密码
+        就多出一个能从登录页进来、且绕过 MFA 强制范围（非 staff）的账号。
+        reset_password 动作那边也拦了一道，这里覆盖 create/update 路径。
+        """
+        if attrs.get('password') and getattr(self.instance, 'is_service', False):
+            raise serializers.ValidationError({
+                'password': f'{self.instance.username} 是 API 凭证的服务账号，不允许设置密码。',
+            })
+        return attrs
 
     def create(self, validated_data):
         password = validated_data.pop('password', None)

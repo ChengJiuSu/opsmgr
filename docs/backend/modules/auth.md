@@ -457,11 +457,32 @@ fail-closed：配置不对时拒绝，而不是放过去。
 | `sig_mode` / `sig_header` / `sig_prefix` / `signing_secret_enc` | 验签配置；密钥需原值重算 HMAC，故走 Fernet 加密而非哈希 |
 | `rate_limit` | DRF 速率语法，留空用 `API_KEY_DEFAULT_RATE` |
 | `allowed_project_groups` / `allowed_environments` | 数据范围（M2M，空 = 不限），见下节 |
-| `bound_user` | 服务账号（`svc-<名称>`，密码不可用、非 staff）。返回真实 User 让审计按 FK 落调用方，既有权限类也原样生效 |
+| `bound_user` | 服务账号（`svc-<名称>`，`is_service=True`、密码不可用、非 staff）。返回真实 User 让审计按 FK 落调用方，既有权限类也原样生效。生命周期见下 |
 | `enabled` / `expires_at` | 停用比删除更可逆，泄露时的第一动作 |
 | `last_used_at` / `last_used_ip` | 使用痕迹，按 `API_KEY_TOUCH_INTERVAL` 节流写库 |
 
 明文只在创建 / 轮换的响应里出现一次，任何后续接口都取不到。
+
+### 服务账号的生命周期
+
+凭证绑定的 `svc-<名称>` 账号带 `is_service=True` 标记（独立字段而不是靠 `svc-` 前缀
+判断——前缀可能撞上真人用户名，而这个标记要用来决定「能不能登录」「列表要不要显示」，
+判错的后果不对称）。
+
+| 事件 | 行为 |
+|------|------|
+| 建凭证 | 取或建 `svc-<名称>`，密码置为不可用；复用已停用的同名账号时重新启用 |
+| 删凭证 | **停用**（`is_active=False`），不删除 |
+| 用户列表 | 默认不列，`?include_service=true` 才出现；按 id 的详情/停用/删除**不过滤**（否则管理员对服务账号完全无从下手，表现是 404）|
+| 设密码 | 一律拒绝（`reset_password` 动作与 `UserSerializer` 两处都拦）|
+
+**为什么删凭证只停用不删账号**：审计表的 `user` 外键是 `SET_NULL`，删掉账号会把历史
+机读调用的归属抹成空——「这次上报是哪把凭证干的」就再也查不到了，那比留一个停用账号
+糟得多。停用后它既登不进来（密码本就不可用）也认不过凭证校验（认证类检查
+`is_active`）。
+
+**为什么不许设密码**：密码被置成不可用正是为了「登不进来」。设了密码就多出一个能从
+登录页进来、且因为非 staff 还可能绕过 MFA 强制范围的账号。
 
 ### 已登记作用域
 

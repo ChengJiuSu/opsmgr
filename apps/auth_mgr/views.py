@@ -26,7 +26,7 @@ from common.response import fail, ok
 
 from . import roles, services
 from .permissions import module_perm
-from .apikey import SCOPES, ensure_service_user
+from .apikey import SCOPES, ensure_service_user, retire_service_user
 from .models import ApiCredential, Role
 from .serializers import (
     ApiCredentialSerializer,
@@ -421,6 +421,13 @@ class UserViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         qs = super().get_queryset()
+        params = self.request.query_params
+        # 服务账号（API 凭证的审计身份）默认不进**列表**：它们不是人，混在用户列表里
+        # 只会让「这个平台有几个人」这个问题变得难回答。要看就传 include_service=true。
+        # 只过滤 list：详情/停用/删除等按 id 的操作仍要能操作到它们，否则管理员对
+        # 服务账号完全无从下手（表现是 404）
+        if self.action == 'list' and params.get('include_service') != 'true':
+            qs = qs.filter(is_service=False)
         keyword = self.request.query_params.get('keyword')
         is_active = self.request.query_params.get('is_active')
         department = self.request.query_params.get('department')
@@ -468,6 +475,9 @@ class UserViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def reset_password(self, request, pk=None):
         user = self.get_object()
+        if user.is_service:
+            return fail(f'{user.username} 是 API 凭证的服务账号，不允许设置密码'
+                        f'（设了它就成了一个能登录的账号）。凭证轮换请用「API 凭证」页。')
         new_password = request.data.get('new_password')
         if not new_password:
             return fail('缺少 new_password')
@@ -539,9 +549,14 @@ class ApiCredentialViewSet(viewsets.ModelViewSet):
 
     def destroy(self, request, *args, **kwargs):
         credential = self.get_object()
+        service_user = credential.bound_user
         logger.warning('管理员 %s 删除 API 凭证 %s', request.user.username, credential.key_id)
         credential.delete()
-        return ok(msg='已删除。')
+        # 停用（不是删除）随之空闲的服务账号：审计表的 user 是 SET_NULL，删账号会把
+        # 历史机读调用的归属抹成空
+        retired = retire_service_user(service_user)
+        suffix = f'，服务账号 {service_user.username} 已停用（审计历史保留）' if retired else ''
+        return ok(msg=f'已删除{suffix}。')
 
     @extend_schema(request=None, responses=OpenApiTypes.OBJECT)
     @action(detail=True, methods=['post'])

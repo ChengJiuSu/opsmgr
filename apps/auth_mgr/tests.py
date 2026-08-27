@@ -1579,3 +1579,107 @@ class ExecCapabilityTests(TestCase):
                         {'action': 'continue'}, format='json')
         self.assertEqual(r.status_code, 403)
         self.assertIn('不允许对生产环境', r.json()['msg'])
+
+
+class ServiceAccountLifecycleTests(TestCase):
+    """服务账号：停用而非删除、不进用户列表、不许设密码、重建时复用。"""
+
+    URL = '/api/auth/api-credentials/'
+
+    def setUp(self):
+        cache.clear()
+        self.admin = User.objects.create(username='svc_admin', is_staff=True)
+        self.admin.set_password(PASSWORD)
+        self.admin.save()
+        self.client = self._login()
+        grant_sudo(self.client, PASSWORD)
+
+    def tearDown(self):
+        cache.clear()
+
+    def _login(self):
+        client = APIClient()
+        r = client.post('/api/auth/login/',
+                        {'username': 'svc_admin', 'password': PASSWORD}, format='json')
+        client.credentials(HTTP_AUTHORIZATION='Bearer ' + r.json()['access'])
+        return client
+
+    def _create(self, name='sa-ci'):
+        r = self.client.post(self.URL, {
+            'name': name, 'scopes': ['artifact:report'], 'ip_whitelist': '10.0.1.0/24',
+        }, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        return r.json()['data']['id']
+
+    def test_created_account_is_marked_and_unusable(self):
+        self._create()
+        user = User.objects.get(username='svc-sa-ci')
+        self.assertTrue(user.is_service)
+        self.assertFalse(user.is_staff)
+        self.assertFalse(user.has_usable_password())
+
+    def test_delete_credential_retires_account_keeping_audit(self):
+        """删账号会把审计里的机读调用归属抹成空（SET_NULL），所以只停用。"""
+        credential_id = self._create()
+        user = User.objects.get(username='svc-sa-ci')
+        AuditLog.objects.create(user=user, action='POST', path='/api/artifacts/report/',
+                                method='POST', status_code=200)
+
+        r = self.client.delete(f'{self.URL}{credential_id}/')
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertIn('已停用', r.json()['msg'])
+
+        user.refresh_from_db()
+        self.assertFalse(user.is_active)          # 停用
+        self.assertTrue(User.objects.filter(pk=user.pk).exists())  # 未删除
+        # 归属仍在（审计里还有中间件自己记的写操作，按路径取那条机读记录）
+        entry = AuditLog.objects.get(path='/api/artifacts/report/')
+        self.assertEqual(entry.user, user)
+
+    def test_shared_account_not_retired(self):
+        """还有别的凭证绑着它时不能停用，否则那把凭证会一起失效。"""
+        first = self._create('sa-shared')
+        user = User.objects.get(username='svc-sa-shared')
+        r = self.client.post(self.URL, {
+            'name': 'sa-second', 'scopes': ['artifact:report'],
+            'ip_whitelist': '10.0.1.0/24', 'bound_user': user.id,
+        }, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+
+        self.client.delete(f'{self.URL}{first}/')
+        user.refresh_from_db()
+        self.assertTrue(user.is_active)
+
+    def test_recreating_credential_reactivates_account(self):
+        credential_id = self._create('sa-again')
+        self.client.delete(f'{self.URL}{credential_id}/')
+        self.assertFalse(User.objects.get(username='svc-sa-again').is_active)
+
+        self._create('sa-again')
+        self.assertTrue(User.objects.get(username='svc-sa-again').is_active)
+
+    def test_hidden_from_user_list_by_default(self):
+        """服务账号不是人，混在用户列表里会让「平台有几个人」变得难回答。"""
+        self._create()
+        names = [item['username'] for item in self.client.get('/api/auth/users/').json()['data']['results']]
+        self.assertNotIn('svc-sa-ci', names)
+
+        names = [item['username'] for item in
+                 self.client.get('/api/auth/users/?include_service=true').json()['data']['results']]
+        self.assertIn('svc-sa-ci', names)
+
+    def test_cannot_set_password_on_service_account(self):
+        """设了密码它就成了一个能登录、且绕过 MFA 强制范围（非 staff）的账号。"""
+        self._create()
+        user = User.objects.get(username='svc-sa-ci')
+
+        r = self.client.post(f'/api/auth/users/{user.id}/reset_password/',
+                             {'new_password': 'Brand!New2345'}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('服务账号', r.json()['msg'])
+
+        r = self.client.patch(f'/api/auth/users/{user.id}/',
+                              {'password': 'Brand!New2345'}, format='json')
+        self.assertEqual(r.status_code, 400)
+        user.refresh_from_db()
+        self.assertFalse(user.has_usable_password())

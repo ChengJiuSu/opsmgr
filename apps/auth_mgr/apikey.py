@@ -393,14 +393,42 @@ def ensure_service_user(name):
     账号名 `svc-<凭证名>`，密码置为不可用（`set_unusable_password`）——凭证
     走的是 key 校验，这个账号只用来给审计记录一个可读的调用方身份，不该能
     从登录页进来。非 staff：机读接口不该能碰只给管理员的写操作。
+
+    复用同名账号时把 `is_service` 补上（该字段晚于服务账号引入），并重新启用
+    ——之前那把凭证删除时它被停用过（见 retire_service_user）。
     """
     User = get_user_model()
     username = f'svc-{name}'[:150]
     user = User.objects.filter(username=username).first()
     if user:
+        if not (user.is_service and user.is_active):
+            user.is_service = True
+            user.is_active = True
+            user.save(update_fields=['is_service', 'is_active'])
         return user
     user = User(username=username, is_staff=False, is_active=True,
-                department=SERVICE_DEPARTMENT)
+                is_service=True, department=SERVICE_DEPARTMENT)
     user.set_unusable_password()
     user.save()
     return user
+
+
+def retire_service_user(user):
+    """凭证删除后停用其服务账号（没有别的凭证还在用它时）。
+
+    **停用而不是删除**：审计表的 user 外键是 SET_NULL，删掉账号会把历史机读调用的
+    归属抹成空——「这次上报是哪把凭证干的」就再也查不到了，那比留一个停用账号糟得多。
+
+    停用后它既登不进来（密码本就不可用）也认不过凭证校验（认证类会检查
+    `is_active`），且默认不出现在用户列表里（UserViewSet 过滤 is_service）。
+    """
+    if not (user and getattr(user, 'is_service', False)):
+        return False
+    if user.api_credentials.exists():
+        return False  # 还有别的凭证绑着它
+    if not user.is_active:
+        return False
+    user.is_active = False
+    user.save(update_fields=['is_active'])
+    logger.info('凭证删除后停用服务账号：%s（审计历史保留）', user.username)
+    return True

@@ -17,6 +17,9 @@
           <el-option label="启用" value="true" />
           <el-option label="停用" value="false" />
         </el-select>
+        <el-checkbox v-model="filter.include_service" @change="handleSearch">
+          显示服务账号
+        </el-checkbox>
         <el-button :icon="Search" @click="handleSearch">查询</el-button>
       </div>
       <el-button type="primary" :icon="Plus" @click="openDialog()">新增用户</el-button>
@@ -30,7 +33,11 @@
       <el-table-column prop="department" label="部门" width="120" />
       <el-table-column label="角色" width="130">
         <template #default="{ row }">
-          <el-tag size="small" :type="row.role ? 'warning' : (row.is_staff ? 'danger' : 'info')">
+          <el-tag v-if="row.is_service" size="small" type="info">服务账号</el-tag>
+          <el-tag
+            v-else
+            size="small" :type="row.role ? 'warning' : (row.is_staff ? 'danger' : 'info')"
+          >
             {{ row.role_name || (row.is_staff ? '管理员（未配角色）' : '普通用户（未配角色）') }}
           </el-tag>
         </template>
@@ -177,7 +184,8 @@ const tableData = ref([])
 const total = ref(0)
 const page = ref(1)
 const pageSize = ref(20)
-const filter = reactive({ keyword: '', is_active: '' })
+// include_service：服务账号（API 凭证的审计身份）默认不列，排查时才打开
+const filter = reactive({ keyword: '', is_active: '', include_service: false })
 
 const dialogVisible = ref(false)
 const editRow = ref(null)
@@ -212,6 +220,7 @@ async function fetchData() {
     const params = { page: page.value, page_size: pageSize.value }
     if (filter.keyword) params.keyword = filter.keyword
     if (filter.is_active) params.is_active = filter.is_active
+    if (filter.include_service) params.include_service = 'true'
     const res = await getUsers(params)
     tableData.value = res.data?.results || []
     total.value = res.data?.total || 0

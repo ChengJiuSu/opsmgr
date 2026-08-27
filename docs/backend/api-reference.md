@@ -570,6 +570,10 @@ POST /api/assets/servers/batch/update/
 }
 ```
 
+删除凭证会**停用**（不是删除）随之空闲的服务账号——审计表的 `user` 是 `SET_NULL`，
+删账号会把历史机读调用的归属抹成空。用户列表默认不含服务账号，
+`GET /api/auth/users/?include_service=true` 可见。
+
 `allowed_project_groups` / `allowed_environments` 是**数据范围**（留空 = 不限）：
 主机清单按范围收窄可见集，变量解析与制品上报/下载按范围拒绝越界维度。
 作用域含 `variable:secret` 时 `ip_unrestricted: true` 会被拒（高敏作用域必须限定来源）。

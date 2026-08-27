@@ -54,6 +54,10 @@ class User(AbstractUser):
     phone = models.CharField('手机号', max_length=20, blank=True)
     department = models.CharField('部门', max_length=100, blank=True)
     is_ldap = models.BooleanField('LDAP 用户', default=False)
+    # 服务账号：API 凭证自动创建的行权/审计身份（见 apikey.ensure_service_user）。
+    # 独立字段而不是靠 `svc-` 前缀判断——前缀可能撞上真人用户名，而这个标记要用来
+    # 决定「能不能登录」「用户列表要不要显示」，判错的后果不对称
+    is_service = models.BooleanField('服务账号', default=False, editable=False)
     # 角色为空时回退 is_staff 语义（见 roles.user_level）：存量账号行为不变，
     # 不需要一次性给所有人配角色
     role = models.ForeignKey(
