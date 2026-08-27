@@ -145,6 +145,18 @@ class ApiCredential(models.Model):
     rate_limit = models.CharField('限速', max_length=16, blank=True,
                                   help_text='DRF 速率语法，如 60/min；留空用全局默认')
 
+    # ── 数据范围（空 = 不限；纯收窄，配不出比作用域更宽的权限）──
+    # 作用域管「能调哪类接口」，这两个管「能作用在哪些资源上」，两层正交。
+    # 一把部署机上的 key 不该能读到全公司的主机清单与变量。
+    allowed_project_groups = models.ManyToManyField(
+        'asset_mgr.ProjectGroup', verbose_name='可访问项目组', blank=True,
+        related_name='api_credentials',
+    )
+    allowed_environments = models.ManyToManyField(
+        'asset_mgr.Environment', verbose_name='可访问环境', blank=True,
+        related_name='api_credentials',
+    )
+
     # 凭证的行权身份：审计表按 user 记录调用方，权限类也照常生效。
     # PROTECT：删用户前必须先处理引用它的凭证，避免凭证悄悄失去身份
     bound_user = models.ForeignKey(
@@ -227,6 +239,57 @@ class ApiCredential(models.Model):
         if self.ip_unrestricted:
             return True
         return ip_matches_rules(ip, self.ip_whitelist)
+
+    # ── 数据范围 ──────────────────────────────────────────
+    def allowed_dims(self):
+        """缓存一次范围 id 集合：一个请求里可能反复判定，不该每次查表。
+
+        返回 (项目组 id 集合 或 None, 环境 id 集合 或 None)，None = 不限。
+        """
+        if not hasattr(self, '_dim_cache'):
+            groups = set(self.allowed_project_groups.values_list('id', flat=True))
+            envs = set(self.allowed_environments.values_list('id', flat=True))
+            self._dim_cache = (groups or None, envs or None)
+        return self._dim_cache
+
+    def allows_dims(self, project_group_id=None, environment_id=None):
+        """该维度组合是否在凭证范围内（未配置范围一律放行）。
+
+        入参为 None 表示「本次不涉及该维度」，不做限制——比如按项目组查主机时
+        没带环境，不该因为凭证限了环境就整体拒绝；真正的收窄由 narrow() 做。
+        """
+        groups, envs = self.allowed_dims()
+        if groups is not None and project_group_id is not None \
+                and project_group_id not in groups:
+            return False
+        if envs is not None and environment_id is not None and environment_id not in envs:
+            return False
+        return True
+
+    def narrow(self, queryset, project_group_field='project_group_id',
+               environment_field='environment_id'):
+        """按凭证范围收窄查询集（列表接口用）。
+
+        收窄可见集而不是返回 403：调用方不必传筛选参数也只看得到自己那部分，
+        既好用又更难出错——忘了带筛选参数时拿到的是「我的全部」，不是「全公司」。
+        """
+        groups, envs = self.allowed_dims()
+        if groups is not None:
+            queryset = queryset.filter(**{f'{project_group_field}__in': groups})
+        if envs is not None:
+            queryset = queryset.filter(**{f'{environment_field}__in': envs})
+        return queryset
+
+    @property
+    def scope_label(self):
+        """数据范围的可读描述（日志与报错里指名道姓，省一次翻页面）。"""
+        groups, envs = self.allowed_dims()
+        parts = []
+        if groups is not None:
+            parts.append(f'项目组 {sorted(groups)}')
+        if envs is not None:
+            parts.append(f'环境 {sorted(envs)}')
+        return ' + '.join(parts) if parts else '不限'
 
     # ── Webhook 签名密钥 ──────────────────────────────────
     def set_signing_secret(self, raw):

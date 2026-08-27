@@ -15,6 +15,7 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import AccessToken
 
 from apps.audit.models import AuditLog
+from apps.task_exec.models import ExecVariable
 from apps.system_cfg.models import SystemConfig
 from common import totp
 from common.response import ok
@@ -1172,3 +1173,149 @@ class ApiCredentialAdminTests(TestCase):
         r = client.post(self.URL, self._payload(), format='json')
         self.assertEqual(r.status_code, 403)
         self.assertEqual(r.json()['error_code'], 'sudo_required')
+
+
+@override_settings(ROOT_URLCONF='ops_manager.urls', TRUSTED_PROXIES=TRUSTED)
+class CredentialDimScopeTests(TestCase):
+    """凭证数据范围：作用域管「能调哪类接口」，范围管「能作用在哪些资源上」。"""
+
+    ALLOWED_IP = '203.0.113.9'
+
+    def setUp(self):
+        from apps.asset_mgr.models import Channel, Environment, ProjectGroup, Server
+
+        cache.clear()
+        self.pg_a = ProjectGroup.objects.create(name='项目A', code='ds-a')
+        self.pg_b = ProjectGroup.objects.create(name='项目B', code='ds-b')
+        self.ch = Channel.objects.create(name='官服', code='ds-official')
+        self.env_test = Environment.objects.create(name='测试', code='ds-test')
+        self.env_prod = Environment.objects.create(name='生产', code='ds-prod', is_prod=True)
+        self.host_a = Server.objects.create(
+            name='ds-host-a', private_ip='10.0.0.1',
+            project_group=self.pg_a, channel=self.ch, environment=self.env_test)
+        self.host_b = Server.objects.create(
+            name='ds-host-b', private_ip='10.0.0.2',
+            project_group=self.pg_b, channel=self.ch, environment=self.env_test)
+        self.client = APIClient()
+
+    def tearDown(self):
+        cache.clear()
+
+    def _credential(self, name, scopes, groups=(), envs=()):
+        credential, raw = make_credential(name=name, scopes=scopes)
+        if groups:
+            credential.allowed_project_groups.set(groups)
+        if envs:
+            credential.allowed_environments.set(envs)
+        return credential, raw
+
+    def _get(self, url, key):
+        return self.client.get(url, HTTP_X_API_KEY=key, REMOTE_ADDR=self.ALLOWED_IP)
+
+    # ── 主机清单 ──────────────────────────────────────────
+    def test_asset_read_narrows_to_allowed_groups(self):
+        """收窄可见集而不是拒绝：忘了带筛选参数时拿到的是「我的全部」。"""
+        _, key = self._credential('ds-deploy', ['asset:read'], groups=[self.pg_a])
+        r = self._get('/api/assets/servers/', key)
+        self.assertEqual(r.status_code, 200, r.content)
+        names = [item['name'] for item in r.json()['data']['results']]
+        self.assertEqual(names, ['ds-host-a'])
+
+    def test_asset_read_without_scope_denied(self):
+        """凭证绑的是真实服务账号，若权限类用「或」语义，这里会漏放行。"""
+        _, key = self._credential('ds-noscope', ['artifact:report'])
+        r = self._get('/api/assets/servers/', key)
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()['error_code'], 'api_key_scope_denied')
+
+    def test_asset_read_is_read_only(self):
+        """一个「读」作用域绝不能顺带放行写——凭证认证绕过了 MFA 与 sudo。"""
+        _, key = self._credential('ds-ro', ['asset:read'])
+        r = self.client.post('/api/assets/servers/', {'name': 'x', 'private_ip': '10.0.0.9'},
+                             format='json', HTTP_X_API_KEY=key, REMOTE_ADDR=self.ALLOWED_IP)
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()['error_code'], 'api_key_scope_denied')
+
+    def test_no_dim_scope_sees_everything(self):
+        _, key = self._credential('ds-all', ['asset:read'])
+        r = self._get('/api/assets/servers/', key)
+        self.assertEqual(r.json()['data']['total'], 2)
+
+    # ── 变量解析 ──────────────────────────────────────────
+    def _resolved_url(self, pg, env):
+        return (f'/api/exec/variables/resolved/?project_group={pg.code}'
+                f'&channel={self.ch.code}&env={env.code}')
+
+    def test_variable_read_within_scope(self):
+        ExecVariable.objects.create(
+            key='app_port', value='8080', project_group=self.pg_a,
+            channel=self.ch, environment=self.env_test)
+        _, key = self._credential('ds-vars', ['variable:read'], groups=[self.pg_a])
+        r = self._get(self._resolved_url(self.pg_a, self.env_test), key)
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(r.json()['data']['vars']['app_port'], 8080)
+
+    def test_variable_read_outside_scope_denied(self):
+        """三维度是必填参数，调用方已明确要哪一组，静默换成别的组更糟，所以拒绝。"""
+        _, key = self._credential('ds-vars2', ['variable:read'], groups=[self.pg_a])
+        r = self._get(self._resolved_url(self.pg_b, self.env_test), key)
+        self.assertEqual(r.status_code, 403)
+        self.assertIn('数据范围', r.json()['msg'])
+
+    def test_secret_needs_extra_scope(self):
+        """两级作用域：读变量与读密码的泄露后果不在一个量级。"""
+        var = ExecVariable(
+            key='db_password', is_secret=True, project_group=self.pg_a,
+            channel=self.ch, environment=self.env_test)
+        var.set_value('p@ss#word')
+        var.save()
+
+        _, plain_key = self._credential('ds-plain', ['variable:read'], groups=[self.pg_a])
+        url = self._resolved_url(self.pg_a, self.env_test) + '&include_secrets=true'
+        r = self._get(url, plain_key)
+        self.assertEqual(r.status_code, 403)
+        self.assertIn('variable:secret', r.json()['msg'])
+
+        _, secret_key = self._credential(
+            'ds-secret', ['variable:read', 'variable:secret'], groups=[self.pg_a])
+        r = self._get(url, secret_key)
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(r.json()['data']['vars']['db_password'], 'p@ss#word')
+
+    def test_secret_excluded_without_flag(self):
+        var = ExecVariable(
+            key='db_password', is_secret=True, project_group=self.pg_a,
+            channel=self.ch, environment=self.env_test)
+        var.set_value('p@ss#word')
+        var.save()
+        _, key = self._credential(
+            'ds-secret2', ['variable:read', 'variable:secret'], groups=[self.pg_a])
+        r = self._get(self._resolved_url(self.pg_a, self.env_test), key)
+        self.assertNotIn('db_password', r.json()['data']['vars'])
+        self.assertEqual(r.json()['data']['secret_keys_excluded'], ['db_password'])
+
+    # ── 高敏作用域禁止不限 IP ──────────────────────────────
+    def test_high_risk_scope_forbids_unrestricted_ip(self):
+        admin = User.objects.create(username='dim_admin', is_staff=True)
+        admin.set_password(PASSWORD)
+        admin.save()
+        client = APIClient()
+        r = client.post('/api/auth/login/',
+                        {'username': 'dim_admin', 'password': PASSWORD}, format='json')
+        client.credentials(HTTP_AUTHORIZATION='Bearer ' + r.json()['access'])
+        grant_sudo(client, PASSWORD)
+
+        r = client.post('/api/auth/api-credentials/', {
+            'name': 'ds-risky', 'scopes': ['variable:secret'],
+            'ip_unrestricted': True, 'ip_whitelist': '',
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('高敏', r.json()['msg'])
+
+        r = client.post('/api/auth/api-credentials/', {
+            'name': 'ds-ok', 'scopes': ['variable:secret'],
+            'ip_whitelist': '10.0.1.0/24',
+            'allowed_project_groups': [self.pg_a.id],
+        }, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(r.json()['data']['scope_label'], f'项目组 [{self.pg_a.id}]')

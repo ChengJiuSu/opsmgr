@@ -31,7 +31,7 @@ from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
 from rest_framework.authentication import BaseAuthentication
 from rest_framework.exceptions import AuthenticationFailed, PermissionDenied, Throttled
-from rest_framework.permissions import BasePermission
+from rest_framework.permissions import SAFE_METHODS, BasePermission
 from rest_framework.throttling import SimpleRateThrottle
 
 from common import ratelimit
@@ -48,7 +48,14 @@ SCOPES = {
     'artifact:report': '上报构建制品（CI 用）',
     'artifact:download': '下载构建制品',
     'task:trigger': '触发任务流执行（内部脚本 / Webhook）',
+    'asset:read': '读取主机清单（只读）',
+    'variable:read': '读取执行变量（不含敏感值）',
+    'variable:secret': '读取敏感变量真值（高敏，必须配 IP 白名单）',
 }
+
+#: 高敏作用域：这些凭证禁止「不限制来源 IP」（序列化器强制），
+#: 因为它们能拿到密码类内容，泄露后果与其余作用域不在一个量级
+HIGH_RISK_SCOPES = frozenset({'variable:secret'})
 
 KEY_HEADER = 'X-API-KEY'
 #: 兼容 `Authorization: ApiKey <明文>`，方便某些只能设 Authorization 的客户端
@@ -255,12 +262,19 @@ class HasApiScope(BasePermission):
 
     #: 子类覆盖：需要的作用域元组（全部具备才放行）
     scopes = ()
+    #: 子类覆盖：True 表示该作用域只放行安全方法
+    read_only = False
 
     def has_permission(self, request, view):
         credential = getattr(request, 'auth', None)
         if not isinstance(credential, ApiCredential):
             # 不是凭证认证进来的（未带 key / 走 JWT）：交给 401 或其他权限类判
             return False
+        if self.read_only and request.method not in SAFE_METHODS:
+            # 「读」作用域绝不能顺带放行写：凭证认证绕过了 MFA 与 sudo，
+            # 一个 asset:read 的 key 能 POST 主机的话比漏配权限更糟
+            raise ApiKeyScopeDenied(
+                f'凭证「{credential.name}」的作用域为只读，不允许 {request.method}。')
         missing = [scope for scope in self.scopes if not credential.has_scope(scope)]
         if missing:
             logger.warning('凭证 %s 缺少作用域 %s', credential.key_id, missing)
@@ -268,8 +282,11 @@ class HasApiScope(BasePermission):
         return True
 
 
-def scope_required(*scopes):
+def scope_required(*scopes, read_only=False):
     """生成要求指定作用域的权限类（用法见模块开头）。
+
+    read_only=True 时只放行安全方法——挂在既有的读写 ViewSet 上时必须带它，
+    否则一个「读」作用域的 key 顺带拿到了写权限。
 
     作用域拼错在这里就报错：写成权限类属性的话，要到线上调用返回 403 才发现。
     """
@@ -278,7 +295,71 @@ def scope_required(*scopes):
         raise ImproperlyConfigured(f'未登记的作用域：{unknown}，请先在 apikey.SCOPES 中登记。')
     name = 'HasApiScope' + ''.join(
         part.title() for scope in scopes for part in scope.replace(':', '_').split('_'))
-    return type(name, (HasApiScope,), {'scopes': tuple(scopes)})
+    if read_only:
+        name += 'ReadOnly'
+    return type(name, (HasApiScope,), {'scopes': tuple(scopes), 'read_only': read_only})
+
+
+def request_credential(request):
+    """本次请求的 API 凭证；不是凭证认证进来的返回 None。
+
+    给视图收窄 queryset 用（见 ApiCredential.narrow），避免各处重复 isinstance。
+    """
+    credential = getattr(request, 'auth', None)
+    return credential if isinstance(credential, ApiCredential) else None
+
+
+class UserOrScope(BasePermission):
+    """按认证方式分流：凭证认证判作用域，JWT/匿名交给原有权限类。
+
+    **为什么不能写成 `IsAdminOrReadOnly | scope_required(...)`**：凭证绑定的是
+    真实服务账号，`request.user.is_authenticated` 为真，OR 的左边（只读放行）会
+    直接命中——等于任何凭证不带任何作用域也能读。或语义在这里是个安全漏洞，
+    必须按认证方式分流。
+
+    用 user_or_scope() 生成子类，不直接用。
+    """
+
+    user_permission = None
+    scopes = ()
+    read_only = True
+
+    def has_permission(self, request, view):
+        if request_credential(request) is not None:
+            return self._scope_permission().has_permission(request, view)
+        return self.user_permission().has_permission(request, view)
+
+    def has_object_permission(self, request, view, obj):
+        if request_credential(request) is not None:
+            return True  # 对象级由 queryset 收窄兜住（见 ApiCredential.narrow）
+        checker = self.user_permission()
+        if hasattr(checker, 'has_object_permission'):
+            return checker.has_object_permission(request, view, obj)
+        return True
+
+    @classmethod
+    def _scope_permission(cls):
+        return scope_required(*cls.scopes, read_only=cls.read_only)()
+
+
+def user_or_scope(user_permission, *scopes, read_only=True):
+    """生成「登录用户走 user_permission、机读凭证走作用域」的权限类。
+
+        permission_classes = [
+            user_or_scope(IsAdminOrReadCreate, 'asset:read'),
+            sudo_required_for('PUT', 'PATCH', 'DELETE'),
+        ]
+    """
+    unknown = [scope for scope in scopes if scope not in SCOPES]
+    if unknown:
+        raise ImproperlyConfigured(f'未登记的作用域：{unknown}，请先在 apikey.SCOPES 中登记。')
+    name = f'{user_permission.__name__}Or' + ''.join(
+        part.title() for scope in scopes for part in scope.replace(':', '_').split('_'))
+    return type(name, (UserOrScope,), {
+        'user_permission': user_permission,
+        'scopes': tuple(scopes),
+        'read_only': read_only,
+    })
 
 
 # ── 限速 ──────────────────────────────────────────────────

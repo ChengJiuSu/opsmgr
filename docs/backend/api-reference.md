@@ -520,9 +520,15 @@ POST /api/assets/servers/batch/update/
   "signing_secret": "",
   "rate_limit": "60/min",
   "expires_at": null,
+  "allowed_project_groups": [1, 2],
+  "allowed_environments": [],
   "remark": "Jenkins 制品上报"
 }
 ```
+
+`allowed_project_groups` / `allowed_environments` 是**数据范围**（留空 = 不限）：
+主机清单按范围收窄可见集，变量解析与制品上报/下载按范围拒绝越界维度。
+作用域含 `variable:secret` 时 `ip_unrestricted: true` 会被拒（高敏作用域必须限定来源）。
 
 `ip_whitelist` 留空必须同时给 `ip_unrestricted: true`，否则 400。`sig_mode` 取
 `none` / `hmac_sha256` / `token`，非 `none` 时 `sig_header` 与 `signing_secret` 必填。

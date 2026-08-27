@@ -27,6 +27,14 @@
           <span v-else class="mono">{{ row.ip_whitelist }}</span>
         </template>
       </el-table-column>
+      <el-table-column label="数据范围" min-width="150">
+        <template #default="{ row }">
+          <span v-if="row.allowed_project_groups?.length || row.allowed_environments?.length">
+            {{ dimLabel(row) }}
+          </span>
+          <span v-else class="muted">不限</span>
+        </template>
+      </el-table-column>
       <el-table-column label="签名" width="110">
         <template #default="{ row }">
           <el-tag v-if="row.sig_mode === 'none'" size="small" type="info">不验签</el-tag>
@@ -85,8 +93,11 @@
 
       <el-divider content-position="left">来源限制</el-divider>
       <el-form-item label="不限制 IP">
-        <el-switch v-model="form.ip_unrestricted" />
-        <span class="tip danger" v-if="form.ip_unrestricted">
+        <el-switch v-model="form.ip_unrestricted" :disabled="hasHighRiskScope" />
+        <span class="tip danger" v-if="hasHighRiskScope">
+          已选高敏作用域（读敏感变量真值），必须限定来源 IP，不允许「不限制」
+        </span>
+        <span class="tip danger" v-else-if="form.ip_unrestricted">
           该 Key 可从任意公网地址使用，泄露即全开，仅在来源确实无法枚举时选择
         </span>
       </el-form-item>
@@ -97,6 +108,22 @@
         />
         <div class="tip">
           按平台看到的真实客户端 IP 匹配（经可信代理链解析，伪造的 X-Forwarded-For 无效）
+        </div>
+      </el-form-item>
+
+      <el-divider content-position="left">数据范围（可选，留空 = 不限）</el-divider>
+      <el-form-item label="项目组">
+        <el-select v-model="form.allowed_project_groups" multiple placeholder="留空 = 不限" style="width:100%">
+          <el-option v-for="o in dictOptions.projects" :key="o.id" :label="o.name" :value="o.id" />
+        </el-select>
+      </el-form-item>
+      <el-form-item label="环境">
+        <el-select v-model="form.allowed_environments" multiple placeholder="留空 = 不限" style="width:100%">
+          <el-option v-for="o in dictOptions.envs" :key="o.id" :label="o.name" :value="o.id" />
+        </el-select>
+        <div class="tip">
+          纯收窄，配不出比作用域更宽的权限。主机清单按范围<b>收窄可见集</b>（不是拒绝请求），
+          变量解析与制品上报/下载则按范围<b>拒绝</b>越界维度。
         </div>
       </el-form-item>
 
@@ -164,13 +191,17 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import { Plus, Edit, Delete, Refresh } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   getApiCredentials, getApiScopes, createApiCredential, updateApiCredential,
   deleteApiCredential, rotateApiCredentialKey, toggleApiCredential,
 } from '../../api/apikeys'
+import { fetchDictOptions, projectGroupApi, environmentApi } from '../../api/assets'
+
+// 高敏作用域：与后端 apikey.HIGH_RISK_SCOPES 对齐，禁止「不限制来源 IP」
+const HIGH_RISK_SCOPES = ['variable:secret']
 
 const loading = ref(false)
 const submitting = ref(false)
@@ -182,9 +213,13 @@ const editRow = ref(null)
 const formRef = ref()
 const form = reactive({
   name: '', scopes: [], ip_unrestricted: false, ip_whitelist: '',
+  allowed_project_groups: [], allowed_environments: [],
   sig_mode: 'none', sig_header: '', sig_prefix: '', signing_secret: '',
   rate_limit: '', expires_at: null, enabled: true, remark: '',
 })
+const dictOptions = reactive({ projects: [], envs: [] })
+
+const hasHighRiskScope = computed(() => form.scopes.some((s) => HIGH_RISK_SCOPES.includes(s)))
 
 // 白名单留空必须显式勾选「不限制」——与后端同一条规则，前端先挡一次给出明确提示
 const rules = {
@@ -205,6 +240,17 @@ const oneTimeKey = ref('')
 
 const formatTime = (t) => (t ? t.slice(0, 19).replace('T', ' ') : '')
 const scopeLabel = (value) => scopes.value.find((s) => s.value === value)?.label || value
+const dictName = (list, id) => list.find((o) => o.id === id)?.name || id
+const dimLabel = (row) => {
+  const parts = []
+  if (row.allowed_project_groups?.length) {
+    parts.push(row.allowed_project_groups.map((id) => dictName(dictOptions.projects, id)).join('、'))
+  }
+  if (row.allowed_environments?.length) {
+    parts.push(row.allowed_environments.map((id) => dictName(dictOptions.envs, id)).join('、'))
+  }
+  return parts.join(' / ')
+}
 const statusType = (row) => (row.expired ? 'danger' : row.enabled ? 'success' : 'info')
 const statusLabel = (row) => (row.expired ? '已过期' : row.enabled ? '启用' : '停用')
 
@@ -242,6 +288,8 @@ function openDialog(row = null) {
     scopes: row?.scopes ? [...row.scopes] : [],
     ip_unrestricted: row?.ip_unrestricted || false,
     ip_whitelist: row?.ip_whitelist || '',
+    allowed_project_groups: row?.allowed_project_groups ? [...row.allowed_project_groups] : [],
+    allowed_environments: row?.allowed_environments ? [...row.allowed_environments] : [],
     sig_mode: row?.sig_mode || 'none',
     sig_header: row?.sig_header || '',
     sig_prefix: row?.sig_prefix || '',
@@ -260,6 +308,7 @@ async function handleSubmit() {
   submitting.value = true
   try {
     const payload = { ...form, expires_at: form.expires_at || null }
+    if (hasHighRiskScope.value) payload.ip_unrestricted = false
     if (!payload.signing_secret) delete payload.signing_secret  // 留空 = 保持原密钥
     if (editRow.value) {
       await updateApiCredential(editRow.value.id, payload)
@@ -320,9 +369,18 @@ async function copyKey() {
   }
 }
 
+async function loadDicts() {
+  const [proj, env] = await Promise.all([
+    fetchDictOptions(projectGroupApi), fetchDictOptions(environmentApi),
+  ])
+  dictOptions.projects = proj.data?.results || []
+  dictOptions.envs = env.data?.results || []
+}
+
 onMounted(() => {
   fetchData()
   loadScopes()
+  loadDicts()
 })
 </script>
 

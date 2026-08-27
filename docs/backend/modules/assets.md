@@ -199,3 +199,23 @@ region         = CharField(max_length=50, blank=True)
 - **区服（游戏服）模块**：项目组 × 渠道 × 环境 × 区服 链路，区服关联部署主机后可按区服圈选执行目标
 - **云账号**：对接 `method_mgr` 的 `cloud_host` 执行器时，为云厂商挂载 AK/SK 账号（加密存储、不回显）
 - SSH 连通性检测：异步任务定期探测服务器
+
+---
+
+## 机读通道（内部脚本读主机清单）
+
+`GET /api/assets/servers/` 除登录用户外，也接受 **API 凭证**（`asset:read` 作用域，
+见 `docs/backend/modules/auth.md`）：
+
+```bash
+curl -H "X-API-KEY: ak_xxx.yyy" \
+  "https://ops.example.com/api/assets/servers/?project_group=main-game&executable=true"
+```
+
+两点约束：
+
+- **只读**。`user_or_scope(..., read_only=True)` 只放行安全方法——凭证认证绕过了
+  MFA 与 sudo，一个 `asset:read` 的 key 能 POST 主机比漏配权限更糟；
+- **按凭证数据范围收窄可见集**（`get_queryset` 里先 `credential.narrow(qs)` 再叠
+  常规筛选）。收窄而不是拒绝：调用方忘了带筛选参数时拿到的是「我的全部」，
+  不是「全公司的全部」。

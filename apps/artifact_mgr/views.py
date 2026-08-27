@@ -13,9 +13,13 @@ from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import AllowAny
 from rest_framework.views import APIView
 
-from apps.auth_mgr.apikey import ApiKeyAuthentication, ApiKeyThrottle, scope_required
+from apps.auth_mgr.apikey import (
+    ApiKeyAuthentication,
+    ApiKeyThrottle,
+    request_credential,
+    scope_required,
+)
 from apps.auth_mgr.authentication import MfaJWTAuthentication
-from apps.auth_mgr.models import ApiCredential
 from common.ansible import resolve_within
 from common.permissions import IsAdminOrReadOnly
 from common.response import fail, ok
@@ -91,6 +95,12 @@ class ArtifactReportView(APIView):
         pg, ch, env = data['project_group'], data['channel'], data['environment']
         upload = data['file']
 
+        # 凭证数据范围：一把限定了项目组的 CI key 不该能往别的项目组塞包
+        credential = request_credential(request)
+        if credential is not None and not credential.allows_dims(pg.id, env.id):
+            return fail(f'凭证「{credential.name}」的数据范围不含 {pg.code}/{env.code}'
+                        f'（当前范围：{credential.scope_label}）', status=403)
+
         if Artifact.objects.filter(
             project_group=pg, channel=ch, environment=env, version=data['version'],
         ).exists():
@@ -149,10 +159,13 @@ class ArtifactDownloadView(APIView):
         if artifact is None:
             return fail('制品不存在', status=404)
 
-        credential = request.auth if isinstance(request.auth, ApiCredential) else None
+        credential = request_credential(request)
         if credential is not None:
             if not credential.has_scope('artifact:download'):
                 return fail(f'凭证「{credential.name}」缺少作用域：artifact:download', status=403)
+            if not credential.allows_dims(artifact.project_group_id, artifact.environment_id):
+                return fail(f'凭证「{credential.name}」的数据范围不含该制品'
+                            f'（当前范围：{credential.scope_label}）', status=403)
         elif not (request.user and request.user.is_authenticated):
             sig = request.query_params.get('sig', '')
             expected = artifact.download_sig()

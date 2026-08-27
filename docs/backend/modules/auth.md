@@ -344,6 +344,7 @@ fail-closed：配置不对时拒绝，而不是放过去。
 | `ip_unrestricted` / `ip_whitelist` | 不限制开关 + CIDR 文本（逗号/换行分隔）|
 | `sig_mode` / `sig_header` / `sig_prefix` / `signing_secret_enc` | 验签配置；密钥需原值重算 HMAC，故走 Fernet 加密而非哈希 |
 | `rate_limit` | DRF 速率语法，留空用 `API_KEY_DEFAULT_RATE` |
+| `allowed_project_groups` / `allowed_environments` | 数据范围（M2M，空 = 不限），见下节 |
 | `bound_user` | 服务账号（`svc-<名称>`，密码不可用、非 staff）。返回真实 User 让审计按 FK 落调用方，既有权限类也原样生效 |
 | `enabled` / `expires_at` | 停用比删除更可逆，泄露时的第一动作 |
 | `last_used_at` / `last_used_ip` | 使用痕迹，按 `API_KEY_TOUCH_INTERVAL` 节流写库 |
@@ -357,8 +358,47 @@ fail-closed：配置不对时拒绝，而不是放过去。
 | `artifact:report` | 上报构建制品 | `POST /api/artifacts/report/` |
 | `artifact:download` | 下载构建制品 | `GET /api/artifacts/{id}/download/` |
 | `task:trigger` | 触发任务流执行 | `POST /api/exec/tasks/{id}/trigger/` |
+| `asset:read` | 读取主机清单（只读）| `GET /api/assets/servers/` |
+| `variable:read` | 读取执行变量（不含敏感值）| `GET /api/exec/variables/resolved/` |
+| `variable:secret` | 读取敏感变量真值（**高敏**）| 同上，配合 `include_secrets=true` |
 
 新增机读接口时先在 `apikey.SCOPES` 登记，`scope_required()` 会校验拼写（拼错启动即报错）。
+
+`HIGH_RISK_SCOPES`（当前只有 `variable:secret`）的凭证**禁止**勾选「不限制来源
+IP」，序列化器直接拦。它能拿到密码类内容，泄露后果与其余作用域不在一个量级，
+这里不给「我知道风险」的余地——真要放开就拆一把只带普通作用域的 key。
+
+### 数据范围（`allowed_project_groups` / `allowed_environments`）
+
+作用域管「能调哪类接口」，数据范围管「能作用在哪些资源上」，两层正交。留空 = 不限。
+
+**纯收窄**：配不出比作用域更宽的权限，这是它比「路径通配符授权」安全的根本原因
+——下拉多选表达不出「过宽」。
+
+两种执行方式，按接口语义选：
+
+| 接口 | 方式 | 为什么 |
+|------|------|--------|
+| 主机清单 | **收窄可见集**（`ApiCredential.narrow`）| 调用方忘了带筛选参数时拿到的是「我的全部」而不是「全公司的全部」，既好用又更难出错 |
+| 变量解析 / 制品上报 / 制品下载 | **拒绝越界维度**（`allows_dims`）| 维度是必填参数，调用方已明确说了要哪一组，静默换成别的组更糟 |
+
+### 为什么权限类不能用「或」
+
+凭证绑定的是真实服务账号，`request.user.is_authenticated` 为真。所以
+
+```python
+permission_classes = [IsAdminOrReadCreate | scope_required('asset:read')]  # 错
+```
+
+的左边（只读放行）会直接命中——任何凭证不带任何作用域也能读。必须按认证方式分流：
+
+```python
+permission_classes = [user_or_scope(IsAdminOrReadCreate, 'asset:read')]    # 对
+```
+
+`user_or_scope` 生成的权限类：凭证认证的请求判作用域（默认只放行安全方法），
+其余交给原来的权限类。`read_only` 默认为 True——一个「读」作用域顺带拿到写权限
+比漏配权限更糟，因为凭证认证同时绕过了 MFA 与 sudo。
 
 ### 暴破与限速
 

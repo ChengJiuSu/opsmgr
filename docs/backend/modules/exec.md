@@ -68,6 +68,11 @@ ansible 优先级最高**——剧本内 `vars:` 不会反过来覆盖平台变�
 （`ExecVariableVersion`，`EXEC_VARIABLE_VERSION_LIMIT` 默认保留 10 版），
 支持回滚。
 
+**机读通道**：`resolved` 动作单独挂了 API 凭证认证（`variable:read` 作用域，
+`include_secrets=true` 另需 `variable:secret`），并按凭证数据范围校验维度。只在这个
+动作上开——脚本要的是「按维度解析好的变量字典」，不是整张变量表，把 list 也开出去
+只是白扩大暴露面。
+
 **对外取值**（`GET /api/exec/variables/resolved/`）：供 Jenkins 等外部系统按
 维度拉取**已解析合并**的变量字典，配合服务器接口（`executable=true`）自行
 拼装 ansible 调用。与执行器共用 `runner.collect_dim_variables()`，保证内外

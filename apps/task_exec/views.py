@@ -13,6 +13,13 @@ from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.views import APIView
 
+from apps.auth_mgr.apikey import (
+    ApiKeyAuthentication,
+    ApiKeyThrottle,
+    request_credential,
+    user_or_scope,
+)
+from apps.auth_mgr.authentication import MfaJWTAuthentication
 from common.ansible import resolve_within
 from common.crypto import DecryptError
 from common.permissions import IsAdmin, IsAdminOrReadOnly
@@ -130,7 +137,14 @@ class ExecVariableViewSet(viewsets.ModelViewSet):
         ],
         responses=OpenApiTypes.OBJECT,
     )
-    @action(detail=False, methods=['get'])
+    @action(
+        detail=False, methods=['get'],
+        # 只在这个动作上开机读通道：脚本要的是「按维度解析好的变量字典」，
+        # 不是整张变量表，把 list 也开出去只是白扩大暴露面
+        authentication_classes=[ApiKeyAuthentication, MfaJWTAuthentication],
+        permission_classes=[user_or_scope(IsAdminOrReadOnly, 'variable:read')],
+        throttle_classes=[ApiKeyThrottle],
+    )
     def resolved(self, request):
         """按维度返回已解析合并的变量字典，供外部系统直接喂给 ansible。
 
@@ -145,11 +159,25 @@ class ExecVariableViewSet(viewsets.ModelViewSet):
         dims, err = self._resolve_dims(request.query_params)
         if err:
             return fail(err)
+        # 机读凭证：请求的维度必须在凭证数据范围内。这里是拒绝而不是收窄——
+        # 三维度是必填参数，调用方已经明确说了要哪一组，静默换成别的组更糟
+        credential = request_credential(request)
+        if credential is not None and not credential.allows_dims(
+                dims['project_group'].id, dims['environment'].id):
+            return fail(f'凭证「{credential.name}」的数据范围不含该维度'
+                        f'（当前范围：{credential.scope_label}）', status=403)
+
         # 敏感变量默认不下发：这个接口普通登录用户也能调，全量返回等于任何账号
-        # 拉一次就把密码全拿走。要真值必须显式 include_secrets=true 且是管理员
+        # 拉一次就把密码全拿走。要真值必须显式 include_secrets=true，且
+        # 登录用户须是管理员 / 机读凭证须另有 variable:secret 作用域
         include_secrets = request.query_params.get('include_secrets') == 'true'
-        if include_secrets and not request.user.is_staff:
-            return fail('include_secrets 仅管理员可用', status=403)
+        if include_secrets:
+            if credential is not None:
+                if not credential.has_scope('variable:secret'):
+                    return fail(f'凭证「{credential.name}」缺少作用域：variable:secret',
+                                status=403)
+            elif not request.user.is_staff:
+                return fail('include_secrets 仅管理员可用', status=403)
         variables = collect_dim_variables(dims['project_group'].id, dims['channel'].id,
                                           dims['environment'].id,
                                           include_secrets=include_secrets)

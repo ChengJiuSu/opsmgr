@@ -13,6 +13,13 @@ from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.views import APIView
 
+from apps.auth_mgr.apikey import (
+    ApiKeyAuthentication,
+    ApiKeyThrottle,
+    request_credential,
+    user_or_scope,
+)
+from apps.auth_mgr.authentication import MfaJWTAuthentication
 from common.jumpserver import register_servers
 from common.permissions import IsAdmin, IsAdminOrReadCreate
 from common.sudo import SudoRequired
@@ -118,7 +125,14 @@ class ServerViewSet(viewsets.ModelViewSet):
     # 已认证用户可查看/新增服务器，修改与删除仅管理员
     # 改/删还要 sudo 二次验证：channel_mode/agent 决定命令下发到哪台机器执行，
     # 与通道路由同性质。新增不拦——新加的主机不会改变已有主机的执行通道
-    permission_classes = [IsAdminOrReadCreate, sudo_required_for('PUT', 'PATCH', 'DELETE')]
+    # 登录用户走原有权限；API 凭证（内部脚本）凭 asset:read 只读，
+    # 且可见范围由凭证的项目组/环境收窄（见 get_queryset）
+    authentication_classes = [ApiKeyAuthentication, MfaJWTAuthentication]
+    permission_classes = [
+        user_or_scope(IsAdminOrReadCreate, 'asset:read'),
+        sudo_required_for('PUT', 'PATCH', 'DELETE'),
+    ]
+    throttle_classes = [ApiKeyThrottle]
 
     # 查询参数 → 字典外键字段映射（值为纯数字按 id 过滤，否则按 code 过滤）
     DICT_FILTERS = (
@@ -130,6 +144,12 @@ class ServerViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         qs = super().get_queryset()
+        # 机读凭证：先按凭证的数据范围收窄，再叠常规筛选。
+        # 收窄可见集而不是拒绝请求——调用方忘了带筛选参数时拿到的是「我的全部」，
+        # 不是「全公司的全部」
+        credential = request_credential(self.request)
+        if credential is not None:
+            qs = credential.narrow(qs)
         params = self.request.query_params
         status = params.get('status')
         keyword = params.get('keyword')

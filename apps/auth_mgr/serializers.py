@@ -8,7 +8,7 @@ from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 from common.request import parse_ip_rules
 
-from .apikey import SCOPES
+from .apikey import HIGH_RISK_SCOPES, SCOPES
 from .models import ApiCredential
 from .services import AMR_PASSWORD
 
@@ -143,6 +143,8 @@ class ApiCredentialSerializer(serializers.ModelSerializer):
         style={'input_type': 'password'}, label='签名密钥',
     )
     has_signing_secret = serializers.BooleanField(read_only=True)
+    # 数据范围的可读描述，列表页直接展示（省得前端再拼字典名）
+    scope_label = serializers.CharField(read_only=True)
     bound_user_name = serializers.CharField(source='bound_user.username', read_only=True)
     created_by_name = serializers.CharField(
         source='created_by.username', read_only=True, default=None)
@@ -156,6 +158,7 @@ class ApiCredentialSerializer(serializers.ModelSerializer):
             'sig_mode', 'sig_header', 'sig_prefix',
             'signing_secret', 'has_signing_secret',
             'rate_limit', 'bound_user', 'bound_user_name',
+            'allowed_project_groups', 'allowed_environments', 'scope_label',
             'enabled', 'expires_at', 'expired',
             'last_used_at', 'last_used_ip',
             'created_by', 'created_by_name', 'remark',
@@ -215,8 +218,19 @@ class ApiCredentialSerializer(serializers.ModelSerializer):
         默认拒的理由：留空放行会让「忘了填」与「故意不填」外观一致，一次手滑
         就产出一把全网可用的 key。勾了不限制就把白名单清空，避免页面上留着
         一份看着生效实则被忽略的文本。
+
+        高敏作用域（HIGH_RISK_SCOPES，当前是读敏感变量真值）**禁止**不限制：
+        它能拿到密码类内容，泄露后果与其余作用域不在一个量级，这里不给「我知道
+        风险」的余地——真要放开就拆一把只带普通作用域的 key。
         """
         unrestricted = self._value(attrs, 'ip_unrestricted', False)
+        scopes = self._value(attrs, 'scopes', []) or []
+        high_risk = sorted(set(scopes) & HIGH_RISK_SCOPES)
+        if unrestricted and high_risk:
+            raise serializers.ValidationError({
+                'ip_unrestricted': f'作用域 {"、".join(high_risk)} 属高敏，必须限定来源 IP，'
+                                   f'不允许「不限制来源 IP」。',
+            })
         whitelist = (self._value(attrs, 'ip_whitelist', '') or '').strip()
         if unrestricted:
             attrs['ip_whitelist'] = ''
@@ -257,14 +271,23 @@ class ApiCredentialSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         secret = validated_data.pop('signing_secret', '')
+        groups = validated_data.pop('allowed_project_groups', None)
+        envs = validated_data.pop('allowed_environments', None)
         credential = ApiCredential(**validated_data)
         if secret:
             credential.set_signing_secret(secret)
         credential.save()
+        if groups is not None:
+            credential.allowed_project_groups.set(groups)
+        if envs is not None:
+            credential.allowed_environments.set(envs)
         return credential
 
     def update(self, instance, validated_data):
         secret = validated_data.pop('signing_secret', None)
+        # M2M 不能直接 setattr；未传字段保持原值（PATCH 语义）
+        groups = validated_data.pop('allowed_project_groups', None)
+        envs = validated_data.pop('allowed_environments', None)
         for field, value in validated_data.items():
             setattr(instance, field, value)
         if secret:
@@ -273,4 +296,10 @@ class ApiCredentialSerializer(serializers.ModelSerializer):
             # 关掉验签就把密钥一起清掉，不留着一份没人用的秘密
             instance.signing_secret_enc = ''
         instance.save()
+        if groups is not None:
+            instance.allowed_project_groups.set(groups)
+        if envs is not None:
+            instance.allowed_environments.set(envs)
+        # 范围改了要让缓存失效，否则同请求内后续判定还用旧值
+        instance.__dict__.pop('_dim_cache', None)
         return instance
