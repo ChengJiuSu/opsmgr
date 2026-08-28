@@ -1,5 +1,6 @@
 """agent_mgr 测试：管理 API 权限与 token、Consumer 协议、dispatch、通道解析与 runner 分组。"""
 import importlib
+import json
 from unittest import mock
 
 from channels.routing import URLRouter
@@ -241,6 +242,47 @@ class DispatchTests(TestCase):
         self.assertEqual(rc, 1)
         self.assertIn('channel layer', out)  # 已过能力校验，卡在下发环节
         self.assertTrue(AgentJob.objects.exists())
+
+    def test_secret_fields_not_persisted_but_dispatched(self):
+        """证书内容这类字段只下发，不进 AgentJob.payload。"""
+        from .dispatch import SECRET_PLACEHOLDER
+
+        node = AgentNode.objects.create(
+            name='gw-secret', token_hash='x', status='online', channel_name='ch')
+        sent = []
+
+        class FakeLayer:
+            async def group_send(self, group, message):
+                sent.append(message)
+
+        class FakeTime:
+            """只替 dispatch 模块内的时钟：首次取时间后立刻越过等待窗口。"""
+
+            def __init__(self):
+                self._calls = 0
+
+            def monotonic(self):
+                self._calls += 1
+                return 0 if self._calls == 1 else 10 ** 6
+
+            def sleep(self, _seconds):
+                pass
+
+        with mock.patch('apps.agent_mgr.dispatch.get_channel_layer',
+                        return_value=FakeLayer()), \
+                mock.patch('apps.agent_mgr.dispatch.time', FakeTime()):
+            rc, _out = run_via_agent(
+                node, {'step_type': 'cert_deploy',
+                       'files': [{'name': 'a.key', 'mode': '0600', 'content': 'PRIVATE'}]},
+                timeout=1, secret_fields=('files',))
+        self.assertEqual(rc, 124)  # 无 agent 回传，走等待超时分支
+        # 下发内容原样带证书
+        dispatched = next(m for m in sent if m['type'] == 'agent.dispatch')
+        self.assertEqual(dispatched['job']['files'][0]['content'], 'PRIVATE')
+        # 落库内容脱敏
+        job = AgentJob.objects.get()
+        self.assertEqual(job.payload['files'], SECRET_PLACEHOLDER)
+        self.assertNotIn('PRIVATE', json.dumps(job.payload, ensure_ascii=False))
 
 
 class RunnerChannelSplitTests(TestCase):

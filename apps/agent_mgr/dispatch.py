@@ -18,6 +18,8 @@ from .models import AgentJob
 logger = logging.getLogger('apps.agent_mgr')
 
 POLL_INTERVAL = 1  # 秒
+# 落库 payload 里替换敏感字段的占位串（下发给 agent 的仍是原值）
+SECRET_PLACEHOLDER = '***（敏感内容仅下发，未落库）***'
 DISPATCH_MARGIN = 60  # 等待余量：模块 timeout 之外留给下发/回传的时间
 
 
@@ -39,24 +41,42 @@ def agent_offline_reason(agent, capability=None):
     return None
 
 
+def redact_payload(payload, secret_fields):
+    """返回可落库的 payload 副本：secret_fields 里的键值换成占位串。
+
+    证书私钥这类内容必须下发给 agent，但不该留在 AgentJob.payload 里
+    （任务详情/后台随手可见，DB 里也没有 EncryptedTextField 的保护）。
+    """
+    if not secret_fields:
+        return payload
+    redacted = dict(payload)
+    for key in secret_fields:
+        if key in redacted:
+            redacted[key] = SECRET_PLACEHOLDER
+    return redacted
+
+
 def run_via_agent(agent, payload, timeout, task_id=None, log_id=None,
-                  step_order=None, on_data=None, capability=None):
+                  step_order=None, on_data=None, capability=None,
+                  secret_fields=()):
     """经 agent 执行一个模块单元，阻塞等待终态，返回 (rc, output)。
 
     通道层失败（离线/拒收/等待超时）rc=1/124，输出为中文原因；
     执行结果 rc 与 agent 侧输出原样透传。on_data 为实时输出回调：轮询到新
     分片即回调增量（agent 侧日志分片由 consumer 异步落库）。capability 为
     该 payload 需要的 agent 能力（如 'jenkins'），用于对老 agent fail fast。
+    secret_fields 列出只下发、不落库的 payload 键（如证书分发的 files）。
     """
     reason = agent_offline_reason(agent, capability=capability)
     if reason:
         return 1, reason
 
     job = AgentJob.objects.create(
-        agent=agent, payload=payload,
+        agent=agent, payload=redact_payload(payload, secret_fields),
         task_id=task_id, log_id=log_id, step_order=step_order)
     payload = dict(payload, job_id=str(job.job_id))
-    AgentJob.objects.filter(pk=job.pk).update(payload=payload)
+    AgentJob.objects.filter(pk=job.pk).update(
+        payload=redact_payload(payload, secret_fields))
 
     channel_layer = get_channel_layer()
     if channel_layer is None:

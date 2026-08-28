@@ -126,16 +126,21 @@ cert-deployments `certificate`、`target_type`、`status`。
 
 ## 证书分发（deploy.py）
 
-- **服务器**：临时目录写 PEM（0600）→ 生成 JSON 格式剧本（合法 YAML，规避引号
-  转义）→ 复用 `task_exec.runner._write_inventory` 生成动态 inventory →
+- **服务器（直连）**：临时目录写 PEM（0600）→ 生成 JSON 格式剧本（合法 YAML，
+  规避引号转义）→ 复用 `task_exec.runner._write_inventory` 生成动态 inventory →
   `ansible-playbook --forks 1` 执行。剧本三步：建目录（0750）、copy 三个文件
   （crt/fullchain 0644、key 0600，`backup: true` 覆盖前留旧副本）、执行重载命令
   （留空则跳过）。执行完临时目录连私钥副本一并清理；输出截尾 4000 字入
   `last_output`。
 - **文件名**：`<安全证书名>.crt` / `.key` / `.fullchain.pem`，与下载包同口径
   （`deploy.safe_cert_name`）。
-- **agent 通道主机**：v1 不支持（证书内容不出通道，与 method 模块同口径），
-  明确报错而非静默降级。
+- **服务器（agent 通道）**：按 `agent_mgr.channel.resolve_agent` 自动选路，解析
+  出 agent 即打 `step_type='cert_deploy'` payload 经 dispatch 下发（`files` 为
+  同一份文件清单，inventory 用无密钥版本，capability 校验 `cert_deploy` 对老
+  agent fail fast）。剧本由 agent 本地按同口径生成，agent 需 ≥ v1.2.0。
+  证书内容**只下发不落库**（`secret_fields=('files',)`，`AgentJob.payload` 里
+  是占位串），agent 侧只写 0700 临时目录并在执行后删除；细节与暴露面分析见
+  `docs/ops-agent-design.md` 3.4.2。
 - **续签联动**：`run_issue` 签发成功后顺序执行该证书全部 `auto_deploy=True`
   的目标（同线程串行，避免并发抢同一主机）。
 - **lb/ga/cdn**：`DEPLOYERS` 中各自桩函数抛中文 `CertDeployError`；

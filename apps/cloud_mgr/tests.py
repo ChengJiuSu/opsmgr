@@ -663,19 +663,61 @@ class CertDeploymentApiTests(BaseApiTest):
         self.assertEqual(dep.status, 'failed')
         self.assertIn('UNREACHABLE', dep.last_error)
 
-    def test_deploy_rejects_agent_channel_host(self):
+    def _pin_agent(self):
         from apps.agent_mgr.models import AgentNode
-        agent = AgentNode.objects.create(name='nat-gw', token_hash='x' * 64)
+        agent = AgentNode.objects.create(
+            name='nat-gw', token_hash='x' * 64, status='online', channel_name='ch',
+            meta={'capabilities': ['command', 'playbook', 'cert_deploy', 'jenkins']})
         self.server.channel_mode = 'agent'
         self.server.agent = agent
         self.server.save(update_fields=['channel_mode', 'agent'])
+        return agent
+
+    def test_deploy_agent_channel_host_dispatches_payload(self):
+        """agent 通道主机：打 cert_deploy payload 下发，证书内容只下发不落库。"""
+        agent = self._pin_agent()
         dep = self._create_deployment()
         admin = self._client()
-        with self.settings(TASK_EXEC_BACKEND='sync'):
+        with patch('apps.agent_mgr.dispatch.run_via_agent',
+                   return_value=(0, 'ok changed=4')) as mock_agent, \
+                patch('apps.cloud_mgr.deploy.run_subprocess') as mock_local, \
+                self.settings(TASK_EXEC_BACKEND='sync'):
+            r = admin.post(f'/api/cloud/cert-deployments/{dep.id}/deploy/')
+        self.assertEqual(r.status_code, 200, r.content)
+        mock_local.assert_not_called()  # 不在 manager 本机起 ansible
+        dep.refresh_from_db()
+        self.assertEqual(dep.status, 'success')
+        self.assertIn('changed=4', dep.last_output)
+
+        called_agent, payload = mock_agent.call_args.args
+        kwargs = mock_agent.call_args.kwargs
+        self.assertEqual(called_agent.pk, agent.pk)
+        self.assertEqual(kwargs['capability'], 'cert_deploy')
+        self.assertEqual(kwargs['secret_fields'], ('files',))
+        self.assertEqual(payload['step_type'], 'cert_deploy')
+        self.assertEqual(payload['deploy_path'], '/etc/nginx/ssl')
+        self.assertEqual(payload['reload_cmd'], 'nginx -s reload')
+        self.assertEqual(
+            [(f['name'], f['mode']) for f in payload['files']],
+            [('web-cert.crt', '0644'), ('web-cert.fullchain.pem', '0644'),
+             ('web-cert.key', '0600')])
+        self.assertEqual(payload['files'][-1]['content'], 'KEY')
+        # inventory 走无密钥版本（SSH 凭据驻留 agent 主机）
+        self.assertIn('ansible_host=8.8.8.8', payload['inventory'])
+        self.assertNotIn('ansible_ssh_pass', payload['inventory'])
+
+    def test_deploy_agent_channel_failure_records_error(self):
+        self._pin_agent()
+        dep = self._create_deployment()
+        admin = self._client()
+        with patch('apps.agent_mgr.dispatch.run_via_agent',
+                   return_value=(1, 'Agent「nat-gw」离线（最近心跳：从未），无法下发。')), \
+                self.settings(TASK_EXEC_BACKEND='sync'):
             admin.post(f'/api/cloud/cert-deployments/{dep.id}/deploy/')
         dep.refresh_from_db()
         self.assertEqual(dep.status, 'failed')
-        self.assertIn('agent', dep.last_error)
+        self.assertIn('离线', dep.last_error)
+        self.assertIn('nat-gw', dep.last_error)
 
     def test_deploy_stub_target_types_rejected(self):
         admin = self._client()

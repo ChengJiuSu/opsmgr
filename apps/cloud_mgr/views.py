@@ -551,7 +551,8 @@ class CertDeploymentViewSet(viewsets.ModelViewSet):
 
     - deploy：单目标分发；deploying 状态防重入；未接入的目标类型明确拒绝；
     - 证书签发/续签成功后 auto_deploy 目标由 tasks.run_issue 自动触发；
-    - 分发前置校验：证书已签发、服务器为直连通道（agent 通道 v1 不支持）。
+    - 分发前置校验：证书已签发；执行通道由 deploy.py 按主机三态自动选路
+      （直连本机起 ansible，agent 通道下发 cert_deploy 单元）。
 
     **写操作要求 sudo 二次验证**：`reload_cmd` 是在目标主机上执行的任意 shell
     命令，登记一条分发目标等于拿到该主机的远程命令执行面——和「连接凭据」同性质，

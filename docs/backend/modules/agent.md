@@ -13,9 +13,10 @@ NAT 出口执行代理（ops-agent）的服务端：agent 主动外连 WebSocket
 路由到 agent 通道的主机组打包为**自包含执行单元**（AgentJob）下发，agent
 本地调用 ansible 执行并流式回传日志。
 
-执行单元有三类 `step_type`：`command` / `playbook`（agent 侧调 ansible）与
+执行单元有四类 `step_type`：`command` / `playbook`（agent 侧调 ansible）、
 `jenkins`（agent 侧调内网 Jenkins REST，用于 manager 在公网而 Jenkins 在内网
-的场景，见 `docs/backend/modules/artifacts.md`）。
+的场景，见 `docs/backend/modules/artifacts.md`）与 `cert_deploy`（云控证书分发
+到内网主机，剧本由 agent 本地生成，见 `docs/backend/modules/cloud.md`）。
 
 | 概念 | 说明 |
 |------|------|
@@ -83,12 +84,15 @@ Server.channel_mode='auto'（默认）：
 
 ## 下发与可靠回传
 
-- `run_via_agent(agent, payload, timeout, capability=None)` 同步阻塞（与
+- `run_via_agent(agent, payload, timeout, capability=None, secret_fields=())`
+  同步阻塞（与
   runner 每模块同步语义一致）：离线/禁用 fail fast 不落 job；下发后 1s 轮询
   AgentJob 至终态，超时（模块 timeout + 60s 余量）置 failed(rc=124) 并转发
   `task.cancel`。`capability`（如 `'jenkins'`）非空时校验 agent `register`
   上报的能力清单（落 `meta.capabilities`）：不支持则 fail fast 提示升级；
   老 agent 不上报该字段时不校验，由 agent 侧 `task.ack` 拒收兜底。
+  `secret_fields` 列出「只下发、不落 `AgentJob.payload`」的键（证书分发的
+  `files`）：落库前换占位串，agent 侧 spool 同样脱敏，见设计文档 3.4.2。
 - 日志分片 `log.chunk` 携带严格递增 `chunk_seq`：Consumer 只追加大于当前
   游标的分片（重复/乱序重 ack 游标，agent 按游标补传），单 job 输出上限
   2MB 超限截断。`task.result` 幂等，重复上报只重 ack。
@@ -150,8 +154,8 @@ WS   /ws/agent/                          agent 接入（握手头 Authorization:
 上行（agent → manager）：`register`（含 `capabilities`：支持的 step_type
 清单）、`heartbeat`、`task.ack`、`log.chunk`、`task.result`；下行：
 `register.ack`、`task.dispatch`（`step_type` = command / playbook /
-jenkins）、`task.cancel`、`log.ack`、`result.ack`、`error`。字段明细见设计
-文档第 3.3/3.4 节。
+cert_deploy / jenkins）、`task.cancel`、`log.ack`、`result.ack`、`error`。
+字段明细见设计文档第 3.3/3.4 节。
 
 ## 部署
 

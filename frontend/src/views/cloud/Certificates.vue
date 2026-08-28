@@ -290,7 +290,7 @@
             :value="s.id"
           />
         </el-select>
-        <div class="tip">agent 执行通道主机暂不支持分发（证书内容不出通道）</div>
+        <div class="tip">按主机执行通道自动选路：直连主机本机推送，agent 通道主机经该 agent 下发（agent 需 v1.2+）</div>
       </el-form-item>
       <el-form-item label="部署目录" prop="deploy_path">
         <el-input v-model="deployForm.deploy_path" placeholder="/etc/nginx/ssl" />

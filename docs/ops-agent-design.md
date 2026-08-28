@@ -102,7 +102,7 @@ JSON 文本帧，统一信封：
 
 | 类型 | 方向 | data 字段 | 说明 |
 |------|------|-----------|------|
-| `register` | agent → mgr | `agent_name, version, hostname, capabilities` | 连接后首条消息，manager 校验后回 `register.ack`；`capabilities` 为支持的 step_type 清单（`command`/`playbook`/`jenkins`），落 `AgentNode.meta`，下发时对老 agent fail fast（未上报则不校验） |
+| `register` | agent → mgr | `agent_name, version, hostname, capabilities` | 连接后首条消息，manager 校验后回 `register.ack`；`capabilities` 为支持的 step_type 清单（`command`/`playbook`/`cert_deploy`/`jenkins`），落 `AgentNode.meta`，下发时对老 agent fail fast（未上报则不校验） |
 | `heartbeat` | agent → mgr | `running_tasks, load1, disk_free_pct, version` | 30s 周期 |
 | `task.dispatch` | mgr → agent | 见 3.4 | 下发一个「模块执行单元」 |
 | `task.ack` | agent → mgr | `job_id, accepted, reason` | 收单确认；队列满/磁盘不足时 `accepted=false` |
@@ -187,6 +187,49 @@ manager 部署在公网、Jenkins 在公司内网时，manager 直连不通，�
 **已知边界**：agent 重启时该单元按 rc=137 上报中断，但 Jenkins 上的构建不随
 agent 进程消亡，仍会跑完（与 ansible 子进程不同）；v2 可用 spool 里的
 build_url 重连续跟。
+
+### 3.4.2 证书分发执行单元（`step_type='cert_deploy'`）
+
+内网主机的证书分发（2026-08-28 落地，替代 v1 的「agent 通道主机直接拒绝」）：
+
+```json
+{
+  "job_id": "uuid",
+  "step_type": "cert_deploy",
+  "inventory": "<INI 文本，无密钥版本>",
+  "deploy_path": "/etc/nginx/ssl",
+  "reload_cmd": "nginx -s reload",
+  "files": [
+    {"name": "web-cert.crt", "mode": "0644", "content": "-----BEGIN CERT..."},
+    {"name": "web-cert.fullchain.pem", "mode": "0644", "content": "..."},
+    {"name": "web-cert.key", "mode": "0600", "content": "-----BEGIN PRIVATE KEY..."}
+  ],
+  "forks": 1,
+  "timeout": 300
+}
+```
+
+- **剧本由 agent 本地生成**（`executor.build_cert_playbook`），与 manager 侧
+  `cloud_mgr.deploy._build_playbook` 同口径：建目录 0750 → copy 每个文件
+  （`backup: true`）→ 可选 reload。**不下发剧本内容**：agent 的 ansible 执行面
+  仍只有「项目目录内既有剧本」与这三个固定动作，避免开出任意剧本执行口子；
+- agent 侧校验（不假设上游一定对）：`deploy_path` 必须绝对路径且不含 `..`；
+  `name` 只收纯文件名（`[\w.@*-]+`，挡 `../` 与子路径）；`mode` 须 `0[0-7]{3}`；
+  单文件 ≤ 256 KiB、合计 ≤ 1 MiB。任一不过 → rc=126 并回传中文原因；
+- **证书内容的落盘面**（这是 v1 拒绝经 agent 的原因，现在按面逐个封）：
+  - manager 侧 `AgentJob.payload` **不存** `files`（`dispatch.run_via_agent`
+    的 `secret_fields=('files',)` 换占位串，DB 里没有 EncryptedTextField 保护）；
+  - agent 侧 spool 的 `payload.json` 同样脱敏（`executor.redact_payload`）；
+    崩溃恢复只把未完成 job 标 rc=137 上报、从不重放执行，故不影响可靠性；
+  - agent 侧证书明文只写 `tempfile.mkdtemp()`（0700）内的 0600 文件，
+    inventory 与生成的剧本一并放在那里（**不进 artifacts**，artifacts 有留存期），
+    执行结束（含异常/超时/取消）在 `finally` 里整目录删除；
+  - ansible `copy` 传的是 `src` 文件路径而非 `content`，故 stdout 与回传日志
+    里不出现证书内容。
+- **仍在通道内的暴露面**：证书内容随 `task.dispatch` 过 channel layer（Redis）
+  一次。Redis 须只监听本机/内网并设密码——与 manager 库里的加密私钥相比，这是
+  本方案唯一新增的暴露点，接受该取舍（另一路「agent 用一次性签名令牌回拉」
+  需要 manager 开一个吐私钥的对外端点，暴露面更差）。
 
 ### 3.5 Ansible 项目目录同步（playbook 模块）
 
@@ -441,10 +484,12 @@ WantedBy=multi-user.target
 - agent 零监听端口，只出不进；
 - wss 强制 TLS，校验 manager 证书（配置可指定 CA）；
 - token 泄露处置：manager 侧禁用/重置该 AgentNode 即断连；
-- 只执行 `task.dispatch` 定义的两类单元（command / playbook），无任意
-  代码加载路径；剧本路径限制在 `ansible_project_dir` 内（复用
-  `resolve_within` 同款校验）；
-- SSH 私钥仅驻留 agent 主机，通道与 manager 均不经手。
+- 只执行 `task.dispatch` 定义的单元类型（command / playbook / cert_deploy /
+  jenkins），无任意代码加载路径；剧本路径限制在 `ansible_project_dir` 内
+  （复用 `resolve_within` 同款校验），cert_deploy 的剧本由 agent 本地按固定
+  模板生成（见 3.4.2）；
+- SSH 私钥与 Jenkins 凭据仅驻留 agent 主机，通道与 manager 均不经手；
+- 唯一经通道下发的秘密是证书内容（cert_deploy），落盘面按 3.4.2 逐个封住。
 
 ---
 
@@ -473,6 +518,7 @@ steps_result / 失败处理（retry/skip/abort）流程。
 | v1 | Channels 接入 + AgentNode 模型/管理页 + Server.agent 通道字段 + runner 通道分组下发 + agent（心跳/command/playbook/日志回传/留存/资源限制） | NAT 主机可经 agent 执行任务流，日志前端实时可见 |
 | v1.1 | task.cancel 取消、崩溃恢复补传、磁盘水位清理 | 可靠性补齐 |
 | P1（2026-08-24） | 主机通道三态 + 项目组/环境路由规则 + 有效通道展示 | 新增主机自动继承通道，管理服可钉死直连 |
+| P4（2026-08-28） | 证书分发经 agent：`step_type='cert_deploy'` 单元 + payload 敏感字段脱敏（manager `AgentJob.payload` 与 agent spool 都不落证书） | 内网主机的证书可自动续签自动分发，不必再改「强制直连」 |
 | P2（2026-08-25） | Jenkins 代触发：`step_type='jenkins'` 单元 + agent 侧 REST 客户端 + register capabilities + 四级通道解析 + 系统配置 `jenkins.agent` | 公网 manager 可触发内网 Jenkins，构建日志实时回传 |
 | v2 | 剧本 commit 校验、ansible_playbook method 经 agent、多 Jenkins 实例（payload 带实例名）、agent 重启后按 build_url 续跟构建、多 agent 冷备切换、心跳指标进 dashboard | 能力扩展 |
 
@@ -487,6 +533,9 @@ steps_result / 失败处理（retry/skip/abort）流程。
 | `apps/agent_mgr/channel.py` | 通道解析唯一口径（runner / 证书分发 / 序列化共用） |
 | `apps/task_exec/runner.py` | 模块主机按通道分组；agent 组走 dispatch 等待，输出拼接 |
 | `apps/method_mgr/executors/jenkins.py` | 直连/经 agent 双路：解析出 agent 则打 `step_type='jenkins'` payload 下发（P2） |
+| `apps/cloud_mgr/deploy.py` | 直连/经 agent 双路：解析出 agent 则打 `step_type='cert_deploy'` payload 下发（P4） |
+| `apps/agent_mgr/dispatch.py` | `secret_fields` 参数：敏感 payload 字段只下发不落库（P4） |
+| `ops-agent/ops_agent/executor.py` | cert_deploy 剧本本地生成 + 私有临时目录 + spool 脱敏（P4） |
 | `ops-agent/ops_agent/jenkins.py` | agent 侧 Jenkins REST 客户端与执行句柄（P2） |
 | `frontend` | Agent 管理页；服务器表单「执行通道」项 |
 | `ops-agent/`（新仓库或本仓库子目录） | agent 全部代码 |
