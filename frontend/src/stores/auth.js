@@ -31,13 +31,21 @@ export const useAuthStore = defineStore('auth', () => {
 
   /**
    * 是否具备某模块的某档权限。
-   * @param {string} module 模块标识（cmdb / exec / credential / artifact / cloud / agent / system / audit）
+   * @param {string} module 模块标识（见后端 roles.MODULES：cmdb / dict / exec / method /
+   *   variable / artifact / credential / cloud / cloud_account / agent / account / system / audit）
    * @param {'read'|'create'|'write'} action 默认 read
    */
   function can(module, action = 'read') {
     // 快照缺失（老 token / 未取到 me）时回退 is_staff，避免整站按钮全灰
-    if (!perms.value) return isStaff.value
-    const level = perms.value.modules?.[module] || 'none'
+    const modules = perms.value?.modules
+    if (!modules) return isStaff.value
+    // 快照里**根本没有这个键** = 这份快照比该模块还老（后端拆分模块后，登录时
+    // 缓存的旧快照只有旧模块名）。此时按 none 处理会把管理员的菜单整块藏掉，
+    // 且刷新页面也好不了——快照只在登录时取。判为「不知道」，回退 is_staff，
+    // 由 Layout 挂载时的 fetchMe 把快照换新。可见性错了最多多显示一个按钮，
+    // 点下去仍由后端判定
+    if (!(module in modules)) return isStaff.value
+    const level = modules[module] || 'none'
     return LEVELS.indexOf(level) >= LEVELS.indexOf(METHOD_LEVEL[action] || 'read')
   }
 

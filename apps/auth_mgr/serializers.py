@@ -383,18 +383,31 @@ class RoleSerializer(serializers.ModelSerializer):
         if bad:
             raise serializers.ValidationError(
                 f'未知权限档：{"、".join(bad)}；可选：{"、".join(roles.LEVELS)}')
+        # 档位还要落在该模块的可选范围内（roles.MODULE_LEVELS）：审计没有写接口、
+        # 制品页面上没有新增，配出来的那一档不会生效——存进去只会让人误以为
+        # 自己给出去的是一个更小/更大的权限
+        for module, level in value.items():
+            if level not in roles.allowed_levels(module):
+                raise serializers.ValidationError(
+                    f'模块「{roles.MODULES[module]}」不支持「{roles.LEVEL_LABELS[level]}」档；'
+                    f'可选：{"、".join(roles.LEVEL_LABELS[lv] for lv in roles.allowed_levels(module))}')
         # 缺失模块补 none，避免「没配就继承了什么」的歧义
         return {module: value.get(module, 'none') for module in roles.MODULES}
 
     def validate(self, attrs):
-        """内置「超级管理」必须保持全 write：否则一次手滑能把所有人锁在门外。"""
+        """内置「超级管理」必须保持每个模块的最高档：否则一次手滑能把所有人锁在门外。
+
+        比的是 `roles.top_level(module)` 而不是写死 write——audit 的最高档就是
+        read（审计没有写接口），要求它 write 等于这个角色永远存不下去。
+        """
         instance = self.instance
         if instance and instance.is_builtin and instance.code == 'super':
             permissions = attrs.get('permissions', instance.permissions)
-            weak = sorted(m for m in roles.MODULES if permissions.get(m) != 'write')
+            weak = sorted(m for m in roles.MODULES
+                          if permissions.get(m) != roles.top_level(m))
             if weak:
                 raise serializers.ValidationError(
-                    f'内置角色「超级管理」必须对所有模块保持读写（当前不足：{"、".join(weak)}），'
+                    f'内置角色「超级管理」必须对所有模块保持最高档（当前不足：{"、".join(weak)}），'
                     f'否则可能把所有人锁在系统之外。需要受限角色请新建一个。')
             if not (attrs.get('can_exec_prod', instance.can_exec_prod)
                     and attrs.get('can_execute', instance.can_execute)):

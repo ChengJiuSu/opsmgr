@@ -410,14 +410,14 @@ class ChangePasswordView(APIView):
 
 
 class UserViewSet(viewsets.ModelViewSet):
-    """用户管理（仅管理员）。"""
+    """用户管理（account 模块 write + sudo 二次验证）。"""
 
     queryset = User.objects.all().order_by('-date_joined')
     serializer_class = UserSerializer
     # 配置面写操作要求 sudo 二次验证（common/sudo.py）：改了就能拿到更多东西，
     # 而登录那次 MFA 可能是 60 分钟前的事
     # 建号/改权限/重置他人密码或 MFA——权限扩大面里最直接的一条
-    permission_classes = [module_perm('system', min_level='write'), sudo.SudoRequired]
+    permission_classes = [module_perm('account', min_level='write'), sudo.SudoRequired]
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -491,7 +491,7 @@ class UserViewSet(viewsets.ModelViewSet):
 
 
 class ApiCredentialViewSet(viewsets.ModelViewSet):
-    """API 凭证管理（仅管理员 + sudo 二次验证）。
+    """API 凭证管理（account 模块 write + sudo 二次验证）。
 
     与系统配置、Agent 令牌同级：建一把凭证等于开一条免登录入口，改白名单等于
     改这条入口能从哪来，属于「改了就能拿到更多东西」的操作，而登录那次 MFA
@@ -502,7 +502,7 @@ class ApiCredentialViewSet(viewsets.ModelViewSet):
 
     queryset = ApiCredential.objects.select_related('bound_user', 'created_by')
     serializer_class = ApiCredentialSerializer
-    permission_classes = [module_perm('system', min_level='write'), sudo.SudoRequired]
+    permission_classes = [module_perm('account', min_level='write'), sudo.SudoRequired]
     pagination_class = None  # 凭证数量与脚本数同量级，全量返回便于一眼看完
 
     def get_queryset(self):
@@ -524,7 +524,7 @@ class ApiCredentialViewSet(viewsets.ModelViewSet):
 
     @extend_schema(responses=OpenApiResponse(description='可授权的作用域字典'))
     @action(detail=False, methods=['get'],
-            permission_classes=[module_perm('system', min_level='write')])
+            permission_classes=[module_perm('account', min_level='write')])
     def scopes(self, request):
         """可授权作用域清单（前端建凭证时的多选来源）。"""
         return ok([{'value': key, 'label': label} for key, label in SCOPES.items()])
@@ -583,7 +583,7 @@ class ApiCredentialViewSet(viewsets.ModelViewSet):
 
 
 class RoleViewSet(viewsets.ModelViewSet):
-    """角色管理（system 模块 write + sudo 二次验证）。
+    """角色管理（account 模块 write + sudo 二次验证）。
 
     与用户管理同级：改矩阵等于改所有绑定该角色的人的权限面，属「改了就能拿到更多
     东西」的操作。
@@ -594,15 +594,32 @@ class RoleViewSet(viewsets.ModelViewSet):
 
     queryset = Role.objects.all()
     serializer_class = RoleSerializer
-    permission_classes = [module_perm('system', min_level='write'), sudo.SudoRequired]
+    permission_classes = [module_perm('account', min_level='write'), sudo.SudoRequired]
     pagination_class = None  # 角色数量与团队规模同量级，全量返回便于一眼看完
 
     @extend_schema(responses=OpenApiResponse(description='模块清单与权限档定义'))
     @action(detail=False, methods=['get'])
     def meta(self, request):
-        """模块清单 + 权限档定义（前端渲染矩阵表格的数据源，避免前端硬编码）。"""
+        """模块清单 + 分组 + 每模块可选档（前端渲染矩阵的唯一数据源，前端不硬编码）。"""
         return ok({
-            'modules': [{'value': key, 'label': label} for key, label in roles.MODULES.items()],
+            # 每个模块带上自己的可选档（levels）：13 个模块里有 6 个不是四档全开，
+            # 前端按这个渲染单选组，配不出「点了不生效」的档
+            'modules': [
+                {
+                    'value': key,
+                    'label': label,
+                    'levels': [
+                        {'value': lv, 'label': roles.LEVEL_LABELS[lv]}
+                        for lv in roles.allowed_levels(key)
+                    ],
+                }
+                for key, label in roles.MODULES.items()
+            ],
+            # 页面分组（与侧边栏同构），前端按组分块渲染
+            'groups': [
+                {'label': label, 'modules': list(members)}
+                for label, members in roles.MODULE_GROUPS
+            ],
             'levels': [{'value': key, 'label': roles.LEVEL_LABELS[key]} for key in roles.LEVELS],
             'capabilities': [
                 {'value': 'can_execute', 'label': '可发起任务流执行'},

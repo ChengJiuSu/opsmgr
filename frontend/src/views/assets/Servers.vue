@@ -31,7 +31,7 @@
         </el-select>
       </div>
       <div class="toolbar-right">
-        <template v-if="authStore.isStaff">
+        <template v-if="canWrite">
           <el-button :icon="EditPen" :disabled="!selection.length" @click="openBatchEdit">
             批量编辑<template v-if="selection.length">（{{ selection.length }}）</template>
           </el-button>
@@ -57,7 +57,7 @@
       stripe
       @selection-change="(rows) => (selection = rows)"
     >
-      <el-table-column v-if="authStore.isStaff" type="selection" width="46" reserve-selection />
+      <el-table-column v-if="canWrite" type="selection" width="46" reserve-selection />
       <el-table-column prop="name" label="名称" min-width="120" />
       <el-table-column prop="private_ip" label="私网 IP" width="130" />
       <el-table-column label="公网 IP" width="130">
@@ -105,7 +105,7 @@
           </template>
         </template>
       </el-table-column>
-      <el-table-column v-if="authStore.isStaff" label="操作" width="140" fixed="right">
+      <el-table-column v-if="canWrite" label="操作" width="140" fixed="right">
         <template #default="{ row }">
           <el-button size="small" :icon="Edit" @click="openDialog(row)">编辑</el-button>
           <el-button size="small" type="danger" :icon="Delete" @click="handleDelete(row)">删除</el-button>
@@ -218,8 +218,8 @@
             <el-input-number v-model="form.ssh_port" :min="1" :max="65535" style="width:100%" />
           </el-form-item>
         </el-col>
-        <!-- 执行通道选项来自 Agent 管理（仅管理员接口），普通用户不展示 -->
-        <el-col v-if="authStore.isStaff" :span="12">
+        <!-- 执行通道选项来自 Agent 管理接口，没有 agent 模块权限就不展示 -->
+        <el-col v-if="canAgent" :span="12">
           <el-form-item label="执行通道">
             <el-select v-model="form.channel_mode" style="width:100%" @change="onChannelModeChange">
               <el-option label="自动（按路由规则）" value="auto" />
@@ -232,7 +232,7 @@
             </div>
           </el-form-item>
         </el-col>
-        <el-col v-if="authStore.isStaff && form.channel_mode === 'agent'" :span="12">
+        <el-col v-if="canAgent && form.channel_mode === 'agent'" :span="12">
           <el-form-item label="指定 Agent" prop="agent">
             <el-select v-model="form.agent" clearable placeholder="请选择 Agent" style="width:100%">
               <el-option v-for="o in agents" :key="o.id" :label="o.name" :value="o.id" />
@@ -376,7 +376,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, onUnmounted } from 'vue'
+import { ref, computed, reactive, onMounted, onUnmounted } from 'vue'
 import { debounce } from '../../utils/debounce'
 import { Plus, Edit, Delete, EditPen, Connection, Upload, Download } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -390,6 +390,10 @@ import { getAgents } from '../../api/agents'
 import { useAuthStore } from '../../stores/auth'
 
 const authStore = useAuthStore()
+// 按钮可见性跟角色矩阵走（后端 roles.MODULES）：cmdb 写档才给增删改，
+// 执行通道那两个字段的选项来自 Agent 接口，另按 agent 模块判
+const canWrite = computed(() => authStore.can('cmdb', 'write'))
+const canAgent = computed(() => authStore.can('agent'))
 
 const loading = ref(false)
 const submitting = ref(false)
@@ -450,7 +454,7 @@ async function loadDicts() {
   dicts.channels = channels.data?.results || []
   dicts.cloudProviders = providers.data?.results || []
   dicts.serviceTypes = serviceTypes.data?.results || []
-  if (authStore.isStaff) {
+  if (canAgent.value) {
     const res = await getAgents()
     agents.value = Array.isArray(res) ? res : res.data || []
   }

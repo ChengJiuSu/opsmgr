@@ -14,8 +14,12 @@
 `module_perm('x')` 按 HTTP 方法要求档位（GET→read、POST→read_create、
 改删→write），所以「可读可新增」这一档能自然表达出来——那正是 CMDB 现在的语义。
 
-`min_level` 用于「整个 ViewSet 连读都要最高档」的场景（连接凭据、系统配置、
-API 凭证）：这些接口的读本身就泄露敏感信息，不能因为是 GET 就放行。
+`min_level` 用于「整个 ViewSet 连读都要最高档」的场景（云账号、系统配置、
+用户与 API 凭证）：这些接口的读本身就泄露敏感信息，不能因为是 GET 就放行。
+
+方法推导出的档位会按模块的可选档**向上取整**（roles.required_level）：`agent`
+模块只有 none/read/write，那里的 POST 直接要 write，不会落在一个配不出来的
+`read_create` 上。
 """
 from rest_framework.permissions import BasePermission
 
@@ -34,7 +38,7 @@ class HasModulePerm(BasePermission):
         user = getattr(request, 'user', None)
         if not (user and user.is_authenticated):
             return False
-        required = self.min_level or roles.required_level(request.method)
+        required = self.min_level or roles.required_level(request.method, self.module)
         return roles.satisfies(roles.user_level(user, self.module), required)
 
 
@@ -46,8 +50,11 @@ def module_perm(module, min_level=None):
     """
     if module not in roles.MODULES:
         raise ValueError(f'未登记的模块：{module}，请先在 roles.MODULES 中登记。')
-    if min_level is not None and min_level not in roles.LEVELS:
-        raise ValueError(f'非法权限档：{min_level}')
+    if min_level is not None and min_level not in roles.allowed_levels(module):
+        # 挂一个该模块配不出来的档 = 这个接口谁都进不去，且表现是「权限配错了」，
+        # 排查要绕一大圈。写错就在导入时炸
+        raise ValueError(
+            f'模块 {module} 不支持权限档 {min_level}；可选：{roles.allowed_levels(module)}')
     name = f'HasModulePerm{module.title()}' + (f'{min_level.title()}' if min_level else '')
     return type(name, (HasModulePerm,), {'module': module, 'min_level': min_level})
 

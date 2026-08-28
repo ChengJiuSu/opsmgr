@@ -62,7 +62,7 @@ class BaseDictViewSet(viewsets.ModelViewSet):
     权限：已认证用户可查看/新增，修改与删除仅管理员。
     """
 
-    permission_classes = [module_perm('cmdb')]
+    permission_classes = [module_perm('dict')]
     # 删除保护提示中的引用对象单位（如「台服务器」「条主机服务记录」）
     protected_hint = '台服务器'
 

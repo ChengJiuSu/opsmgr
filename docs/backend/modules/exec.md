@@ -403,7 +403,10 @@ GET                 /api/exec/log-files/content/  日志文本读取（仅管理
 GET                 /api/exec/log-files/download/ 日志原文件下载（仅管理员）：?path= 必填
 ```
 
-任务读写权限：普通用户只读，管理员可保存/编辑/执行（`IsAdminOrReadOnly`）。
+任务读写权限：`module_perm('exec')` 按方法推档（读 read、保存/编辑 write）；
+发起执行另看能力位 `can_execute` / `can_exec_prod`。方法库（`method`）与执行变量
+（`variable`）是**另外两个模块**：能改任务流不等于能改方法模板（模板里能写任意
+命令）或读写敏感变量。
 列表 `task_type` 筛选语义 = 包含该类型模块的任务（`steps__task_type`）。
 
 ### 保存校验规则（仅内容字段）

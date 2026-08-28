@@ -19,7 +19,7 @@
         <el-button :icon="Search" @click="handleSearch">查询</el-button>
         <el-button :icon="Refresh" @click="fetchData">刷新</el-button>
       </div>
-      <el-button v-if="authStore.isStaff" type="primary" :icon="Plus" @click="openDialog()">新增变量</el-button>
+      <el-button v-if="canWrite" type="primary" :icon="Plus" @click="openDialog()">新增变量</el-button>
     </div>
 
     <el-alert type="info" :closable="false" style="margin-bottom: 12px">
@@ -63,11 +63,11 @@
         <template #default="{ row }">
           <el-button size="small" :icon="Clock" @click="openHistory(row)">历史</el-button>
           <el-button
-            v-if="row.is_secret && authStore.isStaff && row.has_value"
+            v-if="row.is_secret && canWrite && row.has_value"
             size="small" :icon="View" @click="handleReveal(row)"
           >查看真值</el-button>
-          <el-button v-if="authStore.isStaff" size="small" :icon="EditPen" @click="openDialog(row)">编辑</el-button>
-          <el-button v-if="authStore.isStaff" size="small" type="danger" :icon="Delete" @click="handleDelete(row)" />
+          <el-button v-if="canWrite" size="small" :icon="EditPen" @click="openDialog(row)">编辑</el-button>
+          <el-button v-if="canWrite" size="small" type="danger" :icon="Delete" @click="handleDelete(row)" />
         </template>
       </el-table-column>
     </el-table>
@@ -175,7 +175,7 @@ ports:
               <el-tag size="small" :type="row.enabled ? 'success' : 'info'">{{ row.enabled ? '启用' : '停用' }}</el-tag>
             </template>
           </el-table-column>
-          <el-table-column v-if="authStore.isStaff" label="操作" width="80">
+          <el-table-column v-if="canWrite" label="操作" width="80">
             <template #default="{ row }">
               <el-button size="small" type="warning" text :disabled="row.version === versions[0]?.version" @click="handleRollback(row)">回滚</el-button>
             </template>
@@ -200,7 +200,7 @@ ports:
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, onUnmounted } from 'vue'
+import { ref, computed, reactive, onMounted, onUnmounted } from 'vue'
 import { debounce } from '../../utils/debounce'
 import { Plus, Delete, Search, Refresh, EditPen, Clock, View } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -212,6 +212,8 @@ import {
 } from '../../api/tasks'
 
 const authStore = useAuthStore()
+// 按钮可见性跟角色矩阵走（变量含敏感真值，与任务流定义分开授权）
+const canWrite = computed(() => authStore.can('variable', 'write'))
 const loading = ref(false)
 const submitting = ref(false)
 const tableData = ref([])

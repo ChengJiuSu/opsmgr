@@ -37,7 +37,7 @@ apps/agent_mgr/
 ├── dispatch.py    # run_via_agent：创建 job → channel layer 下发 → 轮询终态（同步阻塞）
 ├── routing.py     # /ws/agent/ 路由（ops_manager/asgi.py 挂载）
 ├── serializers.py # token 不回显；job 列表不含 output 全文
-├── views.py       # AgentNodeViewSet（仅管理员）+ regen_token / jobs 动作
+├── views.py       # AgentNodeViewSet（agent 模块：read 可查、write 可改）+ regen_token / jobs 动作
 └── tests.py       # API / Consumer（WebsocketCommunicator）/ dispatch / runner 分组
 ```
 
@@ -121,11 +121,11 @@ Server.channel_mode='auto'（默认）：
 ## 接口
 
 ```
-GET/POST/PUT/PATCH/DELETE /api/agents/   Agent CRUD（仅管理员；创建响应含一次性 token；
+GET/POST/PUT/PATCH/DELETE /api/agents/   Agent CRUD（读要 agent read、写要 agent write + sudo；创建响应含一次性 token；
                                           有未终态 job 禁止删除，可先禁用）
 POST /api/agents/{id}/regen_token/       重置令牌（旧 token 即刻失效，响应含一次性新 token）
 GET  /api/agents/{id}/jobs/              最近 50 条任务单元（排障；不含 output 全文）
-GET/POST/PUT/PATCH/DELETE /api/agent-routes/   通道路由规则 CRUD（仅管理员，不分页，
+GET/POST/PUT/PATCH/DELETE /api/agent-routes/   通道路由规则 CRUD（读要 agent read、写要 agent write + sudo，不分页，
                                           支持 agent/project_group/environment 过滤）
 GET  /api/agent-routes/preview/?project_group=&environment=
                                           影响面预览：该维度下 channel_mode=auto 的主机

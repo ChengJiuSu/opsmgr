@@ -19,7 +19,7 @@
         <el-button :icon="Search" @click="handleSearch">查询</el-button>
         <el-button :icon="Refresh" @click="fetchData">刷新</el-button>
       </div>
-      <el-button v-if="authStore.isStaff" type="primary" :icon="Plus" @click="openForm()">新建任务</el-button>
+      <el-button v-if="canWrite" type="primary" :icon="Plus" @click="openForm()">新建任务</el-button>
     </div>
 
     <el-table v-loading="loading" :data="tableData" stripe>
@@ -67,11 +67,11 @@
       </el-table-column>
       <el-table-column label="操作" width="330" fixed="right">
         <template #default="{ row }">
-          <el-button v-if="authStore.isStaff" size="small" type="primary" :icon="CaretRight" :disabled="['running', 'paused'].includes(row.status)" @click="openExec(row)">执行</el-button>
-          <el-button v-if="authStore.isStaff" size="small" :icon="EditPen" :disabled="['running', 'paused'].includes(row.status)" @click="openForm(row)">编辑</el-button>
-          <el-button v-if="authStore.isStaff" size="small" :icon="CopyDocument" @click="handleCopy(row)">复制</el-button>
+          <el-button v-if="canRunTask" size="small" type="primary" :icon="CaretRight" :disabled="['running', 'paused'].includes(row.status)" @click="openExec(row)">执行</el-button>
+          <el-button v-if="canWrite" size="small" :icon="EditPen" :disabled="['running', 'paused'].includes(row.status)" @click="openForm(row)">编辑</el-button>
+          <el-button v-if="canWrite" size="small" :icon="CopyDocument" @click="handleCopy(row)">复制</el-button>
           <el-button size="small" :icon="View" @click="openLogs(row)">日志</el-button>
-          <el-button v-if="authStore.isStaff" size="small" type="danger" :icon="Delete" @click="handleDelete(row)" />
+          <el-button v-if="canWrite" size="small" type="danger" :icon="Delete" @click="handleDelete(row)" />
         </template>
       </el-table-column>
     </el-table>
@@ -150,7 +150,7 @@
           <template #title>
             <span class="pause-line">
               {{ pausedFailed ? '模块执行失败，任务流已暂停，等待人工处理' : '任务流已暂停，等待人工确认后继续' }}
-              <span v-if="authStore.isStaff" class="pause-actions">
+              <span v-if="canRunTask" class="pause-actions">
                 <template v-if="pausedFailed">
                   <el-button size="small" type="primary" :loading="confirming" @click="handleConfirm('retry')">重试失败模块</el-button>
                   <el-button size="small" type="warning" :loading="confirming" @click="handleConfirm('skip')">跳过并继续</el-button>
@@ -193,7 +193,7 @@
       <template #title>
         <span class="pause-line">
           {{ pausedFailed ? '模块执行失败，任务流已暂停，等待人工处理' : '任务流已暂停，等待人工确认后继续' }}
-          <span v-if="authStore.isStaff" class="pause-actions">
+          <span v-if="canRunTask" class="pause-actions">
             <template v-if="pausedFailed">
               <el-button size="small" type="primary" :loading="confirming" @click="handleConfirm('retry')">重试失败模块</el-button>
               <el-button size="small" type="warning" :loading="confirming" @click="handleConfirm('skip')">跳过并继续</el-button>
@@ -713,6 +713,10 @@ import {
 } from '../../api/tasks'
 
 const authStore = useAuthStore()
+// 改任务定义要 exec 写档；发起执行与处理暂停看的是能力位（can_execute），
+// 两者是正交的：只能跑不能改，正是「普通运维」这一档
+const canWrite = computed(() => authStore.can('exec', 'write'))
+const canRunTask = computed(() => authStore.capability('can_execute'))
 const router = useRouter()
 const loading = ref(false)
 const submitting = ref(false)

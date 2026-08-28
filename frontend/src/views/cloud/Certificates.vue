@@ -16,7 +16,7 @@
           <el-option v-for="(label, key) in STATUS_LABELS" :key="key" :label="label" :value="key" />
         </el-select>
       </div>
-      <el-button v-if="authStore.isStaff" type="primary" :icon="Plus" @click="openDialog()">新增证书</el-button>
+      <el-button v-if="canWrite" type="primary" :icon="Plus" @click="openDialog()">新增证书</el-button>
     </div>
 
     <!-- 表格 -->
@@ -57,7 +57,7 @@
       <el-table-column label="自动续签" width="90">
         <template #default="{ row }">
           <el-switch
-            v-if="authStore.isStaff"
+            v-if="canWrite"
             :model-value="row.auto_renew"
             @change="(v) => toggleAutoRenew(row, v)"
           />
@@ -74,7 +74,7 @@
         </template>
       </el-table-column>
       <el-table-column prop="remark" label="备注" min-width="100" show-overflow-tooltip />
-      <el-table-column v-if="authStore.isStaff" label="操作" width="380" fixed="right">
+      <el-table-column v-if="canWrite" label="操作" width="380" fixed="right">
         <template #default="{ row }">
           <el-button
             v-if="['pending', 'failed'].includes(row.status)"
@@ -172,7 +172,7 @@
         到部署目录（私钥 0600、覆盖前自动备份），随后执行重载命令。
         开启「自动分发」的目标在证书续签成功后自动重新推送。
       </div>
-      <div v-if="authStore.isStaff" style="white-space:nowrap">
+      <div v-if="canWrite" style="white-space:nowrap">
         <el-button
           :disabled="!deployRows.length || deployCert?.status !== 'issued'"
           :loading="deployingAll"
@@ -211,7 +211,7 @@
       <el-table-column label="自动分发" width="90">
         <template #default="{ row }">
           <el-switch
-            v-if="authStore.isStaff"
+            v-if="canWrite"
             :model-value="row.auto_deploy"
             @change="(v) => toggleAutoDeploy(row, v)"
           />
@@ -237,7 +237,7 @@
           <span v-else class="muted">—</span>
         </template>
       </el-table-column>
-      <el-table-column v-if="authStore.isStaff" label="操作" width="250" fixed="right">
+      <el-table-column v-if="canWrite" label="操作" width="250" fixed="right">
         <template #default="{ row }">
           <el-button
             size="small"
@@ -327,6 +327,10 @@ import {
 } from '../../api/cloud'
 
 const authStore = useAuthStore()
+// 按钮可见性跟角色矩阵走：域名与证书是 cloud 模块，
+// 云账号下拉另按 cloud_account 判（只读档也能选账号，AccessKey 是打码的）
+const canWrite = computed(() => authStore.can('cloud', 'write'))
+const canAccount = computed(() => authStore.can('cloud_account'))
 
 const STATUS_LABELS = { pending: '待申请', issuing: '申请中', issued: '已签发', failed: '申请失败', expired: '已过期' }
 const STATUS_TAG = { pending: 'info', issuing: 'warning', issued: 'success', failed: 'danger', expired: 'danger' }
@@ -630,20 +634,22 @@ async function handleDeployDelete(row) {
 
 onMounted(async () => {
   fetchData()
-  if (authStore.isStaff) {
+  if (canWrite.value) {
+    // 下拉选项分属四个模块（云账号 / 服务器 / 连接凭据 / 云控自身），逐个按权限取：
+    // Promise.all 一拒全拒，少一个模块的权限不该把整页选项都带走
     const [accRes, domRes, recRes, svrRes, credRes] = await Promise.all([
-      getCloudAccounts({ page_size: 0, enabled: 'true' }),
+      canAccount.value ? getCloudAccounts({ page_size: 0, enabled: 'true' }) : null,
       getDomains({ page_size: 0 }),
       getDnsRecords({ page_size: 0 }),
-      getServers({ page_size: 0 }),
-      getCredentials({ page_size: 0 }),
+      authStore.can('cmdb') ? getServers({ page_size: 0 }) : null,
+      authStore.can('credential') ? getCredentials({ page_size: 0 }) : null,
     ])
-    serverOptions.value = svrRes.data?.results || []
-    credentialOptions.value = credRes.data?.results || []
-    accountOptions.value = accRes.data?.results || []
+    serverOptions.value = svrRes?.data?.results || []
+    credentialOptions.value = credRes?.data?.results || []
+    accountOptions.value = accRes?.data?.results || []
     // 建议项按主域名分组：主域名 + *.通配 + 该域名下子域名 FQDN（A/AAAA/CNAME），可自由输入
-    const records = recRes.data?.results || []
-    domainSuggestions.value = (domRes.data?.results || []).map((d) => {
+    const records = recRes?.data?.results || []
+    domainSuggestions.value = (domRes?.data?.results || []).map((d) => {
       const subs = records
         .filter((r) => r.domain === d.id && ['A', 'AAAA', 'CNAME'].includes(r.type) && r.rr !== '@')
         .map((r) => r.fqdn)

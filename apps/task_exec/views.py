@@ -81,9 +81,16 @@ PLAYBOOK_EXCLUDE_DIRS = {
 
 
 class PlaybookListView(APIView):
-    """列出 ANSIBLE_PROJECT_DIR 内可选的剧本文件（相对路径，供任务表单下拉）。"""
+    """列出 ANSIBLE_PROJECT_DIR 内可选的剧本文件（相对路径，供任务表单下拉）。
 
-    permission_classes = [module_perm('exec', min_level='write')]
+    两处都用得到：定义 ansible 方法（method 模块）与在任务流里加一个 playbook
+    模块（exec 模块）。所以是「两个写档给一个就行」的 OR，而不是挂在其中一个
+    模块上——挂谁都会让另一边的编辑页少一个下拉。
+    """
+
+    permission_classes = [
+        module_perm('method', min_level='write') | module_perm('exec', min_level='write'),
+    ]
 
     @extend_schema(responses=OpenApiTypes.OBJECT)
     def get(self, request):
@@ -121,7 +128,7 @@ class ExecVariableViewSet(viewsets.ModelViewSet):
 
     queryset = ExecVariable.objects.select_related('project_group', 'channel', 'environment')
     serializer_class = ExecVariableSerializer
-    permission_classes = [module_perm('exec')]
+    permission_classes = [module_perm('variable')]
 
     # 查询参数 → 维度外键映射（纯数字按 id、否则按 code，与服务器接口一致）
     DICT_FILTERS = (
@@ -165,7 +172,7 @@ class ExecVariableViewSet(viewsets.ModelViewSet):
         # 只在这个动作上开机读通道：脚本要的是「按维度解析好的变量字典」，
         # 不是整张变量表，把 list 也开出去只是白扩大暴露面
         authentication_classes=[ApiKeyAuthentication, MfaJWTAuthentication],
-        permission_classes=[user_or_scope(module_perm('exec'), 'variable:read')],
+        permission_classes=[user_or_scope(module_perm('variable'), 'variable:read')],
         throttle_classes=[ApiKeyThrottle],
     )
     def resolved(self, request):
@@ -255,7 +262,7 @@ class ExecVariableViewSet(viewsets.ModelViewSet):
         return dims, None
 
     @extend_schema(request=None, responses=OpenApiTypes.OBJECT)
-    @action(detail=True, methods=['post'], permission_classes=[module_perm('exec', min_level='write'), SudoRequired])
+    @action(detail=True, methods=['post'], permission_classes=[module_perm('variable', min_level='write'), SudoRequired])
     def reveal(self, request, pk=None):
         """查看敏感变量真值（管理员 + sudo 二次验证）。
 
@@ -279,7 +286,7 @@ class ExecVariableViewSet(viewsets.ModelViewSet):
         qs = variable.versions.select_related('created_by', 'project_group', 'channel', 'environment')
         return ok(ExecVariableVersionSerializer(qs, many=True).data)
 
-    @action(detail=True, methods=['post'], permission_classes=[module_perm('exec', min_level='write')])
+    @action(detail=True, methods=['post'], permission_classes=[module_perm('variable', min_level='write')])
     def rollback(self, request, pk=None):
         """回滚到指定历史版本：套用快照内容并生成一条新版本记录。"""
         from .models import snapshot_variable

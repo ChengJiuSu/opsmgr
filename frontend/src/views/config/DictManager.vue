@@ -46,12 +46,12 @@
       <el-table-column label="启用" width="80">
         <template #default="{ row }">
           <!-- 启停属于修改操作，普通用户仅展示状态 -->
-          <el-switch v-if="authStore.isStaff" :model-value="row.enabled" @change="(v) => toggleEnabled(row, v)" />
+          <el-switch v-if="canWrite" :model-value="row.enabled" @change="(v) => toggleEnabled(row, v)" />
           <el-tag v-else size="small" :type="row.enabled ? 'success' : 'info'">{{ row.enabled ? '启用' : '停用' }}</el-tag>
         </template>
       </el-table-column>
       <el-table-column prop="remark" label="备注" min-width="120" show-overflow-tooltip />
-      <el-table-column v-if="authStore.isStaff" label="操作" width="140" fixed="right">
+      <el-table-column v-if="canWrite" label="操作" width="140" fixed="right">
         <template #default="{ row }">
           <el-button size="small" :icon="Edit" @click="openDialog(row)">编辑</el-button>
           <el-button size="small" type="danger" :icon="Delete" @click="handleDelete(row)">删除</el-button>
@@ -114,6 +114,8 @@ import { projectGroupApi, channelApi, environmentApi, cloudProviderApi, serviceT
 import { useAuthStore } from '../../stores/auth'
 
 const authStore = useAuthStore()
+// 按钮可见性跟角色矩阵走（字典是数据范围与生产标记的来源，单独一个模块）
+const canWrite = computed(() => authStore.can('dict', 'write'))
 
 // 路由以 props 方式传入字典类型（见 router/index.js）
 const props = defineProps({

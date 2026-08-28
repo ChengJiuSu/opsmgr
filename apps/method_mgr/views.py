@@ -11,7 +11,7 @@ class MethodViewSet(viewsets.ModelViewSet):
 
     queryset = Method.objects.select_related('service_type')
     serializer_class = MethodSerializer
-    permission_classes = [module_perm('exec')]
+    permission_classes = [module_perm('method')]
 
     def get_queryset(self):
         qs = super().get_queryset()

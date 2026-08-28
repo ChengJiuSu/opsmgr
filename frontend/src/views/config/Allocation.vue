@@ -52,7 +52,7 @@
         />
       </div>
       <!-- 批量分配/规划均为修改操作，仅管理员可见 -->
-      <div v-if="authStore.isStaff" class="toolbar-right">
+      <div v-if="canWrite" class="toolbar-right">
         <el-button type="success" :icon="Plus" @click="openAllocateDialog">
           分配服务<template v-if="overview.unassigned.service_type">（{{ overview.unassigned.service_type }} 台未规划）</template>
         </el-button>
@@ -82,7 +82,7 @@
       stripe
       @selection-change="(rows) => (selection = rows)"
     >
-      <el-table-column v-if="authStore.isStaff" type="selection" width="46" reserve-selection />
+      <el-table-column v-if="canWrite" type="selection" width="46" reserve-selection />
       <el-table-column prop="name" label="名称" min-width="120" />
       <!-- 有公网 IP 显示公网，否则显示私网（NAT 出局主机） -->
       <el-table-column label="IP 地址" width="130">
@@ -134,7 +134,7 @@
           <el-tag size="small" :type="statusType(row.status)">{{ statusLabel(row.status) }}</el-tag>
         </template>
       </el-table-column>
-      <el-table-column v-if="authStore.isStaff" label="操作" width="90" fixed="right">
+      <el-table-column v-if="canWrite" label="操作" width="90" fixed="right">
         <template #default="{ row }">
           <el-button size="small" link type="primary" @click="openServiceDialog(row)">服务管理</el-button>
         </template>
@@ -339,6 +339,8 @@ import {
 import { useAuthStore } from '../../stores/auth'
 
 const authStore = useAuthStore()
+// 按钮可见性跟角色矩阵走（分配与服务规划改的是服务器台账）
+const canWrite = computed(() => authStore.can('cmdb', 'write'))
 
 // 下拉哨兵值：清空 / 多台不一致 / 当前未分配（后两者为当前值回显，保持选中即不修改）
 const CLEAR = '__CLEAR__'
@@ -472,7 +474,7 @@ async function fetchData() {
 // 点击概览卡片：未分配类卡片切换筛选（再次点击取消）；「未规划服务」卡片打开分配服务弹窗
 function handleCardClick(card) {
   if (card.filterValue === null) {
-    if (authStore.isStaff) openAllocateDialog()
+    if (canWrite.value) openAllocateDialog()
     return
   }
   filter.unassigned = filter.unassigned === card.filterValue ? '' : card.filterValue

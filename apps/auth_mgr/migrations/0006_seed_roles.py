@@ -9,7 +9,39 @@
 """
 from django.db import migrations
 
-from apps.auth_mgr.roles import BUILTIN_ROLES
+#: 播种时那一版的内置角色，**在迁移里固化一份**而不是 import roles.BUILTIN_ROLES：
+#: 迁移是历史，跟着线上代码一起变会让「新库 migrate 一遍」和「老库逐条 migrate」
+#: 得到不同结果——模块矩阵后来拆成了 13 个（0009），这里必须仍是拆分前的 8 个，
+#: 才能让 0009 的改写规则在新库上跑出与老库一致的矩阵。
+BUILTIN_ROLES = (
+    {
+        'code': 'super', 'name': '超级管理',
+        'remark': '全部模块读写，含用户/角色/凭据/API 凭证与生产执行',
+        'can_execute': True, 'can_exec_prod': True,
+        'permissions': {
+            'cmdb': 'write', 'exec': 'write', 'credential': 'write', 'artifact': 'write',
+            'cloud': 'write', 'agent': 'write', 'system': 'write', 'audit': 'write',
+        },
+    },
+    {
+        'code': 'ops_admin', 'name': '运维管理',
+        'remark': '日常运维读写；连接凭据与 Agent 只读，系统管理不可见',
+        'can_execute': True, 'can_exec_prod': True,
+        'permissions': {
+            'cmdb': 'write', 'exec': 'write', 'artifact': 'write', 'cloud': 'write',
+            'credential': 'read', 'agent': 'read', 'system': 'none', 'audit': 'read',
+        },
+    },
+    {
+        'code': 'ops_member', 'name': '普通运维',
+        'remark': '资产可查可增；任务可执行但不能改定义、不能碰生产',
+        'can_execute': True, 'can_exec_prod': False,
+        'permissions': {
+            'cmdb': 'read_create', 'exec': 'read', 'artifact': 'read', 'cloud': 'read',
+            'credential': 'none', 'agent': 'none', 'system': 'none', 'audit': 'read',
+        },
+    },
+)
 
 
 def forwards(apps, schema_editor):

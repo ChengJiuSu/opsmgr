@@ -28,7 +28,7 @@ apps/auth_mgr/
 ├── services.py      # MFA 业务：绑定、激活、校验、恢复码、强制范围
 ├── tokens.py        # 挑战票据（token_type='mfa'）+ 令牌签发（amr 声明）
 ├── authentication.py # MfaJWTAuthentication：全局 MFA 强制检查
-├── roles.py         # 模块清单 / 权限档 / 内置角色矩阵 / 权限快照
+├── roles.py         # 模块清单 / 分组 / 每模块可选档 / 内置角色矩阵 / 权限快照
 ├── permissions.py   # module_perm / capability_required：基于角色矩阵的权限类
 ├── apikey.py        # 机读访问控制：认证 + IP 白名单 + 验签 + 作用域 + 限速
 ├── views.py         # LoginView（限速+两步）/ MFA 六个接口 / UserViewSet / ApiCredentialViewSet
@@ -313,12 +313,72 @@ MFA 相关请求都是写操作，由审计中间件记录；`code` / `secret` /
 砍掉这一档会造成行为回退。
 
 HTTP 方法 → 所需档位：GET/HEAD/OPTIONS → `read`，POST → `read_create`，
-PUT/PATCH/DELETE → `write`；未知方法当 `write`（fail-closed）。
+PUT/PATCH/DELETE → `write`；未知方法当 `write`（fail-closed）。推出来的档位还会
+**向上取整到该模块的可选档**（见下），所以 `agent` 上的 POST 直接要 `write`。
 
 ### 模块（`roles.MODULES`）
 
-`cmdb` / `exec` / `credential` / `artifact` / `cloud` / `agent` / `system` / `audit`
-——粒度就是「一个业务 app / 一块菜单」，8 个，不是 150 个 action。
+13 个，粒度是「一块菜单 + 一个风险面」，不是 150 个 action：
+
+| 分组 | 模块 | 覆盖 |
+|------|------|------|
+| 资产与配置 | `cmdb` | 服务器台账、服务器分配与服务规划 |
+| | `dict` | 项目组 / 渠道 / 环境 / 云厂商 / 服务类型五张字典 |
+| 任务执行 | `exec` | 任务流定义、执行记录、执行日志与日志文件 |
+| | `method` | 方法库（命令 / playbook / Jenkins 模板）|
+| | `variable` | 执行变量（含敏感变量真值）|
+| | `artifact` | 构建制品 |
+| | `credential` | 连接凭据（SSH 密码与私钥）|
+| 云控管理 | `cloud` | 域名解析、证书签发与部署 |
+| | `cloud_account` | 云账号 AccessKey / Secret |
+| 系统管理 | `agent` | Agent 与执行通道路由 |
+| | `account` | 用户、角色与 API 凭证 |
+| | `system` | 系统配置 |
+| | `audit` | 操作审计 |
+
+**为什么从 8 个拆到 13 个**：第一版按「一个业务 app」切，结果四处「给 A 就顺带
+给了 B」，都是提权面，中间档因此形同虚设——授权只能按组里最危险的那一项来给：
+
+| 原模块 | 混在一起的东西 | 拆成 |
+|--------|----------------|------|
+| `cloud` | 域名 / 证书（日常运维）+ 云账号 AK/SK（拿到即整个云资产）| `cloud` + `cloud_account` |
+| `system` | 系统配置 + 用户 / 角色 / API 凭证（改角色 = 给自己加权）| `system` + `account` |
+| `exec` | 任务流 + 方法库（模板里能写任意命令）+ 变量（含密码类真值）| `exec` + `method` + `variable` |
+| `cmdb` | 服务器台账 + 五张字典（改环境 `is_prod` 可绕过 `can_exec_prod`；项目组 / 环境同时是数据范围的维度）| `cmdb` + `dict` |
+
+判据是「没有一个模块的写权限能顺带拿到另一个模块的能力」，不是「越细越好」——
+细到 action 级就回到 CAM 那条路上去了。
+
+### 每个模块的可选档位（`roles.MODULE_LEVELS`）
+
+不是每个模块四档都有意义，页面上只渲染可选的那几档：
+
+| 模块 | 可选档 | 为什么收窄 |
+|------|--------|-----------|
+| `audit` | none / read | 审计表没有写接口 |
+| `artifact` | none / read / write | 制品只能由 CI 经 API 凭证上报，页面上没有新增 |
+| `method` | none / read / write | 新增一条方法 = 把任意命令带进平台，不比改方法轻 |
+| `agent` | none / read / write | 建 Agent 会下发一次性 token，重置 token 能顶掉现网连接 |
+| `cloud_account` | none / read / write | read 只够在域名/证书页选账号（AccessKey 打码、Secret 不回显）|
+| `account` | none / write | 用户 / 角色 / API 凭证是身份与提权面 |
+| `system` | none / write | 系统配置含 LDAP / SMTP 等连接口令，读即泄露 |
+
+收窄同时定义了方法档位的取整规则（`roles.required_level(method, module)`）：
+取不到更强的可选档就 fail-closed 要 `write`。配得出来但点了不生效的档比没有这个
+开关更糟——它让人以为自己给出去的是一个更小的权限。
+
+### 配角色时的模块依赖
+
+页面上的筛选下拉常常跨模块取数，配角色时要一起给，否则页面能进但下拉是空的：
+
+| 页面 | 除自身模块外还需要 |
+|------|-------------------|
+| 服务器 / 服务器分配 / 任务流 | `dict` read（项目组 / 环境 / 渠道等筛选项）|
+| 服务器编辑的「执行通道」 | `agent` read（Agent 下拉）|
+| 域名 / 证书 | `cloud_account` read（账号下拉）；证书部署还要 `cmdb` read + `credential` read |
+
+前端对这些下拉逐个按模块判权限再取，缺哪个就少哪个下拉——不会因为一个 403 把
+整页选项都带走。
 
 ### 独立能力位
 
@@ -339,9 +399,9 @@ PUT/PATCH/DELETE → `write`；未知方法当 `write`（fail-closed）。
 
 | code | 名称 | 定位 |
 |------|------|------|
-| `super` | 超级管理 | 全模块 write + 全能力位（等于原来的 `is_staff=True`）|
-| `ops_admin` | 运维管理 | 日常运维读写；连接凭据与 Agent 只读，系统管理不可见 |
-| `ops_member` | 普通运维 | 资产可查可增；任务可执行但不能改定义、**不能碰生产** |
+| `super` | 超级管理 | 全模块最高档 + 全能力位（等于原来的 `is_staff=True`；audit 的最高档是 read）|
+| `ops_admin` | 运维管理 | 日常运维读写；云账号 / 连接凭据 / Agent 只读，用户、角色与系统配置不可见 |
+| `ops_member` | 普通运维 | 资产与字典可查可增；任务可执行但不能改定义、不能改方法、**不能碰生产** |
 
 `ops_admin` 正是二档模型缺的那一层。内置角色**可改矩阵、不可删**——删掉「超级管理」
 会把所有人锁在门外；序列化器还额外禁止把 `super` 降档，一次手滑就能锁死所有人。
@@ -351,7 +411,7 @@ PUT/PATCH/DELETE → `write`；未知方法当 `write`（fail-closed）。
 `role` 为空时**严格回退**到原来的 `is_staff` 语义，做到「谁的权限都没变」：
 
 - staff → 全模块 write + 全能力位；
-- 非 staff → 内置「普通运维」的**模块矩阵**（CMDB 可查可增、其余只读），
+- 非 staff → 内置「普通运维」的**模块矩阵**（资产与字典可查可增、其余只读），
   但**不含执行能力**。
 
 最后这条容易写错：内置「普通运维」角色本身是 `can_execute=True`，但**回退不能套用它**
@@ -606,7 +666,7 @@ SIMPLE_JWT = {
 | POST | `/api/auth/users/{id}/reset_mfa/` | 管理员清除他人绑定（丢手机兜底）|
 | GET/POST | `/api/auth/mfa/sudo/` | 敏感操作二次验证窗口：查状态 / 开窗口 |
 | GET | `/api/auth/roles/` | 角色列表（system write，不分页）|
-| GET | `/api/auth/roles/meta/` | 模块清单 + 权限档定义（前端渲染矩阵的数据源）|
+| GET | `/api/auth/roles/meta/` | 模块清单（含每个模块的可选档）+ 分组 + 权限档定义（前端渲染矩阵的唯一数据源）|
 | POST/PATCH/DELETE | `/api/auth/roles/` `…/{id}/` | 角色增改删（system write + sudo；内置不可删）|
 | GET | `/api/auth/api-credentials/` | API 凭证列表（管理员，不分页）|
 | GET | `/api/auth/api-credentials/scopes/` | 可授权作用域清单 |

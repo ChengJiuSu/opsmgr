@@ -92,7 +92,7 @@ class CloudAccountViewSet(viewsets.ModelViewSet):
     serializer_class = CloudAccountSerializer
     # 配置面写操作要求 sudo 二次验证（common/sudo.py）：改了就能拿到更多东西，
     # 而登录那次 MFA 可能是 60 分钟前的事
-    permission_classes = [module_perm('cloud', min_level='write'), SudoRequired]
+    permission_classes = [module_perm('cloud_account'), SudoRequired]
     pagination_class = StandardPagination
 
     def get_queryset(self):

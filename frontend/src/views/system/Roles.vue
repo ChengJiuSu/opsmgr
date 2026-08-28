@@ -2,8 +2,9 @@
   <el-card shadow="never">
     <div class="toolbar">
       <span class="hint">
-        角色 = 模块权限矩阵 + 能力位。用户未绑角色时按「是否管理员」回退（存量账号行为不变）。
-        权限档：无权限 / 只读 / 可读可新增 / 读写；「可读可新增」对应资产模块「可查可增不可改删」。
+        角色 = 模块权限矩阵 + 能力位。用户未绑角色时按「是否管理员」回退（存量账号行为不变）。<br>
+        模块按「一块菜单 + 一个风险面」切分：云账号与域名、方法库与任务流、用户角色与系统配置
+        各自独立，给一个不会顺带给出另一个。部分模块只开放部分档位（如操作审计没有写接口）。
       </span>
       <div>
         <el-button :icon="Refresh" @click="fetchData">刷新</el-button>
@@ -12,7 +13,7 @@
     </div>
 
     <el-table v-loading="loading" :data="tableData" stripe>
-      <el-table-column prop="name" label="角色" min-width="120">
+      <el-table-column prop="name" label="角色" min-width="130">
         <template #default="{ row }">
           {{ row.name }}
           <el-tag v-if="row.is_builtin" size="small" type="info" class="tag-gap">内置</el-tag>
@@ -21,14 +22,28 @@
       <el-table-column prop="code" label="标识" width="110">
         <template #default="{ row }"><code>{{ row.code }}</code></template>
       </el-table-column>
-      <el-table-column
-        v-for="module in meta.modules" :key="module.value"
-        :label="shortLabel(module.label)" width="110"
-      >
+      <!-- 13 个模块平铺成 13 列没法看：按分组给概要，悬停看逐模块档位 -->
+      <el-table-column label="模块权限" min-width="360">
         <template #default="{ row }">
-          <el-tag size="small" :type="levelType(row.permissions?.[module.value])">
-            {{ levelLabel(row.permissions?.[module.value]) }}
-          </el-tag>
+          <el-popover
+            v-for="group in meta.groups" :key="group.label"
+            placement="bottom-start" width="320" trigger="hover"
+          >
+            <template #reference>
+              <el-tag
+                size="small" class="group-tag"
+                :type="groupType(row, group)" effect="plain"
+              >
+                {{ group.label }} {{ grantedCount(row, group) }}/{{ group.modules.length }}
+              </el-tag>
+            </template>
+            <div v-for="key in group.modules" :key="key" class="pop-line">
+              <span class="pop-name">{{ shortLabel(moduleLabel(key)) }}</span>
+              <el-tag size="small" :type="levelType(row.permissions?.[key])">
+                {{ levelLabel(row.permissions?.[key]) }}
+              </el-tag>
+            </div>
+          </el-popover>
         </template>
       </el-table-column>
       <el-table-column label="执行能力" width="150">
@@ -60,8 +75,8 @@
     </el-table>
   </el-card>
 
-  <el-dialog v-model="dialogVisible" :title="editRow ? '编辑角色' : '新增角色'" width="680px">
-    <el-form ref="formRef" :model="form" :rules="rules" label-width="90px">
+  <el-dialog v-model="dialogVisible" :title="editRow ? '编辑角色' : '新增角色'" width="760px">
+    <el-form ref="formRef" :model="form" :rules="rules" label-width="96px">
       <el-row :gutter="16">
         <el-col :span="12">
           <el-form-item label="角色名称" prop="name">
@@ -78,17 +93,35 @@
         <el-input v-model="form.remark" placeholder="这个角色给谁用、能干什么" />
       </el-form-item>
 
-      <el-divider content-position="left">模块权限</el-divider>
-      <el-form-item
-        v-for="module in meta.modules" :key="module.value" :label="shortLabel(module.label)"
-      >
-        <el-radio-group v-model="form.permissions[module.value]">
-          <el-radio-button v-for="lv in meta.levels" :key="lv.value" :value="lv.value">
-            {{ lv.label }}
-          </el-radio-button>
-        </el-radio-group>
-        <div class="tip">{{ module.label }}</div>
-      </el-form-item>
+      <!-- 模块按后端分组渲染（meta.groups，与侧边栏同构）；
+           每个模块的可选档位也由后端给（meta.modules[].levels），
+           配不出「点了不生效」的档 -->
+      <template v-for="group in meta.groups" :key="group.label">
+        <el-divider content-position="left">
+          {{ group.label }}
+          <el-button link type="primary" size="small" @click="setGroup(group, 'none')">
+            全部无权限
+          </el-button>
+          <el-button link type="primary" size="small" @click="setGroup(group, 'read')">
+            全部只读
+          </el-button>
+        </el-divider>
+        <el-form-item v-for="key in group.modules" :key="key" :label="shortLabel(moduleLabel(key))">
+          <el-radio-group v-model="form.permissions[key]">
+            <el-radio-button
+              v-for="lv in moduleLevels(key)" :key="lv.value" :value="lv.value"
+            >
+              {{ lv.label }}
+            </el-radio-button>
+          </el-radio-group>
+          <div class="tip">
+            {{ moduleLabel(key) }}
+            <span v-if="moduleLevels(key).length < meta.levels.length" class="tip-narrow">
+              · 仅这几档有效
+            </span>
+          </div>
+        </el-form-item>
+      </template>
 
       <el-divider content-position="left">执行能力</el-divider>
       <el-form-item label="可执行">
@@ -121,9 +154,9 @@ import { getRoles, getRoleMeta, createRole, updateRole, deleteRole } from '../..
 const loading = ref(false)
 const submitting = ref(false)
 const tableData = ref([])
-// 模块清单与权限档由后端给（roles.MODULES / LEVELS），前端不硬编码——
-// 加一个模块时不用同步改两边
-const meta = reactive({ modules: [], levels: [], capabilities: [] })
+// 模块清单、分组与每个模块的可选档位都由后端给（roles.MODULES / MODULE_GROUPS /
+// MODULE_LEVELS），前端不硬编码——加一个模块时不用同步改两边
+const meta = reactive({ modules: [], groups: [], levels: [], capabilities: [] })
 
 const dialogVisible = ref(false)
 const editRow = ref(null)
@@ -137,13 +170,34 @@ const rules = {
   code: [{ required: true, message: '请输入角色标识' }],
 }
 
-// 模块说明形如「资产与配置（服务器、字典…）」，表头只取括号前的短名
+// 模块说明形如「服务器资产（服务器台账…）」，标签只取括号前的短名
 const shortLabel = (label) => String(label).split('（')[0]
+const moduleOf = (key) => meta.modules.find((item) => item.value === key)
+const moduleLabel = (key) => moduleOf(key)?.label || key
+const moduleLevels = (key) => moduleOf(key)?.levels || meta.levels
 const levelLabel = (level) =>
   meta.levels.find((item) => item.value === (level || 'none'))?.label || '无权限'
 const levelType = (level) => ({
   write: 'success', read_create: 'warning', read: 'info', none: 'danger',
 }[level || 'none'])
+
+/** 该分组里已授权（非 none）的模块数，用于列表页概要。 */
+const grantedCount = (row, group) =>
+  group.modules.filter((key) => (row.permissions?.[key] || 'none') !== 'none').length
+
+const groupType = (row, group) => {
+  const granted = grantedCount(row, group)
+  if (!granted) return 'info'
+  return granted === group.modules.length ? 'success' : 'warning'
+}
+
+/** 分组批量置档：档位在该模块不可选时退到它的最低可选档（通常是 none）。 */
+function setGroup(group, level) {
+  group.modules.forEach((key) => {
+    const levels = moduleLevels(key).map((item) => item.value)
+    form.permissions[key] = levels.includes(level) ? level : levels[0]
+  })
+}
 
 async function fetchData() {
   loading.value = true
@@ -214,9 +268,13 @@ onMounted(async () => {
 </script>
 
 <style scoped>
-.toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; gap: 12px; }
+.toolbar { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 16px; gap: 12px; }
 .hint { color: #909399; font-size: 13px; line-height: 1.6; }
 .tag-gap { margin-left: 6px; }
+.group-tag { margin: 2px 6px 2px 0; cursor: default; }
+.pop-line { display: flex; justify-content: space-between; align-items: center; padding: 3px 0; }
+.pop-name { font-size: 13px; color: #606266; }
 .tip { color: #909399; font-size: 12px; margin-left: 8px; }
+.tip-narrow { color: var(--el-color-warning); }
 .tip.danger { color: var(--el-color-danger); }
 </style>

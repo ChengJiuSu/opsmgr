@@ -21,7 +21,7 @@
           <el-button :icon="Finished" @click="openRequests()">变更审批</el-button>
         </el-badge>
         <el-button :icon="Clock" @click="openChanges()">变更留痕</el-button>
-        <template v-if="authStore.isStaff">
+        <template v-if="canWrite">
           <el-button :icon="Download" @click="openImport">导入域名</el-button>
           <el-button type="primary" :icon="Plus" @click="openDialog()">新增域名</el-button>
         </template>
@@ -52,7 +52,7 @@
                 >显示全部</el-button>
               </span>
               <el-button
-                v-if="authStore.isStaff"
+                v-if="canWrite"
                 size="small"
                 type="primary"
                 :icon="Plus"
@@ -110,7 +110,7 @@
                   <el-tag v-else size="small" type="success">已同步</el-tag>
                 </template>
               </el-table-column>
-              <el-table-column v-if="authStore.isStaff" label="操作" width="300">
+              <el-table-column v-if="canWrite" label="操作" width="300">
                 <template #default="{ row: rec }">
                   <el-button
                     v-if="rec.sync_status !== 'synced'"
@@ -154,7 +154,7 @@
         </template>
       </el-table-column>
       <el-table-column prop="remark" label="备注" min-width="100" show-overflow-tooltip />
-      <el-table-column v-if="authStore.isStaff" label="操作" width="230" fixed="right">
+      <el-table-column v-if="canWrite" label="操作" width="230" fixed="right">
         <template #default="{ row }">
           <el-button size="small" :loading="syncingId === row.id" @click="handleSync(row)">同步</el-button>
           <el-button size="small" :icon="Edit" @click="openDialog(row)">编辑</el-button>
@@ -331,11 +331,11 @@
         <template #default="{ row }">
           <template v-if="row.status === 'pending' && !row.expired">
             <el-button
-              v-if="authStore.isStaff" size="small" type="success"
+              v-if="canWrite" size="small" type="success"
               :loading="reviewingId === row.id" @click="handleApprove(row)"
             >批准</el-button>
             <el-button
-              v-if="authStore.isStaff" size="small" type="danger"
+              v-if="canWrite" size="small" type="danger"
               :loading="reviewingId === row.id" @click="handleReject(row)"
             >驳回</el-button>
             <el-button size="small" @click="handleCancel(row)">撤销</el-button>
@@ -388,7 +388,7 @@
       <el-table-column prop="reason" label="原因" min-width="120" show-overflow-tooltip>
         <template #default="{ row }"><span :class="{ muted: !row.reason }">{{ row.reason || '—' }}</span></template>
       </el-table-column>
-      <el-table-column v-if="authStore.isStaff" label="操作" width="110" fixed="right">
+      <el-table-column v-if="canWrite" label="操作" width="110" fixed="right">
         <template #default="{ row }">
           <el-button
             v-if="row.restorable" size="small" type="warning"
@@ -419,6 +419,10 @@ import {
 } from '../../api/cloud'
 
 const authStore = useAuthStore()
+// 按钮可见性跟角色矩阵走：域名与证书是 cloud 模块，
+// 云账号下拉另按 cloud_account 判（只读档也能选账号，AccessKey 是打码的）
+const canWrite = computed(() => authStore.can('cloud', 'write'))
+const canAccount = computed(() => authStore.can('cloud_account'))
 
 const RECORD_TYPES = ['A', 'AAAA', 'CNAME', 'TXT', 'MX', 'NS', 'SRV', 'CAA']
 const TARGET_LABELS = { none: '无绑定', server: '服务器', lb: '负载均衡', ga: '全球加速', cdn: 'CDN', custom: '自定义' }
@@ -813,13 +817,14 @@ onMounted(async () => {
   fetchData()
   loadPendingCount()  // 工具栏「变更审批」角标：有待审的单子要能一眼看见
   // 云账号下拉（域名归属/导入用）；服务器下拉（记录绑定用，page_size=0 全量）
-  if (authStore.isStaff) {
+  if (canWrite.value) {
+    // 云账号与服务器分属另外两个模块，逐个按权限取：Promise.all 一拒全拒
     const [accRes, svrRes] = await Promise.all([
-      getCloudAccounts({ page_size: 0 }),
-      getServers({ page_size: 0 }),
+      canAccount.value ? getCloudAccounts({ page_size: 0 }) : null,
+      authStore.can('cmdb') ? getServers({ page_size: 0 }) : null,
     ])
-    accountOptions.value = accRes.data?.results || []
-    serverOptions.value = svrRes.data?.results || []
+    accountOptions.value = accRes?.data?.results || []
+    serverOptions.value = svrRes?.data?.results || []
   }
 })
 </script>

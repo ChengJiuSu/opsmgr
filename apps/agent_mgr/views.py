@@ -1,4 +1,4 @@
-"""Agent 管理 API（仅管理员）。
+"""Agent 管理 API（agent 模块：read 可查、write 可改）。
 
 - Agent CRUD：创建/重置令牌时明文 token 仅在响应中出现一次；
 - 删除保护：有未终态任务单元的 agent 禁止删除；
@@ -21,10 +21,12 @@ JOBS_LIMIT = 50
 class AgentNodeViewSet(viewsets.ModelViewSet):
     queryset = AgentNode.objects.all()
     serializer_class = AgentNodeSerializer
-    # 配置面写操作要求 sudo 二次验证（common/sudo.py）：改了就能拿到更多东西，
+    # 读只要 read 档（列表里没有 token，只有名称/心跳/版本），写要 write：
+    # agent 模块的可选档不含 read_create，POST 会被 roles.required_level
+    # 向上取整到 write——建 agent 会发出一次性 token，不是「新增无所谓」那类操作。
+    # 配置面写操作再叠一层 sudo 二次验证（common/sudo.py）：改了就能拿到更多东西，
     # 而登录那次 MFA 可能是 60 分钟前的事
-    # 建 agent 会发出一次性 token，重置 token 能顶掉现有 agent 连接
-    permission_classes = [module_perm('agent', min_level='write'), SudoRequired]
+    permission_classes = [module_perm('agent'), SudoRequired]
     pagination_class = None  # agent 数量极少，直接全量返回
 
     def create(self, request, *args, **kwargs):
@@ -64,10 +66,8 @@ class AgentRouteViewSet(viewsets.ModelViewSet):
 
     queryset = AgentRoute.objects.select_related('agent', 'project_group', 'environment')
     serializer_class = AgentRouteSerializer
-    # 配置面写操作要求 sudo 二次验证（common/sudo.py）：改了就能拿到更多东西，
-    # 而登录那次 MFA 可能是 60 分钟前的事
-    # 改路由 = 改命令下发到哪台机器执行
-    permission_classes = [module_perm('agent', min_level='write'), SudoRequired]
+    # 同上：读给 read 档，写要 write + sudo——改路由 = 改命令下发到哪台机器执行
+    permission_classes = [module_perm('agent'), SudoRequired]
     pagination_class = None  # 规则条数与项目组同量级，全量返回便于一眼看完
 
     def get_queryset(self):

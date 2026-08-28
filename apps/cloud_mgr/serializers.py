@@ -43,6 +43,24 @@ class CloudAccountSerializer(serializers.ModelSerializer):
     def get_has_secret_key(self, obj):
         return bool(obj.secret_key)
 
+    def to_representation(self, instance):
+        """只读档看到的 AccessKey 打码。
+
+        cloud_account 的 read 档是给「域名/证书页要选一个账号」用的，那里只需要
+        账号名。AccessKey ID 单独不能签名，但它是这把密钥的身份标识，泄露出去
+        等于告诉别人「去哪把钥匙上撞」——能改账号的人才看全值。
+        Secret 本来就 write_only，任何档都取不到。
+        """
+        from apps.auth_mgr import roles
+
+        data = super().to_representation(instance)
+        request = self.context.get('request')
+        user = getattr(request, 'user', None) if request else None
+        if data.get('access_key') and not roles.user_can(user, 'cloud_account', 'PUT'):
+            tail = data['access_key'][-4:]
+            data['access_key'] = f'****{tail}'
+        return data
+
     def validate(self, attrs):
         # 新建必须携带 secret_key；编辑留空表示不修改
         if self.instance is None and not attrs.get('secret_key'):

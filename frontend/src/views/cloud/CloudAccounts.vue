@@ -20,7 +20,7 @@
           <el-option label="停用" value="false" />
         </el-select>
       </div>
-      <el-button type="primary" :icon="Plus" @click="openDialog()">新增云账号</el-button>
+      <el-button v-if="canWrite" type="primary" :icon="Plus" @click="openDialog()">新增云账号</el-button>
     </div>
 
     <!-- 表格 -->
@@ -50,7 +50,7 @@
         </template>
       </el-table-column>
       <el-table-column prop="remark" label="备注" min-width="120" show-overflow-tooltip />
-      <el-table-column label="操作" width="240" fixed="right">
+      <el-table-column v-if="canWrite" label="操作" width="240" fixed="right">
         <template #default="{ row }">
           <el-button size="small" :loading="testingId === row.id" @click="handleTest(row)">测试</el-button>
           <el-button size="small" :icon="Edit" @click="openDialog(row)">编辑</el-button>
@@ -109,15 +109,21 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, onUnmounted } from 'vue'
+import { ref, computed, reactive, onMounted, onUnmounted } from 'vue'
 import { Plus, Edit, Delete } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { debounce } from '../../utils/debounce'
+import { useAuthStore } from '../../stores/auth'
 import { cloudProviderApi, fetchDictOptions } from '../../api/assets'
 import {
   getCloudAccounts, createCloudAccount, updateCloudAccount,
   deleteCloudAccount, testCloudAccount,
 } from '../../api/cloud'
+
+const authStore = useAuthStore()
+// 只读档是给「域名/证书页要选一个账号」用的：能看清单，改不了 AK/SK
+// （后端也会把 AccessKey 打码，不是只靠这里藏按钮）
+const canWrite = computed(() => authStore.can('cloud_account', 'write'))
 
 const loading = ref(false)
 const submitting = ref(false)

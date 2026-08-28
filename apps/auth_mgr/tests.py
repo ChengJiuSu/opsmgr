@@ -1431,11 +1431,15 @@ class RoleMatrixTests(TestCase):
         boss = self._user('rm_boss', role=self.super_role, is_staff=True)
         client = self._client(boss)
         grant_sudo(client, PASSWORD)
-        weakened = dict(self.super_role.permissions, system='read')
+        weakened = dict(self.super_role.permissions, system='none')
         r = client.patch(f'/api/auth/roles/{self.super_role.id}/',
                          {'permissions': weakened}, format='json')
         self.assertEqual(r.status_code, 400)
-        self.assertIn('必须对所有模块保持读写', r.json()['msg'])
+        self.assertIn('必须对所有模块保持最高档', r.json()['msg'])
+
+    def test_builtin_super_audit_stays_read(self):
+        """审计没有写接口：超级管理的 audit 最高就是 read，不该被要求 write。"""
+        self.assertEqual(self.super_role.permissions['audit'], 'read')
 
     def test_builtin_role_cannot_be_deleted(self):
         boss = self._user('rm_boss2', role=self.super_role, is_staff=True)
@@ -1481,6 +1485,157 @@ class RoleMatrixTests(TestCase):
         data = client.get('/api/auth/roles/meta/').json()['data']
         self.assertIn('cmdb', [m['value'] for m in data['modules']])
         self.assertIn('read_create', [level['value'] for level in data['levels']])
+        # 每个模块自带可选档，前端不硬编码：审计只有 无权限/只读
+        audit = next(m for m in data['modules'] if m['value'] == 'audit')
+        self.assertEqual([lv['value'] for lv in audit['levels']], ['none', 'read'])
+        # 分组覆盖全部模块（前端按组分块渲染，漏一个就永远配不到）
+        grouped = [m for group in data['groups'] for m in group['modules']]
+        self.assertCountEqual(grouped, [m['value'] for m in data['modules']])
+
+    def test_level_outside_module_range_rejected(self):
+        """配得出来但不生效的档比没有更糟：审计没有写接口，写档直接拒。"""
+        boss = self._user('rm_boss6', role=self.super_role, is_staff=True)
+        client = self._client(boss)
+        grant_sudo(client, PASSWORD)
+        r = client.post('/api/auth/roles/', {
+            'name': '审计员', 'code': 'auditor', 'permissions': {'audit': 'write'},
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('不支持', r.json()['msg'])
+
+    # ── 模块拆分：给 A 不该顺带给 B ────────────────────────
+    def test_cloud_write_does_not_grant_cloud_account(self):
+        """改域名的人不该顺手拿到云账号 AK/SK——拆 cloud_account 就是为了这个。
+
+        只读档保留「看得到账号、选得到账号」（域名与证书页要选一个账号），
+        但 AccessKey 打码、改不了。
+        """
+        from apps.asset_mgr.models import CloudProvider
+        from apps.cloud_mgr.models import CloudAccount
+
+        provider = CloudProvider.objects.create(name='阿里云', code='rm-aliyun')
+        CloudAccount.objects.create(name='rm-acc', provider=provider,
+                                    access_key='AKID000012345678', secret_key='S')
+        admin = self._user('rm_cloudops', role=self.ops_admin)
+        client = self._client(admin)
+        grant_sudo(client, PASSWORD)
+        self.assertEqual(client.get('/api/cloud/domains/').status_code, 200)
+
+        r = client.get('/api/cloud/accounts/')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()['data']['results'][0]['access_key'], '****5678')
+
+        r = client.post('/api/cloud/accounts/', {
+            'name': 'rm-acc2', 'provider': provider.id,
+            'access_key': 'AKID2', 'secret_key': 'S2',
+        }, format='json')
+        self.assertEqual(r.status_code, 403)
+
+    def test_exec_write_does_not_grant_method_write(self):
+        """方法模板里能写任意命令，不该跟着「能改任务流」一起给出去。"""
+        role = Role.objects.create(
+            name='任务流编辑', code='task_editor',
+            permissions={'exec': 'write', 'method': 'read'},
+            can_execute=False, can_exec_prod=False)
+        client = self._client(self._user('rm_taskeditor', role=role))
+        self.assertEqual(client.get('/api/exec/methods/').status_code, 200)
+        r = client.post('/api/exec/methods/',
+                        {'name': 'rm-m1', 'provider': 'shell', 'command': 'id'},
+                        format='json')
+        self.assertEqual(r.status_code, 403)
+
+    def test_exec_write_does_not_grant_variable_reveal(self):
+        """变量里有密码类真值，与任务流定义分开授权。"""
+        role = Role.objects.create(
+            name='任务流编辑2', code='task_editor2',
+            permissions={'exec': 'write', 'variable': 'none'},
+            can_execute=False, can_exec_prod=False)
+        client = self._client(self._user('rm_taskeditor2', role=role))
+        self.assertEqual(client.get('/api/exec/tasks/').status_code, 200)
+        self.assertEqual(client.get('/api/exec/variables/').status_code, 403)
+
+    def test_dict_split_from_cmdb(self):
+        """改环境 is_prod 能绕过生产执行限制，所以字典与服务器台账分开授权。"""
+        role = Role.objects.create(
+            name='资产录入', code='asset_entry',
+            permissions={'cmdb': 'write', 'dict': 'read'},
+            can_execute=False, can_exec_prod=False)
+        client = self._client(self._user('rm_assetentry', role=role))
+        self.assertEqual(client.get('/api/assets/environments/').status_code, 200)
+        r = client.post('/api/assets/environments/',
+                        {'name': '预发', 'code': 'rm-pre'}, format='json')
+        self.assertEqual(r.status_code, 403)
+
+    def test_agent_read_level_lists_without_write(self):
+        """Agent 页面挂的是 read 档：以前连列表都要 write，菜单点进去必 403。"""
+        admin = self._user('rm_agentread', role=self.ops_admin)
+        client = self._client(admin)
+        self.assertEqual(client.get('/api/agents/').status_code, 200)
+        grant_sudo(client, PASSWORD)
+        # agent 模块没有 read_create 档，POST 按可选档向上取整到 write → 拒
+        r = client.post('/api/agents/', {'name': 'rm-agent'}, format='json')
+        self.assertEqual(r.status_code, 403)
+
+    def test_account_split_from_system(self):
+        """能改系统配置不等于能改角色——否则等于自己给自己加权。"""
+        role = Role.objects.create(
+            name='配置管理员', code='cfg_admin',
+            permissions={'system': 'write', 'account': 'none'},
+            can_execute=False, can_exec_prod=False)
+        client = self._client(self._user('rm_cfgadmin', role=role))
+        grant_sudo(client, PASSWORD)
+        self.assertEqual(client.get('/api/system/configs/').status_code, 200)
+        self.assertEqual(client.get('/api/auth/roles/').status_code, 403)
+        self.assertEqual(client.get('/api/auth/users/').status_code, 403)
+
+
+class RoleModuleSplitMigrationTests(TestCase):
+    """0009 的矩阵改写规则：只收窄不放大，内置角色未被改过才换出厂矩阵。"""
+
+    def _mod(self):
+        import importlib
+
+        return importlib.import_module('apps.auth_mgr.migrations.0009_split_role_modules')
+
+    def test_split_inherits_parent_level(self):
+        mig = self._mod()
+        new = mig._to_new({'cmdb': 'write', 'exec': 'write', 'cloud': 'write',
+                           'system': 'write', 'credential': 'read',
+                           'artifact': 'read', 'agent': 'none', 'audit': 'read'})
+        self.assertEqual(new['dict'], 'write')
+        self.assertEqual(new['variable'], 'write')
+        self.assertEqual(new['cloud_account'], 'write')
+        self.assertEqual(new['account'], 'write')
+
+    def test_split_clamps_to_module_range(self):
+        """取整只会更小：旧 exec=read_create 能新增方法，新 method 没有这一档。"""
+        mig = self._mod()
+        new = mig._to_new({'exec': 'read_create', 'audit': 'write', 'system': 'read',
+                           'agent': 'read_create'})
+        self.assertEqual(new['method'], 'read')
+        self.assertEqual(new['exec'], 'read_create')
+        self.assertEqual(new['audit'], 'read')
+        self.assertEqual(new['system'], 'none')
+        self.assertEqual(new['agent'], 'read')
+
+    def test_already_new_matrix_untouched(self):
+        """迁移可重跑：新建的角色（已是新矩阵）不该被当成旧矩阵改写。"""
+        mig = self._mod()
+        role = Role.objects.create(
+            name='新矩阵', code='new_matrix',
+            permissions={'cmdb': 'read', 'dict': 'read', 'cloud_account': 'write'})
+        mig.forwards(_FakeApps(), None)
+        role.refresh_from_db()
+        self.assertEqual(role.permissions['cloud_account'], 'write')
+
+
+class _FakeApps:
+    """让迁移函数在测试里拿到真实模型（迁移只读写 permissions 这一个字段）。"""
+
+    def get_model(self, app_label, model_name):
+        from django.apps import apps as django_apps
+
+        return django_apps.get_model(app_label, model_name)
 
 
 class ExecCapabilityTests(TestCase):

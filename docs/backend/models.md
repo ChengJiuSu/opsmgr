@@ -243,7 +243,7 @@ system_cfg.SystemConfig 独立
 | `id` | BigAutoField | PK | 主键 |
 | `name` | CharField(50) | — | 角色名称，唯一 |
 | `code` | CharField(30) | — | 角色标识，唯一（小写字母/数字/下划线）|
-| `permissions` | JSONField | `{}` | `{模块: 权限档}`，缺失模块视为 `none`（fail-closed）|
+| `permissions` | JSONField | `{}` | `{模块: 权限档}`（13 个模块），缺失模块视为 `none`（fail-closed）；档位还须落在该模块的可选档内（`roles.MODULE_LEVELS`）|
 | `can_execute` | BooleanField | `False` | 可发起任务流执行、可处理暂停 |
 | `can_exec_prod` | BooleanField | `False` | 可对生产环境发起执行 |
 | `is_builtin` | BooleanField | `False` | 内置角色：可改矩阵、不可删 |

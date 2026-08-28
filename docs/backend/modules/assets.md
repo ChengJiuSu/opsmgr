@@ -93,7 +93,9 @@ region         = CharField(max_length=50, blank=True)
 
 ### BaseDictViewSet（字典通用视图）
 
-- 权限 `IsAdminOrReadCreate`：普通用户可查看/新增，修改与删除仅管理员（服务器接口同权限）
+- 权限 `module_perm('dict')`：按 HTTP 方法推档（查 read、新增 read_create、改删 write）。
+  五张字典单独一个 `dict` 模块，不跟服务器台账（`cmdb`）合并——改环境的 `is_prod`
+  能绕过生产执行限制，改项目组/环境等于改数据范围的维度，风险面与「录一台服务器」不同
 - 列表支持 `enabled=true|false`、`keyword`（名称/编码模糊）过滤
 - `destroy` 捕获 `ProtectedError`，返回友好错误：`「生产」仍被 3 台服务器引用，无法删除`
 

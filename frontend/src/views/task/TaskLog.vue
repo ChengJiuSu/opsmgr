@@ -54,7 +54,7 @@
           <span v-if="current">返回码：{{ current.return_code ?? '-' }}</span>
           <span v-if="currentServers" class="muted">{{ currentServers }}</span>
           <!-- 执行现场归档含变量值，仅管理员可读 -->
-          <el-button v-if="authStore.isStaff && current?.id" link type="primary" size="small" @click="openScene">
+          <el-button v-if="canWrite && current?.id" link type="primary" size="small" @click="openScene">
             执行现场
           </el-button>
         </div>
@@ -63,7 +63,7 @@
           <template #title>
             <span class="pause-line">
               {{ pausedFailed ? '模块执行失败，任务流已暂停，等待人工处理' : '任务流已暂停，等待人工确认后继续' }}
-              <span v-if="authStore.isStaff" class="pause-actions">
+              <span v-if="canExec" class="pause-actions">
                 <template v-if="pausedFailed">
                   <el-button size="small" type="primary" :loading="confirming" @click="handleConfirm('retry')">重试失败模块</el-button>
                   <el-button size="small" type="warning" :loading="confirming" @click="handleConfirm('skip')">跳过并继续</el-button>
@@ -120,6 +120,9 @@ import StepOutput from '../../components/StepOutput.vue'
 const route = useRoute()
 const router = useRouter()
 const authStore = useAuthStore()
+// 现场信息要 exec 写档（接口就是这么挂的）；处理暂停看能力位
+const canWrite = computed(() => authStore.can('exec', 'write'))
+const canExec = computed(() => authStore.capability('can_execute'))
 const taskId = Number(route.params.taskId)
 
 const loading = ref(false)

@@ -55,7 +55,7 @@
       <el-table-column label="操作" width="160" fixed="right">
         <template #default="{ row }">
           <el-button size="small" :icon="Download" @click="handleDownload(row)">下载</el-button>
-          <el-button v-if="authStore.isStaff" size="small" type="danger" :icon="Delete" @click="handleDelete(row)" />
+          <el-button v-if="canWrite" size="small" type="danger" :icon="Delete" @click="handleDelete(row)" />
         </template>
       </el-table-column>
     </el-table>
@@ -74,7 +74,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, onUnmounted } from 'vue'
+import { ref, computed, reactive, onMounted, onUnmounted } from 'vue'
 import { debounce } from '../../utils/debounce'
 import { Delete, Download, Refresh, Search } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -83,6 +83,8 @@ import { fetchDictOptions, projectGroupApi, channelApi, environmentApi } from '.
 import { deleteArtifact, getArtifacts } from '../../api/artifacts'
 
 const authStore = useAuthStore()
+// 按钮可见性跟角色矩阵走（制品只能由 CI 上报，页面上只有删）
+const canWrite = computed(() => authStore.can('artifact', 'write'))
 const loading = ref(false)
 const tableData = ref([])
 const total = ref(0)

@@ -24,93 +24,93 @@ const router = createRouter({
           path: 'assets/servers',
           name: 'Servers',
           component: () => import('../views/assets/Servers.vue'),
-          meta: { title: '服务器管理' },
+          meta: { title: '服务器管理', perm: ['cmdb', 'read'] },
         },
         // 云控管理：云账号（仅管理员）+ 域名管理（主域名/解析记录）
         {
           path: 'cloud/accounts',
           name: 'CloudAccounts',
           component: () => import('../views/cloud/CloudAccounts.vue'),
-          meta: { title: '云账号', perm: ['cloud', 'write'] },
+          meta: { title: '云账号', perm: ['cloud_account', 'write'] },
         },
         {
           path: 'cloud/domains',
           name: 'CloudDomains',
           component: () => import('../views/cloud/Domains.vue'),
-          meta: { title: '域名管理' },
+          meta: { title: '域名管理', perm: ['cloud', 'read'] },
         },
         {
           path: 'cloud/certificates',
           name: 'CloudCertificates',
           component: () => import('../views/cloud/Certificates.vue'),
-          meta: { title: '证书管理' },
+          meta: { title: '证书管理', perm: ['cloud', 'read'] },
         },
         // 配置管理：服务器分配（归属分配 + 服务规划，仅显示已规划主机）+ CMDB 基础数据字典
         {
           path: 'config/allocation',
           name: 'ConfigAllocation',
           component: () => import('../views/config/Allocation.vue'),
-          meta: { title: '服务器分配' },
+          meta: { title: '服务器分配', perm: ['cmdb', 'read'] },
         },
         {
           path: 'config/project-groups',
           name: 'ProjectGroups',
           component: () => import('../views/config/DictManager.vue'),
           props: { type: 'project-groups' },
-          meta: { title: '项目组' },
+          meta: { title: '项目组', perm: ['dict', 'read'] },
         },
         {
           path: 'config/channels',
           name: 'Channels',
           component: () => import('../views/config/DictManager.vue'),
           props: { type: 'channels' },
-          meta: { title: '渠道' },
+          meta: { title: '渠道', perm: ['dict', 'read'] },
         },
         {
           path: 'config/environments',
           name: 'Environments',
           component: () => import('../views/config/DictManager.vue'),
           props: { type: 'environments' },
-          meta: { title: '环境' },
+          meta: { title: '环境', perm: ['dict', 'read'] },
         },
         {
           path: 'config/cloud-providers',
           name: 'CloudProviders',
           component: () => import('../views/config/DictManager.vue'),
           props: { type: 'cloud-providers' },
-          meta: { title: '云厂商' },
+          meta: { title: '云厂商', perm: ['dict', 'read'] },
         },
         {
           path: 'config/service-types',
           name: 'ServiceTypes',
           component: () => import('../views/config/DictManager.vue'),
           props: { type: 'service-types' },
-          meta: { title: '服务类型' },
+          meta: { title: '服务类型', perm: ['dict', 'read'] },
         },
         {
           path: 'task/methods',
           name: 'TaskMethods',
           component: () => import('../views/task/Methods.vue'),
-          meta: { title: '方法管理', perm: ['exec', 'write'] },
+          meta: { title: '方法管理', perm: ['method', 'write'] },
         },
         {
           path: 'task/variables',
           name: 'TaskVariables',
           component: () => import('../views/task/Variables.vue'),
-          meta: { title: '变量管理' },
+          meta: { title: '变量管理', perm: ['variable', 'read'] },
         },
         {
           path: 'task/executions',
           name: 'TaskExecutions',
           component: () => import('../views/task/Executions.vue'),
-          meta: { title: '任务执行' },
+          meta: { title: '任务执行', perm: ['exec', 'read'] },
         },
         // 独立执行日志页：URL 可分享定位到某任务的某次执行（logId 可省略=最新一次）
         {
           path: 'task/executions/:taskId(\\d+)/logs/:logId(\\d+)?',
           name: 'TaskLog',
           component: () => import('../views/task/TaskLog.vue'),
-          meta: { title: '执行日志', activeMenu: '/task/executions' },
+          meta: { title: '执行日志', activeMenu: '/task/executions', perm: ['exec', 'read'] },
         },
         {
           path: 'task/log-files',
@@ -122,7 +122,7 @@ const router = createRouter({
           path: 'task/artifacts',
           name: 'TaskArtifacts',
           component: () => import('../views/task/Artifacts.vue'),
-          meta: { title: '制品管理' },
+          meta: { title: '制品管理', perm: ['artifact', 'read'] },
         },
         {
           path: 'task/credentials',
@@ -134,13 +134,13 @@ const router = createRouter({
           path: 'audit/logs',
           name: 'AuditLogs',
           component: () => import('../views/audit/Logs.vue'),
-          meta: { title: '操作审计' },
+          meta: { title: '操作审计', perm: ['audit', 'read'] },
         },
         {
           path: 'system/users',
           name: 'Users',
           component: () => import('../views/system/Users.vue'),
-          meta: { title: '用户管理', perm: ['system', 'write'] },
+          meta: { title: '用户管理', perm: ['account', 'write'] },
         },
         {
           path: 'system/agents',
@@ -152,19 +152,19 @@ const router = createRouter({
           path: 'system/roles',
           name: 'SystemRoles',
           component: () => import('../views/system/Roles.vue'),
-          meta: { title: '角色权限', perm: ['system', 'write'] },
+          meta: { title: '角色权限', perm: ['account', 'write'] },
         },
         {
           path: 'system/api-credentials',
           name: 'SystemApiCredentials',
           component: () => import('../views/system/ApiCredentials.vue'),
-          meta: { title: 'API 凭证', perm: ['system', 'write'] },
+          meta: { title: 'API 凭证', perm: ['account', 'write'] },
         },
         {
           path: 'system/configs',
           name: 'SystemConfigs',
           component: () => import('../views/system/Configs.vue'),
-          meta: { title: '系统配置' },
+          meta: { title: '系统配置', perm: ['system', 'write'] },
         },
         // 二次认证（所有人可见，入口在右上角头像菜单，不进侧边栏）
         {
@@ -185,6 +185,9 @@ const ACTION_LEVEL = { read: 'read', create: 'read_create', write: 'write' }
 function hasRoutePerm(user, perm) {
   const modules = user?.permissions?.modules
   if (!modules || !perm) return !!user?.is_staff
+  // 快照里没有这个模块键 = 快照比该模块老（后端拆分模块前登录的会话），
+  // 判为「不知道」回退 is_staff，否则老会话会被自己的页面挡在门外
+  if (!(perm[0] in modules)) return !!user?.is_staff
   const level = modules[perm[0]] || 'none'
   return LEVELS.indexOf(level) >= LEVELS.indexOf(ACTION_LEVEL[perm[1]] || 'read')
 }

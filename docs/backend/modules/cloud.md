@@ -45,8 +45,8 @@ apps/cloud_mgr/
 
 | 接口 | 方法 | 权限 | 说明 |
 |------|------|------|------|
-| `/api/cloud/accounts/` | CRUD | 仅管理员 | 云账号；有域名引用禁止删除 |
-| `/api/cloud/accounts/{id}/test_connection/` | POST | 仅管理员 | 凭据连通性测试（拉域名列表） |
+| `/api/cloud/accounts/` | CRUD | `cloud_account`：read 可查（AccessKey 打码）/ write 可改 | 云账号；有域名引用禁止删除 |
+| `/api/cloud/accounts/{id}/test_connection/` | POST | `cloud_account` write | 凭据连通性测试（拉域名列表） |
 | `/api/cloud/domains/` | CRUD | 管理员写/登录读 | 删除仅删本地，不动厂商侧解析 |
 | `/api/cloud/domains/import_remote/` | POST | 管理员 | `{"cloud_account": id}`，已存在跳过 |
 | `/api/cloud/domains/{id}/sync_records/` | POST | 管理员 | 厂商侧全量镜像到本地；忽略 `_acme-challenge`；失败置域名 abnormal |
