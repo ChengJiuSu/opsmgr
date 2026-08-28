@@ -13,6 +13,10 @@
 | `ops-manager.conf` | gunicorn supervisor 配置（默认托管方式） |
 | `ops-manager.service` | gunicorn systemd 单元（备选托管方式） |
 | `ops-manager-ws.service` | daphne systemd 单元（/ws/ ops-agent 接入，启用 agent 时部署） |
+| `ops-manager-celery.conf` | celery worker supervisor 配置（`TASK_EXEC_BACKEND=celery` 时必须） |
+| `ops-manager-celery.service` | celery worker systemd 单元（同上，备选托管方式） |
+| `ops-manager-celery-beat.conf` | celery beat supervisor 配置（证书自动续签调度，只起一个实例） |
+| `ops-manager-celery-beat.service` | celery beat systemd 单元（同上，备选托管方式） |
 | `docker/` | 后端容器化：Dockerfile + entrypoint（compose 文件在仓库根） |
 | `nginx.conf` | nginx 站点配置 |
 
@@ -146,9 +150,32 @@ Docker 部署无需手工执行：backend 入口每次启动都会跑 `migrate`�
 ## 切换 celery 任务后端（可选）
 
 1. 装 Redis，`.env` 设 `TASK_EXEC_BACKEND=celery`、`REDIS_URL=redis://127.0.0.1:6379/0`。
-2. 另起 worker（可仿照 `ops-manager.service` 建 systemd 单元）：
-   `venv/bin/celery -A ops_manager worker -l info`
+2. **必须部署 worker**（缺了它任务只入队不执行，页面上是一条永远「申请中」的证书，
+   且没有任何报错）。按 web 用的托管方式二选一 —— supervisor：
+
+   ```bash
+   sudo cp deploy/ops-manager-celery.conf /etc/supervisor/conf.d/
+   sudo cp deploy/ops-manager-celery-beat.conf /etc/supervisor/conf.d/   # 自动续签调度，可选
+   sudo supervisorctl reread && sudo supervisorctl update
+   sudo supervisorctl status | grep celery
+   ```
+
+   或 systemd：
+
+   ```bash
+   sudo cp deploy/ops-manager-celery.service /etc/systemd/system/
+   sudo cp deploy/ops-manager-celery-beat.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now ops-manager-celery ops-manager-celery-beat
+   ```
+
+   两边都要按实际部署改路径、运行用户、`PATH`（须含 `venv/bin` 与 `~/.acme.sh`）
+   与 `HOME`；worker 与 web 用同一个运行用户，否则找不到 acme.sh、签出的文件属主也错。
+   两个坑：supervisor 的续行是**缩进**不是反斜杠（写 `\` 会当字面参数传给 celery）；
+   `stopwaitsecs` 默认 10s 会把正在跑的 acme.sh 砍掉，配置里已给到 930s。
 3. 重启 `ops-manager` 服务。
+4. 自检：`venv/bin/celery -A ops_manager inspect ping` 有回应，
+   `redis-cli -n 0 llen celery` 稳定为 0。
 
 ## 常见问题
 
@@ -157,6 +184,12 @@ Docker 部署无需手工执行：backend 入口每次启动都会跑 `migrate`�
   `showmigrations | grep '\[ \]'` 确认没有未应用的迁移。
 - **登录 401 / 静态 404**：nginx `location` 路径与实际部署路径不符，或未 `collectstatic`。
 - **任务执行超时被断开**：nginx `proxy_read_timeout` 与 gunicorn `--timeout` 均需 ≥600s，已在配置中给出。
+- **证书一直「申请中」/ 任务点了没反应**（celery 模式）：worker 没跑。
+  `venv/bin/celery -A ops_manager inspect ping` 报 `No nodes replied` +
+  `redis-cli -n 0 llen celery` 不为 0 即可确认。装上
+  `ops-manager-celery.conf`（supervisor）或 `ops-manager-celery.service`（systemd，见上节）。残留状态用
+  `manage.py reap_stuck_cert_tasks` 收成失败；队列里的陈旧任务先
+  `redis-cli -n 0 del celery` 清掉，否则 worker 一起来就把过期任务全跑一遍。
 - **制品下载地址错误**：`.env` 的 `SITE_BASE_URL` 未配置为对外可达地址。
 - **纯 HTTP 内网访问**：prod 配置开启了 `SESSION_COOKIE_SECURE`/`CSRF_COOKIE_SECURE`，
   API 走 JWT 不受影响；如需用 Django admin，需上 HTTPS 或临时关闭这两项。

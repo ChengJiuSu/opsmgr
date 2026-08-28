@@ -1,0 +1,28 @@
+# OpsManager Celery beat（定时调度：临期证书自动续签 + 收残留状态）
+# 安装：
+#   sudo cp deploy/ops-manager-celery-beat.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now ops-manager-celery-beat
+#
+# 只跑调度不干活，必须与 ops-manager-celery（worker）成对部署，且**只起一个实例**
+# ——多个 beat 会把同一个任务重复投递。
+# 不部署 beat 的后果：自动续签不生效（手动点续签不受影响），
+# 超时残留状态不会被自动收成 failed（页面仍会在 30 分钟后放开重申请与删除）。
+[Unit]
+Description=OpsManager Celery beat (cert auto-renew scheduler)
+After=network.target redis.service ops-manager-celery.service
+
+[Service]
+User=ops
+Group=ops
+WorkingDirectory=/opt/devops-manager
+Environment=DJANGO_SETTINGS_MODULE=ops_manager.settings.prod
+Environment=PATH=/opt/devops-manager/venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/devops-manager/venv/bin/celery -A ops_manager beat \
+    -l info \
+    --schedule=/opt/devops-manager/logs/celerybeat-schedule \
+    --logfile=/opt/devops-manager/logs/celery-beat.log
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
