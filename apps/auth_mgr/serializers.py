@@ -81,16 +81,34 @@ class UserSerializer(serializers.ModelSerializer):
         return value
 
     def validate(self, attrs):
-        """服务账号不允许设密码。
+        """服务账号：不允许设密码，也不允许配角色。
 
-        它是 API 凭证的审计身份，密码被置成不可用正是为了「登不进来」。给它设了密码
-        就多出一个能从登录页进来、且绕过 MFA 强制范围（非 staff）的账号。
-        reset_password 动作那边也拦了一道，这里覆盖 create/update 路径。
+        **密码**——它是 API 凭证的审计身份，密码被置成不可用正是为了「登不进来」。
+        给它设了密码就多出一个能从登录页进来、且绕过 MFA 强制范围（非 staff）的
+        账号。reset_password 动作那边也拦了一道，这里覆盖 create/update 路径。
+
+        **角色**——机读接口的授权只看**作用域**（apikey.SCOPES）+ IP 白名单 +
+        凭证数据范围；`UserOrScope` 按认证方式分流（凭证认证只判作用域），所以
+        服务账号身上的角色矩阵对机读调用**不生效**。配得出来但不生效的开关比没有
+        这个开关更糟：它会让人以为自己已经把这把 key 收窄了。要收窄机读权限，改
+        凭证的作用域或数据范围。
+
+        为什么不改成「作用域 AND 服务账号矩阵」：矩阵比作用域**粗**（artifact:report
+        与 artifact:download 同属 artifact 模块，要让上报过就得给 write，而 write
+        连删制品都能干），兜不住「作用域给宽了」这种配错；代价却是所有存量 key 因
+        为无角色回退到「普通运维」矩阵而当场 403（CI 上报、webhook 触发全挂），
+        以及「这把 key 能干什么」要读两个地方。
         """
-        if attrs.get('password') and getattr(self.instance, 'is_service', False):
-            raise serializers.ValidationError({
-                'password': f'{self.instance.username} 是 API 凭证的服务账号，不允许设置密码。',
-            })
+        if getattr(self.instance, 'is_service', False):
+            if attrs.get('password'):
+                raise serializers.ValidationError({
+                    'password': f'{self.instance.username} 是 API 凭证的服务账号，不允许设置密码。',
+                })
+            if attrs.get('role') is not None:
+                raise serializers.ValidationError({
+                    'role': f'{self.instance.username} 是 API 凭证的服务账号，角色只作审计身份、'
+                            f'对机读调用不生效。请改凭证的作用域或数据范围。',
+                })
         return attrs
 
     def create(self, validated_data):

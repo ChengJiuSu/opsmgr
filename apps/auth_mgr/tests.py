@@ -1823,6 +1823,26 @@ class ServiceAccountLifecycleTests(TestCase):
                  self.client.get('/api/auth/users/?include_service=true').json()['data']['results']]
         self.assertIn('svc-sa-ci', names)
 
+    def test_cannot_assign_role_to_service_account(self):
+        """角色对机读调用不生效（UserOrScope 按认证方式分流，凭证只判作用域）。
+
+        配得出来但不生效的开关比没有更糟：会让人以为已经把这把 key 收窄了。
+        要收窄机读权限，改凭证的作用域或数据范围。
+        """
+        self._create()
+        user = User.objects.get(username='svc-sa-ci')
+        role = Role.objects.get(code='ops_member')
+
+        r = self.client.patch(f'/api/auth/users/{user.id}/', {'role': role.id}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('服务账号', r.json()['msg'])
+        user.refresh_from_db()
+        self.assertIsNone(user.role_id)
+
+        # 清空角色（role=null）仍放行——否则历史上配过角色的服务账号改不回来
+        r = self.client.patch(f'/api/auth/users/{user.id}/', {'role': None}, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+
     def test_cannot_set_password_on_service_account(self):
         """设了密码它就成了一个能登录、且绕过 MFA 强制范围（非 staff）的账号。"""
         self._create()
