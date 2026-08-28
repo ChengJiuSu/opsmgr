@@ -433,6 +433,65 @@ class CertificateApiTests(BaseApiTest):
         r = admin.delete(f'/api/cloud/certificates/{cert.id}/')
         self.assertEqual(r.status_code, 400)
 
+    def test_stuck_issuing_can_be_reissued_and_deleted(self):
+        """issuing 超时残留必须放开：执行线程随进程重启消失，否则这条记录永久死锁。"""
+        from datetime import timedelta
+        from django.utils import timezone as tz
+        from apps.cloud_mgr.models import Certificate
+        cert = self._create_cert(status='issuing')
+        # updated_at 是 auto_now，只能绕过 save() 直接改库
+        stale = tz.now() - Certificate.ISSUE_TIMEOUT - timedelta(minutes=1)
+        Certificate.objects.filter(pk=cert.pk).update(updated_at=stale)
+        cert.refresh_from_db()
+        self.assertTrue(cert.issue_stuck)
+        admin = self._client()
+        self.assertTrue(admin.get(f'/api/cloud/certificates/{cert.id}/').json()['issue_stuck'])
+        with patch('apps.cloud_mgr.tasks.issue_certificate') as mock_issue:
+            mock_issue.return_value = ('CERT', 'KEY', 'CHAIN', tz.now() + timedelta(days=90))
+            with self.settings(TASK_EXEC_BACKEND='sync'):
+                r = admin.post(f'/api/cloud/certificates/{cert.id}/issue/')
+        self.assertEqual(r.status_code, 200, r.content)
+        # 删除同样放行
+        cert2 = self._create_cert(name='stuck-2', status='issuing')
+        Certificate.objects.filter(pk=cert2.pk).update(updated_at=stale)
+        self.assertEqual(admin.delete(f'/api/cloud/certificates/{cert2.id}/').status_code, 200)
+
+    @patch('apps.cloud_mgr.tasks.issue_certificate')
+    def test_issue_non_acme_exception_records_failure(self, mock_issue):
+        """非 AcmeError 也必须落 failed，漏一个异常就永久停在 issuing。"""
+        mock_issue.side_effect = RuntimeError('SDK 炸了')
+        cert = self._create_cert()
+        admin = self._client()
+        with self.settings(TASK_EXEC_BACKEND='sync'):
+            admin.post(f'/api/cloud/certificates/{cert.id}/issue/')
+        cert.refresh_from_db()
+        self.assertEqual(cert.status, 'failed')
+        self.assertIn('RuntimeError', cert.last_error)
+
+    def test_reap_stuck_marks_timeout_records_failed(self):
+        from datetime import timedelta
+        from django.utils import timezone as tz
+        from apps.cloud_mgr.models import CertDeployment, Certificate
+        from apps.cloud_mgr.tasks import reap_stuck
+        stuck = self._create_cert(name='stuck', status='issuing')
+        fresh = self._create_cert(name='fresh', status='issuing')
+        Certificate.objects.filter(pk=stuck.pk).update(
+            updated_at=tz.now() - Certificate.ISSUE_TIMEOUT - timedelta(minutes=1))
+        issued = self._create_cert(name='dep-cert', status='issued', cert_pem='C')
+        dep = CertDeployment.objects.create(
+            certificate=issued, target_type='server',
+            server=Server.objects.create(name='reap-01', private_ip='10.0.0.9'),
+            deploy_path='/etc/nginx/ssl', status='deploying',
+        )
+        CertDeployment.objects.filter(pk=dep.pk).update(
+            updated_at=tz.now() - CertDeployment.DEPLOY_TIMEOUT - timedelta(minutes=1))
+        self.assertEqual(reap_stuck(), (1, 1))
+        stuck.refresh_from_db(); fresh.refresh_from_db(); dep.refresh_from_db()
+        self.assertEqual(stuck.status, 'failed')
+        self.assertIn('超时未回执', stuck.last_error)
+        self.assertEqual(fresh.status, 'issuing')  # 未超时的不动
+        self.assertEqual(dep.status, 'failed')
+
     def test_renew_requires_issued(self):
         cert = self._create_cert(status='pending')
         admin = self._client()
@@ -671,6 +730,35 @@ class CertDeploymentApiTests(BaseApiTest):
         admin = self._client()
         self.assertEqual(admin.delete(f'/api/cloud/cert-deployments/{dep.id}/').status_code, 400)
         self.assertEqual(admin.post(f'/api/cloud/cert-deployments/{dep.id}/deploy/').status_code, 400)
+
+    def test_stuck_deploying_can_be_redeployed_and_deleted(self):
+        from datetime import timedelta
+        from django.utils import timezone as tz
+        from apps.cloud_mgr.models import CertDeployment
+        dep = self._create_deployment(status='deploying')
+        stale = tz.now() - CertDeployment.DEPLOY_TIMEOUT - timedelta(minutes=1)
+        CertDeployment.objects.filter(pk=dep.pk).update(updated_at=stale)
+        dep.refresh_from_db()
+        self.assertTrue(dep.deploy_stuck)
+        admin = self._client()
+        with patch('apps.cloud_mgr.deploy.run_subprocess', return_value=(0, 'ok')), \
+                self.settings(TASK_EXEC_BACKEND='sync'):
+            r = admin.post(f'/api/cloud/cert-deployments/{dep.id}/deploy/')
+        self.assertEqual(r.status_code, 200, r.content)
+        dep2 = self._create_deployment(status='deploying', deploy_path='/etc/nginx/ssl2')
+        CertDeployment.objects.filter(pk=dep2.pk).update(updated_at=stale)
+        self.assertEqual(admin.delete(f'/api/cloud/cert-deployments/{dep2.id}/').status_code, 200)
+
+    def test_deploy_non_deploy_exception_records_failure(self):
+        """非 CertDeployError 也必须落 failed，否则永久停在 deploying。"""
+        dep = self._create_deployment()
+        admin = self._client()
+        with patch('apps.cloud_mgr.tasks.run_deployment', side_effect=RuntimeError('ansible 进程炸了')), \
+                self.settings(TASK_EXEC_BACKEND='sync'):
+            admin.post(f'/api/cloud/cert-deployments/{dep.id}/deploy/')
+        dep.refresh_from_db()
+        self.assertEqual(dep.status, 'failed')
+        self.assertIn('RuntimeError', dep.last_error)
 
     def test_normal_user_read_only(self):
         dep = self._create_deployment()

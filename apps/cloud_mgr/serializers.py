@@ -189,13 +189,16 @@ class CertificateSerializer(serializers.ModelSerializer):
     has_private_key = serializers.SerializerMethodField()
     days_left = serializers.SerializerMethodField()
     deployment_count = serializers.IntegerField(source='deployments.count', read_only=True)
+    # 前端据此把「申请中」这条记录的按钮放开：卡住的 issuing 不该锁死操作面
+    issue_stuck = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = Certificate
         fields = [
             'id', 'name', 'domains', 'cloud_account', 'cloud_account_name', 'provider_code',
             'status', 'has_private_key', 'issued_at', 'expires_at', 'days_left',
-            'auto_renew', 'deployment_count', 'last_error', 'remark', 'created_at', 'updated_at',
+            'auto_renew', 'deployment_count', 'issue_stuck', 'last_error', 'remark',
+            'created_at', 'updated_at',
         ]
         read_only_fields = ['status', 'issued_at', 'expires_at', 'last_error']
 
@@ -246,6 +249,7 @@ class CertDeploymentSerializer(serializers.ModelSerializer):
     server_ip = serializers.CharField(source='server.conn_ip', read_only=True, default=None)
     credential_name = serializers.CharField(source='credential.name', read_only=True, default=None)
     target_type_display = serializers.CharField(source='get_target_type_display', read_only=True)
+    deploy_stuck = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = CertDeployment
@@ -253,7 +257,7 @@ class CertDeploymentSerializer(serializers.ModelSerializer):
             'id', 'certificate', 'certificate_name', 'target_type', 'target_type_display',
             'server', 'server_name', 'server_ip', 'credential', 'credential_name',
             'deploy_path', 'reload_cmd', 'auto_deploy',
-            'status', 'last_deployed_at', 'last_error', 'last_output',
+            'status', 'deploy_stuck', 'last_deployed_at', 'last_error', 'last_output',
             'created_at', 'updated_at',
         ]
         read_only_fields = ['status', 'last_deployed_at', 'last_error', 'last_output']

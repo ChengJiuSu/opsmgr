@@ -3,6 +3,8 @@
 第一期落地域名管理（云账号 + 主域名 + 子域名解析），证书模型先建表，
 申请/续签/分发链路在 P2/P3 实现。
 """
+from datetime import timedelta
+
 from django.conf import settings
 from django.db import models
 from django.utils import timezone
@@ -174,6 +176,11 @@ class Certificate(models.Model):
         ('expired', '已过期'),
     ]
 
+    # issuing 超过这个时长即视为「卡住」：签发跑在 gunicorn worker 的守护线程里，
+    # 进程重启 / worker 回收会把线程连同 issuing 状态一起留在库里，没人再来收尾。
+    # 真实签发（DNS 解析生效 + ACME 校验）最慢十几分钟，30 分钟外必然是残留。
+    ISSUE_TIMEOUT = timedelta(minutes=30)
+
     name = models.CharField('证书名称', max_length=100, unique=True)
     domains = models.JSONField('域名列表', default=list)
     cloud_account = models.ForeignKey(
@@ -205,6 +212,17 @@ class Certificate(models.Model):
     def __str__(self):
         return self.name
 
+    @property
+    def issue_stuck(self):
+        """issuing 已超时 = 执行线程没了，状态是残留。
+
+        stuck 的记录允许重新申请与删除，否则这条记录永久卡死（原来 issuing
+        既禁止重复触发又禁止删除，重启也不会自愈）。
+        """
+        if self.status != 'issuing' or not self.updated_at:
+            return False
+        return timezone.now() - self.updated_at > self.ISSUE_TIMEOUT
+
 
 class CertDeployment(models.Model):
     """证书分发目标。
@@ -228,6 +246,10 @@ class CertDeployment(models.Model):
         ('success', '成功'),
         ('failed', '失败'),
     ]
+
+    # 同 Certificate.ISSUE_TIMEOUT：deploying 也是守护线程里的状态，进程一重启就残留。
+    # ansible 推证书 + reload 是分钟级，15 分钟外算卡住。
+    DEPLOY_TIMEOUT = timedelta(minutes=15)
 
     certificate = models.ForeignKey(
         Certificate, verbose_name='证书', on_delete=models.CASCADE,
@@ -267,6 +289,13 @@ class CertDeployment(models.Model):
 
     def __str__(self):
         return f'{self.certificate.name} -> {self.get_target_type_display()}'
+
+    @property
+    def deploy_stuck(self):
+        """deploying 已超时 = 执行线程没了，允许重新分发。"""
+        if self.status != 'deploying' or not self.updated_at:
+            return False
+        return timezone.now() - self.updated_at > self.DEPLOY_TIMEOUT
 
 
 class DnsChangeLog(models.Model):

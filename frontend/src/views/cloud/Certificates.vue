@@ -35,6 +35,13 @@
           <el-tooltip v-if="row.status === 'failed'" :content="row.last_error" placement="top">
             <el-tag size="small" type="danger">申请失败</el-tag>
           </el-tooltip>
+          <el-tooltip
+            v-else-if="row.issue_stuck"
+            content="申请超过 30 分钟未回执，执行进程可能已重启。可重新申请或删除。"
+            placement="top"
+          >
+            <el-tag size="small" type="danger">申请超时</el-tag>
+          </el-tooltip>
           <el-tag v-else size="small" :type="STATUS_TAG[row.status]">
             {{ STATUS_LABELS[row.status] }}
             <el-icon v-if="row.status === 'issuing'" class="is-loading" style="margin-left:2px"><Loading /></el-icon>
@@ -77,11 +84,11 @@
       <el-table-column v-if="canWrite" label="操作" width="380" fixed="right">
         <template #default="{ row }">
           <el-button
-            v-if="['pending', 'failed'].includes(row.status)"
+            v-if="['pending', 'failed'].includes(row.status) || row.issue_stuck"
             size="small"
             type="primary"
             @click="handleIssue(row)"
-          >申请</el-button>
+          >{{ row.issue_stuck ? '重新申请' : '申请' }}</el-button>
           <el-button
             v-if="row.status === 'issued'"
             size="small"
@@ -224,6 +231,13 @@
         <template #default="{ row }">
           <el-tooltip v-if="row.status === 'failed'" :content="row.last_error" placement="top">
             <el-tag size="small" type="danger">失败</el-tag>
+          </el-tooltip>
+          <el-tooltip
+            v-else-if="row.deploy_stuck"
+            content="分发超过 15 分钟未回执，执行进程可能已重启。可重新分发。"
+            placement="top"
+          >
+            <el-tag size="small" type="danger">分发超时</el-tag>
           </el-tooltip>
           <el-tag v-else size="small" :type="DEPLOY_TAG[row.status]">
             {{ DEPLOY_LABELS[row.status] }}
@@ -405,7 +419,7 @@ onUnmounted(() => searchDebounced.cancel())
 let pollTimer = null
 function schedulePoll() {
   clearTimeout(pollTimer)
-  if (tableData.value.some((r) => r.status === 'issuing')) {
+  if (tableData.value.some((r) => r.status === 'issuing' && !r.issue_stuck)) {
     pollTimer = setTimeout(fetchData, 5000)
   }
 }
@@ -481,8 +495,11 @@ async function toggleAutoRenew(row, value) {
 }
 
 async function handleDelete(row) {
+  const stuckHint = row.issue_stuck
+    ? '该证书的申请任务已超时未回执（执行进程可能已重启），可直接删除。'
+    : ''
   await ElMessageBox.confirm(
-    `确定删除证书「${row.name}」吗？删除后本平台不再续签，已部署到服务器的副本不受影响。`,
+    `确定删除证书「${row.name}」吗？${stuckHint}删除后本平台不再续签，已部署到服务器的副本不受影响。`,
     '警告',
     { type: 'warning' },
   )
@@ -540,7 +557,7 @@ async function fetchDeployments() {
 let deployTimer = null
 function scheduleDeployPoll() {
   clearTimeout(deployTimer)
-  if (deployVisible.value && deployRows.value.some((r) => r.status === 'deploying')) {
+  if (deployVisible.value && deployRows.value.some((r) => r.status === 'deploying' && !r.deploy_stuck)) {
     deployTimer = setTimeout(fetchDeployments, 5000)
   }
 }

@@ -438,8 +438,8 @@ class CertificateViewSet(viewsets.ModelViewSet):
         serializer.save(created_by=self.request.user)
 
     def _validate_issuable(self, cert):
-        """签发前置校验：厂商支持 + 非 issuing。返回错误信息或 None。"""
-        if cert.status == 'issuing':
+        """签发前置校验：厂商支持 + 非 issuing（超时残留除外）。返回错误信息或 None。"""
+        if cert.status == 'issuing' and not cert.issue_stuck:
             return '证书正在申请中，请等待完成。'
         code = cert.cloud_account.provider.code
         if code not in supported_provider_codes():
@@ -519,7 +519,7 @@ class CertificateViewSet(viewsets.ModelViewSet):
             return fail('证书尚未签发，请先申请证书。')
         dispatched, skipped = [], []
         for deployment in cert.deployments.all():
-            if deployment.status == 'deploying':
+            if deployment.status == 'deploying' and not deployment.deploy_stuck:
                 skipped.append(f'{deployment} 正在分发中')
                 continue
             if deployment.target_type not in supported_target_types():
@@ -537,8 +537,11 @@ class CertificateViewSet(viewsets.ModelViewSet):
 
     def destroy(self, request, *args, **kwargs):
         cert = self.get_object()
-        if cert.status == 'issuing':
-            return fail('证书正在申请中，禁止删除。')
+        # issue_stuck（issuing 超时）放行：执行线程已随进程重启消失，不放行这条记录
+        # 就永久删不掉也重申请不了。
+        if cert.status == 'issuing' and not cert.issue_stuck:
+            minutes = int(Certificate.ISSUE_TIMEOUT.total_seconds() // 60)
+            return fail(f'证书正在申请中，禁止删除。若卡住，{minutes} 分钟后可删除或重新申请。')
         cert.delete()
         return ok(msg='已删除（acme 侧续签记录一并失效，不影响已部署副本）。')
 
@@ -581,7 +584,7 @@ class CertDeploymentViewSet(viewsets.ModelViewSet):
 
     def _validate_deployable(self, deployment):
         """分发前置校验，返回错误信息或 None。"""
-        if deployment.status == 'deploying':
+        if deployment.status == 'deploying' and not deployment.deploy_stuck:
             return '该目标正在分发中，请等待完成。'
         if deployment.target_type not in supported_target_types():
             return (f'{deployment.get_target_type_display()}证书分发暂未接入'
@@ -607,8 +610,9 @@ class CertDeploymentViewSet(viewsets.ModelViewSet):
 
     def destroy(self, request, *args, **kwargs):
         deployment = self.get_object()
-        if deployment.status == 'deploying':
-            return fail('该目标正在分发中，禁止删除。')
+        if deployment.status == 'deploying' and not deployment.deploy_stuck:
+            minutes = int(CertDeployment.DEPLOY_TIMEOUT.total_seconds() // 60)
+            return fail(f'该目标正在分发中，禁止删除。若卡住，{minutes} 分钟后可删除或重新分发。')
         deployment.delete()
         return ok(msg='已删除分发目标（目标机上已部署的证书文件不受影响）。')
 

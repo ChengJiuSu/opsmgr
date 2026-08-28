@@ -52,7 +52,7 @@ apps/cloud_mgr/
 | `/api/cloud/domains/{id}/sync_records/` | POST | 管理员 | 厂商侧全量镜像到本地；忽略 `_acme-challenge`；失败置域名 abnormal |
 | `/api/cloud/dns-records/?domain=` | CRUD | 管理员写/登录读 | 创建/更新/删除即时推送厂商；远端删除失败时本地保留 |
 | `/api/cloud/dns-records/{id}/retry_sync/` | POST | 管理员 | 重推 pending/failed 记录 |
-| `/api/cloud/certificates/` | CRUD | 管理员写/登录读 | 已签发锁定域名与验证账号；issuing 禁止删除 |
+| `/api/cloud/certificates/` | CRUD | 管理员写/登录读 | 已签发锁定域名与验证账号；issuing 禁止删除（超时残留放行） |
 | `/api/cloud/certificates/{id}/issue/` | POST | 管理员 | 后台异步签发（thread/celery，同 TASK_EXEC_BACKEND）；已签发等价强制重签 |
 | `/api/cloud/certificates/{id}/renew/` | POST | 管理员 | 强制重签（--force），仅 issued 状态 |
 | `/api/cloud/certificates/{id}/download/` | GET | 仅管理员 | zip 包，内含一层 `<名称>/` 目录（`.crt` / `.key` / `.fullchain.pem` + README.txt），`Cache-Control: no-store` |
@@ -105,6 +105,18 @@ cert-deployments `certificate`、`target_type`、`status`。
   （失败回退 +90 天）。子进程清代理环境变量（同 DNS 适配层口径）。
 - **调度**：`dispatch_issue` 按 `TASK_EXEC_BACKEND`（thread 默认 / celery / sync），
   状态机 pending/failed → issuing → issued/failed，issuing 禁止重复触发与删除。
+- **卡住自愈**（必须有，别删）：签发跑在 gunicorn worker 的守护线程里，进程重启 /
+  worker 回收会把线程杀掉，`issuing` 就永久留在库里；而 issuing 同时禁止重复触发
+  与删除，那条记录等于死锁——重启不自愈，反而正是重启制造的。三处一起兜：
+  1. `run_issue` / `run_deploy` 除 `AcmeError` / `CertDeployError` 外再 `except Exception`
+     兜底落 `failed`（漏一个异常就是一条永久 issuing）；
+  2. `Certificate.issue_stuck`（`updated_at` 超 `ISSUE_TIMEOUT`=30min）与
+     `CertDeployment.deploy_stuck`（`DEPLOY_TIMEOUT`=15min）：超时即视为残留，
+     视图放行重新申请/分发与删除，序列化器回传给前端换「申请超时/分发超时」标签
+     并停轮询；
+  3. `tasks.reap_stuck()` 把超时残留批量标 `failed`，命令
+     `python manage.py reap_stuck_cert_tasks`（建议 cron 每 10 分钟），
+     beat 续签任务里也先跑一次。
 - **自动续签**：`cloud_mgr.renew_expiring_certificates`（CELERY_BEAT_SCHEDULE 每 24h），
   auto_renew 且距过期 < `CERT_RENEW_BEFORE_DAYS`(30) 天的 issued 证书强制重签；
   未跑 beat 时手动续签不受影响。

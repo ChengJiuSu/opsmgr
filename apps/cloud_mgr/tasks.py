@@ -5,6 +5,8 @@
 - run_deploy：同步执行一个分发目标并落库（deploying → success/failed）；
 - dispatch_issue / dispatch_deploy：按 TASK_EXEC_BACKEND 调度
   （thread 默认 / celery / sync），与 task_exec 同口径；
+- reap_stuck：把超时残留的 issuing / deploying 标为 failed（进程重启会杀掉守护线程，
+  状态留在库里没人收尾），进程启动时执行一次 + reap_stuck_cert_tasks 命令挂 cron；
 - renew_expiring_certificates：celery beat 每日任务，auto_renew 且
   距过期不足 CERT_RENEW_BEFORE_DAYS 天的已签发证书强制重签。
 """
@@ -33,6 +35,14 @@ def run_issue(certificate_id, force=False):
         cert.last_error = str(e)
         cert.save(update_fields=['status', 'last_error', 'updated_at'])
         logger.error('证书 %s 签发失败：%s', cert.name, e)
+        return
+    except Exception as e:  # noqa: BLE001 - 兜底，见下
+        # 非 AcmeError（厂商 SDK 报错、网络异常、编码问题……）也必须落 failed：
+        # 漏一个异常就等于状态永久停在 issuing——线程死了没人收尾，重启也不自愈。
+        cert.status = 'failed'
+        cert.last_error = f'签发异常：{e.__class__.__name__}: {e}'
+        cert.save(update_fields=['status', 'last_error', 'updated_at'])
+        logger.exception('证书 %s 签发异常', cert.name)
         return
     cert.cert_pem = cert_pem
     cert.private_key_pem = key_pem
@@ -101,6 +111,12 @@ def run_deploy(deployment_id):
         deployment.save(update_fields=['status', 'last_error', 'updated_at'])
         logger.error('证书 %s 分发到 %s 失败：%s', cert.name, deployment, e)
         return
+    except Exception as e:  # noqa: BLE001 - 同 run_issue：不落 failed 就永久 deploying
+        deployment.status = 'failed'
+        deployment.last_error = f'分发异常：{e.__class__.__name__}: {e}'
+        deployment.save(update_fields=['status', 'last_error', 'updated_at'])
+        logger.exception('证书 %s 分发到 %s 异常', cert.name, deployment)
+        return
     deployment.status = 'success'
     deployment.last_error = ''
     deployment.last_output = output[-4000:]
@@ -154,6 +170,41 @@ def renew_expiring(now=None):
     return triggered
 
 
+def reap_stuck(now=None):
+    """把超时残留的 issuing / deploying 标为 failed，返回 (证书数, 分发数)。
+
+    签发/分发跑在守护线程里，gunicorn 重启或 worker 回收会把线程杀掉，库里的
+    issuing / deploying 就永久留着——而 issuing 同时禁止重复触发与删除，那条
+    记录等于死锁。进程启动时跑一次 + cron 兜底，状态就能自愈。
+    """
+    from .models import CertDeployment, Certificate
+
+    now = now or timezone.now()
+    cert_qs = Certificate.objects.filter(
+        status='issuing', updated_at__lt=now - Certificate.ISSUE_TIMEOUT,
+    )
+    certs = list(cert_qs)
+    for cert in certs:
+        logger.warning('证书 %s 的 issuing 状态已超时残留，标为失败', cert.name)
+    cert_count = cert_qs.update(
+        status='failed',
+        last_error=f'签发任务超时未回执（超过 {int(Certificate.ISSUE_TIMEOUT.total_seconds() // 60)} 分钟），'
+                   f'执行进程可能已重启。请重新申请。',
+        updated_at=now,
+    )
+
+    deploy_qs = CertDeployment.objects.filter(
+        status='deploying', updated_at__lt=now - CertDeployment.DEPLOY_TIMEOUT,
+    )
+    deploy_count = deploy_qs.update(
+        status='failed',
+        last_error=f'分发任务超时未回执（超过 {int(CertDeployment.DEPLOY_TIMEOUT.total_seconds() // 60)} 分钟），'
+                   f'执行进程可能已重启。请重新分发。',
+        updated_at=now,
+    )
+    return cert_count, deploy_count
+
+
 # ── Celery 任务（仅在已安装 celery 时可用）─────────────────
 try:
     from celery import shared_task
@@ -169,6 +220,7 @@ try:
     @shared_task(name='cloud_mgr.renew_expiring_certificates')
     def renew_expiring_certificates():
         """beat 每日调度：见 settings CELERY_BEAT_SCHEDULE。"""
+        reap_stuck()  # 续签前先收残留，否则 stuck 的证书永远扫不到
         return renew_expiring()
 
 except ImportError:  # celery 未安装时提供占位
