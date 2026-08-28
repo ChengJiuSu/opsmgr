@@ -19,7 +19,7 @@
 | `LOGIN_FAIL_IP_LIMIT` | `50` | 同一客户端 IP 的失败上限（办公网共用出口 IP，刻意宽松）|
 | `LOGIN_FAIL_WINDOW` | `900` | 失败计数窗口（秒）|
 | `LOGIN_FAIL_BLOCK` | `900` | 触发后的锁定时长（秒）|
-| `SECRET_ENC_KEY` | 空（回退 `MFA_SECRET_KEY` 再回退 `SECRET_KEY`）| **库内可还原秘密的统一加密 key**：执行变量敏感值、TOTP 密钥等共用（`common/crypto.py`）。**换 key 会让已入库密文全部解不开**（表现为 MFA 校验失败、任务执行报变量解密失败），换前必须先导出重新加密 |
+| `SECRET_ENC_KEY` | 空（回退 `MFA_SECRET_KEY` 再回退 `SECRET_KEY`）| **库内可还原秘密的统一加密 key**（`common/crypto.py` + `common/fields.py`）：连接凭据的密码/私钥/提权密码、云账号 AccessKey Secret、证书私钥、敏感执行变量、TOTP 密钥。**首次上线必须在 `migrate` 之前配好**——留空会用 `SECRET_KEY` 派生，之后轮换 `SECRET_KEY` 会让上述数据全部解不开（表现为 SSH 认证失败、MFA 校验失败、任务执行报变量解密失败）。它**不是**调用方的 API Key（那是「API 凭证」签发的 `ak_xxx.yyy`，只存哈希） |
 | `MFA_SECRET_KEY` | 空（回退 `SECRET_KEY`）| 历史名字（那时唯一使用者是 MFA），保留以免存量部署换名后密文解不开。新部署配 `SECRET_ENC_KEY`。TOTP 密钥的加密 key。**换掉会让已绑定用户的密钥全部解不开**（需管理员重置绑定），生产建议显式配置并与 `SECRET_KEY` 分开轮换 |
 | `MFA_ISSUER` | `OpsManager` | 验证器 App 里显示的归属名 |
 | `MFA_CHALLENGE_TTL` | `300` | 登录第一步返回的挑战票据有效期（秒）|
