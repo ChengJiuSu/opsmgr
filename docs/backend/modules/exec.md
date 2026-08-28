@@ -107,7 +107,7 @@ ansible-playbook site.yml -e @vars.yml
 | 值语义 | 按**字面字符串**注入，不过 YAML 解析。密码里的 `#` 会被 YAML 当注释截断、`k: v` 会被解析成字典，这类静默改值比报错难查得多 |
 | 执行输出 | 已知明文在进库/落盘/WebSocket 前替换为 `***`（`live.mask_secrets`）|
 | 现场归档 | `vars.yml` 与 `command.txt` 打码后落盘（归档保留期比一次执行长得多）|
-| 对外 resolved | **默认排除**；`include_secrets=true` 仅管理员可用，响应里 `secret_keys_excluded` 告知被排除的变量名 |
+| 对外 resolved | **默认排除**；`include_secrets=true` 登录用户需 `variable` 写档 **+ sudo 窗口**（与 `reveal` 同一道口径——那里看一个变量的真值都要 sudo，这里一次拉回该维度全部密码类变量），机读凭证需 `variable:secret` 作用域（凭证不走 sudo，它的门是 key + IP 白名单 + 作用域）；响应里 `secret_keys_excluded` 告知被排除的变量名 |
 | 审计请求体 | `/api/exec/variables/` 的 `value` 一律打码（`audit.middleware.PATH_SENSITIVE_KEYS`）|
 
 打码为什么放在输出汇聚层而不是靠剧本写 `no_log`：剧本不是平台写的，指望每个

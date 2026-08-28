@@ -2575,15 +2575,47 @@ class SecretVariableTests(TestCase):
         self.assertNotIn('db_password', data['vars'])
         self.assertEqual(data['secret_keys_excluded'], ['db_password'])
 
-    def test_resolved_include_secrets_admin_only(self):
+    def test_resolved_include_secrets_needs_variable_write(self):
+        """要真值须有 variable 写档，与 reveal 同一道口径（不是 is_staff）。"""
+        from apps.auth_mgr.models import Role
+
         self._create()
         query = (f'?project_group={self.pg.code}&channel={self.ch.code}'
                  f'&env={self.env.code}&include_secrets=true')
+        grant_sudo(self.client)  # 看真值要 sudo 窗口（与 reveal 一致）
         r = self.client.get(f'/api/exec/variables/resolved/{query}')
         self.assertEqual(r.json()['data']['vars']['db_password'], self.SECRET)
 
+        # 只读档（无角色非 staff 回退到「普通运维」矩阵，variable=read）拿不到
         member = self._client('var_member')
         self.assertEqual(member.get(f'/api/exec/variables/resolved/{query}').status_code, 403)
+
+        # 配了 variable 写档的非 staff 角色能拿——以前这里判 is_staff，
+        # 同一个人在 reveal 看得到、在这里被拒
+        role = Role.objects.create(
+            name='变量管理', code='var_writer', permissions={'variable': 'write'})
+        writer = User.objects.create(username='var_writer', is_staff=False, role=role)
+        writer.set_password('Pass!2345xyz')
+        writer.save()
+        writer_client = self._client('var_writer')
+        grant_sudo(writer_client, 'Pass!2345xyz')
+        r = writer_client.get(f'/api/exec/variables/resolved/{query}')
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(r.json()['data']['vars']['db_password'], self.SECRET)
+
+    def test_resolved_include_secrets_needs_sudo(self):
+        """一次拉回该维度下全部密码类变量，暴露面比 reveal 单个还大，同样要 sudo。"""
+        self._create()
+        query = (f'?project_group={self.pg.code}&channel={self.ch.code}'
+                 f'&env={self.env.code}&include_secrets=true')
+        fresh = self._client('var_admin')  # 新会话，未开 sudo 窗口
+        r = fresh.get(f'/api/exec/variables/resolved/{query}')
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()['error_code'], 'sudo_required')
+        # 不带 include_secrets 的普通读取不受影响（脚本日常调的就是这条）
+        plain = (f'?project_group={self.pg.code}&channel={self.ch.code}'
+                 f'&env={self.env.code}')
+        self.assertEqual(fresh.get(f'/api/exec/variables/resolved/{plain}').status_code, 200)
 
     # ── 输出打码 ──────────────────────────────────────────
     def test_mask_secrets_longest_first(self):

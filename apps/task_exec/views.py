@@ -24,6 +24,7 @@ from apps.auth_mgr.authentication import MfaJWTAuthentication
 from common.ansible import resolve_within
 from common.crypto import DecryptError
 from apps.auth_mgr.permissions import module_perm
+from common import sudo
 from common.response import fail, ok
 from common.sudo import SudoRequired
 
@@ -203,17 +204,27 @@ class ExecVariableViewSet(viewsets.ModelViewSet):
             return fail(f'你的数据范围不含该维度（当前范围：{request.user.scope_label}）',
                         status=403)
 
-        # 敏感变量默认不下发：这个接口普通登录用户也能调，全量返回等于任何账号
-        # 拉一次就把密码全拿走。要真值必须显式 include_secrets=true，且
-        # 登录用户须是管理员 / 机读凭证须另有 variable:secret 作用域
+        # 敏感变量默认不下发：这个接口只读档也能调，全量返回等于任何账号拉一次就把
+        # 密码全拿走。要真值必须显式 include_secrets=true，且：
+        # 登录用户须有 variable 写档（与 variables/{id}/reveal/ 同一道口径，
+        # 那里也是写档 —— 看真值是同一件事，不该因为换个接口就换成另一套判定）；
+        # 机读凭证须另有 variable:secret 作用域。
+        # 这里刻意不再判 is_staff：角色矩阵落地后 is_staff 只是 Django 后台入口与
+        # 无角色时的回退依据，拿它当权限判据会让「配了 variable=write 的非 staff
+        # 角色」在 reveal 能看、在这里被拒
         include_secrets = request.query_params.get('include_secrets') == 'true'
         if include_secrets:
             if credential is not None:
                 if not credential.has_scope('variable:secret'):
                     return fail(f'凭证「{credential.name}」缺少作用域：variable:secret',
                                 status=403)
-            elif not request.user.is_staff:
-                return fail('include_secrets 仅管理员可用', status=403)
+            elif not roles.user_can(request.user, 'variable', 'PUT'):
+                return fail('include_secrets 需要「执行变量」模块的读写权限', status=403)
+            elif not sudo.is_active(request.user.pk, sudo.token_jti(request)):
+                # 与 reveal 对齐：那里看**一个**变量的真值都要 sudo，这里一次拉回
+                # 该维度下**全部**密码类变量，暴露面只会更大。SudoRequired 权限类
+                # 放行所有 GET，管不到这个查询参数，所以在这里显式判一次
+                raise sudo.SudoRequiredError()
         variables = collect_dim_variables(dims['project_group'].id, dims['channel'].id,
                                           dims['environment'].id,
                                           include_secrets=include_secrets)
