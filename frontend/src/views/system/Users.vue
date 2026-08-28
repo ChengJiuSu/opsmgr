@@ -62,7 +62,10 @@
       <el-table-column label="操作" width="340" fixed="right">
         <template #default="{ row }">
           <el-button size="small" :icon="Edit" @click="openDialog(row)">编辑</el-button>
-          <el-button size="small" :icon="Key" @click="openResetDialog(row)">重置密码</el-button>
+          <el-button
+            v-if="!row.is_service"
+            size="small" :icon="Key" @click="openResetDialog(row)"
+          >重置密码</el-button>
           <el-button
             v-if="row.mfa_enabled"
             size="small"
@@ -96,7 +99,7 @@
       <el-form-item label="用户名" prop="username">
         <el-input v-model="form.username" :disabled="!!editRow" />
       </el-form-item>
-      <el-form-item label="密码" :prop="editRow ? '' : 'password'">
+      <el-form-item v-if="!isService" label="密码" :prop="editRow ? '' : 'password'">
         <el-input
           v-model="form.password"
           type="password"
@@ -114,13 +117,20 @@
         <el-input v-model="form.department" />
       </el-form-item>
       <el-form-item label="角色">
-        <el-select v-model="form.role" clearable placeholder="未配置（按「管理员」开关回退）" style="width:100%">
+        <el-select
+          v-if="!isService"
+          v-model="form.role" clearable placeholder="未配置（按「管理员」开关回退）" style="width:100%"
+        >
           <el-option
             v-for="r in roleOptions" :key="r.id"
             :label="`${r.name}（${r.code}）`" :value="r.id"
           />
         </el-select>
-        <div class="tip">
+        <div v-if="isService" class="tip">
+          服务账号不配角色（后端一律拒绝）。机读授权只看凭证的<b>作用域</b>、IP 白名单与
+          凭证数据范围，角色矩阵对机读调用不生效 —— 要收窄这把 key，去「API 凭证」页改作用域。
+        </div>
+        <div v-else class="tip">
           角色决定各模块的读写档位与执行能力。留空时按下面的「管理员」开关回退
           —— 存量账号不必立刻配角色。
         </div>
@@ -168,7 +178,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { debounce } from '../../utils/debounce'
 import { Plus, Edit, Delete, Search, Key } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -189,6 +199,8 @@ const filter = reactive({ keyword: '', is_active: '', include_service: false })
 
 const dialogVisible = ref(false)
 const editRow = ref(null)
+// 服务账号（API 凭证的审计身份）：密码与角色后端一律拒绝，表单里就不该给这两个控件
+const isService = computed(() => !!editRow.value?.is_service)
 const formRef = ref()
 const emptyForm = () => ({
   username: '', password: '', email: '', phone: '',
@@ -257,6 +269,7 @@ async function handleSubmit() {
   try {
     const payload = { ...form }
     if (editRow.value && !payload.password) delete payload.password
+    if (isService.value) { delete payload.password; delete payload.role }
     if (editRow.value) {
       await updateUser(editRow.value.id, payload)
       ElMessage.success('更新成功')
