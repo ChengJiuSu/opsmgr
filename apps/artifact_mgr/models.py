@@ -22,11 +22,16 @@ FILENAME_RE = re.compile(r'^[A-Za-z0-9._-]{1,255}$')
 logger = logging.getLogger('apps.artifact_mgr')
 
 
-def _api_key():
-    """制品上报/下载签名共用的 API Key：系统配置优先，环境变量兜底。"""
-    from apps.system_cfg.services import get_config
+def _sign_key():
+    """制品下载签名密钥：ARTIFACT_SIGN_KEY → SECRET_ENC_KEY → SECRET_KEY。
 
-    return get_config('artifact.api_key') or os.environ.get('ARTIFACT_API_KEY', '')
+    原来复用系统配置 `artifact.api_key`——那把 key 同时是上报凭据，随 API 凭证
+    上线已下线。签名与上报本来就是两件事，共用一个值只是历史巧合：轮换上报凭据
+    会顺带作废所有下载签名，而这两件事的轮换节奏完全不同。
+    """
+    return (getattr(settings, 'ARTIFACT_SIGN_KEY', '')
+            or getattr(settings, 'SECRET_ENC_KEY', '')
+            or settings.SECRET_KEY)
 
 
 class Artifact(models.Model):
@@ -107,12 +112,16 @@ class Artifact(models.Model):
         return removed
 
     def download_sig(self):
-        """下载签名：hmac_sha256(api_key, "{id}:{md5}")。
+        """下载签名：hmac_sha256(签名密钥, "{id}:{md5}")。
 
         注入到 CD 变量的 package_url 携带该签名，目标主机免登录拉包，
-        原始 API Key 不出现在 URL 与执行日志中。
+        签名密钥不出现在 URL 与执行日志中。
+
+        签名不含有效期：URL 泄露就一直可用。当前可接受——它只能下载这一个制品，
+        且 md5 进了签名，改 id 或换文件都会失配。真要收紧就在签名里加时间戳并在
+        校验侧比对，那会改变 URL 格式与 CD 剧本的消费方式，届时一并评估。
         """
-        key = _api_key()
+        key = _sign_key()
         if not key:
             return ''
         return hmac.new(key.encode(), f'{self.id}:{self.md5}'.encode(), hashlib.sha256).hexdigest()

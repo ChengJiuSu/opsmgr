@@ -416,6 +416,12 @@ TASK_LOG_COLOR = config('TASK_LOG_COLOR', default=True, cast=bool)
 ARTIFACT_ROOT = config('ARTIFACT_ROOT', default=str(MEDIA_ROOT / 'artifacts'))
 # 平台对外基础地址：拼接制品带签名下载 URL（CD 目标主机经此拉包），生产必须配置
 SITE_BASE_URL = config('SITE_BASE_URL', default='http://127.0.0.1:8000')
+# 制品下载签名密钥（Artifact.download_sig）。原来复用系统配置 artifact.api_key
+# ——那把 key 同时是上报凭据，随 API 凭证上线已下线，签名必须有自己的来源。
+# 留空按 SECRET_ENC_KEY → SECRET_KEY 回退（common/crypto 同一条链）。
+# **换掉会让已签发但还没用掉的下载 URL 失效**：这些 URL 在执行时现算现用，
+# 影响面只限于换 key 那一刻正在跑的 CD。
+ARTIFACT_SIGN_KEY = config('ARTIFACT_SIGN_KEY', default='')
 # 制品保留期（天）：clean_artifacts 命令据此清理过期制品记录与文件。
 # 制品是「一条记录一个几百 MB 的包」，只增不减会把盘写满，而写满的表现是
 # 上报 500 与任务执行一起挂（同一个磁盘），所以这个清理不是可选项。

@@ -177,8 +177,8 @@ class ApiCredential(models.Model):
     """机读接口凭证：内部脚本 / Webhook 免登录调用平台接口的身份。
 
     替代原来那把「全局唯一、明文存 SystemConfig、无过期无作用域无来源限制」
-    的 `artifact.api_key`：一把 key 被所有脚本共用时，轮换要同时改所有调用方，
-    泄露了也无法定位是哪个脚本漏的。
+    的 `artifact.api_key`（已删除）：一把 key 被所有脚本共用时，轮换要同时改所有
+    调用方，泄露了也无法定位是哪个脚本漏的。
 
     四道门叠加，任一不过即拒（校验实现见 apps/auth_mgr/apikey.py）：
 
@@ -287,8 +287,8 @@ class ApiCredential(models.Model):
     def split_key(cls, raw):
         """明文 → (key_id, secret)；不是本系统的 key 格式返回 (None, None)。
 
-        返回 None 让认证类原样放行给下一个认证方式/旧 key 兜底，而不是报错——
-        废弃期内老的 `artifact.api_key` 还在同一个请求头里传。
+        返回 (None, None) 而不是报错：请求可能压根没带 key，或走的是另一种认证
+        方式（同一个视图上还挂着 JWT 认证类），交给后续认证类判更准确。
         """
         raw = str(raw or '').strip()
         if not raw.startswith(cls.KEY_PREFIX) or cls.KEY_SEP not in raw:

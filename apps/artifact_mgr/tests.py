@@ -23,7 +23,11 @@ from .models import Artifact
 
 User = get_user_model()
 
-API_KEY = 'test-artifact-key'
+#: 已下线的全局 key，只用于「不该再被接受」的回归断言
+LEGACY_KEY = 'test-artifact-key'
+
+#: _report 的哨兵：区分「不传 api_key（用基类凭证）」与「显式传 None（不带头）」
+_DEFAULT = object()
 ARTIFACT_TMP = tempfile.mkdtemp(prefix='artifact_test_')
 
 
@@ -35,7 +39,14 @@ class ArtifactTestBase(TestCase):
         shutil.rmtree(ARTIFACT_TMP, ignore_errors=True)
 
     def setUp(self):
-        SystemConfig.objects.create(key='artifact.api_key', value=API_KEY)
+        # 上报走 API 凭证（旧的全局 artifact.api_key 已下线）。基类这把不限来源 IP，
+        # 白名单与作用域的拦截由 ArtifactApiCredentialTests 单独覆盖
+        raw, key_id, secret_hash = ApiCredential.generate_key()
+        self.credential = ApiCredential.objects.create(
+            name='at-base', key_id=key_id, secret_hash=secret_hash,
+            scopes=['artifact:report', 'artifact:download'],
+            ip_unrestricted=True, bound_user=ensure_service_user('at-base'))
+        self.api_key = raw
         self.pg = ProjectGroup.objects.create(name='主项目', code='at-proj')
         self.ch = Channel.objects.create(name='官服', code='at-official')
         self.env = Environment.objects.create(name='测试环境', code='at-test')
@@ -50,13 +61,15 @@ class ArtifactTestBase(TestCase):
         c.credentials(HTTP_AUTHORIZATION='Bearer ' + r.json()['access'])
         return c
 
-    def _report(self, content=b'package-bytes', version='1.0.0', api_key=API_KEY, **extra):
+    def _report(self, content=b'package-bytes', version='1.0.0', api_key=_DEFAULT, **extra):
         data = {
             'file': SimpleUploadedFile(extra.pop('filename', 'app.tar.gz'), content),
             'project_group': self.pg.code, 'channel': self.ch.code, 'environment': self.env.code,
             'version': version,
         }
         data.update(extra)
+        if api_key is _DEFAULT:
+            api_key = self.api_key
         headers = {'HTTP_X_API_KEY': api_key} if api_key else {}
         return APIClient().post('/api/artifacts/report/', data, format='multipart', **headers)
 
@@ -93,14 +106,23 @@ class ArtifactReportTests(ArtifactTestBase):
         self.assertEqual(Artifact.objects.count(), 1)
 
     def test_report_requires_api_key(self):
-        # 401 而不是 403：接口现在挂了 ApiKeyAuthentication（带 authenticate_header），
-        # 「没带/带错凭证」按未认证算，语义比原来的 403 更准
+        # 401 而不是 403：接口挂了 ApiKeyAuthentication（带 authenticate_header），
+        # 「没带/带错凭证」按未认证算
         self.assertEqual(self._report(api_key=None).status_code, 401)
         self.assertEqual(self._report(api_key='wrong-key').status_code, 401)
 
-    def test_report_rejects_key_when_unconfigured(self):
-        SystemConfig.objects.all().delete()
-        os.environ.pop('ARTIFACT_API_KEY', None)
+    def test_legacy_global_key_no_longer_accepted(self):
+        """回归测试：旧的全局 artifact.api_key 兜底已删除，不能被谁又加回来。
+
+        那把 key 全脚本共用、无来源限制、无作用域，且同时兼着下载签名密钥
+        ——轮换一次会顺带作废所有下载 URL。
+        """
+        SystemConfig.objects.create(key='artifact.api_key', value=LEGACY_KEY)
+        self.assertEqual(self._report(api_key=LEGACY_KEY).status_code, 401)
+
+    def test_disabled_credential_rejected(self):
+        self.credential.enabled = False
+        self.credential.save(update_fields=['enabled'])
         self.assertEqual(self._report().status_code, 401)
 
     def test_report_rejects_path_traversal_version(self):
@@ -205,10 +227,7 @@ class ArtifactModelTests(ArtifactTestBase):
 
 @override_settings(ARTIFACT_ROOT=ARTIFACT_TMP, TRUSTED_PROXIES=['127.0.0.1'])
 class ArtifactApiCredentialTests(ArtifactTestBase):
-    """上报/下载走新的 API 凭证：作用域与 IP 白名单都要真的拦住。
-
-    旧的全局 artifact.api_key 兜底路径由 ArtifactReportTests 覆盖，废弃期内两者并存。
-    """
+    """上报/下载的作用域、IP 白名单与数据范围都要真的拦住。"""
 
     ALLOWED_IP = '203.0.113.9'
 

@@ -25,7 +25,6 @@ from apps.auth_mgr.permissions import module_perm
 from common.response import fail, ok
 
 from .models import Artifact
-from .permissions import HasArtifactAPIKey
 from .serializers import ArtifactReportSerializer, ArtifactSerializer
 
 logger = logging.getLogger('apps.artifact_mgr')
@@ -76,14 +75,14 @@ class ArtifactReportView(APIView):
     流式写盘同时计算 md5；上报 md5 不一致时删除文件并报错；
     同 项目组/渠道/环境/版本 已存在则拒绝（409），避免制品被静默覆盖。
 
-    鉴权：优先走 API 凭证（key + IP 白名单 + `artifact:report` 作用域）；
-    带的是旧的全局 `artifact.api_key` 时回退到 HasArtifactAPIKey，便于存量
-    Jenkins 任务平滑换 key（回退命中会打 warning，据此盘点剩余调用方）。
-    废弃期结束后删掉 HasArtifactAPIKey 与系统配置项即可。
+    鉴权：API 凭证（key + IP 白名单 + `artifact:report` 作用域 + 数据范围）。
+    旧的全局 `artifact.api_key` 兜底已于废弃期结束后删除——那把 key 全脚本共用、
+    无来源限制、轮换要同时改所有调用方，且它同时兼着下载签名密钥，轮换一次会顺带
+    作废所有下载 URL。
     """
 
     authentication_classes = [ApiKeyAuthentication]
-    permission_classes = [scope_required('artifact:report') | HasArtifactAPIKey]
+    permission_classes = [scope_required('artifact:report')]
     throttle_classes = [ApiKeyThrottle]
     parser_classes = [MultiPartParser, FormParser]
 

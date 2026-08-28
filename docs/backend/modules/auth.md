@@ -247,7 +247,7 @@ GET  /api/auth/mfa/sudo/                          → {active, ttl, mfa_enabled}
 | `agent_mgr.AgentNodeViewSet` | 建 agent 发一次性 token，重置 token 顶掉现有连接 |
 | `agent_mgr.AgentRouteViewSet` | 改路由 = 改命令下发到哪台机器执行 |
 | `cloud_mgr.CloudAccountViewSet` | 云 AK/SK |
-| `system_cfg.SystemConfigViewSet` | 存着 `jenkins.api_token`、`artifact.api_key`、`mfa.enforce_scope` |
+| `system_cfg.SystemConfigViewSet` | 存着 `jenkins.api_token`、`mfa.enforce_scope` 等全站安全策略 |
 | `asset_mgr.ServerViewSet`（仅 PUT/PATCH/DELETE）| `channel_mode`/`agent` 决定命令下发到哪台机器执行，与通道路由同性质。**新增不拦**——新加的主机不会改变已有主机的执行通道（`common.sudo.required_for()` 生成只管指定方法的权限类）|
 | `asset_mgr` 批量改/删、导入 | 一次能动一批主机的执行通道 |
 
@@ -386,7 +386,7 @@ PUT/PATCH/DELETE → `write`；未知方法当 `write`（fail-closed）。
 ### 顺带修掉的一个漏配
 
 系统配置接口原来是 `IsAuthenticated + SudoRequired`——**任何登录用户过了 sudo 就能改**
-`jenkins.api_token` / `artifact.api_key` / `mfa.enforce_scope`。随矩阵一并收到
+`jenkins.api_token` / `mfa.enforce_scope`。随矩阵一并收到
 `system` 模块 write。
 
 ---
@@ -396,7 +396,7 @@ PUT/PATCH/DELETE → `write`；未知方法当 `write`（fail-closed）。
 给**内部脚本与 Webhook** 用的免登录通道。它们没有浏览器、不做 MFA、也不该拿一条能干
 所有事的 JWT。
 
-替代的是原来那把全局 `artifact.api_key`：一把 key 被所有脚本共用，轮换要同时改所有
+替代的是原来那把全局 `artifact.api_key`（已下线）：一把 key 被所有脚本共用，轮换要同时改所有
 调用方，泄露了也无法定位是哪个脚本漏的，且没有来源限制。
 
 ### 四道门（apps/auth_mgr/apikey.py）
@@ -561,12 +561,18 @@ curl -H "X-API-KEY: ak_xxx.yyy" -H 'Content-Type: application/json' \
     --name ci-jenkins --scopes artifact:report --ip 10.0.1.0/24
 ```
 
-### 存量迁移
+### 存量迁移（已完成）
 
-`artifact.api_key` 保留一个废弃期：`ArtifactReportView` 的权限类是
-`scope_required('artifact:report') | HasArtifactAPIKey`，带旧 key 仍能上报，但会打
-`WARNING`（据此盘点还有谁没换）。存量清零后删掉 `apps/artifact_mgr/permissions.py`、
-系统配置项与视图上的兜底权限类即可。
+`artifact.api_key` 的废弃期兜底已删除：`apps/artifact_mgr/permissions.py`、视图上的
+`| HasArtifactAPIKey` 与系统配置项都不再存在，`ArtifactReportView` 只认
+`scope_required('artifact:report')`。
+
+一个连带项：那把 key 同时兼着制品下载签名密钥，下线时把签名迁到了独立的
+`ARTIFACT_SIGN_KEY`（回退 `SECRET_ENC_KEY` → `SECRET_KEY`），见
+`docs/backend/modules/artifacts.md`。
+
+`apps/artifact_mgr/tests.py` 留了一条回归断言：即使有人把 `artifact.api_key`
+写回系统配置，带它上报仍然 401。
 
 ---
 

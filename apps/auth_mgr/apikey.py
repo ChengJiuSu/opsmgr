@@ -99,8 +99,7 @@ class ApiKeyAuthentication(BaseAuthentication):
     """X-API-KEY 认证：定位凭证 → 比对 secret → 过期 → IP → 验签。
 
     请求头里不是本系统 key 格式（`ak_` 开头）时返回 None，把请求交给下一个
-    认证方式或旧 key 兜底权限类——废弃期内老的 `artifact.api_key` 还在用同一
-    个请求头传值。
+    认证方式（同一个视图上可能还挂着 JWT 认证类）——请求也可能压根没带 key。
 
     认证成功返回 `(凭证绑定的服务账号, 凭证对象)`。返回真实 User 而不是自造的
     匿名身份，是为了让审计中间件（按 request.user 落 FK）与既有权限类原样生效。

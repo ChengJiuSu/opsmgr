@@ -30,7 +30,6 @@
 | `jenkins.user` | Jenkins 用户名（直连模式用） |
 | `jenkins.api_token` | 该用户的 API Token（用户设置 → API Token 生成；直连模式用） |
 | `jenkins.agent` | 经 Agent 触发时的默认 Agent 名（manager 在公网、Jenkins 在内网时配置；留空 = 直连） |
-| `artifact.api_key` | 制品上报/下载签名 API Key（自定义随机长串；环境变量 `ARTIFACT_API_KEY` 兜底） |
 
 settings：`ARTIFACT_ROOT`（制品落盘根目录，默认 `media/artifacts`）、
 `SITE_BASE_URL`（拼接制品下载绝对 URL，**生产必须配置为 CD 主机可达地址**）。
@@ -43,7 +42,6 @@ settings：`ARTIFACT_ROOT`（制品落盘根目录，默认 `media/artifacts`）
 apps/artifact_mgr/
 ├── models.py        # Artifact：三维度+version 唯一；latest_for 取最新/锁定版本；
 │                    #   download_sig/download_url：HMAC 签名下载地址
-├── permissions.py   # HasArtifactAPIKey：**已废弃**，全局 artifact.api_key 的废弃期兜底
 ├── serializers.py   # 展示 + 上报入参校验（维度按 code/id 解析、版本/文件名白名单防穿越）
 ├── views.py         # ArtifactViewSet（查/删）+ ArtifactReportView（上报）+ ArtifactDownloadView（下载）
 └── urls.py
@@ -125,9 +123,11 @@ manager（需要 Jenkins 所在内网能出公网；不能出网时得另做 age
 | POST | `/api/artifacts/report/` | API 凭证 `artifact:report`（旧全局 key 兜底） | CI 上报（multipart，见下） |
 | GET | `/api/artifacts/{id}/download/?sig=…` | 登录用户 / API 凭证 `artifact:download` / URL 签名 | 附件下载；`sig=hmac_sha256(api_key, "{id}:{md5}")` |
 
-> **鉴权已升级为 API 凭证**（`ak_xxx.yyy`，带 per-key IP 白名单、作用域、可轮换可停用）。
-> 全局 `artifact.api_key` 进入废弃期：仍能上报，但每次命中打 `WARNING`，用于盘点未换的
-> 调用方。签发与语义见 `docs/backend/modules/auth.md` 的「API 凭证」章节。
+> **鉴权为 API 凭证**（`ak_xxx.yyy`，带 per-key IP 白名单、作用域、数据范围、可轮换可
+> 停用）。签发与语义见 `docs/backend/modules/auth.md` 的「API 凭证」章节。
+>
+> 全局 `artifact.api_key` 已下线（连同 `permissions.py` 的兜底权限类与系统配置项）。
+> 那把 key 全脚本共用、无来源限制、无作用域，轮换要同时改所有调用方。
 
 ### 上报（multipart 字段）
 
@@ -194,3 +194,23 @@ python manage.py clean_artifacts             # 实际清理
 文件删除口径统一在 `Artifact.remove_file()`：页面删除与保留期清理共用一份实现。
 两处各写一遍迟早分叉，分叉的表现是「记录删了文件还在」——磁盘被没人知道的孤儿
 文件慢慢吃掉。
+
+---
+
+## 下载签名密钥
+
+`Artifact.download_sig()` = `hmac_sha256(签名密钥, "{id}:{md5}")`，注入 CD 变量的
+`package_url` 带着它，目标主机免登录拉包。
+
+密钥来源按序回退：`ARTIFACT_SIGN_KEY` → `SECRET_ENC_KEY` → `SECRET_KEY`。
+
+**原来复用的是系统配置 `artifact.api_key`** ——那把 key 同时是上报凭据。共用一个值
+只是历史巧合，代价是「轮换上报凭据会顺带作废所有下载签名」，而这两件事的轮换节奏
+完全不同。随全局 key 下线，签名有了自己的来源。
+
+换签名密钥会让**已签发但还没用掉**的下载 URL 失效。这些 URL 在执行时现算现用，
+影响面只限于换 key 那一刻正在跑的 CD。
+
+签名不含有效期：URL 泄露就一直可用。当前可接受——它只能下载这一个制品，且 md5 进了
+签名，改 id 或换文件都会失配。要收紧就在签名里加时间戳并在校验侧比对，那会改变 URL
+格式与 CD 剧本的消费方式，届时一并评估。
