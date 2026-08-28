@@ -555,8 +555,12 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
         parameters=[OpenApiParameter('file', str, description='归档内相对路径，缺省则列出清单')],
         responses=OpenApiTypes.OBJECT,
     )
+    # 现场归档与「日志文件」页读的是同一批文件（TASK_LOG_DIR/<task>/<log>.d/），
+    # 归档时敏感变量已打码、inventory 不含凭据（见 runner.archive_scene），所以
+    # 与执行日志同档（exec read）。把这里单独抬到 write 只会造成「同一个文件，
+    # 换个入口就能看」的假门槛
     @action(detail=True, methods=['get'], url_path=r'logs/(?P<log_id>\d+)/scene',
-            permission_classes=[module_perm('exec', min_level='write')])
+            permission_classes=[module_perm('exec', min_level='read')])
     def log_scene(self, request, pk=None, log_id=None):
         """执行现场归档（inventory / 变量 / 命令）：缺省列清单，带 file 返回内容。
 

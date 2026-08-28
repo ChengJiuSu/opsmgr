@@ -1805,7 +1805,8 @@ class ExecSceneArchiveTests(TestCase):
                 r = c.get(base, {'file': 'step9/direct/vars.yml'})
                 self.assertEqual(r.status_code, 400)
 
-                # 归档含变量值，仅管理员可读
+                # 归档与执行日志同档（exec read）：敏感变量落盘时已打码、
+                # inventory 是无密钥版本，且「日志文件」页读的就是同一批文件
                 u = User.objects.create(username='scene_viewer')
                 u.set_password('Pass!2345xyz')
                 u.save()
@@ -1814,7 +1815,22 @@ class ExecSceneArchiveTests(TestCase):
                                 {'username': 'scene_viewer', 'password': 'Pass!2345xyz'},
                                 format='json')
                 vc.credentials(HTTP_AUTHORIZATION='Bearer ' + login.json()['access'])
-                self.assertEqual(vc.get(base).status_code, 403)
+                self.assertEqual(vc.get(base).status_code, 200)
+
+                # exec=none 的角色仍然拒
+                from apps.auth_mgr.models import Role
+
+                blocked_role = Role.objects.create(
+                    name='无执行权限', code='scene_none', permissions={'exec': 'none'})
+                blocked = User.objects.create(username='scene_blocked', role=blocked_role)
+                blocked.set_password('Pass!2345xyz')
+                blocked.save()
+                bc = APIClient()
+                login = bc.post('/api/auth/login/',
+                                {'username': 'scene_blocked', 'password': 'Pass!2345xyz'},
+                                format='json')
+                bc.credentials(HTTP_AUTHORIZATION='Bearer ' + login.json()['access'])
+                self.assertEqual(bc.get(base).status_code, 403)
         finally:
             shutil.rmtree(log_dir, ignore_errors=True)
 
@@ -2248,6 +2264,28 @@ class LogFileBrowserTests(TestCase):
             r = c.get('/api/exec/log-files/download/', {'path': '../../../../etc/passwd'})
             self.assertEqual(r.status_code, 400)
 
+    def test_read_level_can_browse_but_none_cannot(self):
+        """exec 只读档能翻日志；exec=none 的角色仍然一律拒。"""
+        from apps.auth_mgr.models import Role
+
+        reader_role = Role.objects.create(
+            name='日志只读', code='log_reader', permissions={'exec': 'read'})
+        reader = User.objects.create(username='logreader', role=reader_role)
+        reader.set_password('Pass!2345xyz')
+        reader.save()
+        nobody_role = Role.objects.create(
+            name='无执行权限', code='no_exec', permissions={'exec': 'none'})
+        nobody = User.objects.create(username='lognobody', role=nobody_role)
+        nobody.set_password('Pass!2345xyz')
+        nobody.save()
+        rel = f'{self.task.id}/{self.log.id}.log'
+        with override_settings(TASK_LOG_DIR=self.dir):
+            self.assertEqual(
+                self._client('logreader').get(
+                    '/api/exec/log-files/content/', {'path': rel}).status_code, 200)
+            self.assertEqual(
+                self._client('lognobody').get('/api/exec/log-files/').status_code, 403)
+
     def test_symlink_outside_root_rejected(self):
         """指向根目录外的软链接同样拒绝（realpath 比较）。"""
         outside = tempfile.mkdtemp(prefix='outside_')
@@ -2270,17 +2308,24 @@ class LogFileBrowserTests(TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()['data']['entries'], [])
 
-    def test_non_admin_forbidden(self):
+    def test_no_role_member_can_read(self):
+        """无角色的非 staff 走回退矩阵（exec=read），能翻日志。
+
+        原来这三个接口要 exec 写档，这条用例断言的是「非管理员一律 403」。
+        日志正文与 logs/{id}/ 详情返回的是同一份内容，拦它拦不住什么，只是把
+        「看自己跑过的日志」变成管理员专属——新人排障恰恰最需要翻这些。
+        """
         u = User.objects.create(username='logviewer')
         u.set_password('Pass!2345xyz')
         u.save()
+        rel = f'{self.task.id}/{self.log.id}.log'
         with override_settings(TASK_LOG_DIR=self.dir):
             c = self._client('logviewer')
-            self.assertEqual(c.get('/api/exec/log-files/').status_code, 403)
-            self.assertEqual(c.get('/api/exec/log-files/content/',
-                                   {'path': f'{self.task.id}/{self.log.id}.log'}).status_code, 403)
-            self.assertEqual(c.get('/api/exec/log-files/download/',
-                                   {'path': f'{self.task.id}/{self.log.id}.log'}).status_code, 403)
+            self.assertEqual(c.get('/api/exec/log-files/').status_code, 200)
+            self.assertEqual(
+                c.get('/api/exec/log-files/content/', {'path': rel}).status_code, 200)
+            self.assertEqual(
+                c.get('/api/exec/log-files/download/', {'path': rel}).status_code, 200)
 
 
 @override_settings(TRUSTED_PROXIES=['127.0.0.1'], TASK_EXEC_BACKEND='sync',

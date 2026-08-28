@@ -59,12 +59,17 @@
 
 | 页面 | 判定 |
 |------|------|
-| 服务器 / 服务器分配 | `can('cmdb', 'write')`；「执行通道」两个字段另看 `can('agent')`（选项来自 Agent 接口）|
-| 字典管理 | `can('dict', 'write')` |
-| 域名 / 证书 | `can('cloud', 'write')`；账号下拉看 `can('cloud_account')` |
+| 服务器 / 服务器分配 | 新增按 `can('cmdb', 'create')`、改删按 `can('cmdb', 'write')`；「执行通道」两个字段另看 `can('agent')`（选项来自 Agent 接口）|
+| 字典管理 | 新增按 `can('dict', 'create')`、改删按 `can('dict', 'write')` |
+| 域名 / 证书 | `can('cloud', 'write')`；「变更审批」是批/驳入口，同样按写档判（「变更留痕」是只读，保留）；账号下拉看 `can('cloud_account')` |
 | 云账号 | `can('cloud_account', 'write')`（只读档能看清单，AccessKey 由后端打码）|
 | 任务列表 / 执行日志 | 改定义 `can('exec', 'write')`；发起执行与处理暂停看能力位 `capability('can_execute')` |
 | 变量 / 制品 | `can('variable', 'write')` / `can('artifact', 'write')` |
+| 日志文件 / 执行现场 | `can('exec')` 只读档即可 —— 与执行日志详情同一份内容 |
+
+**新增按钮必须按 `create` 档判，不能跟改删共用一个 `canWrite`**：`cmdb` / `dict`
+有「可读可新增」这一档，只读档的人看到新增按钮点下去就是 403；反过来把新增并进
+写档，又会让「可读可新增」这一档在页面上根本用不出来。
 
 依赖多个模块的下拉（证书页要账号 + 主机 + 凭据）**逐个按各自模块取**：
 `Promise.all` 一拒全拒，缺一个模块的权限不该把整页选项都带走。

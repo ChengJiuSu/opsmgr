@@ -17,7 +17,7 @@
           <el-option label="停用" value="false" />
         </el-select>
       </div>
-      <el-button type="primary" :icon="Plus" @click="openDialog()">新增{{ cfg.label }}</el-button>
+      <el-button v-if="canCreate" type="primary" :icon="Plus" @click="openDialog()">新增{{ cfg.label }}</el-button>
     </div>
 
     <!-- 表格 -->
@@ -114,7 +114,9 @@ import { projectGroupApi, channelApi, environmentApi, cloudProviderApi, serviceT
 import { useAuthStore } from '../../stores/auth'
 
 const authStore = useAuthStore()
-// 按钮可见性跟角色矩阵走（字典是数据范围与生产标记的来源，单独一个模块）
+// 按钮可见性跟角色矩阵走（字典是数据范围与生产标记的来源，单独一个模块）。
+// 新增与改删分开判：dict 有「可读可新增」这一档，只读档不该看到新增按钮
+const canCreate = computed(() => authStore.can('dict', 'create'))
 const canWrite = computed(() => authStore.can('dict', 'write'))
 
 // 路由以 props 方式传入字典类型（见 router/index.js）

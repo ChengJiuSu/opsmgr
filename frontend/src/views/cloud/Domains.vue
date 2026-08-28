@@ -17,7 +17,9 @@
         </el-select>
       </div>
       <div>
-        <el-badge :value="pendingCount" :hidden="!pendingCount" type="warning">
+        <!-- 变更审批是「批/驳一条高危变更」的入口（后端要 cloud write + sudo），
+             只读档看得到也点不动，藏掉；变更留痕是纯只读，保留 -->
+        <el-badge v-if="canWrite" :value="pendingCount" :hidden="!pendingCount" type="warning">
           <el-button :icon="Finished" @click="openRequests()">变更审批</el-button>
         </el-badge>
         <el-button :icon="Clock" @click="openChanges()">变更留痕</el-button>
@@ -815,7 +817,7 @@ async function handleRetry(domainRow, rec) {
 
 onMounted(async () => {
   fetchData()
-  loadPendingCount()  // 工具栏「变更审批」角标：有待审的单子要能一眼看见
+  if (canWrite.value) loadPendingCount()  // 「变更审批」角标：有待审的单子要能一眼看见
   // 云账号下拉（域名归属/导入用）；服务器下拉（记录绑定用，page_size=0 全量）
   if (canWrite.value) {
     // 云账号与服务器分属另外两个模块，逐个按权限取：Promise.all 一拒全拒

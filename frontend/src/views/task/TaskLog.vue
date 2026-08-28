@@ -54,7 +54,7 @@
           <span v-if="current">返回码：{{ current.return_code ?? '-' }}</span>
           <span v-if="currentServers" class="muted">{{ currentServers }}</span>
           <!-- 执行现场归档含变量值，仅管理员可读 -->
-          <el-button v-if="canWrite && current?.id" link type="primary" size="small" @click="openScene">
+          <el-button v-if="canScene && current?.id" link type="primary" size="small" @click="openScene">
             执行现场
           </el-button>
         </div>
@@ -120,8 +120,10 @@ import StepOutput from '../../components/StepOutput.vue'
 const route = useRoute()
 const router = useRouter()
 const authStore = useAuthStore()
-// 现场信息要 exec 写档（接口就是这么挂的）；处理暂停看能力位
-const canWrite = computed(() => authStore.can('exec', 'write'))
+// 现场信息与执行日志同档（exec read）：归档里敏感变量已打码、inventory 无凭据，
+// 且「日志文件」页读的就是同一批文件，抬到写档只是个换个入口就绕过的假门槛。
+// 处理暂停看能力位
+const canScene = computed(() => authStore.can('exec'))
 const canExec = computed(() => authStore.capability('can_execute'))
 const taskId = Number(route.params.taskId)
 

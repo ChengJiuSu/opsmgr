@@ -116,7 +116,7 @@ const router = createRouter({
           path: 'task/log-files',
           name: 'TaskLogFiles',
           component: () => import('../views/task/LogFiles.vue'),
-          meta: { title: '日志文件', perm: ['exec', 'write'] },
+          meta: { title: '日志文件', perm: ['exec', 'read'] },
         },
         {
           path: 'task/artifacts',

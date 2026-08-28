@@ -45,7 +45,7 @@
           <el-button :icon="Upload" @click="openImport">导入</el-button>
         </template>
         <el-button :icon="Download" @click="handleExport">导出</el-button>
-        <el-button type="primary" :icon="Plus" @click="openDialog()">新增服务器</el-button>
+        <el-button v-if="canCreate" type="primary" :icon="Plus" @click="openDialog()">新增服务器</el-button>
       </div>
     </div>
 
@@ -392,6 +392,8 @@ import { useAuthStore } from '../../stores/auth'
 const authStore = useAuthStore()
 // 按钮可见性跟角色矩阵走（后端 roles.MODULES）：cmdb 写档才给增删改，
 // 执行通道那两个字段的选项来自 Agent 接口，另按 agent 模块判
+// 新增与改删分开判：cmdb 有「可读可新增」这一档，只读档不该看到新增按钮
+const canCreate = computed(() => authStore.can('cmdb', 'create'))
 const canWrite = computed(() => authStore.can('cmdb', 'write'))
 const canAgent = computed(() => authStore.can('agent'))
 

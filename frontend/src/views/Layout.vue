@@ -61,7 +61,7 @@
           <el-menu-item v-if="authStore.can('method', 'write')" index="/task/methods">方法管理</el-menu-item>
           <el-menu-item v-if="authStore.can('variable')" index="/task/variables">变量管理</el-menu-item>
           <el-menu-item v-if="authStore.can('exec')" index="/task/executions">任务列表</el-menu-item>
-          <el-menu-item v-if="authStore.can('exec', 'write')" index="/task/log-files">日志文件</el-menu-item>
+          <el-menu-item v-if="authStore.can('exec')" index="/task/log-files">日志文件</el-menu-item>
           <el-menu-item v-if="authStore.can('artifact')" index="/task/artifacts">制品管理</el-menu-item>
           <el-menu-item v-if="authStore.can('credential')" index="/task/credentials">连接凭据</el-menu-item>
         </el-sub-menu>

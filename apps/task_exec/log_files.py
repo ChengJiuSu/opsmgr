@@ -1,4 +1,4 @@
-"""任务日志文件浏览（只读文件系统视图，仅管理员）。
+"""任务日志文件浏览（只读文件系统视图，`exec` 模块 read 档即可）。
 
 以 ``settings.TASK_LOG_DIR`` 为根，把落盘的执行日志与执行现场归档整棵目录树
 开放给 Web 页面按目录浏览：
@@ -11,7 +11,12 @@
 
 与 ExecutionTaskViewSet.log_scene 的区别：那个接口按「某任务的某次执行」定向取
 归档，本模块是不依赖数据库记录的目录浏览器——记录已被清理、或任务已删除但文件
-仍在时，仍能翻到文件。两者共用同一片目录，权限同为管理员（归档含变量值）。
+仍在时，仍能翻到文件。两者共用同一片目录，权限也一致（`exec` read）。
+
+**为什么只读档就够**：日志正文与 `logs/{id}/` 详情接口返回的是同一份内容（超长
+部分本就从这些文件读），归档里的敏感变量在落盘时已打码、inventory 是无密钥版本
+（见 runner.archive_scene）。要求写档拦不住任何东西，只是把「看自己跑过的日志」
+变成管理员专属——新人排障恰恰最需要翻这些。
 
 安全：所有入参路径经 resolve_within 收敛到 TASK_LOG_DIR 内（realpath 比较，
 软链接指向外部同样拒绝），只读，不提供任何写/删接口。
@@ -143,7 +148,7 @@ def _annotate_logs(task_id, entries):
 class TaskLogFileListView(APIView):
     """任务日志目录浏览：列出 TASK_LOG_DIR 内某层目录的子目录与文件。"""
 
-    permission_classes = [module_perm('exec', min_level='write')]
+    permission_classes = [module_perm('exec')]
 
     @extend_schema(
         parameters=[OpenApiParameter('path', str, description='相对 TASK_LOG_DIR 的目录路径，缺省为根')],
@@ -172,7 +177,7 @@ class TaskLogFileListView(APIView):
 class TaskLogFileContentView(APIView):
     """任务日志文件内容：按字节区间返回文本（大日志分段读，或直接读末尾）。"""
 
-    permission_classes = [module_perm('exec', min_level='write')]
+    permission_classes = [module_perm('exec')]
 
     @extend_schema(
         parameters=[
@@ -219,7 +224,7 @@ class TaskLogFileContentView(APIView):
 class TaskLogFileDownloadView(APIView):
     """任务日志文件下载：原文件流式下载（大日志不进内存、不受内容接口上限限制）。"""
 
-    permission_classes = [module_perm('exec', min_level='write')]
+    permission_classes = [module_perm('exec')]
 
     @extend_schema(
         parameters=[OpenApiParameter('path', str, description='相对 TASK_LOG_DIR 的文件路径，必填')],

@@ -140,7 +140,7 @@ apps/task_exec/
 ├── views.py         # 变量/凭据/任务 ViewSet + matched_servers/execute/output/logs 动作 + 剧本列表
 ├── trigger.py       # 发起前置校验 + 主机快照固化 + 调度（页面执行与接口触发共用）
 ├── webhook.py       # TaskTriggerView：API 凭证鉴权的机读触发入口
-├── log_files.py     # 日志文件浏览：TASK_LOG_DIR 只读目录树 / 文本分段读 / 原文件下载（仅管理员）
+├── log_files.py     # 日志文件浏览：TASK_LOG_DIR 只读目录树 / 文本分段读 / 原文件下载（exec read）
 ├── runner.py        # 任务流执行：逐模块解析主机 + 动态 inventory + 变量注入 + ansible 调用，失败中止
 ├── live.py          # 实时输出汇聚 + 敏感变量打码（mask_secrets / LiveSink.add_secrets）
 ├── live.py          # LiveSink：流式日志汇聚（节流写库预览 + 落盘 + WebSocket 推送）
@@ -216,7 +216,7 @@ TASK_LOG_DIR/<task_id>/<log_id>.d/step<order>[-retry<n>]/
 - 归档目录 0700、文件 0600；归档失败只告警，不影响执行本体；
 - 重试单独落 `-retry<n>` 目录，每次尝试的现场都留痕；
 - 直接调 `runner.run`（无执行记录，如单测）不归档；
-- 读取走 `logs/{log_id}/scene/`（**仅管理员**，归档含变量值），前端执行日志页
+- 读取走 `logs/{log_id}/scene/`（`exec` read；归档里敏感变量已打码、inventory 无凭据），前端执行日志页
   `TaskLog.vue` 的「执行现场」按钮按文件浏览内容；`file` 参数经 `resolve_within`
   限制在本条执行记录的归档目录内，防路径穿越。
 
@@ -224,7 +224,7 @@ TASK_LOG_DIR/<task_id>/<log_id>.d/step<order>[-retry<n>]/
 
 `scene/` 接口按「某任务的某次执行」定向取归档；另有一组不依赖数据库记录的
 目录浏览接口（`log_files.py`），把 `TASK_LOG_DIR` 整棵树开放给前端页面
-「任务执行 → 日志文件」（`views/task/LogFiles.vue`，仅管理员）：
+「任务执行 → 日志文件」（`views/task/LogFiles.vue`，`exec` read 即可）：
 
 - `GET /api/exec/log-files/?path=` 列目录，返回
   `{path, parent, entries:[{name,path,type,size,modified_at,label}], root}`；
@@ -395,15 +395,18 @@ POST                /api/exec/tasks/{id}/confirm/ 人工处理暂停：确认模
 GET                 /api/exec/tasks/{id}/output/  轻量轮询：状态与输出；?offset=N 只回增量（delta=true 时前端追加，返回新 offset）
 GET                 /api/exec/tasks/{id}/logs/    执行历史列表（含主机数/执行方式/逐模块结果 steps_result）
 GET                 /api/exec/tasks/{id}/logs/{log_id}/  单条日志详情（完整输出 + 主机快照）
-GET                 /api/exec/tasks/{id}/logs/{log_id}/scene/  执行现场归档（仅管理员）：
+GET                 /api/exec/tasks/{id}/logs/{log_id}/scene/  执行现场归档（exec read）：
                                                   缺省列清单 {files:[{path,size}],retained}；
                                                   ?file=step1/direct/vars.yml 返回 {path,content,truncated}
-GET                 /api/exec/log-files/          日志目录浏览（仅管理员）：?path= 相对 TASK_LOG_DIR，缺省为根
-GET                 /api/exec/log-files/content/  日志文本读取（仅管理员）：?path= 必填，?offset=&limit=&tail=true 分段读
-GET                 /api/exec/log-files/download/ 日志原文件下载（仅管理员）：?path= 必填
+GET                 /api/exec/log-files/          日志目录浏览（exec read）：?path= 相对 TASK_LOG_DIR，缺省为根
+GET                 /api/exec/log-files/content/  日志文本读取（exec read）：?path= 必填，?offset=&limit=&tail=true 分段读
+GET                 /api/exec/log-files/download/ 日志原文件下载（exec read）：?path= 必填
 ```
 
-任务读写权限：`module_perm('exec')` 按方法推档（读 read、保存/编辑 write）；
+任务读写权限：`module_perm('exec')` 按方法推档（读 read、保存/编辑 write）。
+**日志相关一律 read 档**（执行日志详情、日志文件浏览、执行现场归档）：它们是同一份
+内容的三个入口，抬到写档拦不住什么，只会把「看自己跑过的日志」变成管理员专属——
+新人排障最需要翻这些。
 发起执行另看能力位 `can_execute` / `can_exec_prod`。方法库（`method`）与执行变量
 （`variable`）是**另外两个模块**：能改任务流不等于能改方法模板（模板里能写任意
 命令）或读写敏感变量。
