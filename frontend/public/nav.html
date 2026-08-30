@@ -398,148 +398,68 @@ h1{
 
 <script>
 /* ==========================================================================
-   配置层 —— 五块彼此独立，按需各改各的
+   配置层 —— 整份配置来自「配置管理 → 内部导航页」
 
-     SETTINGS   外观与行为开关（侧栏宽度、网格列数上限等）
-     NAV        左侧导航列：分组与条目，顺序即侧栏从上到下的顺序
-     BLOCKS     右侧内容区块：顺序即页面从上到下的顺序
-     SYSTEMS    系统清单，block 字段指向 BLOCKS 的 id
-     NOTICES    维护公告
+   页面启动时调 GET /api/portal/config/ 取回下面这些结构，形状与原先写死在这里
+   的数组一致，渲染逻辑没有跟着改：
 
-   导航列与内容区块只通过 id 关联，不强制一一对应：
-     · 导航项写 block  → 点击滚动到该区块并聚焦
-     · 导航项写 href   → 纯外链，新窗口打开，不需要有对应内容区块
-     · 内容区块不写进 NAV → 页面照常渲染，只是侧栏不列出来
-     · 两边顺序可以完全不同；条目序号统一取自内容区块的位置
-   页面加载时会自检配置（缺失的 block、空区块、重复 id），结果打在控制台。
+     SETTINGS  外观与文案（侧栏宽度、列数上限、品牌区、报头、底部说明）
+     NAV       左侧导航列：分组与条目，条目指向区块或外链
+     BLOCKS    右侧内容区块，顺序即页面从上到下的顺序
+     SYSTEMS   系统清单，block 字段指向 BLOCKS 的 id
+     NOTICES   维护公告
+
+   鉴权复用管理后台的登录态：同源下直接读 localStorage 里的 access_token，
+   401 就跳登录页并带上 next，登录后能回到这里。刻意不在这里做 token 刷新——
+   这页是只读门户，让用户重登一次比在两处维护刷新逻辑更简单。
    ========================================================================== */
 
-const SETTINGS = {
-  sidebarWidth: 272,        // 左侧导航列宽度，px
-  maxCols: 4,               // 卡片网格列数上限，超出的分组换行排
-  recentMax: 8,             // 「最近访问」保留条数
-  mastheadOpenByDefault: true,  // 首次访问时报头是否展开
+const API = '/api/portal/config/';
+const LOGIN_PATH = '/login';
 
-  // 侧栏品牌区。mark 为方形标里的字符（留空则不显示该标）。
-  brand: {
-    mark: 'N',
-    name: '内部系统导航台',
-    sub:  'Internal Systems Index',
-  },
+let SETTINGS = {}, NAV = [], BLOCKS = [], SYSTEMS = [], NOTICES = [];
 
-  // 侧栏底部说明。每行可以是一个字符串，也可以是分段数组——
-  // 数组的奇数段（第 2、4… 个）自动加粗，用来突出维护方、工单号等。
-  footer: [
-    ['维护方：', '基础架构部 · 运维平台组'],
-    ['新增或下线系统请提工单 ', '#IT-NAV'],
-  ],
+function gotoLogin(){
+  const next = encodeURIComponent(location.pathname + location.search);
+  location.replace(`${LOGIN_PATH}?next=${next}`);
+}
 
-  // 报头文案。纯文本，渲染时统一转义，不解析 HTML。
-  // intro 里若提到分类（如「按运维、平台…四类归档」），改 NAV 分组时记得同步这句。
-  masthead: {
-    eyebrow: 'Corp Intranet / 2026',
-    title:   ['公司内部系统', '统一入口'],   // 每个元素单独一行
-    intro:   '这里收录公司在用的全部内部系统入口，按运维、平台、公共服务、文档四类归档。'
-           + '账号统一走单点登录；若某个系统提示无权限，请按卡片所属小节向对应负责团队申请。'
-           + '清单每周同步一次。',
-    // 统计块：数值自动计算（系统总数取 SYSTEMS 长度，类别数取 NAV 分组数），这里只配标签
-    systemsLabel: '系统总数',
-    groupsLabel:  '一级类别',
-  },
-};
+async function loadConfig(){
+  const token = localStorage.getItem('access_token');
+  if (!token) { gotoLogin(); return false; }
 
-// ---------------- 左侧导航列（可独立增删改排序） ----------------
-const NAV = [
-  { group:'运维工具',     en:'Operations', items:[
-      { label:'监控告警',     block:'monitor' },
-      { label:'发布与流水线', block:'cicd' },
-      { label:'主机与资源',   block:'infra' } ] },
-  { group:'平台工具',     en:'Platform',   items:[
-      { label:'应用平台',     block:'apps' },
-      { label:'数据与报表',   block:'data' } ] },
-  { group:'公共服务',     en:'Workplace',  items:[
-      { label:'办公协同',     block:'office' },
-      { label:'人事财务',     block:'hr' } ] },
-  { group:'文档与知识库', en:'Knowledge',  items:[
-      { label:'技术文档',     block:'techdoc' },
-      { label:'流程规范',     block:'process' },
-      // 外链示例：不占内容区块，点击直接新窗口打开
-      // { label:'集团制度库', href:'https://policy.corp.internal' },
-  ] },
-];
+  let res;
+  try {
+    res = await fetch(API, { headers:{ Authorization:'Bearer ' + token } });
+  } catch {
+    showFatal('无法连接服务端', '请检查网络后刷新页面重试。');
+    return false;
+  }
+  if (res.status === 401) { gotoLogin(); return false; }
+  if (!res.ok) {
+    showFatal(`加载配置失败（HTTP ${res.status}）`, '请稍后刷新重试，或联系平台维护方。');
+    return false;
+  }
 
-// ---------------- 右侧内容区块（可独立增删改排序） ----------------
-// id 供 NAV 与 SYSTEMS 引用；title 为区块标题；tag 为标题右侧的小号归类标签
-const BLOCKS = [
-  { id:'monitor', title:'监控告警',     tag:'运维工具' },
-  { id:'cicd',    title:'发布与流水线', tag:'运维工具' },
-  { id:'infra',   title:'主机与资源',   tag:'运维工具' },
-  { id:'apps',    title:'应用平台',     tag:'平台工具' },
-  { id:'data',    title:'数据与报表',   tag:'平台工具' },
-  { id:'office',  title:'办公协同',     tag:'公共服务' },
-  { id:'hr',      title:'人事财务',     tag:'公共服务' },
-  { id:'techdoc', title:'技术文档',     tag:'文档与知识库' },
-  { id:'process', title:'流程规范',     tag:'文档与知识库' },
-];
+  const body = await res.json();
+  const cfg = body.data || {};
+  SETTINGS = cfg.settings || {};
+  NAV      = cfg.nav || [];
+  BLOCKS   = cfg.blocks || [];
+  SYSTEMS  = cfg.systems || [];
+  NOTICES  = cfg.notices || [];
+  return true;
+}
 
-// ---------------- 系统清单：block=所属内容区块 id ----------------
-const SYSTEMS = [
-  { block:'monitor', name:'统一监控中心', abbr:'MON', desc:'主机、容器与业务指标的统一大盘，含告警规则与静默配置。', domain:'monitor.corp.internal', url:'https://monitor.corp.internal' },
-  { block:'monitor', name:'日志检索平台', abbr:'LOG', desc:'全量应用日志采集与检索，支持按 traceId 串联上下游。', domain:'log.corp.internal', url:'https://log.corp.internal' },
-  { block:'monitor', name:'链路追踪',     abbr:'APM', desc:'分布式调用链与慢接口分析，定位跨服务性能瓶颈。', domain:'apm.corp.internal', url:'https://apm.corp.internal' },
-  { block:'monitor', name:'值班与告警',   abbr:'DUT', desc:'排班表、告警升级策略与故障处理记录。', domain:'duty.corp.internal', url:'https://duty.corp.internal' },
-
-  { block:'cicd', name:'持续集成',   abbr:'CI',  desc:'代码提交后的构建、单测与镜像打包流水线。', domain:'ci.corp.internal', url:'https://ci.corp.internal' },
-  { block:'cicd', name:'制品仓库',   abbr:'ART', desc:'容器镜像、Maven 与 npm 私有仓库，含保留策略。', domain:'artifact.corp.internal', url:'https://artifact.corp.internal' },
-  { block:'cicd', name:'发布中心',   abbr:'REL', desc:'灰度发布、回滚与发布窗口审批，串联变更单。', domain:'release.corp.internal', url:'https://release.corp.internal' },
-
-  { block:'infra', name:'资产配置库',   abbr:'CMDB', desc:'主机、集群、域名与服务归属关系的唯一事实来源。', domain:'cmdb.corp.internal', url:'https://cmdb.corp.internal' },
-  { block:'infra', name:'堡垒机',       abbr:'BAS',  desc:'生产环境统一登录入口，全程录屏审计。', domain:'bastion.corp.internal', url:'https://bastion.corp.internal' },
-  { block:'infra', name:'云资源控制台', abbr:'CLD',  desc:'多云账号下的实例、网络与账单聚合视图。', domain:'cloud.corp.internal', url:'https://cloud.corp.internal' },
-  { block:'infra', name:'域名与证书',   abbr:'DNS',  desc:'内外网解析记录、证书申请与到期提醒。', domain:'dns.corp.internal', url:'https://dns.corp.internal' },
-
-  { block:'apps', name:'容器平台',   abbr:'K8S', desc:'应用编排与扩缩容，命名空间按业务线划分。', domain:'paas.corp.internal', url:'https://paas.corp.internal' },
-  { block:'apps', name:'配置中心',   abbr:'CFG', desc:'环境配置与开关灰度下发，改动留审计记录。', domain:'config.corp.internal', url:'https://config.corp.internal' },
-  { block:'apps', name:'任务调度',   abbr:'JOB', desc:'定时任务编排与执行历史，支持失败重试与告警。', domain:'job.corp.internal', url:'https://job.corp.internal' },
-
-  { block:'data', name:'数据看板',   abbr:'BI',  desc:'经营与业务指标报表，按角色分配查看范围。', domain:'bi.corp.internal', url:'https://bi.corp.internal' },
-  { block:'data', name:'指标平台',   abbr:'MET', desc:'指标口径定义与血缘，避免同名不同义。', domain:'metrics.corp.internal', url:'https://metrics.corp.internal' },
-  { block:'data', name:'数据开发',   abbr:'ETL', desc:'离线与实时任务开发、调度与数据质量校验。', domain:'etl.corp.internal', url:'https://etl.corp.internal' },
-  { block:'data', name:'实验平台',   abbr:'EXP', desc:'A/B 分流配置与效果分析，含显著性检验。', domain:'ab.corp.internal', url:'https://ab.corp.internal' },
-
-  { block:'office', name:'企业邮箱',   abbr:'MAIL', desc:'公司邮箱 Web 端，支持邮件组与共享日历。', domain:'mail.corp.internal', url:'https://mail.corp.internal' },
-  { block:'office', name:'内部即时通讯', abbr:'IM', desc:'团队沟通与机器人通知的网页端入口。', domain:'im.corp.internal', url:'https://im.corp.internal' },
-  { block:'office', name:'会议室预订', abbr:'ROOM', desc:'各办公区会议室与工位预订，可绑定日历。', domain:'room.corp.internal', url:'https://room.corp.internal' },
-  { block:'office', name:'文件云盘',   abbr:'DRV',  desc:'部门共享目录与文档外链管理，含权限回收。', domain:'drive.corp.internal', url:'https://drive.corp.internal' },
-
-  { block:'hr', name:'人事系统',   abbr:'HR',  desc:'考勤、请假、绩效与个人信息维护。', domain:'hr.corp.internal', url:'https://hr.corp.internal' },
-  { block:'hr', name:'费用报销',   abbr:'FIN', desc:'差旅与日常报销提单，含发票查验与进度跟踪。', domain:'fin.corp.internal', url:'https://fin.corp.internal' },
-  { block:'hr', name:'采购与合同', abbr:'BUY', desc:'采购申请、供应商信息与合同用印流程。', domain:'buy.corp.internal', url:'https://buy.corp.internal' },
-
-  { block:'techdoc', name:'研发知识库', abbr:'WIKI', desc:'各团队技术文档、故障复盘与上手指引。', domain:'wiki.corp.internal', url:'https://wiki.corp.internal' },
-  { block:'techdoc', name:'接口文档',   abbr:'API',  desc:'内部服务 OpenAPI 文档与在线调试。', domain:'api-doc.corp.internal', url:'https://api-doc.corp.internal' },
-  { block:'techdoc', name:'架构决策记录', abbr:'ADR', desc:'重大技术选型的背景、取舍与结论归档。', domain:'adr.corp.internal', url:'https://adr.corp.internal' },
-
-  { block:'process', name:'工单系统',   abbr:'TIC', desc:'IT 支持、权限申请与资源开通的统一提单入口。', domain:'ticket.corp.internal', url:'https://ticket.corp.internal' },
-  { block:'process', name:'变更与审批', abbr:'CHG', desc:'生产变更登记、风险评估与审批流转。', domain:'change.corp.internal', url:'https://change.corp.internal' },
-  { block:'process', name:'安全合规',   abbr:'SEC', desc:'安全基线、漏洞处置与合规制度查阅。', domain:'sec.corp.internal', url:'https://sec.corp.internal' },
-];
-
-// 维护公告
-const NOTICES = [
-  { id:'2026-08-CHG-114',
-    title:'核心网络设备固件升级',
-    systems:['统一监控中心','堡垒机','制品仓库'],
-    start:'2026-08-29 22:00',
-    end:'2026-09-01 06:00',
-    body:'升级期间上述系统会出现 2～5 分钟的间歇性不可用，登录会话可能被断开，重新登录即可。\n构建流水线请避开该窗口触发；已排队任务会在升级完成后自动继续。\n如遇异常请在工单系统提单并标注「网络升级」。' },
-  { id:'2026-07-CHG-098',
-    title:'报销系统版本切换',
-    systems:['费用报销'],
-    start:'2026-07-12 20:00',
-    end:'2026-07-13 02:00',
-    body:'历史公告，仅作示例，已过生效窗口。' },
-];
+// 取不到配置时，页面上要有话说，而不是留一片空白
+function showFatal(title, hint){
+  document.getElementById('masthead').innerHTML =
+    `<div class="masthead-text">
+       <div class="eyebrow">加载失败</div>
+       <h1>${esc(title)}</h1>
+       <p>${esc(hint)}</p>
+     </div>`;
+}
 
 /* ==========================================================================
    状态 —— localStorage
@@ -556,12 +476,19 @@ const write = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } ca
 let pins   = read(LS.pins, []);
 let recent = read(LS.recent, []);
 let muted  = read(LS.muted, []);
-let mhOpen = read(LS.masthead, SETTINGS.mastheadOpenByDefault);
+let mhOpen = true;   // 真值在 deriveConfig() 里按设置取，见启动流程
 
-const blockById  = Object.fromEntries(BLOCKS.map(b => [b.id, b]));
-const blockIndex = Object.fromEntries(BLOCKS.map((b, i) => [b.id, i + 1]));
-const sysOf      = id => SYSTEMS.filter(x => x.block === id);
-const navItems   = NAV.flatMap(g => g.items);
+// 下面这几个索引由配置算出，必须在拿到接口数据之后重建
+let blockById = {}, blockIndex = {}, navItems = [], byKey = {};
+const sysOf = id => SYSTEMS.filter(x => x.block === id);
+
+function deriveConfig(){
+  blockById  = Object.fromEntries(BLOCKS.map(b => [b.id, b]));
+  blockIndex = Object.fromEntries(BLOCKS.map((b, i) => [b.id, i + 1]));
+  navItems   = NAV.flatMap(g => g.items);
+  byKey      = Object.fromEntries(SYSTEMS.map(s => [sysKey(s), s]));
+  mhOpen     = read(LS.masthead, SETTINGS.mastheadOpenByDefault !== false);
+}
 
 // 配置自检：导航列与内容区块拆开后，错配只会静默少一块，这里主动报出来
 function auditConfig(){
@@ -578,11 +505,12 @@ function auditConfig(){
   BLOCKS.forEach(b => { if (!sysOf(b.id).length) warn.push(`内容区块「${b.title}」下没有系统`); });
   const linked = new Set(navItems.map(it => it.block).filter(Boolean));
   BLOCKS.forEach(b => { if (!linked.has(b.id)) warn.push(`内容区块「${b.title}」没有对应导航项（页面照常显示）`); });
-  if (warn.length) console.warn('[nav] 配置自检：\n· ' + warn.join('\n· '));
+  if (warn.length) {
+    console.warn('[nav] 配置自检（改配置见「配置管理 → 内部导航页」）：\n· ' + warn.join('\n· '));
+  }
 }
 
 const sysKey = s => s.domain;
-const byKey  = Object.fromEntries(SYSTEMS.map(s => [sysKey(s), s]));
 const pad2   = n => String(n).padStart(2,'0');
 const esc    = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
@@ -984,19 +912,28 @@ window.addEventListener('resize', () => { relayout(); syncSpy(); });
 /* ==========================================================================
    启动
    ========================================================================== */
-document.documentElement.style.scrollBehavior = 'smooth';
-document.documentElement.style.setProperty('--sidebar-w', SETTINGS.sidebarWidth + 'px');
-auditConfig();
-renderBrand();
-renderMasthead();
-renderSidebar();
-renderZones();
-renderPinned();
-renderRecent();
-applyMasthead();
-relayout();
-syncSpy();
-openNotices(false);
+async function boot(){
+  document.documentElement.style.scrollBehavior = 'smooth';
+  if (!await loadConfig()) return;        // 未登录/取数失败：已跳转或已提示，不再往下渲染
+
+  deriveConfig();
+  if (SETTINGS.sidebarWidth) {
+    document.documentElement.style.setProperty('--sidebar-w', SETTINGS.sidebarWidth + 'px');
+  }
+  auditConfig();
+  renderBrand();
+  renderMasthead();
+  renderSidebar();
+  renderZones();
+  renderPinned();
+  renderRecent();
+  applyMasthead();
+  relayout();
+  syncSpy();
+  openNotices(false);
+}
+
+boot();
 </script>
 </body>
 </html>

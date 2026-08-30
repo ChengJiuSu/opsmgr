@@ -88,6 +88,12 @@ const router = createRouter({
           meta: { title: '服务类型', perm: ['dict', 'read'] },
         },
         {
+          path: 'config/portal',
+          name: 'ConfigPortal',
+          component: () => import('../views/config/Portal.vue'),
+          meta: { title: '内部导航页', perm: ['dict', 'read'] },
+        },
+        {
           path: 'task/methods',
           name: 'TaskMethods',
           component: () => import('../views/task/Methods.vue'),
