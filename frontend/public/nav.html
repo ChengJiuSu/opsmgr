@@ -354,19 +354,8 @@ h1{
     </header>
 
     <div class="content">
-      <section class="masthead" id="masthead">
-        <div class="masthead-text">
-          <div class="eyebrow">Corp Intranet / 2026</div>
-          <h1>公司内部系统<br>统一入口</h1>
-          <p>这里收录公司在用的全部内部系统入口，按运维、平台、公共服务、文档四类归档。账号统一走单点登录；若某个系统提示无权限，请按卡片所属小节向对应负责团队申请。清单每周同步一次。</p>
-        </div>
-        <!-- 统计块：系统总数取 SYSTEMS 长度，类别数取 NAV 分组数，均自动计算。
-             改动导航分组时，记得同步上面这段说明里的分类描述。 -->
-        <div class="statblock">
-          <div class="stat"><div class="stat-num" id="statSystems">0</div><div class="stat-label">系统总数</div></div>
-          <div class="stat"><div class="stat-num" id="statCats">0</div><div class="stat-label">一级类别</div></div>
-        </div>
-      </section>
+      <!-- 报头内容由 SETTINGS.masthead 渲染，见脚本 renderMasthead() -->
+      <section class="masthead" id="masthead"></section>
 
       <section class="zone" id="zone-recent">
         <div class="zone-head">
@@ -436,6 +425,19 @@ const SETTINGS = {
   maxCols: 4,               // 卡片网格列数上限，超出的分组换行排
   recentMax: 8,             // 「最近访问」保留条数
   mastheadOpenByDefault: true,  // 首次访问时报头是否展开
+
+  // 报头文案。纯文本，渲染时统一转义，不解析 HTML。
+  // intro 里若提到分类（如「按运维、平台…四类归档」），改 NAV 分组时记得同步这句。
+  masthead: {
+    eyebrow: 'Corp Intranet / 2026',
+    title:   ['公司内部系统', '统一入口'],   // 每个元素单独一行
+    intro:   '这里收录公司在用的全部内部系统入口，按运维、平台、公共服务、文档四类归档。'
+           + '账号统一走单点登录；若某个系统提示无权限，请按卡片所属小节向对应负责团队申请。'
+           + '清单每周同步一次。',
+    // 统计块：数值自动计算（系统总数取 SYSTEMS 长度，类别数取 NAV 分组数），这里只配标签
+    systemsLabel: '系统总数',
+    groupsLabel:  '一级类别',
+  },
 };
 
 // ---------------- 左侧导航列（可独立增删改排序） ----------------
@@ -617,6 +619,27 @@ function navItemHTML(it){
     <span class="nav-item-label">${esc(label)}</span>
     <span class="nav-item-count">${sysOf(it.block).length}</span>
   </button></li>`;
+}
+
+function renderMasthead(){
+  const m = SETTINGS.masthead || {};
+  const lines = Array.isArray(m.title) ? m.title : [m.title || ''];
+  document.getElementById('masthead').innerHTML = `
+    <div class="masthead-text">
+      ${m.eyebrow ? `<div class="eyebrow">${esc(m.eyebrow)}</div>` : ''}
+      <h1>${lines.map(esc).join('<br>')}</h1>
+      ${m.intro ? `<p>${esc(m.intro)}</p>` : ''}
+    </div>
+    <div class="statblock">
+      <div class="stat">
+        <div class="stat-num">${SYSTEMS.length}</div>
+        <div class="stat-label">${esc(m.systemsLabel || '系统总数')}</div>
+      </div>
+      <div class="stat">
+        <div class="stat-num">${NAV.length}</div>
+        <div class="stat-label">${esc(m.groupsLabel || '一级类别')}</div>
+      </div>
+    </div>`;
 }
 
 function renderSidebar(){
@@ -939,9 +962,8 @@ window.addEventListener('resize', () => { relayout(); syncSpy(); });
    ========================================================================== */
 document.documentElement.style.scrollBehavior = 'smooth';
 document.documentElement.style.setProperty('--sidebar-w', SETTINGS.sidebarWidth + 'px');
-document.getElementById('statSystems').textContent = SYSTEMS.length;
-document.getElementById('statCats').textContent = NAV.length;
 auditConfig();
+renderMasthead();
 renderSidebar();
 renderZones();
 renderPinned();
