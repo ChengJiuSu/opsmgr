@@ -74,7 +74,9 @@ a{color:inherit;text-decoration:none}
   border-left:3px solid transparent;cursor:pointer;text-align:left;
   font-size:13px;font-weight:500;color:var(--ink);
 }
+.nav-item{font-family:inherit;text-decoration:none}
 .nav-item:hover{background:var(--red-wash)}
+.nav-item-link .nav-item-idx{font-size:12px}
 .nav-item.active{background:var(--red-wash);border-left-color:var(--red);font-weight:700}
 .nav-item.active .nav-item-idx{color:var(--red)}
 .nav-item-idx{font-size:10px;font-weight:700;color:var(--ink-3);font-variant-numeric:tabular-nums;width:16px;flex:none}
@@ -358,6 +360,8 @@ h1{
           <h1>公司内部系统<br>统一入口</h1>
           <p>这里收录公司在用的全部内部系统入口，按运维、平台、公共服务、文档四类归档。账号统一走单点登录；若某个系统提示无权限，请按卡片所属小节向对应负责团队申请。清单每周同步一次。</p>
         </div>
+        <!-- 统计块：系统总数取 SYSTEMS 长度，类别数取 NAV 分组数，均自动计算。
+             改动导航分组时，记得同步上面这段说明里的分类描述。 -->
         <div class="statblock">
           <div class="stat"><div class="stat-num" id="statSystems">0</div><div class="stat-label">系统总数</div></div>
           <div class="stat"><div class="stat-num" id="statCats">0</div><div class="stat-label">一级类别</div></div>
@@ -411,67 +415,104 @@ h1{
 
 <script>
 /* ==========================================================================
-   数据层 —— 替换为真实清单时只改这两个数组
+   配置层 —— 五块彼此独立，按需各改各的
+
+     SETTINGS   外观与行为开关（侧栏宽度、网格列数上限等）
+     NAV        左侧导航列：分组与条目，顺序即侧栏从上到下的顺序
+     BLOCKS     右侧内容区块：顺序即页面从上到下的顺序
+     SYSTEMS    系统清单，block 字段指向 BLOCKS 的 id
+     NOTICES    维护公告
+
+   导航列与内容区块只通过 id 关联，不强制一一对应：
+     · 导航项写 block  → 点击滚动到该区块并聚焦
+     · 导航项写 href   → 纯外链，新窗口打开，不需要有对应内容区块
+     · 内容区块不写进 NAV → 页面照常渲染，只是侧栏不列出来
+     · 两边顺序可以完全不同；条目序号统一取自内容区块的位置
+   页面加载时会自检配置（缺失的 block、空区块、重复 id），结果打在控制台。
    ========================================================================== */
 
-// 一级类别 → 二级小节
-const CATEGORIES = [
-  { id:'ops',      name:'运维工具',     en:'Operations',  sections:[
-      { id:'monitor', name:'监控告警' },
-      { id:'cicd',    name:'发布与流水线' },
-      { id:'infra',   name:'主机与资源' } ] },
-  { id:'platform', name:'平台工具',     en:'Platform',    sections:[
-      { id:'apps',    name:'应用平台' },
-      { id:'data',    name:'数据与报表' } ] },
-  { id:'common',   name:'公共服务',     en:'Workplace',   sections:[
-      { id:'office',  name:'办公协同' },
-      { id:'hr',      name:'人事财务' } ] },
-  { id:'docs',     name:'文档与知识库', en:'Knowledge',   sections:[
-      { id:'techdoc', name:'技术文档' },
-      { id:'process', name:'流程规范' } ] },
+const SETTINGS = {
+  sidebarWidth: 272,        // 左侧导航列宽度，px
+  maxCols: 4,               // 卡片网格列数上限，超出的分组换行排
+  recentMax: 8,             // 「最近访问」保留条数
+  mastheadOpenByDefault: true,  // 首次访问时报头是否展开
+};
+
+// ---------------- 左侧导航列（可独立增删改排序） ----------------
+const NAV = [
+  { group:'运维工具',     en:'Operations', items:[
+      { label:'监控告警',     block:'monitor' },
+      { label:'发布与流水线', block:'cicd' },
+      { label:'主机与资源',   block:'infra' } ] },
+  { group:'平台工具',     en:'Platform',   items:[
+      { label:'应用平台',     block:'apps' },
+      { label:'数据与报表',   block:'data' } ] },
+  { group:'公共服务',     en:'Workplace',  items:[
+      { label:'办公协同',     block:'office' },
+      { label:'人事财务',     block:'hr' } ] },
+  { group:'文档与知识库', en:'Knowledge',  items:[
+      { label:'技术文档',     block:'techdoc' },
+      { label:'流程规范',     block:'process' },
+      // 外链示例：不占内容区块，点击直接新窗口打开
+      // { label:'集团制度库', href:'https://policy.corp.internal' },
+  ] },
 ];
 
-// 系统清单：section=所属小节 id，name/abbr/desc/domain/url
+// ---------------- 右侧内容区块（可独立增删改排序） ----------------
+// id 供 NAV 与 SYSTEMS 引用；title 为区块标题；tag 为标题右侧的小号归类标签
+const BLOCKS = [
+  { id:'monitor', title:'监控告警',     tag:'运维工具' },
+  { id:'cicd',    title:'发布与流水线', tag:'运维工具' },
+  { id:'infra',   title:'主机与资源',   tag:'运维工具' },
+  { id:'apps',    title:'应用平台',     tag:'平台工具' },
+  { id:'data',    title:'数据与报表',   tag:'平台工具' },
+  { id:'office',  title:'办公协同',     tag:'公共服务' },
+  { id:'hr',      title:'人事财务',     tag:'公共服务' },
+  { id:'techdoc', title:'技术文档',     tag:'文档与知识库' },
+  { id:'process', title:'流程规范',     tag:'文档与知识库' },
+];
+
+// ---------------- 系统清单：block=所属内容区块 id ----------------
 const SYSTEMS = [
-  { section:'monitor', name:'统一监控中心', abbr:'MON', desc:'主机、容器与业务指标的统一大盘，含告警规则与静默配置。', domain:'monitor.corp.internal', url:'https://monitor.corp.internal' },
-  { section:'monitor', name:'日志检索平台', abbr:'LOG', desc:'全量应用日志采集与检索，支持按 traceId 串联上下游。', domain:'log.corp.internal', url:'https://log.corp.internal' },
-  { section:'monitor', name:'链路追踪',     abbr:'APM', desc:'分布式调用链与慢接口分析，定位跨服务性能瓶颈。', domain:'apm.corp.internal', url:'https://apm.corp.internal' },
-  { section:'monitor', name:'值班与告警',   abbr:'DUT', desc:'排班表、告警升级策略与故障处理记录。', domain:'duty.corp.internal', url:'https://duty.corp.internal' },
+  { block:'monitor', name:'统一监控中心', abbr:'MON', desc:'主机、容器与业务指标的统一大盘，含告警规则与静默配置。', domain:'monitor.corp.internal', url:'https://monitor.corp.internal' },
+  { block:'monitor', name:'日志检索平台', abbr:'LOG', desc:'全量应用日志采集与检索，支持按 traceId 串联上下游。', domain:'log.corp.internal', url:'https://log.corp.internal' },
+  { block:'monitor', name:'链路追踪',     abbr:'APM', desc:'分布式调用链与慢接口分析，定位跨服务性能瓶颈。', domain:'apm.corp.internal', url:'https://apm.corp.internal' },
+  { block:'monitor', name:'值班与告警',   abbr:'DUT', desc:'排班表、告警升级策略与故障处理记录。', domain:'duty.corp.internal', url:'https://duty.corp.internal' },
 
-  { section:'cicd', name:'持续集成',   abbr:'CI',  desc:'代码提交后的构建、单测与镜像打包流水线。', domain:'ci.corp.internal', url:'https://ci.corp.internal' },
-  { section:'cicd', name:'制品仓库',   abbr:'ART', desc:'容器镜像、Maven 与 npm 私有仓库，含保留策略。', domain:'artifact.corp.internal', url:'https://artifact.corp.internal' },
-  { section:'cicd', name:'发布中心',   abbr:'REL', desc:'灰度发布、回滚与发布窗口审批，串联变更单。', domain:'release.corp.internal', url:'https://release.corp.internal' },
+  { block:'cicd', name:'持续集成',   abbr:'CI',  desc:'代码提交后的构建、单测与镜像打包流水线。', domain:'ci.corp.internal', url:'https://ci.corp.internal' },
+  { block:'cicd', name:'制品仓库',   abbr:'ART', desc:'容器镜像、Maven 与 npm 私有仓库，含保留策略。', domain:'artifact.corp.internal', url:'https://artifact.corp.internal' },
+  { block:'cicd', name:'发布中心',   abbr:'REL', desc:'灰度发布、回滚与发布窗口审批，串联变更单。', domain:'release.corp.internal', url:'https://release.corp.internal' },
 
-  { section:'infra', name:'资产配置库',   abbr:'CMDB', desc:'主机、集群、域名与服务归属关系的唯一事实来源。', domain:'cmdb.corp.internal', url:'https://cmdb.corp.internal' },
-  { section:'infra', name:'堡垒机',       abbr:'BAS',  desc:'生产环境统一登录入口，全程录屏审计。', domain:'bastion.corp.internal', url:'https://bastion.corp.internal' },
-  { section:'infra', name:'云资源控制台', abbr:'CLD',  desc:'多云账号下的实例、网络与账单聚合视图。', domain:'cloud.corp.internal', url:'https://cloud.corp.internal' },
-  { section:'infra', name:'域名与证书',   abbr:'DNS',  desc:'内外网解析记录、证书申请与到期提醒。', domain:'dns.corp.internal', url:'https://dns.corp.internal' },
+  { block:'infra', name:'资产配置库',   abbr:'CMDB', desc:'主机、集群、域名与服务归属关系的唯一事实来源。', domain:'cmdb.corp.internal', url:'https://cmdb.corp.internal' },
+  { block:'infra', name:'堡垒机',       abbr:'BAS',  desc:'生产环境统一登录入口，全程录屏审计。', domain:'bastion.corp.internal', url:'https://bastion.corp.internal' },
+  { block:'infra', name:'云资源控制台', abbr:'CLD',  desc:'多云账号下的实例、网络与账单聚合视图。', domain:'cloud.corp.internal', url:'https://cloud.corp.internal' },
+  { block:'infra', name:'域名与证书',   abbr:'DNS',  desc:'内外网解析记录、证书申请与到期提醒。', domain:'dns.corp.internal', url:'https://dns.corp.internal' },
 
-  { section:'apps', name:'容器平台',   abbr:'K8S', desc:'应用编排与扩缩容，命名空间按业务线划分。', domain:'paas.corp.internal', url:'https://paas.corp.internal' },
-  { section:'apps', name:'配置中心',   abbr:'CFG', desc:'环境配置与开关灰度下发，改动留审计记录。', domain:'config.corp.internal', url:'https://config.corp.internal' },
-  { section:'apps', name:'任务调度',   abbr:'JOB', desc:'定时任务编排与执行历史，支持失败重试与告警。', domain:'job.corp.internal', url:'https://job.corp.internal' },
+  { block:'apps', name:'容器平台',   abbr:'K8S', desc:'应用编排与扩缩容，命名空间按业务线划分。', domain:'paas.corp.internal', url:'https://paas.corp.internal' },
+  { block:'apps', name:'配置中心',   abbr:'CFG', desc:'环境配置与开关灰度下发，改动留审计记录。', domain:'config.corp.internal', url:'https://config.corp.internal' },
+  { block:'apps', name:'任务调度',   abbr:'JOB', desc:'定时任务编排与执行历史，支持失败重试与告警。', domain:'job.corp.internal', url:'https://job.corp.internal' },
 
-  { section:'data', name:'数据看板',   abbr:'BI',  desc:'经营与业务指标报表，按角色分配查看范围。', domain:'bi.corp.internal', url:'https://bi.corp.internal' },
-  { section:'data', name:'指标平台',   abbr:'MET', desc:'指标口径定义与血缘，避免同名不同义。', domain:'metrics.corp.internal', url:'https://metrics.corp.internal' },
-  { section:'data', name:'数据开发',   abbr:'ETL', desc:'离线与实时任务开发、调度与数据质量校验。', domain:'etl.corp.internal', url:'https://etl.corp.internal' },
-  { section:'data', name:'实验平台',   abbr:'EXP', desc:'A/B 分流配置与效果分析，含显著性检验。', domain:'ab.corp.internal', url:'https://ab.corp.internal' },
+  { block:'data', name:'数据看板',   abbr:'BI',  desc:'经营与业务指标报表，按角色分配查看范围。', domain:'bi.corp.internal', url:'https://bi.corp.internal' },
+  { block:'data', name:'指标平台',   abbr:'MET', desc:'指标口径定义与血缘，避免同名不同义。', domain:'metrics.corp.internal', url:'https://metrics.corp.internal' },
+  { block:'data', name:'数据开发',   abbr:'ETL', desc:'离线与实时任务开发、调度与数据质量校验。', domain:'etl.corp.internal', url:'https://etl.corp.internal' },
+  { block:'data', name:'实验平台',   abbr:'EXP', desc:'A/B 分流配置与效果分析，含显著性检验。', domain:'ab.corp.internal', url:'https://ab.corp.internal' },
 
-  { section:'office', name:'企业邮箱',   abbr:'MAIL', desc:'公司邮箱 Web 端，支持邮件组与共享日历。', domain:'mail.corp.internal', url:'https://mail.corp.internal' },
-  { section:'office', name:'内部即时通讯', abbr:'IM', desc:'团队沟通与机器人通知的网页端入口。', domain:'im.corp.internal', url:'https://im.corp.internal' },
-  { section:'office', name:'会议室预订', abbr:'ROOM', desc:'各办公区会议室与工位预订，可绑定日历。', domain:'room.corp.internal', url:'https://room.corp.internal' },
-  { section:'office', name:'文件云盘',   abbr:'DRV',  desc:'部门共享目录与文档外链管理，含权限回收。', domain:'drive.corp.internal', url:'https://drive.corp.internal' },
+  { block:'office', name:'企业邮箱',   abbr:'MAIL', desc:'公司邮箱 Web 端，支持邮件组与共享日历。', domain:'mail.corp.internal', url:'https://mail.corp.internal' },
+  { block:'office', name:'内部即时通讯', abbr:'IM', desc:'团队沟通与机器人通知的网页端入口。', domain:'im.corp.internal', url:'https://im.corp.internal' },
+  { block:'office', name:'会议室预订', abbr:'ROOM', desc:'各办公区会议室与工位预订，可绑定日历。', domain:'room.corp.internal', url:'https://room.corp.internal' },
+  { block:'office', name:'文件云盘',   abbr:'DRV',  desc:'部门共享目录与文档外链管理，含权限回收。', domain:'drive.corp.internal', url:'https://drive.corp.internal' },
 
-  { section:'hr', name:'人事系统',   abbr:'HR',  desc:'考勤、请假、绩效与个人信息维护。', domain:'hr.corp.internal', url:'https://hr.corp.internal' },
-  { section:'hr', name:'费用报销',   abbr:'FIN', desc:'差旅与日常报销提单，含发票查验与进度跟踪。', domain:'fin.corp.internal', url:'https://fin.corp.internal' },
-  { section:'hr', name:'采购与合同', abbr:'BUY', desc:'采购申请、供应商信息与合同用印流程。', domain:'buy.corp.internal', url:'https://buy.corp.internal' },
+  { block:'hr', name:'人事系统',   abbr:'HR',  desc:'考勤、请假、绩效与个人信息维护。', domain:'hr.corp.internal', url:'https://hr.corp.internal' },
+  { block:'hr', name:'费用报销',   abbr:'FIN', desc:'差旅与日常报销提单，含发票查验与进度跟踪。', domain:'fin.corp.internal', url:'https://fin.corp.internal' },
+  { block:'hr', name:'采购与合同', abbr:'BUY', desc:'采购申请、供应商信息与合同用印流程。', domain:'buy.corp.internal', url:'https://buy.corp.internal' },
 
-  { section:'techdoc', name:'研发知识库', abbr:'WIKI', desc:'各团队技术文档、故障复盘与上手指引。', domain:'wiki.corp.internal', url:'https://wiki.corp.internal' },
-  { section:'techdoc', name:'接口文档',   abbr:'API',  desc:'内部服务 OpenAPI 文档与在线调试。', domain:'api-doc.corp.internal', url:'https://api-doc.corp.internal' },
-  { section:'techdoc', name:'架构决策记录', abbr:'ADR', desc:'重大技术选型的背景、取舍与结论归档。', domain:'adr.corp.internal', url:'https://adr.corp.internal' },
+  { block:'techdoc', name:'研发知识库', abbr:'WIKI', desc:'各团队技术文档、故障复盘与上手指引。', domain:'wiki.corp.internal', url:'https://wiki.corp.internal' },
+  { block:'techdoc', name:'接口文档',   abbr:'API',  desc:'内部服务 OpenAPI 文档与在线调试。', domain:'api-doc.corp.internal', url:'https://api-doc.corp.internal' },
+  { block:'techdoc', name:'架构决策记录', abbr:'ADR', desc:'重大技术选型的背景、取舍与结论归档。', domain:'adr.corp.internal', url:'https://adr.corp.internal' },
 
-  { section:'process', name:'工单系统',   abbr:'TIC', desc:'IT 支持、权限申请与资源开通的统一提单入口。', domain:'ticket.corp.internal', url:'https://ticket.corp.internal' },
-  { section:'process', name:'变更与审批', abbr:'CHG', desc:'生产变更登记、风险评估与审批流转。', domain:'change.corp.internal', url:'https://change.corp.internal' },
-  { section:'process', name:'安全合规',   abbr:'SEC', desc:'安全基线、漏洞处置与合规制度查阅。', domain:'sec.corp.internal', url:'https://sec.corp.internal' },
+  { block:'process', name:'工单系统',   abbr:'TIC', desc:'IT 支持、权限申请与资源开通的统一提单入口。', domain:'ticket.corp.internal', url:'https://ticket.corp.internal' },
+  { block:'process', name:'变更与审批', abbr:'CHG', desc:'生产变更登记、风险评估与审批流转。', domain:'change.corp.internal', url:'https://change.corp.internal' },
+  { block:'process', name:'安全合规',   abbr:'SEC', desc:'安全基线、漏洞处置与合规制度查阅。', domain:'sec.corp.internal', url:'https://sec.corp.internal' },
 ];
 
 // 维护公告
@@ -505,12 +546,31 @@ const write = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } ca
 let pins   = read(LS.pins, []);
 let recent = read(LS.recent, []);
 let muted  = read(LS.muted, []);
-let mhOpen = read(LS.masthead, true);   // 首次访问默认展开
+let mhOpen = read(LS.masthead, SETTINGS.mastheadOpenByDefault);
 
-const MAX_COLS = 4;      // 列数上限：卡片再多也不会挤成细条
-const RECENT_MAX = 8;
+const blockById  = Object.fromEntries(BLOCKS.map(b => [b.id, b]));
+const blockIndex = Object.fromEntries(BLOCKS.map((b, i) => [b.id, i + 1]));
+const sysOf      = id => SYSTEMS.filter(x => x.block === id);
+const navItems   = NAV.flatMap(g => g.items);
 
-const SECTIONS = CATEGORIES.flatMap(c => c.sections.map(s => ({ ...s, cat:c })));
+// 配置自检：导航列与内容区块拆开后，错配只会静默少一块，这里主动报出来
+function auditConfig(){
+  const warn = [];
+  const dup = BLOCKS.map(b => b.id).filter((id, i, a) => a.indexOf(id) !== i);
+  if (dup.length) warn.push(`BLOCKS 存在重复 id：${[...new Set(dup)].join('、')}`);
+  navItems.forEach(it => {
+    if (!it.block && !it.href) warn.push(`导航项「${it.label}」既没写 block 也没写 href`);
+    if (it.block && !blockById[it.block]) warn.push(`导航项「${it.label}」指向的 block「${it.block}」不在 BLOCKS 中`);
+  });
+  SYSTEMS.forEach(x => {
+    if (!blockById[x.block]) warn.push(`系统「${x.name}」的 block「${x.block}」不在 BLOCKS 中，不会显示`);
+  });
+  BLOCKS.forEach(b => { if (!sysOf(b.id).length) warn.push(`内容区块「${b.title}」下没有系统`); });
+  const linked = new Set(navItems.map(it => it.block).filter(Boolean));
+  BLOCKS.forEach(b => { if (!linked.has(b.id)) warn.push(`内容区块「${b.title}」没有对应导航项（页面照常显示）`); });
+  if (warn.length) console.warn('[nav] 配置自检：\n· ' + warn.join('\n· '));
+}
+
 const sysKey = s => s.domain;
 const byKey  = Object.fromEntries(SYSTEMS.map(s => [sysKey(s), s]));
 const pad2   = n => String(n).padStart(2,'0');
@@ -537,44 +597,51 @@ function cardHTML(sys){
 }
 
 function gridHTML(list){
-  const cols = Math.min(Math.max(list.length,1), MAX_COLS);
+  const cols = Math.min(Math.max(list.length,1), SETTINGS.maxCols);
   return `<div class="card-grid" data-cols="${cols}" style="--cols:${cols}">${list.map(cardHTML).join('')}</div>`;
 }
 
+function navItemHTML(it){
+  // 外链项：不需要对应内容区块，直接新窗口打开
+  if (!it.block) {
+    return `<li><a class="nav-item nav-item-link" href="${esc(it.href)}" target="_blank" rel="noopener">
+      <span class="nav-item-idx">↗</span>
+      <span class="nav-item-label">${esc(it.label)}</span>
+    </a></li>`;
+  }
+  const blk = blockById[it.block];
+  if (!blk) return '';                       // 指向不存在的区块：跳过，自检已提示
+  const label = it.label || blk.title;       // 导航项可以不写 label，回落到区块标题
+  return `<li><button class="nav-item" type="button" data-goto="${esc(it.block)}">
+    <span class="nav-item-idx">${pad2(blockIndex[it.block])}</span>
+    <span class="nav-item-label">${esc(label)}</span>
+    <span class="nav-item-count">${sysOf(it.block).length}</span>
+  </button></li>`;
+}
+
 function renderSidebar(){
-  let n = 0;
-  document.getElementById('nav').innerHTML = CATEGORIES.map((c,ci) => `
+  document.getElementById('nav').innerHTML = NAV.map((g, gi) => `
     <div class="nav-cat">
       <div class="nav-cat-head">
-        <span class="nav-cat-idx">${pad2(ci+1)}</span>
-        <span class="nav-cat-name-cn">${esc(c.name)}</span>
-        <span class="nav-cat-name" style="margin-left:auto;color:var(--ink-3)">${esc(c.en)}</span>
+        <span class="nav-cat-idx">${pad2(gi+1)}</span>
+        <span class="nav-cat-name-cn">${esc(g.group)}</span>
+        ${g.en ? `<span class="nav-cat-name" style="margin-left:auto;color:var(--ink-3)">${esc(g.en)}</span>` : ''}
       </div>
-      <ul class="nav-list">
-        ${c.sections.map(s => {
-          n++;
-          const count = SYSTEMS.filter(x => x.section === s.id).length;
-          return `<li><button class="nav-item" type="button" data-goto="${s.id}">
-            <span class="nav-item-idx">${pad2(n)}</span>
-            <span class="nav-item-label">${esc(s.name)}</span>
-            <span class="nav-item-count">${count}</span>
-          </button></li>`;
-        }).join('')}
-      </ul>
+      <ul class="nav-list">${g.items.map(navItemHTML).join('')}</ul>
     </div>`).join('');
 }
 
 function renderZones(){
-  document.getElementById('zones').innerHTML = SECTIONS.map((s,i) => {
-    const list = SYSTEMS.filter(x => x.section === s.id);
-    return `<section class="zone" id="sec-${s.id}" data-section="${s.id}">
+  document.getElementById('zones').innerHTML = BLOCKS.map((b, i) => {
+    const list = sysOf(b.id);
+    return `<section class="zone" id="sec-${esc(b.id)}" data-section="${esc(b.id)}">
       <div class="zone-head">
         <span class="zone-idx">${pad2(i+1)}</span>
-        <span class="zone-title">${esc(s.name)}</span>
-        <span class="zone-cat">${esc(s.cat.name)}</span>
+        <span class="zone-title">${esc(b.title)}</span>
+        ${b.tag ? `<span class="zone-cat">${esc(b.tag)}</span>` : ''}
         <span class="zone-count">${list.length} 个系统</span>
       </div>
-      ${gridHTML(list)}
+      ${list.length ? gridHTML(list) : '<div class="empty">该区块下暂无系统。</div>'}
     </section>`;
   }).join('');
 }
@@ -594,7 +661,7 @@ function renderRecent(){
         `<button class="tag" type="button" data-open="${esc(sysKey(s))}">
            <span class="tag-abbr">${esc(s.abbr)}</span><span>${esc(s.name)}</span>
          </button>`).join('') + '</div>'
-    : '<div class="empty">还没有访问记录。打开任意系统后，最近 ' + RECENT_MAX + ' 条会出现在这里。</div>';
+    : '<div class="empty">还没有访问记录。打开任意系统后，最近 ' + SETTINGS.recentMax + ' 条会出现在这里。</div>';
 }
 
 /* 网格描边：行内最后一列不画竖线，最后一行不画底线（按实际列数计算） */
@@ -641,7 +708,7 @@ function applyFilter(){
       card.classList.toggle('hidden', !match);
       if (match) visible++;
     });
-    const cols = Math.min(Math.max(visible, 1), MAX_COLS);
+    const cols = Math.min(Math.max(visible, 1), SETTINGS.maxCols);
     grid.dataset.cols = cols;
     grid.style.setProperty('--cols', cols);
     grid.style.display = visible ? '' : 'none';
@@ -680,7 +747,7 @@ function setFocus(id){
   });
   focusbar.classList.add('on');
   document.getElementById('focusName').textContent =
-    (SECTIONS.find(s => s.id === id) || {}).name || '';
+    (blockById[id] || {}).title || '';
   setActiveNav(id);
 }
 
@@ -733,7 +800,7 @@ function togglePin(key){
 }
 
 function pushRecent(key){
-  recent = [key, ...recent.filter(k => k !== key)].slice(0, RECENT_MAX);
+  recent = [key, ...recent.filter(k => k !== key)].slice(0, SETTINGS.recentMax);
   write(LS.recent, recent);
   renderRecent();
   relayout();
@@ -871,8 +938,10 @@ window.addEventListener('resize', () => { relayout(); syncSpy(); });
    启动
    ========================================================================== */
 document.documentElement.style.scrollBehavior = 'smooth';
+document.documentElement.style.setProperty('--sidebar-w', SETTINGS.sidebarWidth + 'px');
 document.getElementById('statSystems').textContent = SYSTEMS.length;
-document.getElementById('statCats').textContent = CATEGORIES.length;
+document.getElementById('statCats').textContent = NAV.length;
+auditConfig();
 renderSidebar();
 renderZones();
 renderPinned();
