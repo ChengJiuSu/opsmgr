@@ -1,0 +1,886 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>公司内部系统导航台</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="/favicon.svg">
+<link rel="stylesheet" href="/fonts/fonts.css">
+<style>
+/* ============================================================
+   设计令牌 —— 瑞士平面 / 现代主义：浅灰白底、墨色正文、单一红
+   ============================================================ */
+:root{
+  --bg:#f3f2f2;
+  --ink:#201e1d;
+  --ink-2:#6b6563;
+  --ink-3:#98918f;
+  --red:#ec3013;
+  --red-wash:#fae8e3;
+  --red-ink:#ffffff;
+  --rule:#201e1d;
+  --rule-soft:#c9c5c3;
+  --sidebar-w:272px;
+  --topbar-h:68px;
+  --font-ui:"Archivo","Noto Sans SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+}
+*,*::before,*::after{box-sizing:border-box;border-radius:0}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0;background:var(--bg);color:var(--ink);
+  font-family:var(--font-ui);font-size:14px;line-height:1.5;
+  font-synthesis-weight:none;-webkit-font-smoothing:antialiased;
+}
+img,svg{display:block}
+button,input{font:inherit;color:inherit}
+a{color:inherit;text-decoration:none}
+::selection{background:var(--red);color:var(--red-ink)}
+
+/* 键盘焦点：2px 红色 outline，禁用浏览器默认蓝框 */
+:focus{outline:none}
+:focus-visible{outline:2px solid var(--red);outline-offset:2px}
+
+/* ============================================================ 骨架 */
+.app{min-height:100vh}
+
+/* --------------------------------------------------- 左侧固定侧栏 */
+.sidebar{
+  position:fixed;inset:0 auto 0 0;width:var(--sidebar-w);
+  background:var(--bg);border-right:2px solid var(--rule);
+  display:flex;flex-direction:column;overflow-y:auto;z-index:40;
+}
+.brand{padding:22px 20px 18px;border-bottom:2px solid var(--rule)}
+.brand-mark{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:34px;height:34px;background:var(--red);color:var(--red-ink);
+  font-weight:900;font-size:15px;letter-spacing:-.04em;margin-bottom:14px;
+}
+.brand-name{font-size:19px;font-weight:900;letter-spacing:-.045em;line-height:1.05}
+.brand-sub{margin-top:5px;font-size:11px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3)}
+
+.nav{flex:1 1 auto;padding:0 0 12px}
+.nav-cat{border-bottom:2px solid var(--rule)}
+.nav-cat:last-of-type{border-bottom:0}
+.nav-cat-head{
+  display:flex;align-items:baseline;gap:8px;padding:14px 20px 8px;
+}
+.nav-cat-idx{font-size:11px;font-weight:800;color:var(--red);letter-spacing:.02em;font-variant-numeric:tabular-nums}
+.nav-cat-name{font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}
+.nav-cat-name-cn{font-size:13px;font-weight:800;letter-spacing:-.01em}
+.nav-list{list-style:none;margin:0;padding:0 0 10px}
+.nav-item{
+  display:flex;width:100%;align-items:center;gap:9px;
+  padding:7px 16px 7px 17px;background:none;border:0;
+  border-left:3px solid transparent;cursor:pointer;text-align:left;
+  font-size:13px;font-weight:500;color:var(--ink);
+}
+.nav-item:hover{background:var(--red-wash)}
+.nav-item.active{background:var(--red-wash);border-left-color:var(--red);font-weight:700}
+.nav-item.active .nav-item-idx{color:var(--red)}
+.nav-item-idx{font-size:10px;font-weight:700;color:var(--ink-3);font-variant-numeric:tabular-nums;width:16px;flex:none}
+.nav-item-label{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.nav-item-count{font-size:11px;font-weight:600;color:var(--ink-3);font-variant-numeric:tabular-nums}
+.nav-item.active .nav-item-count{color:var(--ink)}
+.sidebar-foot{
+  padding:14px 20px 18px;border-top:2px solid var(--rule);
+  font-size:11px;line-height:1.6;color:var(--ink-2);
+}
+.sidebar-foot b{color:var(--ink);font-weight:700}
+
+/* ------------------------------------------------------- 右侧主区 */
+.main{margin-left:var(--sidebar-w);min-width:0}
+
+/* 吸顶栏 */
+.topbar{
+  position:sticky;top:0;z-index:30;background:var(--bg);
+  border-bottom:2px solid var(--rule);
+}
+.topbar-row{
+  display:flex;align-items:center;gap:16px;height:var(--topbar-h);
+  padding:0 28px;
+}
+.search{position:relative;flex:1 1 auto;max-width:560px;min-width:0}
+.search input{
+  width:100%;height:42px;padding:0 92px 0 14px;background:transparent;
+  border:2px solid var(--rule);font-size:14px;font-weight:500;
+}
+.search input::placeholder{color:var(--ink-3);font-weight:400}
+.search input:focus{outline:2px solid var(--red);outline-offset:-2px;border-color:var(--red)}
+.search-hint{
+  position:absolute;right:10px;top:50%;transform:translateY(-50%);
+  display:flex;align-items:center;gap:8px;pointer-events:none;
+}
+.kbd{
+  display:inline-flex;align-items:center;justify-content:center;
+  min-width:20px;height:20px;padding:0 5px;border:2px solid var(--rule-soft);
+  font-size:11px;font-weight:700;color:var(--ink-3);
+}
+.hits{font-size:11px;font-weight:700;letter-spacing:.06em;color:var(--red);font-variant-numeric:tabular-nums}
+.topbar-spacer{flex:1 1 auto}
+.btn{
+  display:inline-flex;align-items:center;gap:8px;height:38px;padding:0 14px;
+  border:2px solid var(--rule);background:transparent;cursor:pointer;
+  font-size:12px;font-weight:700;letter-spacing:.02em;white-space:nowrap;
+}
+.btn:hover{background:var(--red-wash)}
+.btn.has-dot::before{content:"";width:8px;height:8px;background:var(--red);flex:none}
+.avatar{
+  width:38px;height:38px;flex:none;border:2px solid var(--rule);
+  display:flex;align-items:center;justify-content:center;
+  font-size:12px;font-weight:800;letter-spacing:-.02em;background:transparent;cursor:pointer;
+}
+.avatar:hover{background:var(--red-wash)}
+
+/* 聚焦条 */
+.focusbar{display:none;align-items:center;gap:14px;padding:0 28px;height:44px;background:var(--red);color:var(--red-ink);border-bottom:2px solid var(--rule)}
+.focusbar.on{display:flex}
+.focusbar-label{font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}
+.focusbar-name{font-size:13px;font-weight:700}
+.focusbar button{
+  margin-left:auto;display:inline-flex;align-items:center;gap:8px;height:28px;padding:0 10px;
+  background:transparent;border:2px solid var(--red-ink);color:var(--red-ink);
+  font-size:12px;font-weight:700;cursor:pointer;
+}
+.focusbar button:hover{background:var(--red-ink);color:var(--red)}
+.focusbar button:focus-visible{outline:2px solid var(--red-ink);outline-offset:2px}
+
+/* ---------------------------------------------------------- 内容 */
+.content{padding:0 0 96px}
+
+/* 报头 */
+.masthead{
+  display:flex;align-items:flex-end;gap:32px;flex-wrap:wrap;
+  padding:28px 28px 24px;border-bottom:2px solid var(--rule);
+}
+.masthead.collapsed{display:none}
+.masthead-text{flex:1 1 420px;min-width:0}
+.eyebrow{font-size:10px;font-weight:800;letter-spacing:.15em;text-transform:uppercase;color:var(--red)}
+h1{
+  margin:10px 0 0;font-size:clamp(26px,3vw,40px);font-weight:900;
+  letter-spacing:-.04em;line-height:1.04;text-wrap:balance;
+}
+.masthead p{margin:12px 0 0;max-width:54ch;font-size:13px;line-height:1.6;color:var(--ink-2)}
+.statblock{
+  flex:0 0 auto;display:flex;background:var(--red);color:var(--red-ink);
+}
+.stat{padding:13px 20px 11px;min-width:96px;border-right:2px solid var(--red-ink)}
+.stat:last-child{border-right:0}
+.stat-num{font-size:30px;font-weight:900;letter-spacing:-.05em;line-height:1;font-variant-numeric:tabular-nums}
+.stat-label{margin-top:5px;font-size:9px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}
+
+/* 区块通用 */
+.zone{padding:34px 28px 0;scroll-margin-top:132px;transition:opacity .28s ease,filter .28s ease}
+.zone.dim{opacity:.22;filter:grayscale(1);pointer-events:none}
+.zone-head{display:flex;align-items:baseline;gap:12px;padding-bottom:12px}
+.zone-idx{font-size:11px;font-weight:800;color:var(--red);font-variant-numeric:tabular-nums}
+.zone-title{font-size:20px;font-weight:800;letter-spacing:-.035em}
+.zone-cat{font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-3)}
+.zone-count{margin-left:auto;font-size:11px;font-weight:700;letter-spacing:.08em;color:var(--ink-3);font-variant-numeric:tabular-nums}
+.zone.hidden{display:none}
+
+/* 最近访问 */
+.recent{display:flex;flex-wrap:wrap;gap:0;border-top:2px solid var(--rule);padding-top:14px}
+.tag{
+  display:inline-flex;align-items:center;gap:8px;height:32px;padding:0 12px;
+  border:2px solid var(--rule);margin:0 10px 10px 0;cursor:pointer;
+  font-size:12px;font-weight:600;background:transparent;
+}
+.tag:hover{background:var(--red-wash)}
+.tag-abbr{font-size:10px;font-weight:800;letter-spacing:.06em;color:var(--red)}
+.empty{
+  border-top:2px solid var(--rule);padding:18px 0 2px;
+  font-size:13px;color:var(--ink-2);
+}
+
+/* --------------------------------------------------------- 卡片网格
+   列数 = 该分组真实卡片数（上限 4）；DOM 中只有真实卡片，无占位元素 */
+.card-grid{
+  display:grid;width:100%;
+  grid-template-columns:repeat(var(--cols,3),1fr);
+  border-top:2px solid var(--rule);
+}
+.card{
+  position:relative;display:flex;gap:14px;min-width:0;
+  padding:18px 16px 16px;
+  border-right:2px solid var(--rule);border-bottom:2px solid var(--rule);
+  transition:background .12s linear;
+}
+.card.no-r{border-right:0}
+.card.no-b{border-bottom:0}
+.card.hidden{display:none}
+.card:hover{background:var(--red-wash)}
+.card:hover .abbr{background:var(--red);border-color:var(--red);color:var(--red-ink)}
+.abbr{
+  flex:none;width:44px;height:44px;border:2px solid var(--rule);
+  display:flex;align-items:center;justify-content:center;
+  font-size:12px;font-weight:800;letter-spacing:-.02em;
+  transition:background .12s linear,color .12s linear,border-color .12s linear;
+}
+.card-body{min-width:0;flex:1 1 auto;padding-right:26px}
+.card-name{display:block;font-size:14px;font-weight:700;letter-spacing:-.015em;line-height:1.3}
+.card-name::after{content:"";position:absolute;inset:0}
+.card-desc{
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;
+  margin-top:5px;font-size:12px;line-height:1.5;color:var(--ink-2);
+}
+.card-domain{
+  display:block;margin-top:8px;font-size:10px;font-weight:700;
+  letter-spacing:.09em;text-transform:uppercase;color:var(--ink-3);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.card:hover .card-domain{color:var(--red)}
+.star{
+  position:absolute;top:12px;right:10px;z-index:2;
+  width:26px;height:26px;display:flex;align-items:center;justify-content:center;
+  background:transparent;border:0;cursor:pointer;color:var(--ink-3);padding:0;
+}
+.star:hover{color:var(--red)}
+.star svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:2}
+.star.on{color:var(--red)}
+.star.on svg{fill:currentColor}
+
+/* ------------------------------------------------------------ 模态 */
+.overlay{
+  position:fixed;inset:0;z-index:60;display:none;
+  background:rgba(32,30,29,.55);padding:24px;
+  align-items:flex-start;justify-content:center;overflow-y:auto;
+}
+.overlay.on{display:flex}
+.modal{
+  width:min(620px,100%);margin-top:8vh;background:var(--bg);
+  border:2px solid var(--rule);
+}
+.modal-bar{
+  display:flex;align-items:center;gap:12px;
+  background:var(--red);color:var(--red-ink);padding:14px 18px;
+}
+.modal-bar-tag{font-size:10px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;border:2px solid var(--red-ink);padding:2px 6px}
+.modal-bar-title{font-size:15px;font-weight:800;letter-spacing:-.02em;flex:1 1 auto;min-width:0}
+.modal-close{
+  flex:none;width:26px;height:26px;background:transparent;border:2px solid var(--red-ink);
+  color:var(--red-ink);font-size:13px;font-weight:800;cursor:pointer;line-height:1;
+}
+.modal-close:hover{background:var(--red-ink);color:var(--red)}
+.modal-close:focus-visible{outline:2px solid var(--red-ink);outline-offset:2px}
+.modal-body{padding:20px 18px 6px}
+.meta-row{display:flex;gap:14px;padding:10px 0;border-bottom:2px solid var(--rule-soft)}
+.meta-row:first-child{padding-top:0}
+.meta-k{flex:0 0 88px;font-size:10px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-3);padding-top:2px}
+.meta-v{flex:1 1 auto;min-width:0;font-size:13px;line-height:1.6}
+.meta-v.time{font-variant-numeric:tabular-nums;font-weight:600}
+.chip{display:inline-block;border:2px solid var(--rule);padding:1px 7px;margin:0 6px 6px 0;font-size:11px;font-weight:700}
+.modal-text{padding:16px 0 4px;font-size:13px;line-height:1.7;color:var(--ink-2);white-space:pre-line}
+.modal-foot{
+  display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+  padding:14px 18px;border-top:2px solid var(--rule);
+}
+.check{display:inline-flex;align-items:center;gap:9px;font-size:12px;font-weight:600;cursor:pointer}
+.check input{appearance:none;width:16px;height:16px;border:2px solid var(--rule);background:transparent;cursor:pointer;flex:none}
+.check input:checked{background:var(--red);border-color:var(--red);box-shadow:inset 0 0 0 3px var(--bg)}
+.check input:focus-visible{outline:2px solid var(--red);outline-offset:2px}
+.modal-foot .btn{margin-left:auto}
+.modal-foot .btn.primary{background:var(--red);border-color:var(--red);color:var(--red-ink)}
+.modal-foot .btn.primary:hover{background:var(--ink);border-color:var(--ink)}
+.queue-pos{font-size:11px;font-weight:700;color:var(--ink-3);font-variant-numeric:tabular-nums}
+
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+
+/* -------------------------------------------------------- 响应式 */
+@media (max-width:1023.98px){
+  .sidebar{position:static;width:100%;border-right:0;border-bottom:2px solid var(--rule)}
+  .main{margin-left:0}
+  .card-grid{grid-template-columns:repeat(2,1fr)}
+  .card-grid[data-cols="1"]{grid-template-columns:1fr}
+  .masthead{padding:32px 20px 28px}
+  .zone{padding:28px 20px 0}
+  .topbar-row,.focusbar{padding:0 20px}
+}
+@media (max-width:639.98px){
+  .card-grid{grid-template-columns:1fr}
+  .topbar-row{height:auto;padding:12px 16px;flex-wrap:wrap}
+  .search{max-width:none;flex:1 1 100%;order:3}
+  .zone{padding:24px 16px 0}
+  .masthead{padding:22px 16px 20px;gap:20px}
+  #mhToggle{display:none}
+  .statblock{width:100%}
+  .stat{flex:1 1 0}
+}
+@media (prefers-reduced-motion:reduce){
+  *{transition:none !important;scroll-behavior:auto !important}
+}
+</style>
+</head>
+<body>
+
+<div class="app">
+  <!-- ============================== 左侧侧栏 ============================== -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">N</div>
+      <div class="brand-name">内部系统导航台</div>
+      <div class="brand-sub">Internal Systems Index</div>
+    </div>
+    <nav class="nav" id="nav" aria-label="系统类别"></nav>
+    <div class="sidebar-foot">
+      维护方：<b>基础架构部 · 运维平台组</b><br>
+      新增或下线系统请提工单 <b>#IT-NAV</b>
+    </div>
+  </aside>
+
+  <!-- ============================== 右侧主区 ============================== -->
+  <div class="main">
+    <header class="topbar">
+      <div class="topbar-row">
+        <div class="search">
+          <label class="sr" for="q">搜索系统</label>
+          <input id="q" type="search" autocomplete="off" spellcheck="false" placeholder="搜索系统名称、描述或域名">
+          <div class="search-hint">
+            <span class="hits" id="hits"></span>
+            <span class="kbd">/</span>
+          </div>
+        </div>
+        <div class="topbar-spacer"></div>
+        <button class="btn" id="mhToggle" type="button" aria-controls="masthead" aria-expanded="true">收起报头</button>
+        <button class="btn" id="noticeBtn" type="button">维护公告</button>
+        <button class="avatar" id="me" type="button" title="当前登录：suchengjiu">SC</button>
+      </div>
+      <div class="focusbar" id="focusbar">
+        <span class="focusbar-label">聚焦</span>
+        <span class="focusbar-name" id="focusName"></span>
+        <button type="button" id="focusExit">显示全部 ✕</button>
+      </div>
+    </header>
+
+    <div class="content">
+      <section class="masthead" id="masthead">
+        <div class="masthead-text">
+          <div class="eyebrow">Corp Intranet / 2026</div>
+          <h1>公司内部系统<br>统一入口</h1>
+          <p>这里收录公司在用的全部内部系统入口，按运维、平台、公共服务、文档四类归档。账号统一走单点登录；若某个系统提示无权限，请按卡片所属小节向对应负责团队申请。清单每周同步一次。</p>
+        </div>
+        <div class="statblock">
+          <div class="stat"><div class="stat-num" id="statSystems">0</div><div class="stat-label">系统总数</div></div>
+          <div class="stat"><div class="stat-num" id="statCats">0</div><div class="stat-label">一级类别</div></div>
+        </div>
+      </section>
+
+      <section class="zone" id="zone-recent">
+        <div class="zone-head">
+          <span class="zone-idx">—</span>
+          <span class="zone-title">最近访问</span>
+          <span class="zone-cat">Recent</span>
+        </div>
+        <div id="recentWrap"></div>
+      </section>
+
+      <section class="zone" id="zone-pinned">
+        <div class="zone-head">
+          <span class="zone-idx">★</span>
+          <span class="zone-title">我的置顶</span>
+          <span class="zone-cat">Pinned</span>
+          <span class="zone-count" id="pinnedCount"></span>
+        </div>
+        <div id="pinnedWrap"></div>
+      </section>
+
+      <div id="zones"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================== 公告模态 ============================== -->
+<div class="overlay" id="overlay" role="dialog" aria-modal="true" aria-labelledby="noticeTitle">
+  <div class="modal">
+    <div class="modal-bar">
+      <span class="modal-bar-tag">维护公告</span>
+      <span class="modal-bar-title" id="noticeTitle"></span>
+      <button class="modal-close" id="noticeX" type="button" aria-label="关闭">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="meta-row"><div class="meta-k">影响系统</div><div class="meta-v" id="noticeSystems"></div></div>
+      <div class="meta-row"><div class="meta-k">时间窗口</div><div class="meta-v time" id="noticeWindow"></div></div>
+      <div class="modal-text" id="noticeBody"></div>
+    </div>
+    <div class="modal-foot">
+      <label class="check"><input type="checkbox" id="noticeMute"><span>不再提示本条</span></label>
+      <span class="queue-pos" id="noticePos"></span>
+      <button class="btn primary" id="noticeNext" type="button">知道了</button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ==========================================================================
+   数据层 —— 替换为真实清单时只改这两个数组
+   ========================================================================== */
+
+// 一级类别 → 二级小节
+const CATEGORIES = [
+  { id:'ops',      name:'运维工具',     en:'Operations',  sections:[
+      { id:'monitor', name:'监控告警' },
+      { id:'cicd',    name:'发布与流水线' },
+      { id:'infra',   name:'主机与资源' } ] },
+  { id:'platform', name:'平台工具',     en:'Platform',    sections:[
+      { id:'apps',    name:'应用平台' },
+      { id:'data',    name:'数据与报表' } ] },
+  { id:'common',   name:'公共服务',     en:'Workplace',   sections:[
+      { id:'office',  name:'办公协同' },
+      { id:'hr',      name:'人事财务' } ] },
+  { id:'docs',     name:'文档与知识库', en:'Knowledge',   sections:[
+      { id:'techdoc', name:'技术文档' },
+      { id:'process', name:'流程规范' } ] },
+];
+
+// 系统清单：section=所属小节 id，name/abbr/desc/domain/url
+const SYSTEMS = [
+  { section:'monitor', name:'统一监控中心', abbr:'MON', desc:'主机、容器与业务指标的统一大盘，含告警规则与静默配置。', domain:'monitor.corp.internal', url:'https://monitor.corp.internal' },
+  { section:'monitor', name:'日志检索平台', abbr:'LOG', desc:'全量应用日志采集与检索，支持按 traceId 串联上下游。', domain:'log.corp.internal', url:'https://log.corp.internal' },
+  { section:'monitor', name:'链路追踪',     abbr:'APM', desc:'分布式调用链与慢接口分析，定位跨服务性能瓶颈。', domain:'apm.corp.internal', url:'https://apm.corp.internal' },
+  { section:'monitor', name:'值班与告警',   abbr:'DUT', desc:'排班表、告警升级策略与故障处理记录。', domain:'duty.corp.internal', url:'https://duty.corp.internal' },
+
+  { section:'cicd', name:'持续集成',   abbr:'CI',  desc:'代码提交后的构建、单测与镜像打包流水线。', domain:'ci.corp.internal', url:'https://ci.corp.internal' },
+  { section:'cicd', name:'制品仓库',   abbr:'ART', desc:'容器镜像、Maven 与 npm 私有仓库，含保留策略。', domain:'artifact.corp.internal', url:'https://artifact.corp.internal' },
+  { section:'cicd', name:'发布中心',   abbr:'REL', desc:'灰度发布、回滚与发布窗口审批，串联变更单。', domain:'release.corp.internal', url:'https://release.corp.internal' },
+
+  { section:'infra', name:'资产配置库',   abbr:'CMDB', desc:'主机、集群、域名与服务归属关系的唯一事实来源。', domain:'cmdb.corp.internal', url:'https://cmdb.corp.internal' },
+  { section:'infra', name:'堡垒机',       abbr:'BAS',  desc:'生产环境统一登录入口，全程录屏审计。', domain:'bastion.corp.internal', url:'https://bastion.corp.internal' },
+  { section:'infra', name:'云资源控制台', abbr:'CLD',  desc:'多云账号下的实例、网络与账单聚合视图。', domain:'cloud.corp.internal', url:'https://cloud.corp.internal' },
+  { section:'infra', name:'域名与证书',   abbr:'DNS',  desc:'内外网解析记录、证书申请与到期提醒。', domain:'dns.corp.internal', url:'https://dns.corp.internal' },
+
+  { section:'apps', name:'容器平台',   abbr:'K8S', desc:'应用编排与扩缩容，命名空间按业务线划分。', domain:'paas.corp.internal', url:'https://paas.corp.internal' },
+  { section:'apps', name:'配置中心',   abbr:'CFG', desc:'环境配置与开关灰度下发，改动留审计记录。', domain:'config.corp.internal', url:'https://config.corp.internal' },
+  { section:'apps', name:'任务调度',   abbr:'JOB', desc:'定时任务编排与执行历史，支持失败重试与告警。', domain:'job.corp.internal', url:'https://job.corp.internal' },
+
+  { section:'data', name:'数据看板',   abbr:'BI',  desc:'经营与业务指标报表，按角色分配查看范围。', domain:'bi.corp.internal', url:'https://bi.corp.internal' },
+  { section:'data', name:'指标平台',   abbr:'MET', desc:'指标口径定义与血缘，避免同名不同义。', domain:'metrics.corp.internal', url:'https://metrics.corp.internal' },
+  { section:'data', name:'数据开发',   abbr:'ETL', desc:'离线与实时任务开发、调度与数据质量校验。', domain:'etl.corp.internal', url:'https://etl.corp.internal' },
+  { section:'data', name:'实验平台',   abbr:'EXP', desc:'A/B 分流配置与效果分析，含显著性检验。', domain:'ab.corp.internal', url:'https://ab.corp.internal' },
+
+  { section:'office', name:'企业邮箱',   abbr:'MAIL', desc:'公司邮箱 Web 端，支持邮件组与共享日历。', domain:'mail.corp.internal', url:'https://mail.corp.internal' },
+  { section:'office', name:'内部即时通讯', abbr:'IM', desc:'团队沟通与机器人通知的网页端入口。', domain:'im.corp.internal', url:'https://im.corp.internal' },
+  { section:'office', name:'会议室预订', abbr:'ROOM', desc:'各办公区会议室与工位预订，可绑定日历。', domain:'room.corp.internal', url:'https://room.corp.internal' },
+  { section:'office', name:'文件云盘',   abbr:'DRV',  desc:'部门共享目录与文档外链管理，含权限回收。', domain:'drive.corp.internal', url:'https://drive.corp.internal' },
+
+  { section:'hr', name:'人事系统',   abbr:'HR',  desc:'考勤、请假、绩效与个人信息维护。', domain:'hr.corp.internal', url:'https://hr.corp.internal' },
+  { section:'hr', name:'费用报销',   abbr:'FIN', desc:'差旅与日常报销提单，含发票查验与进度跟踪。', domain:'fin.corp.internal', url:'https://fin.corp.internal' },
+  { section:'hr', name:'采购与合同', abbr:'BUY', desc:'采购申请、供应商信息与合同用印流程。', domain:'buy.corp.internal', url:'https://buy.corp.internal' },
+
+  { section:'techdoc', name:'研发知识库', abbr:'WIKI', desc:'各团队技术文档、故障复盘与上手指引。', domain:'wiki.corp.internal', url:'https://wiki.corp.internal' },
+  { section:'techdoc', name:'接口文档',   abbr:'API',  desc:'内部服务 OpenAPI 文档与在线调试。', domain:'api-doc.corp.internal', url:'https://api-doc.corp.internal' },
+  { section:'techdoc', name:'架构决策记录', abbr:'ADR', desc:'重大技术选型的背景、取舍与结论归档。', domain:'adr.corp.internal', url:'https://adr.corp.internal' },
+
+  { section:'process', name:'工单系统',   abbr:'TIC', desc:'IT 支持、权限申请与资源开通的统一提单入口。', domain:'ticket.corp.internal', url:'https://ticket.corp.internal' },
+  { section:'process', name:'变更与审批', abbr:'CHG', desc:'生产变更登记、风险评估与审批流转。', domain:'change.corp.internal', url:'https://change.corp.internal' },
+  { section:'process', name:'安全合规',   abbr:'SEC', desc:'安全基线、漏洞处置与合规制度查阅。', domain:'sec.corp.internal', url:'https://sec.corp.internal' },
+];
+
+// 维护公告
+const NOTICES = [
+  { id:'2026-08-CHG-114',
+    title:'核心网络设备固件升级',
+    systems:['统一监控中心','堡垒机','制品仓库'],
+    start:'2026-08-29 22:00',
+    end:'2026-09-01 06:00',
+    body:'升级期间上述系统会出现 2～5 分钟的间歇性不可用，登录会话可能被断开，重新登录即可。\n构建流水线请避开该窗口触发；已排队任务会在升级完成后自动继续。\n如遇异常请在工单系统提单并标注「网络升级」。' },
+  { id:'2026-07-CHG-098',
+    title:'报销系统版本切换',
+    systems:['费用报销'],
+    start:'2026-07-12 20:00',
+    end:'2026-07-13 02:00',
+    body:'历史公告，仅作示例，已过生效窗口。' },
+];
+
+/* ==========================================================================
+   状态 —— localStorage
+   ========================================================================== */
+const LS = {
+  pins:'nav.pins.v1',
+  recent:'nav.recent.v1',
+  muted:'nav.notices.muted.v1',
+  masthead:'nav.masthead.open.v1',
+};
+const read = (k, fb) => { try { return JSON.parse(localStorage.getItem(k)) ?? fb; } catch { return fb; } };
+const write = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
+
+let pins   = read(LS.pins, []);
+let recent = read(LS.recent, []);
+let muted  = read(LS.muted, []);
+let mhOpen = read(LS.masthead, true);   // 首次访问默认展开
+
+const MAX_COLS = 4;      // 列数上限：卡片再多也不会挤成细条
+const RECENT_MAX = 8;
+
+const SECTIONS = CATEGORIES.flatMap(c => c.sections.map(s => ({ ...s, cat:c })));
+const sysKey = s => s.domain;
+const byKey  = Object.fromEntries(SYSTEMS.map(s => [sysKey(s), s]));
+const pad2   = n => String(n).padStart(2,'0');
+const esc    = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+/* ==========================================================================
+   渲染
+   ========================================================================== */
+const STAR_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.6l2.6 5.5 6 .8-4.4 4.2 1.1 6L12 17.2 6.7 20.1l1.1-6L3.4 9.9l6-.8z"/></svg>';
+
+function cardHTML(sys){
+  const k = sysKey(sys);
+  const on = pins.includes(k);
+  return `<div class="card" data-key="${esc(k)}" data-search="${esc((sys.name+' '+sys.abbr+' '+sys.desc+' '+sys.domain).toLowerCase())}">
+    <span class="abbr">${esc(sys.abbr)}</span>
+    <span class="card-body">
+      <a class="card-name" href="${esc(sys.url)}" target="_blank" rel="noopener">${esc(sys.name)}</a>
+      <span class="card-desc">${esc(sys.desc)}</span>
+      <span class="card-domain">${esc(sys.domain)}</span>
+    </span>
+    <button class="star${on?' on':''}" type="button" data-star="${esc(k)}"
+      aria-pressed="${on}" aria-label="${on?'取消置顶':'置顶'} ${esc(sys.name)}">${STAR_SVG}</button>
+  </div>`;
+}
+
+function gridHTML(list){
+  const cols = Math.min(Math.max(list.length,1), MAX_COLS);
+  return `<div class="card-grid" data-cols="${cols}" style="--cols:${cols}">${list.map(cardHTML).join('')}</div>`;
+}
+
+function renderSidebar(){
+  let n = 0;
+  document.getElementById('nav').innerHTML = CATEGORIES.map((c,ci) => `
+    <div class="nav-cat">
+      <div class="nav-cat-head">
+        <span class="nav-cat-idx">${pad2(ci+1)}</span>
+        <span class="nav-cat-name-cn">${esc(c.name)}</span>
+        <span class="nav-cat-name" style="margin-left:auto;color:var(--ink-3)">${esc(c.en)}</span>
+      </div>
+      <ul class="nav-list">
+        ${c.sections.map(s => {
+          n++;
+          const count = SYSTEMS.filter(x => x.section === s.id).length;
+          return `<li><button class="nav-item" type="button" data-goto="${s.id}">
+            <span class="nav-item-idx">${pad2(n)}</span>
+            <span class="nav-item-label">${esc(s.name)}</span>
+            <span class="nav-item-count">${count}</span>
+          </button></li>`;
+        }).join('')}
+      </ul>
+    </div>`).join('');
+}
+
+function renderZones(){
+  document.getElementById('zones').innerHTML = SECTIONS.map((s,i) => {
+    const list = SYSTEMS.filter(x => x.section === s.id);
+    return `<section class="zone" id="sec-${s.id}" data-section="${s.id}">
+      <div class="zone-head">
+        <span class="zone-idx">${pad2(i+1)}</span>
+        <span class="zone-title">${esc(s.name)}</span>
+        <span class="zone-cat">${esc(s.cat.name)}</span>
+        <span class="zone-count">${list.length} 个系统</span>
+      </div>
+      ${gridHTML(list)}
+    </section>`;
+  }).join('');
+}
+
+function renderPinned(){
+  const list = pins.map(k => byKey[k]).filter(Boolean);
+  document.getElementById('pinnedCount').textContent = list.length ? list.length + ' 个系统' : '';
+  document.getElementById('pinnedWrap').innerHTML = list.length
+    ? gridHTML(list)
+    : '<div class="empty">还没有置顶的系统。点击任意卡片右上角的星标，把常用入口固定到这里。</div>';
+}
+
+function renderRecent(){
+  const list = recent.map(k => byKey[k]).filter(Boolean);
+  document.getElementById('recentWrap').innerHTML = list.length
+    ? '<div class="recent">' + list.map(s =>
+        `<button class="tag" type="button" data-open="${esc(sysKey(s))}">
+           <span class="tag-abbr">${esc(s.abbr)}</span><span>${esc(s.name)}</span>
+         </button>`).join('') + '</div>'
+    : '<div class="empty">还没有访问记录。打开任意系统后，最近 ' + RECENT_MAX + ' 条会出现在这里。</div>';
+}
+
+/* 网格描边：行内最后一列不画竖线，最后一行不画底线（按实际列数计算） */
+function relayout(){
+  document.querySelectorAll('.card-grid').forEach(grid => {
+    const cards = [...grid.children].filter(c => !c.classList.contains('hidden'));
+    if (!cards.length) return;
+    const tpl = getComputedStyle(grid).gridTemplateColumns;
+    let cols = tpl && tpl !== 'none' ? tpl.trim().split(/\s+/).length : Number(grid.dataset.cols) || 1;
+    if (!Number.isFinite(cols) || cols < 1) cols = 1;
+    const rows = Math.ceil(cards.length / cols);
+    cards.forEach((card, i) => {
+      card.classList.toggle('no-r', (i + 1) % cols === 0 || i === cards.length - 1);
+      card.classList.toggle('no-b', Math.floor(i / cols) === rows - 1);
+    });
+  });
+}
+
+/* ==========================================================================
+   报头收起 / 展开（首次访问默认展开，之后记住选择）
+   ========================================================================== */
+function applyMasthead(){
+  document.getElementById('masthead').classList.toggle('collapsed', !mhOpen);
+  const b = document.getElementById('mhToggle');
+  b.textContent = mhOpen ? '收起报头' : '展开报头';
+  b.setAttribute('aria-expanded', String(mhOpen));
+  syncSpy();
+}
+
+/* ==========================================================================
+   搜索过滤
+   ========================================================================== */
+const qEl = document.getElementById('q');
+const hitsEl = document.getElementById('hits');
+
+function applyFilter(){
+  const q = qEl.value.trim().toLowerCase();
+  let hits = 0;
+
+  document.querySelectorAll('.card-grid').forEach(grid => {
+    let visible = 0;
+    [...grid.children].forEach(card => {
+      const match = !q || card.dataset.search.includes(q);
+      card.classList.toggle('hidden', !match);
+      if (match) visible++;
+    });
+    const cols = Math.min(Math.max(visible, 1), MAX_COLS);
+    grid.dataset.cols = cols;
+    grid.style.setProperty('--cols', cols);
+    grid.style.display = visible ? '' : 'none';
+  });
+
+  // 主区块：无命中则整块隐藏（不留空壳）
+  document.querySelectorAll('#zones .zone').forEach(zone => {
+    const visible = zone.querySelectorAll('.card:not(.hidden)').length;
+    zone.classList.toggle('hidden', !!q && visible === 0);
+    if (visible) hits += visible;
+    const c = zone.querySelector('.zone-count');
+    if (c) c.textContent = visible + ' 个系统';
+  });
+
+  // 搜索时收起「最近访问 / 我的置顶」，结果只看主清单
+  document.getElementById('zone-recent').classList.toggle('hidden', !!q);
+  document.getElementById('zone-pinned').classList.toggle('hidden', !!q);
+
+  hitsEl.textContent = q ? `命中 ${hits}` : '';
+  if (q) exitFocus();
+  relayout();
+  syncSpy();
+}
+
+/* ==========================================================================
+   聚焦模式
+   ========================================================================== */
+let focusId = null;
+const focusbar = document.getElementById('focusbar');
+
+function setFocus(id){
+  if (focusId === id) { exitFocus(); return; }
+  focusId = id;
+  document.querySelectorAll('#zones .zone, #zone-recent, #zone-pinned').forEach(z => {
+    z.classList.toggle('dim', z.dataset.section !== id);
+  });
+  focusbar.classList.add('on');
+  document.getElementById('focusName').textContent =
+    (SECTIONS.find(s => s.id === id) || {}).name || '';
+  setActiveNav(id);
+}
+
+function exitFocus(){
+  if (!focusId) return;
+  focusId = null;
+  document.querySelectorAll('.dim').forEach(z => z.classList.remove('dim'));
+  focusbar.classList.remove('on');
+}
+
+function gotoSection(id){
+  const el = document.getElementById('sec-' + id);
+  if (!el) return;
+  const focusing = focusId !== id;
+  setFocus(id);
+  if (focusing) el.scrollIntoView({ behavior:'smooth', block:'start' });
+}
+
+/* ==========================================================================
+   滚动高亮
+   ========================================================================== */
+function setActiveNav(id){
+  document.querySelectorAll('.nav-item').forEach(b => {
+    b.classList.toggle('active', b.dataset.goto === id);
+  });
+}
+function syncSpy(){
+  if (focusId) return;
+  const zones = [...document.querySelectorAll('#zones .zone:not(.hidden)')];
+  if (!zones.length) { setActiveNav(null); return; }
+  const line = document.querySelector('.topbar').offsetHeight + 40;
+  let cur = zones[0];
+  for (const z of zones) if (z.getBoundingClientRect().top <= line) cur = z;
+  setActiveNav(cur.dataset.section);
+}
+
+/* ==========================================================================
+   置顶 / 最近访问
+   ========================================================================== */
+function togglePin(key){
+  pins = pins.includes(key) ? pins.filter(k => k !== key) : [key, ...pins];
+  write(LS.pins, pins);
+  const on = pins.includes(key);
+  document.querySelectorAll(`[data-star="${CSS.escape(key)}"]`).forEach(b => {
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', String(on));
+  });
+  renderPinned();
+  applyFilter();
+}
+
+function pushRecent(key){
+  recent = [key, ...recent.filter(k => k !== key)].slice(0, RECENT_MAX);
+  write(LS.recent, recent);
+  renderRecent();
+  relayout();
+}
+
+/* ==========================================================================
+   维护公告
+   ========================================================================== */
+const parseTs = s => new Date(String(s).replace(/-/g, '/')).getTime();
+const isActive = n => { const now = Date.now(); return parseTs(n.start) <= now && now <= parseTs(n.end); };
+const fmt = s => s.replace(/^\d{4}-/, '').replace(/-/g, '/');
+
+const overlay = document.getElementById('overlay');
+const muteEl  = document.getElementById('noticeMute');
+let queue = [], qi = 0, lastFocused = null;
+
+function showNotice(){
+  const n = queue[qi];
+  if (!n) { closeNotice(); return; }
+  document.getElementById('noticeTitle').textContent = n.title;
+  document.getElementById('noticeSystems').innerHTML =
+    n.systems.map(s => `<span class="chip">${esc(s)}</span>`).join('');
+  document.getElementById('noticeWindow').textContent = `${fmt(n.start)} — ${fmt(n.end)}`;
+  document.getElementById('noticeBody').textContent = n.body;
+  document.getElementById('noticePos').textContent = queue.length > 1 ? `${qi + 1} / ${queue.length}` : '';
+  document.getElementById('noticeNext').textContent = qi < queue.length - 1 ? '下一条' : '知道了';
+  muteEl.checked = muted.includes(n.id);
+  overlay.classList.add('on');
+  document.getElementById('noticeX').focus();
+}
+
+function commitMute(){
+  const n = queue[qi];
+  if (!n) return;
+  if (muteEl.checked && !muted.includes(n.id)) muted = [...muted, n.id];
+  if (!muteEl.checked) muted = muted.filter(id => id !== n.id);
+  write(LS.muted, muted);
+}
+
+function openNotices(all){
+  const act = NOTICES.filter(isActive);
+  queue = all ? act : act.filter(n => !muted.includes(n.id));
+  qi = 0;
+  if (!queue.length) {
+    if (all) { queue = [{ id:'__none__', title:'当前没有生效中的公告', systems:['—'], start:'—', end:'—',
+      body:'历史公告已归档在工单系统的「变更公告」列表中。' }]; }
+    else return;
+  }
+  lastFocused = document.activeElement;
+  showNotice();
+}
+
+function nextNotice(){
+  commitMute();
+  if (qi < queue.length - 1) { qi++; showNotice(); } else closeNotice();
+}
+
+function closeNotice(){
+  commitMute();
+  overlay.classList.remove('on');
+  if (lastFocused && lastFocused.focus) lastFocused.focus();
+}
+
+/* ==========================================================================
+   事件绑定
+   ========================================================================== */
+document.addEventListener('click', e => {
+  const star = e.target.closest('[data-star]');
+  if (star) { e.preventDefault(); togglePin(star.dataset.star); return; }
+
+  const goto = e.target.closest('[data-goto]');
+  if (goto) { gotoSection(goto.dataset.goto); return; }
+
+  const tag = e.target.closest('[data-open]');
+  if (tag) {
+    const sys = byKey[tag.dataset.open];
+    if (sys) { pushRecent(tag.dataset.open); window.open(sys.url, '_blank', 'noopener'); }
+    return;
+  }
+
+  const link = e.target.closest('.card-name');
+  if (link) {
+    const card = link.closest('.card');
+    if (card) pushRecent(card.dataset.key);
+    return;
+  }
+
+  if (e.target === overlay) closeNotice();
+});
+
+document.getElementById('mhToggle').addEventListener('click', () => {
+  mhOpen = !mhOpen;
+  write(LS.masthead, mhOpen);
+  applyMasthead();
+});
+document.getElementById('noticeBtn').addEventListener('click', () => openNotices(true));
+document.getElementById('noticeNext').addEventListener('click', nextNotice);
+document.getElementById('noticeX').addEventListener('click', closeNotice);
+document.getElementById('focusExit').addEventListener('click', exitFocus);
+document.getElementById('me').addEventListener('click', () => {
+  qEl.focus(); qEl.select();
+});
+
+qEl.addEventListener('input', applyFilter);
+
+document.addEventListener('keydown', e => {
+  if (e.key === '/' && !/^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName)) {
+    e.preventDefault(); qEl.focus(); qEl.select(); return;
+  }
+  if (e.key === 'Escape') {
+    if (overlay.classList.contains('on')) { closeNotice(); return; }
+    if (focusId) { exitFocus(); return; }
+    if (qEl.value) { qEl.value = ''; applyFilter(); }
+  }
+  // 模态内简单焦点约束
+  if (e.key === 'Tab' && overlay.classList.contains('on')) {
+    const f = [...overlay.querySelectorAll('button, input')].filter(x => x.offsetParent !== null);
+    if (!f.length) return;
+    const first = f[0], last = f[f.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  }
+});
+
+let ticking = false;
+window.addEventListener('scroll', () => {
+  if (ticking) return;
+  ticking = true;
+  requestAnimationFrame(() => { syncSpy(); ticking = false; });
+}, { passive:true });
+
+window.addEventListener('resize', () => { relayout(); syncSpy(); });
+
+/* ==========================================================================
+   启动
+   ========================================================================== */
+document.documentElement.style.scrollBehavior = 'smooth';
+document.getElementById('statSystems').textContent = SYSTEMS.length;
+document.getElementById('statCats').textContent = CATEGORIES.length;
+renderSidebar();
+renderZones();
+renderPinned();
+renderRecent();
+applyMasthead();
+relayout();
+syncSpy();
+openNotices(false);
+</script>
+</body>
+</html>
