@@ -50,6 +50,7 @@
             <el-menu-item index="/config/cloud-providers">云厂商</el-menu-item>
             <el-menu-item index="/config/environments">环境</el-menu-item>
             <el-menu-item index="/config/service-types">服务类型</el-menu-item>
+            <el-menu-item index="/config/portal">内部导航页</el-menu-item>
           </template>
           <el-menu-item v-if="authStore.can('cmdb')" index="/config/allocation">服务器分配</el-menu-item>
         </el-sub-menu>
