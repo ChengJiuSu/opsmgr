@@ -317,16 +317,10 @@ h1{
 <div class="app">
   <!-- ============================== 左侧侧栏 ============================== -->
   <aside class="sidebar">
-    <div class="brand">
-      <div class="brand-mark">N</div>
-      <div class="brand-name">内部系统导航台</div>
-      <div class="brand-sub">Internal Systems Index</div>
-    </div>
+    <!-- 品牌区与底部说明由 SETTINGS.brand / SETTINGS.footer 渲染 -->
+    <div class="brand" id="brand"></div>
     <nav class="nav" id="nav" aria-label="系统类别"></nav>
-    <div class="sidebar-foot">
-      维护方：<b>基础架构部 · 运维平台组</b><br>
-      新增或下线系统请提工单 <b>#IT-NAV</b>
-    </div>
+    <div class="sidebar-foot" id="sidebarFoot"></div>
   </aside>
 
   <!-- ============================== 右侧主区 ============================== -->
@@ -425,6 +419,20 @@ const SETTINGS = {
   maxCols: 4,               // 卡片网格列数上限，超出的分组换行排
   recentMax: 8,             // 「最近访问」保留条数
   mastheadOpenByDefault: true,  // 首次访问时报头是否展开
+
+  // 侧栏品牌区。mark 为方形标里的字符（留空则不显示该标）。
+  brand: {
+    mark: 'N',
+    name: '内部系统导航台',
+    sub:  'Internal Systems Index',
+  },
+
+  // 侧栏底部说明。每行可以是一个字符串，也可以是分段数组——
+  // 数组的奇数段（第 2、4… 个）自动加粗，用来突出维护方、工单号等。
+  footer: [
+    ['维护方：', '基础架构部 · 运维平台组'],
+    ['新增或下线系统请提工单 ', '#IT-NAV'],
+  ],
 
   // 报头文案。纯文本，渲染时统一转义，不解析 HTML。
   // intro 里若提到分类（如「按运维、平台…四类归档」），改 NAV 分组时记得同步这句。
@@ -619,6 +627,22 @@ function navItemHTML(it){
     <span class="nav-item-label">${esc(label)}</span>
     <span class="nav-item-count">${sysOf(it.block).length}</span>
   </button></li>`;
+}
+
+// 一行文案：字符串直出；数组则奇数段加粗。两种写法都做转义，不解析 HTML
+function lineHTML(line){
+  const segs = Array.isArray(line) ? line : [line];
+  return segs.map((t, i) => i % 2 ? `<b>${esc(t)}</b>` : esc(t)).join('');
+}
+
+function renderBrand(){
+  const b = SETTINGS.brand || {};
+  document.getElementById('brand').innerHTML = `
+    ${b.mark ? `<div class="brand-mark">${esc(b.mark)}</div>` : ''}
+    ${b.name ? `<div class="brand-name">${esc(b.name)}</div>` : ''}
+    ${b.sub  ? `<div class="brand-sub">${esc(b.sub)}</div>`   : ''}`;
+  document.getElementById('sidebarFoot').innerHTML =
+    (SETTINGS.footer || []).map(lineHTML).join('<br>');
 }
 
 function renderMasthead(){
@@ -963,6 +987,7 @@ window.addEventListener('resize', () => { relayout(); syncSpy(); });
 document.documentElement.style.scrollBehavior = 'smooth';
 document.documentElement.style.setProperty('--sidebar-w', SETTINGS.sidebarWidth + 'px');
 auditConfig();
+renderBrand();
 renderMasthead();
 renderSidebar();
 renderZones();
