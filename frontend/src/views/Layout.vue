@@ -66,10 +66,6 @@
           <el-menu-item v-if="authStore.can('artifact')" index="/task/artifacts">制品管理</el-menu-item>
           <el-menu-item v-if="authStore.can('credential')" index="/task/credentials">连接凭据</el-menu-item>
         </el-sub-menu>
-        <el-menu-item v-if="authStore.can('audit')" index="/audit/logs">
-          <el-icon><Document /></el-icon>
-          <template #title>操作审计</template>
-        </el-menu-item>
         <el-sub-menu v-if="canSystem" index="system">
           <template #title>
             <el-icon><Setting /></el-icon>
@@ -81,6 +77,10 @@
           <el-menu-item v-if="authStore.can('account', 'write')" index="/system/api-credentials">API 凭证</el-menu-item>
           <el-menu-item v-if="authStore.can('system', 'write')" index="/system/configs">系统配置</el-menu-item>
         </el-sub-menu>
+        <el-menu-item v-if="authStore.can('audit')" index="/audit/logs">
+          <el-icon><Document /></el-icon>
+          <template #title>操作审计</template>
+        </el-menu-item>
       </el-menu>
     </el-aside>
 
