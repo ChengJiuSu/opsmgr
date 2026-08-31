@@ -12,6 +12,7 @@ import io
 import logging
 import re
 import zipfile
+from datetime import timedelta
 
 from django.db import transaction
 from django.db.models import Q, Value
@@ -432,6 +433,19 @@ class CertificateViewSet(viewsets.ModelViewSet):
         keyword = self.request.query_params.get('keyword')
         if keyword:
             qs = qs.filter(name__icontains=keyword)
+        # expiring_days=N：N 天内到期（含已过期）。概览页的过期告警点进来要看到
+        # 的就是这一批；靠前端在当前页里筛会漏掉翻页外的证书
+        expiring_days = self.request.query_params.get('expiring_days')
+        if expiring_days:
+            try:
+                days = int(expiring_days)
+            except ValueError:
+                days = None
+            if days is not None:
+                qs = qs.filter(
+                    expires_at__isnull=False,
+                    expires_at__lte=timezone.now() + timedelta(days=days),
+                ).order_by('expires_at')
         return qs
 
     def perform_create(self, serializer):

@@ -11,6 +11,8 @@ from apps.asset_mgr.models import Server
 from apps.audit.models import AuditLog
 from common.response import ok
 
+from .services import build_overview
+
 
 class DashboardStatsView(APIView):
     """概览统计：服务器、用户、审计日志聚合数据。"""
@@ -60,3 +62,18 @@ class DashboardStatsView(APIView):
             },
             'recent_actions': recent_actions,
         })
+
+
+class DashboardOverviewView(APIView):
+    """概览页「值班视角」：异常 / 待处理 / 运行态。
+
+    块级权限在 services.build_overview 里按 roles.user_level 裁剪，这里只要求登录：
+    每块依赖的模块不同，用单个 module_perm 挡整个接口会让无云控权限的人连自己的
+    暂停任务也看不到。
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(responses=OpenApiTypes.OBJECT)
+    def get(self, request):
+        return ok(build_overview(request.user))

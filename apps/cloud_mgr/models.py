@@ -208,6 +208,8 @@ class Certificate(models.Model):
         verbose_name_plural = '证书'
         db_table = 'cloud_certificate'
         ordering = ['-id']
+        # 概览页的过期告警按 (status, expires_at) 过滤
+        indexes = [models.Index(fields=['status', 'expires_at'])]
 
     def __str__(self):
         return self.name

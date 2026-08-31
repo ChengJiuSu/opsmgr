@@ -484,6 +484,8 @@ class TaskExecutionLog(models.Model):
         verbose_name_plural = '任务执行日志'
         db_table = 'task_execution_log'
         ordering = ['-created_at']
+        # 概览页按状态取「执行中」与近 24 小时失败，量级涨上去后这是全表扫
+        indexes = [models.Index(fields=['status', '-created_at'])]
 
     def __str__(self):
         return f'{self.task_id}#{self.pk} {self.get_status_display()}'

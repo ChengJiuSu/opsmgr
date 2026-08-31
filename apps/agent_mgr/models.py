@@ -11,8 +11,10 @@ AgentRoute：按维度（项目组 + 可选环境）把主机默认路由到某�
 Server.channel_mode='auto' 的主机继承；解析口径见 channel.py。
 """
 import uuid
+from datetime import timedelta
 
 from django.db import models
+from django.utils import timezone
 
 from common.secrets import generate_secret, hash_secret
 
@@ -26,6 +28,11 @@ class AgentNode(models.Model):
         ('online', '在线'),
         ('offline', '离线'),
     ]
+
+    # 心跳新鲜度阈值：status 由 consumer 的 disconnect 置 offline，但 kill -9/掉电/
+    # 网络黑洞时 disconnect 根本不会跑，库里会留一个假的 online。判「是否真的在」
+    # 只能看心跳时间。agent 端心跳周期远小于此值。
+    HEARTBEAT_TIMEOUT = timedelta(minutes=3)
 
     name = models.CharField('名称', max_length=64, unique=True)
     token_hash = models.CharField('令牌哈希', max_length=64, editable=False)
@@ -49,6 +56,17 @@ class AgentNode(models.Model):
 
     def __str__(self):
         return self.name
+
+    @property
+    def stale(self):
+        """心跳已过期：status 仍是 online 也不能认为它在线。"""
+        if not self.last_heartbeat:
+            return True
+        return timezone.now() - self.last_heartbeat > self.HEARTBEAT_TIMEOUT
+
+    @property
+    def is_offline(self):
+        return self.status != 'online' or self.stale
 
     @property
     def group_name(self):
