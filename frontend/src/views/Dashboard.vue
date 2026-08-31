@@ -40,25 +40,29 @@
       </el-col>
     </el-row>
 
-    <el-row :gutter="16" class="stat-cards row-gap">
-      <el-col :span="6" v-for="card in statCards" :key="card.label">
-        <el-card shadow="never" class="stat-card">
-          <div class="stat-inner">
-            <div class="stat-info">
-              <div class="stat-value">{{ card.value }}</div>
-              <div class="stat-label">{{ card.label }}</div>
-            </div>
-            <el-icon :size="44" :color="card.color" class="stat-icon">
-              <component :is="card.icon" />
-            </el-icon>
-          </div>
+    <!-- 资产盘子：主机分布与服务规划三态 + 各维度当前版本 -->
+    <el-row :gutter="16" class="row-gap" v-if="assetsVisible || artifactsVisible">
+      <el-col :span="assetsVisible && artifactsVisible ? 13 : 24" v-if="assetsVisible">
+        <el-card shadow="never" header="资产分布">
+          <AssetDistribution :assets="assets" />
+        </el-card>
+      </el-col>
+      <el-col :span="assetsVisible ? 11 : 24" v-if="artifactsVisible">
+        <el-card shadow="never" header="各环境当前版本">
+          <LatestArtifacts :items="artifacts.items" />
         </el-card>
       </el-col>
     </el-row>
 
     <el-row :gutter="16" class="row-gap">
       <el-col :span="12">
-        <el-card header="近 7 天操作趋势" shadow="never" v-loading="loading">
+        <el-card shadow="never" v-loading="loading">
+          <template #header>
+            <div class="card-head">
+              <span>近 7 天操作趋势</span>
+              <span class="refreshed">今日 {{ todayActions }} 次</span>
+            </div>
+          </template>
           <div class="trend">
             <div v-for="d in recentActions" :key="d.date" class="trend-col">
               <div class="trend-bar-wrap">
@@ -97,12 +101,12 @@
 
 <script setup>
 import { ref, onMounted, onUnmounted, computed } from 'vue'
-import {
-  Box, Monitor, Setting, Document, Refresh, CircleCheckFilled,
-} from '@element-plus/icons-vue'
+import { Refresh, CircleCheckFilled } from '@element-plus/icons-vue'
 import DutyBlocks from '../components/dashboard/DutyBlocks.vue'
 import RunningTasks from '../components/dashboard/RunningTasks.vue'
 import AgentStatus from '../components/dashboard/AgentStatus.vue'
+import AssetDistribution from '../components/dashboard/AssetDistribution.vue'
+import LatestArtifacts from '../components/dashboard/LatestArtifacts.vue'
 import { getDashboardStats, getDashboardOverview } from '../api/dashboard'
 import { getAuditLogs } from '../api/audit'
 
@@ -116,10 +120,14 @@ const alerts = ref([])
 const todos = ref([])
 const running = ref({ visible: false, tasks: [] })
 const agents = ref({ visible: false, online: 0, offline: 0, nodes: [] })
+const assets = ref({ visible: false, total: 0, services: {}, by_environment: [], by_project_group: [] })
+const artifacts = ref({ visible: false, items: [] })
 const refreshedAt = ref(null)
 
 const runningVisible = computed(() => running.value.visible)
 const agentsVisible = computed(() => agents.value.visible)
+const assetsVisible = computed(() => assets.value.visible)
+const artifactsVisible = computed(() => artifacts.value.visible)
 const refreshedLabel = computed(() =>
   refreshedAt.value ? `更新于 ${refreshedAt.value.toTimeString().slice(0, 8)}` : '',
 )
@@ -133,6 +141,8 @@ async function fetchOverview() {
     todos.value = d.todos || []
     running.value = d.running || { visible: false, tasks: [] }
     agents.value = d.agents || { visible: false, online: 0, offline: 0, nodes: [] }
+    if (d.assets) assets.value = d.assets
+    if (d.artifacts) artifacts.value = d.artifacts
     refreshedAt.value = new Date()
   } finally {
     overviewLoading.value = false
@@ -149,13 +159,8 @@ function onVisible() {
   if (!document.hidden) fetchOverview()
 }
 
-// ── 统计卡片与活动流（口径待 P2/P3 调整）──────────────
-const statCards = ref([
-  { label: '服务器总数', value: 0, icon: Box, color: '#409EFF' },
-  { label: '运行中', value: 0, icon: Monitor, color: '#67C23A' },
-  { label: '维护中', value: 0, icon: Setting, color: '#E6A23C' },
-  { label: '今日操作', value: 0, icon: Document, color: '#F56C6C' },
-])
+// ── 活动流（趋势口径改成执行维度排在 P3）──────────────
+const todayActions = ref(0)
 
 const maxCount = computed(() => Math.max(1, ...recentActions.value.map((d) => d.count)))
 const barHeight = (count) => `${Math.round((count / maxCount.value) * 100) || 2}%`
@@ -176,10 +181,7 @@ onMounted(async () => {
     ])
     if (statsRes.status === 'fulfilled') {
       const d = statsRes.value.data || {}
-      statCards.value[0].value = d.servers?.total ?? 0
-      statCards.value[1].value = d.servers?.running ?? 0
-      statCards.value[2].value = d.servers?.maintenance ?? 0
-      statCards.value[3].value = d.audit?.today ?? 0
+      todayActions.value = d.audit?.today ?? 0
       recentActions.value = d.recent_actions || []
     }
     if (logRes.status === 'fulfilled') {
@@ -204,12 +206,6 @@ onUnmounted(() => {
 .all-clear { display: flex; align-items: center; gap: 8px; color: #67c23a; font-size: 14px; padding: 4px 0; }
 .section-label { color: #909399; font-size: 12px; margin-bottom: 8px; }
 .row-gap { margin-top: 16px; }
-
-.stat-card { border-radius: 8px; }
-.stat-inner { display: flex; align-items: center; justify-content: space-between; padding: 8px 4px; }
-.stat-value { font-size: 32px; font-weight: 700; color: #303133; line-height: 1; }
-.stat-label { margin-top: 8px; color: #909399; font-size: 14px; }
-.stat-icon { opacity: 0.15; }
 
 .trend { display: flex; align-items: flex-end; height: 280px; gap: 8px; padding: 8px 0; }
 .trend-col { flex: 1; display: flex; flex-direction: column; align-items: center; height: 100%; }

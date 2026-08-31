@@ -14,7 +14,12 @@
 2. **有没有等我处理的？** → 待处理块（暂停任务、DNS 待审批、自己没开 MFA）
 3. **现在在跑什么？** → 执行中的任务 + Agent 节点心跳
 
-底部保留原有的统计卡片、近 7 天操作趋势与最近操作记录（口径调整排在 P2/P3）。
+再往下是「盘子有多大」：主机分布与服务规划三态、各环境当前制品版本；最后是近
+7 天操作趋势与最近操作记录（趋势换成执行维度排在 P3）。
+
+原先那排统计卡（服务器总数 / 运行中 / 维护中 / 今日操作）已删除：`Server.status`
+是人工维护字段，没人在主机停机时回来改，长期恒为 running，摆在首页只是个假数字。
+今日操作数移到趋势卡的标题右侧。
 
 ---
 
@@ -28,8 +33,11 @@ Dashboard
 ├── 运行态行
 │   ├── RunningTasks（执行中的任务：模块进度、发起人、已跑时长）
 │   └── AgentStatus（在线/离线 + 心跳快照 load1 / disk_free_pct / running_jobs）
-├── 统计卡片行（/api/dashboard/stats/）
-└── 趋势 + 最近操作记录
+├── 资产盘子行
+│   ├── AssetDistribution（主机总数 / 已部署 / 已规划待部署 / 已下线 + 按环境与
+│   │   项目组的分布条，超过 6 档尾部并成「其他」）
+│   └── LatestArtifacts（各「项目组 × 渠道 × 环境」当前最新版本）
+└── 趋势（标题带今日操作数）+ 最近操作记录（/api/dashboard/stats/）
 ```
 
 ---
@@ -38,8 +46,8 @@ Dashboard
 
 值班区数据全部来自 `/api/dashboard/overview/`，**块的有无由后端按角色矩阵裁剪**
 （`apps/dashboard/services.build_overview`）：无 `cloud` 权限不会拿到证书名与内网
-域名，无 `exec` 不会拿到任务名，无 `agent` 时 `agents.visible=false`。前端不做
-权限判断，只按响应渲染。
+域名，无 `exec` 不会拿到任务名，无 `agent` / `cmdb` / `artifact` 时对应块的
+`visible=false`（前端整块不渲染）。前端不做权限判断，只按响应渲染。
 
 块与明细都可能带 `link`（`{path, query}`），点击即 `router.push`：
 
@@ -52,6 +60,8 @@ Dashboard
 | 暂停任务 | 该次执行的日志页，取不到日志时回退 `/task/executions?status=paused` |
 | DNS 变更单 | `/cloud/domains?requests=pending`（自动打开审批抽屉） |
 | Agent 离线 | `/system/agents` |
+| 资产分布 | `/assets/servers`、`/config/allocation` |
+| 各环境当前版本 | `/task/artifacts` |
 
 对应的三个落地页在 `onMounted` 里读 `route.query` 预置筛选。
 

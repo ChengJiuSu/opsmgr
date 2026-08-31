@@ -5,6 +5,9 @@
   2. 有没有等我的？  → todos（不处理就一直停在那的东西）
   3. 现在在跑什么？  → running（执行中的任务与 agent 节点）
 
+再加一块「盘子有多大」：assets（主机分布与服务规划状态）、artifacts（各维度当前
+最新制品版本）。它们不是值班信号，放在页面下半部分。
+
 口径上的两个决定：
 
 - **实时算，不落表、不上定时任务。** 全是 count/exists 与小 limit 查询，数据量
@@ -21,10 +24,12 @@
 import logging
 from datetime import timedelta
 
-from django.db.models import Count
+from django.db.models import Count, Max
 from django.utils import timezone
 
 from apps.agent_mgr.models import AgentNode
+from apps.artifact_mgr.models import Artifact
+from apps.asset_mgr.models import Server, ServerService
 from apps.auth_mgr import roles
 from apps.cloud_mgr.models import Certificate, CertDeployment, DnsChangeRequest, DnsRecord, Domain
 from apps.task_exec.models import ExecutionTask, TaskExecutionLog
@@ -341,6 +346,85 @@ def agent_panel():
     }
 
 
+# ── 资产盘子 ────────────────────────────────────────────────────────
+
+
+#: 分布图最多列几档：环境/项目组超过这个数就把尾巴合成「其他」，
+#: 首页不是报表页，二十条横条没人看。
+DIST_LIMIT = 6
+
+
+def _distribution(label_field):
+    """按某个字典维度统计主机数，超出 DIST_LIMIT 的尾部合并为「其他」。"""
+    rows = list(
+        Server.objects.values(label_field).annotate(c=Count('id')).order_by('-c')
+    )
+    items = [{'name': r[label_field] or '未分配', 'count': r['c']} for r in rows]
+    if len(items) > DIST_LIMIT:
+        head, tail = items[:DIST_LIMIT], items[DIST_LIMIT:]
+        head.append({'name': '其他', 'count': sum(i['count'] for i in tail)})
+        items = head
+    return items
+
+
+def asset_summary():
+    """主机分布与服务规划状态。
+
+    不统计 Server.status（running/stopped/maintenance）：那是人工维护的字段，
+    实际上没人在主机停机时回来改，长期恒为 running，摆在首页只是个假数字。
+    真正有动作含义的是 ServerService 的三态——尤其「已规划未部署」，那是一批
+    等着有人去部署的机器。
+    """
+    service_counts = dict(
+        ServerService.objects.values_list('status').annotate(c=Count('id'))
+    )
+    return {
+        'visible': True,
+        'total': Server.objects.count(),
+        'by_environment': _distribution('environment__name'),
+        'by_project_group': _distribution('project_group__name'),
+        'services': {
+            'planned': service_counts.get('planned', 0),
+            'deployed': service_counts.get('deployed', 0),
+            'offline': service_counts.get('offline', 0),
+        },
+        'link': {'path': '/config/allocation'},
+    }
+
+
+def latest_artifacts():
+    """各「项目组 × 渠道 × 环境」的当前最新制品版本。
+
+    「生产现在跑的是哪个版本」是运维被问最多的一句话，答案就在这张表里，但原先
+    只能去制品页按三个维度筛。取数与 CD 注入 package_* 变量同口径（每组取 id
+    最大的一条），不重算「最新」的定义。
+    """
+    latest_ids = list(
+        Artifact.objects.values('project_group', 'channel', 'environment')
+        .annotate(latest=Max('id')).values_list('latest', flat=True)
+    )
+    if not latest_ids:
+        return {'visible': True, 'items': [], 'link': {'path': '/task/artifacts'}}
+    rows = (
+        Artifact.objects.filter(id__in=latest_ids)
+        .select_related('project_group', 'channel', 'environment')
+        .order_by('environment__id', 'project_group__id', 'channel__id')
+    )
+    return {
+        'visible': True,
+        'items': [{
+            'id': a.id,
+            'project_group': a.project_group.name,
+            'channel': a.channel.name,
+            'environment': a.environment.name,
+            'version': a.version,
+            'build_number': a.build_number,
+            'reported_at': a.reported_at,
+        } for a in rows],
+        'link': {'path': '/task/artifacts'},
+    }
+
+
 # ── 组装 ────────────────────────────────────────────────────────────
 
 #: (块名, 依赖模块, builder, 是否要 user)。模块为 None = 不需要权限。
@@ -397,4 +481,16 @@ def build_overview(user):
         if result:
             agents = result
 
-    return {'alerts': alerts, 'todos': todos, 'running': running, 'agents': agents}
+    assets = {'visible': False, 'total': 0, 'by_environment': [],
+              'by_project_group': [], 'services': {}}
+    if allowed('cmdb'):
+        assets = _run('asset_summary', asset_summary, user, False) or assets
+
+    artifacts = {'visible': False, 'items': []}
+    if allowed('artifact'):
+        artifacts = _run('latest_artifacts', latest_artifacts, user, False) or artifacts
+
+    return {
+        'alerts': alerts, 'todos': todos, 'running': running, 'agents': agents,
+        'assets': assets, 'artifacts': artifacts,
+    }

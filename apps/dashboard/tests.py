@@ -13,7 +13,10 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from apps.agent_mgr.models import AgentNode
-from apps.asset_mgr.models import CloudProvider
+from apps.artifact_mgr.models import Artifact
+from apps.asset_mgr.models import (
+    Channel, CloudProvider, Environment, ProjectGroup, Server, ServerService, ServiceType,
+)
 from apps.auth_mgr.models import Role
 from apps.cloud_mgr.models import Certificate, CloudAccount, Domain
 from apps.task_exec.models import ExecutionTask, TaskExecutionLog
@@ -209,6 +212,91 @@ class TaskBlockTests(OverviewTestBase):
         running = self._keys(self.client_)['body']['running']
         self.assertEqual(running['tasks'][0]['step_done'], 1)
         self.assertEqual(running['tasks'][0]['step_total'], 2)
+
+
+class AssetSummaryTests(OverviewTestBase):
+    """资产盘子：主机分布 + 服务规划三态。"""
+
+    def setUp(self):
+        # 环境/渠道等字典由 0004 迁移预置，直接取现成的，避免撞 code 唯一约束
+        self.prod, _ = Environment.objects.get_or_create(
+            code='prod', defaults={'name': '生产'})
+        self.test, _ = Environment.objects.get_or_create(
+            code='test', defaults={'name': '测试'})
+        self.group = ProjectGroup.objects.create(name='游戏A', code='ga')
+        self.svc_type = ServiceType.objects.create(name='网关', code='gate')
+        s1 = Server.objects.create(name='p1', private_ip='10.0.0.1',
+                                   environment=self.prod, project_group=self.group)
+        Server.objects.create(name='p2', private_ip='10.0.0.2', environment=self.prod)
+        Server.objects.create(name='t1', private_ip='10.0.1.1', environment=self.test)
+        # 没有维度的主机也要计进总数，分布里落到「未分配」
+        Server.objects.create(name='x1', private_ip='10.0.2.1')
+        ServerService.objects.create(server=s1, service_type=self.svc_type, status='planned')
+
+    def test_distribution_and_service_states(self):
+        client = self._login('ops', {'cmdb': 'read'})
+        assets = self._keys(client)['body']['assets']
+        self.assertTrue(assets['visible'])
+        self.assertEqual(assets['total'], 4)
+        by_env = {r['name']: r['count'] for r in assets['by_environment']}
+        self.assertEqual(by_env['生产'], 2)
+        self.assertEqual(by_env['测试'], 1)
+        self.assertEqual(by_env['未分配'], 1)
+        self.assertEqual(assets['services'], {'planned': 1, 'deployed': 0, 'offline': 0})
+
+    def test_hidden_without_cmdb_permission(self):
+        client = self._login('nocmdb', {'exec': 'read'})
+        assets = self._keys(client)['body']['assets']
+        self.assertFalse(assets['visible'])
+        self.assertEqual(assets['total'], 0)
+        self.assertNotIn('游戏A', str(assets))
+
+    def test_distribution_tail_collapsed(self):
+        """维度多到装不下时尾部并成「其他」，首页不铺二十条横条。"""
+        for i in range(9):
+            env = Environment.objects.create(name=f'env{i}', code=f'seed-env-{i}')
+            Server.objects.create(name=f'h{i}', private_ip=f'10.1.0.{i + 1}', environment=env)
+        client = self._login('ops', {'cmdb': 'read'})
+        rows = self._keys(client)['body']['assets']['by_environment']
+        self.assertEqual(len(rows), 7)          # DIST_LIMIT + 「其他」
+        self.assertEqual(rows[-1]['name'], '其他')
+
+
+class LatestArtifactTests(OverviewTestBase):
+    """各维度当前最新制品版本：每组只留 id 最大的一条，与 CD 注入同口径。"""
+
+    def setUp(self):
+        self.group = ProjectGroup.objects.create(name='游戏A', code='ga')
+        self.channel, _ = Channel.objects.get_or_create(
+            code='official', defaults={'name': '官方'})
+        self.prod, _ = Environment.objects.get_or_create(
+            code='prod', defaults={'name': '生产'})
+        self.test, _ = Environment.objects.get_or_create(
+            code='test', defaults={'name': '测试'})
+
+    def _artifact(self, env, version):
+        return Artifact.objects.create(
+            project_group=self.group, channel=self.channel, environment=env,
+            version=version, file_path=f'{version}.zip', original_name=f'{version}.zip',
+            md5='0' * 32, size=1)
+
+    def test_only_latest_per_dimension(self):
+        self._artifact(self.prod, '1.0.0')
+        self._artifact(self.prod, '1.0.1')
+        self._artifact(self.test, '2.0.0')
+        client = self._login('ops', {'artifact': 'read'})
+        items = self._keys(client)['body']['artifacts']['items']
+        self.assertEqual(len(items), 2)
+        versions = {i['environment']: i['version'] for i in items}
+        self.assertEqual(versions['生产'], '1.0.1')
+        self.assertEqual(versions['测试'], '2.0.0')
+
+    def test_hidden_without_artifact_permission(self):
+        self._artifact(self.prod, '1.0.0')
+        client = self._login('noart', {'cmdb': 'read'})
+        artifacts = self._keys(client)['body']['artifacts']
+        self.assertFalse(artifacts['visible'])
+        self.assertEqual(artifacts['items'], [])
 
 
 class MfaTodoTests(OverviewTestBase):
