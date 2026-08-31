@@ -2,16 +2,19 @@
 
 权限口径分两层，刻意不一致：
 - 管理接口（增删改查配置）走 `module_perm('dict')`，与其它基础字典同档；
-- 聚合读接口 `/api/portal/config/` 只要求登录——导航页是全员入口，若也挂
-  dict 档，没有字典权限的同事会打不开导航页，等于把一个门户做成了管理员工具。
-  它吐的是内部系统名称与地址，本就是登录用户可见的信息。
+- 聚合读接口 `/api/portal/config/` 完全开放，不需要登录——导航页是内网门户，
+  挂上登录态就意味着每个人打开浏览器首页都要先过一次登录，失去了「入口」的
+  意义。它吐的是内部系统名称与地址，可见范围由内网边界控制，不由本接口控制。
+
+  注意：开放意味着能访问到本服务的任何人都能拿到完整的内部系统清单（名称、
+  描述、内网域名、维护公告）。部署时必须确保本站点不暴露在公网。
 """
 
 from django.db.models import ProtectedError
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema
 from rest_framework import viewsets
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny
 from rest_framework.views import APIView
 
 from apps.auth_mgr.permissions import module_perm
@@ -137,9 +140,15 @@ class PortalSettingView(APIView):
 
 
 class PortalConfigView(APIView):
-    """导航页启动时拉取的整份配置。全员可读，见模块 docstring。"""
+    """导航页启动时拉取的整份配置。完全开放，见模块 docstring。
 
-    permission_classes = [IsAuthenticated]
+    authentication_classes 显式清空：不清的话，浏览器里残留的过期 JWT 会被
+    MfaJWTAuthentication 判失败并直接抛 401，一个匿名可读的接口反而因为「带了
+    坏 token」打不开。本接口不需要任何身份信息，索性不解析凭据。
+    """
+
+    authentication_classes = []
+    permission_classes = [AllowAny]
 
     @extend_schema(responses=OpenApiTypes.OBJECT)
     def get(self, request):

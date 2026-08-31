@@ -52,10 +52,16 @@ class SeedTests(TestCase):
 
 
 class ConfigApiTests(BaseApiTest):
-    def test_config_requires_login_but_not_dict_perm(self):
-        """导航页是全员入口：普通用户能读整份配置，未登录不能。"""
+    def test_config_is_public(self):
+        """导航页是内网门户入口：匿名与普通用户都能读整份配置。"""
         anon = APIClient()
-        self.assertEqual(anon.get('/api/portal/config/').status_code, 401)
+        r = anon.get('/api/portal/config/')
+        self.assertEqual(r.status_code, 200)
+
+        # 残留的坏 token 不能把匿名接口顶成 401（authentication_classes 已清空）
+        stale = APIClient()
+        stale.credentials(HTTP_AUTHORIZATION='Bearer not-a-real-token')
+        self.assertEqual(stale.get('/api/portal/config/').status_code, 200)
 
         normal = self._client(is_staff=False)
         r = normal.get('/api/portal/config/')

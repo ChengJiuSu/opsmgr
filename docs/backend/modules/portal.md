@@ -50,7 +50,7 @@ apps/portal_mgr/
 
 | 方法 | 路径 | 说明 | 权限 |
 |------|------|------|------|
-| GET | `/api/portal/config/` | 导航页启动取数，整份配置 | 仅需登录 |
+| GET | `/api/portal/config/` | 导航页启动取数，整份配置 | 公开，无需登录 |
 | GET / PUT | `/api/portal/setting/` | 外观文案单例 | 读 `dict`；写 `dict:write` |
 | CRUD | `/api/portal/blocks/` | 内容区块 | `dict` |
 | CRUD | `/api/portal/systems/` | 系统清单，支持 `?block=` | `dict` |
@@ -64,9 +64,16 @@ apps/portal_mgr/
 ### 权限口径为什么不一致
 
 管理接口挂 `module_perm('dict')`，与其它基础字典同档。聚合读接口
-`/api/portal/config/` 只要求登录：导航页是全员入口，若也挂 dict 档，没有字典
-权限的同事会打不开导航页，等于把一个门户做成了管理员工具；它吐的是内部系统
-名称与地址，本就是登录用户可见的信息。
+`/api/portal/config/` 完全开放：导航页是内网门户入口，谁把它设成浏览器首页都
+该直接看到，挂上登录态就等于每天先过一次登录，入口的意义没了。
+
+该视图还显式清空了 `authentication_classes`。不清的话，浏览器里残留的过期
+JWT 会被 `MfaJWTAuthentication` 判失败并直接抛 401——一个匿名可读的接口反而
+因为「带了坏 token」打不开。它不需要任何身份信息，索性不解析凭据。
+
+> **部署约束**：开放后，能访问到本服务的任何人都能拿到完整的内部系统清单
+> （名称、描述、内网域名、维护公告）。可见范围由内网边界控制，不由本接口
+> 控制——必须确保站点不暴露在公网。
 
 ---
 
@@ -100,9 +107,9 @@ apps/portal_mgr/
 - 管理页：`frontend/src/views/config/Portal.vue`，路由 `/config/portal`，
   菜单在「配置管理」下。五个 Tab 对应五块配置，另有「配置自检」按钮，拉一次
   `/api/portal/config/` 把空区块、无导航项的区块等错配当场列出来。
-- 导航页：`frontend/public/nav.html`，静态单页不进 SPA。同源下直接读
-  `localStorage.access_token` 调接口，401 跳 `/login?next=`。刻意不做 token
-  刷新——只读门户，让用户重登一次比在两处维护刷新逻辑简单。
+- 导航页：`frontend/public/nav.html`，静态单页不进 SPA，不做鉴权。裸调
+  `/api/portal/config/`，刻意不带 `Authorization`——带上残留的过期 token 反而
+  会被认证层判 401。取数失败时在报头位置写明原因，不留白页。
 
 ---
 
