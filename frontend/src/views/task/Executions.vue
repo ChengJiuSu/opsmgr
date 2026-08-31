@@ -695,7 +695,7 @@
 <script setup>
 import { ref, reactive, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { debounce } from '../../utils/debounce'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import {
   Plus, Delete, Search, Refresh, View, Loading, CaretRight, EditPen, CopyDocument, Close, Top, Bottom, FullScreen, TopRight,
 } from '@element-plus/icons-vue'
@@ -717,6 +717,7 @@ const authStore = useAuthStore()
 // 两者是正交的：只能跑不能改，正是「普通运维」这一档
 const canWrite = computed(() => authStore.can('exec', 'write'))
 const canRunTask = computed(() => authStore.capability('can_execute'))
+const route = useRoute()
 const router = useRouter()
 const loading = ref(false)
 const submitting = ref(false)
@@ -1535,6 +1536,8 @@ function stopPolling() {
 }
 
 onMounted(() => {
+  // 概览页的待办 / 失败告警落地：?status=paused|failed 预置状态筛选
+  if (route.query.status) filter.status = String(route.query.status)
   fetchData()
   listTimer = setInterval(() => {
     if (tableData.value.some((t) => ['running', 'pending', 'paused'].includes(t.status))) {

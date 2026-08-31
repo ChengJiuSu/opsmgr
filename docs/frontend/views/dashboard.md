@@ -1,16 +1,20 @@
 # 概览仪表板（Dashboard.vue）
 
-**路由：** `/dashboard`  
+**路由：** `/dashboard`
 **文件：** `src/views/Dashboard.vue`
+**子组件：** `src/components/dashboard/{DutyBlocks,RunningTasks,AgentStatus}.vue`
 
 ---
 
-## 功能
+## 定位
 
-- 展示系统核心统计数据（4 个统计卡片）
-- 展示最新服务器状态列表（最多 10 条）
-- 展示最近操作记录（最多 10 条）
-- 页面加载时并行请求两个接口
+这一页不是统计看板，是**值班首页**：从上到下回答三个问题——
+
+1. **出事没？** → 异常块（无异常时整块不渲染）
+2. **有没有等我处理的？** → 待处理块（暂停任务、DNS 待审批、自己没开 MFA）
+3. **现在在跑什么？** → 执行中的任务 + Agent 节点心跳
+
+底部保留原有的统计卡片、近 7 天操作趋势与最近操作记录（口径调整排在 P2/P3）。
 
 ---
 
@@ -18,42 +22,55 @@
 
 ```
 Dashboard
-├── 统计卡片行（el-row + el-col × 4）
-│   ├── 服务器总数
-│   ├── 运行中数量
-│   ├── 维护中数量
-│   └── 今日操作数
-└── 数据表格行（el-row × 2列）
-    ├── 服务器状态表（名称、IP、环境、状态）
-    └── 最近操作记录（用户、方法、路径、时间）
+├── 值班状态卡片（/api/dashboard/overview/）
+│   ├── DutyBlocks（异常：证书过期/卡死、域名与解析异常、失败执行、Agent 离线）
+│   └── DutyBlocks（待处理：暂停任务、DNS 变更单、MFA 未启用）
+├── 运行态行
+│   ├── RunningTasks（执行中的任务：模块进度、发起人、已跑时长）
+│   └── AgentStatus（在线/离线 + 心跳快照 load1 / disk_free_pct / running_jobs）
+├── 统计卡片行（/api/dashboard/stats/）
+└── 趋势 + 最近操作记录
 ```
 
 ---
 
-## 数据加载
+## 数据来源与权限
 
-```javascript
-onMounted(async () => {
-  // 并行请求，任一失败不影响另一个
-  const [serverRes, logRes] = await Promise.allSettled([
-    getServers({ page_size: 10 }),
-    getAuditLogs({ page_size: 10 }),
-  ])
+值班区数据全部来自 `/api/dashboard/overview/`，**块的有无由后端按角色矩阵裁剪**
+（`apps/dashboard/services.build_overview`）：无 `cloud` 权限不会拿到证书名与内网
+域名，无 `exec` 不会拿到任务名，无 `agent` 时 `agents.visible=false`。前端不做
+权限判断，只按响应渲染。
 
-  // 统计卡片从服务器列表计算
-  statCards.value[0].value = total          // 总数
-  statCards.value[1].value = running.length // 运行中
-  statCards.value[2].value = maint.length   // 维护中
-  statCards.value[3].value = logs.length    // 今日操作
-})
-```
+块与明细都可能带 `link`（`{path, query}`），点击即 `router.push`：
+
+| 块 | 落地页 |
+|----|--------|
+| 证书即将过期 | `/cloud/certificates?expiring_days=30` |
+| 证书申请失败 / 签发卡住 | `/cloud/certificates?status=failed` / `?status=issuing` |
+| 域名与解析异常 | `/cloud/domains?keyword=<域名>` |
+| 失败执行（明细） | `/task/executions/:taskId/logs/:logId` |
+| 暂停任务 | 该次执行的日志页，取不到日志时回退 `/task/executions?status=paused` |
+| DNS 变更单 | `/cloud/domains?requests=pending`（自动打开审批抽屉） |
+| Agent 离线 | `/system/agents` |
+
+对应的三个落地页在 `onMounted` 里读 `route.query` 预置筛选。
 
 ---
 
-## 辅助函数
+## 刷新策略
 
 ```javascript
-const statusType  = (s) => ({ running: 'success', stopped: 'danger', maintenance: 'warning' }[s])
-const methodType  = (m) => ({ GET: 'info', POST: 'success', PUT: 'warning', DELETE: 'danger' }[m])
-const formatTime  = (t) => t?.slice(5, 16).replace('T', ' ')   // 截取 MM-DD HH:mm
+timer = setInterval(tick, 30000)               // 30s 轮询
+function tick() { if (!document.hidden) fetchOverview() }
+document.addEventListener('visibilitychange', onVisible)  // 回到前台立即补一次
 ```
+
+标签页在后台时跳过请求：值班页常年开着，不跳过等于一天白刷几千次。
+`onUnmounted` 里清 timer 与事件监听。
+
+---
+
+## 空状态
+
+`alerts` 与 `todos` 同时为空时显示一行绿字「当前无异常，也没有等待处理的事项」，
+不渲染空卡片——一屏空框会让人以为接口挂了。

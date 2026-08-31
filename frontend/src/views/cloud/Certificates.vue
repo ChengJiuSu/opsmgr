@@ -19,6 +19,18 @@
       <el-button v-if="canWrite" type="primary" :icon="Plus" @click="openDialog()">新增证书</el-button>
     </div>
 
+    <!-- 从概览页的过期告警点进来时提示当前视图被收窄了，可一键清除 -->
+    <el-alert
+      v-if="filter.expiringDays"
+      type="warning"
+      :closable="false"
+      show-icon
+      class="scoped-alert"
+    >
+      仅显示 {{ filter.expiringDays }} 天内到期（含已过期）的证书，按到期时间升序。
+      <el-button link type="primary" @click="clearExpiring">显示全部</el-button>
+    </el-alert>
+
     <!-- 表格 -->
     <el-table v-loading="loading" :data="tableData" stripe>
       <el-table-column prop="name" label="证书名称" min-width="130" />
@@ -328,6 +340,7 @@
 import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { Plus, Edit, Delete, Download, Loading } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { useRoute } from 'vue-router'
 import { useAuthStore } from '../../stores/auth'
 import { debounce } from '../../utils/debounce'
 import { getServers } from '../../api/assets'
@@ -340,6 +353,7 @@ import {
   deleteCertDeployment, deployCertDeployment, deployCertificateAll,
 } from '../../api/cloud'
 
+const route = useRoute()
 const authStore = useAuthStore()
 // 按钮可见性跟角色矩阵走：域名与证书是 cloud 模块，
 // 云账号下拉另按 cloud_account 判（只读档也能选账号，AccessKey 是打码的）
@@ -366,7 +380,9 @@ const tableData = ref([])
 const total = ref(0)
 const page = ref(1)
 const pageSize = ref(20)
-const filter = reactive({ keyword: '', status: '' })
+// expiringDays 只由概览页的过期告警带进来（?expiring_days=30），没有对应的下拉框：
+// 它是「从别处点进来看这一批」的视图，不是常驻筛选项，清掉即恢复全量
+const filter = reactive({ keyword: '', status: '', expiringDays: '' })
 const accountOptions = ref([])
 const domainSuggestions = ref([])
 const dialogVisible = ref(false)
@@ -395,6 +411,7 @@ async function fetchData() {
     const params = { page: page.value, page_size: pageSize.value }
     if (filter.keyword) params.keyword = filter.keyword
     if (filter.status) params.status = filter.status
+    if (filter.expiringDays) params.expiring_days = filter.expiringDays
     const res = await getCertificates(params)
     tableData.value = res.data?.results || []
     total.value = res.data?.total || 0
@@ -649,7 +666,17 @@ async function handleDeployDelete(row) {
   fetchData()
 }
 
+function clearExpiring() {
+  filter.expiringDays = ''
+  handleSearch()
+}
+
 onMounted(async () => {
+  // 概览页告警的落地筛选：?expiring_days=30 / ?status=failed / ?keyword=xxx
+  const q = route.query
+  if (q.expiring_days) filter.expiringDays = String(q.expiring_days)
+  if (q.status) filter.status = String(q.status)
+  if (q.keyword) filter.keyword = String(q.keyword)
   fetchData()
   if (canWrite.value) {
     // 下拉选项分属四个模块（云账号 / 服务器 / 连接凭据 / 云控自身），逐个按权限取：
@@ -677,6 +704,7 @@ onMounted(async () => {
 </script>
 
 <style scoped>
+.scoped-alert { margin-bottom: 12px; }
 .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .toolbar-left { display: flex; gap: 8px; }
 .muted { color: #909399; }

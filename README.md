@@ -19,7 +19,7 @@
 | 构建制品 | Jenkins CI 完成后脚本上报压缩包（版本/md5，关联项目组/渠道/环境），CD 执行自动注入最新制品变量 |
 | 操作审计 | 自动记录所有写操作（POST/PUT/PATCH/DELETE），多维过滤 |
 | 系统配置 | 键值对形式的全局配置管理 |
-| 概览统计 | 服务器/用户/审计聚合 + 近 7 天操作趋势 |
+| 概览首页 | 值班视角：异常（证书过期/卡死、域名与解析异常、失败执行、Agent 离线）+ 待处理（暂停任务、DNS 待审批、MFA 未启用）+ 运行态；下方保留统计与近 7 天趋势 |
 | API 文档 | 自动生成 Swagger UI 文档 |
 
 ---
@@ -177,6 +177,7 @@ Authorization: Bearer <access_token>
 | GET | `/api/audit/logs/` | 操作审计日志（支持 username/method/status_code/keyword/date 过滤） |
 | GET/POST | `/api/system/configs/` | 系统配置列表 / 创建 |
 | GET | `/api/dashboard/stats/` | 概览聚合统计（服务器 / 用户 / 审计 / 近 7 天趋势） |
+| GET | `/api/dashboard/overview/` | 值班视角聚合（异常 / 待处理 / 运行态，块级按角色矩阵裁剪） |
 | GET/POST | `/api/exec/methods/` | 平台方法列表 / 创建（仅管理员，普通用户只读） |
 | GET/PATCH/DELETE | `/api/exec/methods/{id}/` | 方法详情 / 更新 / 删除 |
 | GET/POST | `/api/exec/tasks/` | 执行任务列表 / 创建（创建即调度执行） |

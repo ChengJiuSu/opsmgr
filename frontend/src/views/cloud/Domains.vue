@@ -406,6 +406,7 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
+import { useRoute } from 'vue-router'
 import { Plus, Edit, Delete, Download, Clock, Finished, Refresh } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../../stores/auth'
@@ -420,6 +421,7 @@ import {
   cancelDnsChangeRequest,
 } from '../../api/cloud'
 
+const route = useRoute()
 const authStore = useAuthStore()
 // 按钮可见性跟角色矩阵走：域名与证书是 cloud 模块，
 // 云账号下拉另按 cloud_account 判（只读档也能选账号，AccessKey 是打码的）
@@ -816,7 +818,12 @@ async function handleRetry(domainRow, rec) {
 }
 
 onMounted(async () => {
+  // 概览页的待办点进来：?requests=pending 直接开审批抽屉（否则落到列表页还要
+  // 自己找「变更审批」按钮）；?keyword= 预置搜索定位到具体域名
+  const q = route.query
+  if (q.keyword) filter.keyword = String(q.keyword)
   fetchData()
+  if (q.requests && canWrite.value) openRequests()
   if (canWrite.value) loadPendingCount()  // 「变更审批」角标：有待审的单子要能一眼看见
   // 云账号下拉（域名归属/导入用）；服务器下拉（记录绑定用，page_size=0 全量）
   if (canWrite.value) {
