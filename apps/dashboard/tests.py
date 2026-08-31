@@ -299,6 +299,49 @@ class LatestArtifactTests(OverviewTestBase):
         self.assertEqual(artifacts['items'], [])
 
 
+class ExecTrendTests(OverviewTestBase):
+    """近 7 天执行趋势：按成败分色，未结束的单独一列。"""
+
+    def setUp(self):
+        self.task = ExecutionTask.objects.create(name='t')
+        self.client_ = self._login('ops', {'exec': 'read'})
+
+    def _log(self, status, days_ago=0):
+        log = TaskExecutionLog.objects.create(task=self.task, status=status)
+        if days_ago:
+            TaskExecutionLog.objects.filter(pk=log.pk).update(
+                created_at=timezone.now() - timedelta(days=days_ago))
+        return log
+
+    def test_always_seven_days_even_when_empty(self):
+        trend = self._keys(self.client_)['body']['trend']
+        self.assertTrue(trend['visible'])
+        self.assertEqual(len(trend['days']), 7)
+        self.assertEqual(sum(d['success'] + d['failed'] for d in trend['days']), 0)
+
+    def test_counts_split_by_status(self):
+        self._log('success')
+        self._log('success')
+        self._log('failed')
+        self._log('running')
+        today = self._keys(self.client_)['body']['trend']['days'][-1]
+        self.assertEqual(today['success'], 2)
+        self.assertEqual(today['failed'], 1)
+        # 未结束的不算进成败，否则当天的数字过几分钟会自己变
+        self.assertEqual(today['running'], 1)
+
+    def test_older_than_window_excluded(self):
+        self._log('success', days_ago=8)
+        trend = self._keys(self.client_)['body']['trend']
+        self.assertEqual(sum(d['success'] for d in trend['days']), 0)
+
+    def test_hidden_without_exec_permission(self):
+        client = self._login('noexec2', {'cmdb': 'read'})
+        trend = self._keys(client)['body']['trend']
+        self.assertFalse(trend['visible'])
+        self.assertEqual(trend['days'], [])
+
+
 class MfaTodoTests(OverviewTestBase):
     def test_mfa_off_todo_present_for_everyone(self):
         client = self._login('plain', {})

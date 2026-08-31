@@ -42,6 +42,8 @@ CERT_EXPIRY_WARN_DAYS = 30
 TASK_FAILED_WINDOW = timedelta(hours=24)
 #: 每块最多回传的明细条数：概览只给「点进去之前」的信息量。
 ITEM_LIMIT = 5
+#: 执行趋势的天数，与页面上的柱子数一致。
+TREND_DAYS = 7
 
 
 def _alert(key, level, title, items, link, total=None):
@@ -425,6 +427,44 @@ def latest_artifacts():
     }
 
 
+# ── 执行趋势 ────────────────────────────────────────────────────────
+
+
+def exec_trend():
+    """近 7 天每天的执行成功 / 失败次数。
+
+    页面原先那张趋势图画的是审计写操作条数：它把「改了一个字典项」和「往生产
+    推了一次包」算作同样的一格，看不出这一周跑得顺不顺。执行次数按成败分色才
+    是运维想从趋势里看的东西。
+
+    未结束的执行（running/paused/pending）单独计一列，不混进成败——它们还没有
+    结果，算进任何一边都会让当天的数字在几分钟后自己变。
+    """
+    today = timezone.localdate()
+    start = today - timedelta(days=TREND_DAYS - 1)
+    rows = (
+        TaskExecutionLog.objects.filter(created_at__date__gte=start)
+        .values_list('created_at__date', 'status').annotate(c=Count('id'))
+    )
+    buckets = {str(start + timedelta(days=i)): {'success': 0, 'failed': 0, 'running': 0}
+               for i in range(TREND_DAYS)}
+    for day, status, count in rows:
+        bucket = buckets.get(str(day))
+        if bucket is None:
+            continue
+        if status == 'success':
+            bucket['success'] += count
+        elif status == 'failed':
+            bucket['failed'] += count
+        else:
+            bucket['running'] += count
+    return {
+        'visible': True,
+        'days': [{'date': date, **counts} for date, counts in buckets.items()],
+        'link': {'path': '/task/executions'},
+    }
+
+
 # ── 组装 ────────────────────────────────────────────────────────────
 
 #: (块名, 依赖模块, builder, 是否要 user)。模块为 None = 不需要权限。
@@ -490,7 +530,11 @@ def build_overview(user):
     if allowed('artifact'):
         artifacts = _run('latest_artifacts', latest_artifacts, user, False) or artifacts
 
+    trend = {'visible': False, 'days': []}
+    if allowed('exec'):
+        trend = _run('exec_trend', exec_trend, user, False) or trend
+
     return {
         'alerts': alerts, 'todos': todos, 'running': running, 'agents': agents,
-        'assets': assets, 'artifacts': artifacts,
+        'assets': assets, 'artifacts': artifacts, 'trend': trend,
     }
