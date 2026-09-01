@@ -934,3 +934,111 @@ class HealthTests(BaseTopoTest):
         r = c.get('/api/dashboard/overview/')
         keys = [b['key'] for b in r.json()['data']['alerts']]
         self.assertNotIn('topo_issues', keys)
+
+
+class DashboardTopoLinkTests(BaseTopoTest):
+    """概览页异常明细上的「所在链路图」深链。"""
+
+    def _put(self, client, nodes):
+        r = client.put(f'/api/topo/canvases/{self.canvas.id}/graph/',
+                       {'nodes': nodes, 'edges': []}, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        return r
+
+    def _block(self, client, key):
+        r = client.get('/api/dashboard/overview/')
+        self.assertEqual(r.status_code, 200)
+        blocks = r.json()['data']['alerts']
+        return next((b for b in blocks if b['key'] == key), None)
+
+    def _expiring_cert(self, name='soon-expire'):
+        account = CloudAccount.objects.create(
+            name=f'账号-{name}', provider=self.provider, access_key='AK')
+        return Certificate.objects.create(
+            name=name, domains=['a.example.com'], status='issued',
+            cloud_account=account,
+            expires_at=timezone.now() + timezone.timedelta(days=5))
+
+    def test_certificate_alert_carries_canvas_link(self):
+        admin = self._client()
+        cert = self._expiring_cert()
+        self._put(admin, [{'key': 'c', 'source': 'ref', 'kind': 'certificate',
+                           'ref_id': cert.id, 'label': cert.name}])
+        block = self._block(admin, 'cert_expiring')
+        item = next(i for i in block['items'] if i['id'] == cert.id)
+        self.assertEqual([c['id'] for c in item['topo']], [self.canvas.id])
+        self.assertEqual(item['topo'][0]['link']['path'],
+                         f'/topo/canvases/{self.canvas.id}')
+        # 生产环境的画布标红，值班的人先看这个
+        self.assertTrue(item['topo'][0]['is_prod'])
+
+    def test_agent_alert_points_at_canvases_of_its_hosts(self):
+        """Agent 本身不是画布节点，但钉死到它的主机是——那才是值班要知道的。"""
+        from apps.agent_mgr.models import AgentNode
+
+        admin = self._client()
+        agent = AgentNode.objects.create(name='nat-1', status='offline', enabled=True)
+        server = self._server(channel_mode='agent', agent=agent)
+        self._put(admin, [{'key': 's', 'source': 'ref', 'kind': 'server',
+                           'ref_id': server.id, 'label': server.name}])
+        block = self._block(admin, 'agent_offline')
+        item = next(i for i in block['items'] if i['id'] == agent.id)
+        self.assertEqual([c['id'] for c in item['topo']], [self.canvas.id])
+
+    def test_dns_failure_falls_back_to_domain_node(self):
+        """图上只画了主域名、没画这条记录时也要能跳过去。"""
+        admin = self._client()
+        server = self._server()
+        domain, record = self._domain_record(server)
+        record.sync_status = 'failed'
+        record.save(update_fields=['sync_status'])
+        self._put(admin, [{'key': 'd', 'source': 'ref', 'kind': 'domain',
+                           'ref_id': domain.id, 'label': domain.name}])
+        block = self._block(admin, 'dns_sync_failed')
+        item = next(i for i in block['items'] if i['id'] == record.id)
+        self.assertEqual([c['id'] for c in item['topo']], [self.canvas.id])
+
+    def test_no_link_without_topo_permission(self):
+        from apps.auth_mgr.models import Role
+
+        admin = self._client()
+        cert = self._expiring_cert()
+        self._put(admin, [{'key': 'c', 'source': 'ref', 'kind': 'certificate',
+                           'ref_id': cert.id, 'label': cert.name}])
+        role = Role.objects.create(name='只看云控', code='cloud-only',
+                                   permissions={'cloud': 'read', 'topo': 'none'})
+        user = User.objects.create(username='cloud_only', is_staff=False, role=role)
+        user.set_password('Pass!2345xyz')
+        user.save()
+        c = APIClient()
+        res = c.post('/api/auth/login/',
+                     {'username': 'cloud_only', 'password': 'Pass!2345xyz'}, format='json')
+        c.credentials(HTTP_AUTHORIZATION='Bearer ' + res.json()['access'])
+        block = self._block(c, 'cert_expiring')
+        self.assertIsNotNone(block)
+        self.assertNotIn('topo', block['items'][0])
+
+    def test_link_respects_data_scope(self):
+        """范围外的画布不该借概览页的深链露出来。"""
+        admin = self._client()
+        cert = self._expiring_cert()
+        self._put(admin, [{'key': 'c', 'source': 'ref', 'kind': 'certificate',
+                           'ref_id': cert.id, 'label': cert.name}])
+        scoped = User.objects.create(username='scoped_d', is_staff=True)
+        scoped.set_password('Pass!2345xyz')
+        scoped.save()
+        scoped.allowed_project_groups.add(ProjectGroup.objects.create(
+            name='别的组', code='other-d'))
+        c = APIClient()
+        res = c.post('/api/auth/login/',
+                     {'username': 'scoped_d', 'password': 'Pass!2345xyz'}, format='json')
+        c.credentials(HTTP_AUTHORIZATION='Bearer ' + res.json()['access'])
+        block = self._block(c, 'cert_expiring')
+        self.assertNotIn('topo', block['items'][0])
+
+    def test_items_without_canvas_have_no_topo_key(self):
+        """没画进任何图的异常不带这个字段，前端就不会渲染一个空壳标签。"""
+        admin = self._client()
+        self._expiring_cert('nowhere')
+        block = self._block(admin, 'cert_expiring')
+        self.assertNotIn('topo', block['items'][0])

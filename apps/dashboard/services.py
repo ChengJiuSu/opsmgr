@@ -34,6 +34,7 @@ from apps.auth_mgr import roles
 from apps.cloud_mgr.models import Certificate, CertDeployment, DnsChangeRequest, DnsRecord, Domain
 from apps.task_exec.models import ExecutionTask, TaskExecutionLog
 from apps.topo_mgr import health as topo_health
+from apps.topo_mgr import impact as topo_impact
 from apps.topo_mgr.models import TopoCanvas
 
 logger = logging.getLogger(__name__)
@@ -137,7 +138,9 @@ def cert_stuck_alerts():
     if stuck_deploys:
         blocks.append(_alert(
             'cert_deploy_stuck', 'danger', f'{len(stuck_deploys)} 个证书分发卡住（可重新分发）',
+            # certificate_id / server_id 供拓扑深链反查用（明细本身按分发展示）
             [{'id': d.id, 'name': str(d), 'updated_at': d.updated_at,
+              'certificate_id': d.certificate_id, 'server_id': d.server_id,
               'link': {'path': '/cloud/certificates',
                        'query': {'keyword': d.certificate.name}}}
              for d in stuck_deploys[:ITEM_LIMIT]],
@@ -470,6 +473,82 @@ def exec_trend():
 # ── 组装 ────────────────────────────────────────────────────────────
 
 #: (块名, 依赖模块, builder, 是否要 user)。模块为 None = 不需要权限。
+#: 异常块 → 该块明细对应哪些画布节点（kind, 取 id 的字段）。
+#: 表驱动而不是在各 builder 里各写一遍：builder 关心的是「什么坏了」，
+#: 「它画在哪张图上」是另一件事，混在一起两边都难改。
+TOPO_REF_FIELDS = {
+    'cert_expiring': (('certificate', 'id'),),
+    'cert_failed': (('certificate', 'id'),),
+    'cert_issue_stuck': (('certificate', 'id'),),
+    'cert_deploy_stuck': (('certificate', 'certificate_id'), ('server', 'server_id')),
+    'domain_abnormal': (('domain', 'id'),),
+    # 解析记录同步失败时，图上可能只画了它的主域名而没画这条记录——两个都查，
+    # 按画布去重。只查记录会让「明明画了这条链路」的图漏掉
+    'dns_sync_failed': (('dns_record', 'id'), ('domain', 'domain_id')),
+}
+
+
+def attach_topo_links(blocks, user):
+    """在异常明细上标出「它在哪张链路图上」，并给出深链。
+
+    首页的异常是「什么坏了」，画布回答的是「坏的这个东西挂在哪条链路上」——两者之间
+    原来要靠人自己去画布页翻。加这一层之后，值班的人从「证书要过期」一步跳到那张图，
+    立刻能看见它罩着哪几台机。
+
+    整个附加过程是**尽力而为**：一次批量查（`canvases_for_refs`），拿不到就不标，
+    绝不因为它让异常块本身出不来——概览页是出事时最先被打开的页面。
+
+    Agent 离线单独处理：Agent 本身不是画布上的节点类型，但钉死到它的主机是。看板上
+    真正想知道的正是「这个 Agent 挂了，哪几条链路的机器现在下不了命令」。
+    """
+    if roles.user_level(user, 'topo') == 'none':
+        return blocks
+    canvases = TopoCanvas.objects.select_related(
+        'project_group', 'channel', 'environment')
+    if hasattr(user, 'narrow'):
+        canvases = user.narrow(canvases)
+
+    wanted = set()
+    # 块内条目 → 该条目要查的 (kind, ref_id) 列表
+    per_item = {}
+    agent_servers = {}
+    agent_ids = [
+        item.get('id') for block in blocks if block['key'] == 'agent_offline'
+        for item in block['items'] if item.get('id')
+    ]
+    if agent_ids:
+        for server_id, agent_id in Server.objects.filter(
+                channel_mode='agent', agent_id__in=agent_ids
+        ).values_list('id', 'agent_id'):
+            agent_servers.setdefault(agent_id, []).append(server_id)
+
+    for block in blocks:
+        for index, item in enumerate(block['items']):
+            refs = []
+            for kind, field in TOPO_REF_FIELDS.get(block['key'], ()):
+                if item.get(field):
+                    refs.append((kind, item[field]))
+            if block['key'] == 'agent_offline':
+                refs.extend(('server', sid)
+                            for sid in agent_servers.get(item.get('id'), []))
+            if refs:
+                per_item[(block['key'], index)] = refs
+                wanted.update(refs)
+
+    if not wanted:
+        return blocks
+    found = topo_impact.canvases_for_refs(wanted, canvases)
+    for block in blocks:
+        for index, item in enumerate(block['items']):
+            seen = {}
+            for ref in per_item.get((block['key'], index), ()):
+                for canvas in found.get(ref, ()):
+                    seen[canvas['id']] = canvas
+            if seen:
+                item['topo'] = list(seen.values())
+    return blocks
+
+
 def topo_alerts(user):
     """拓扑画布上有异常节点的图。
 
@@ -534,6 +613,11 @@ def build_overview(user):
     for name, module, builder, needs_user in _ALERT_BUILDERS:
         if allowed(module):
             alerts.extend(_run(name, builder, user, needs_user))
+    # 附加拓扑深链：失败只记日志，异常块本身照常下发
+    try:
+        attach_topo_links(alerts, user)
+    except Exception:  # noqa: BLE001 - 附加信息失败不影响主体
+        logger.exception('概览块拓扑深链附加失败')
 
     todos = []
     for name, module, builder, needs_user in _TODO_BUILDERS:

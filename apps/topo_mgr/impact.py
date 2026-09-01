@@ -98,3 +98,41 @@ def impact(kind, ref_id, canvases):
             ],
         })
     return results
+
+
+def canvases_for_refs(refs, canvases):
+    """批量反查：一批 (kind, ref_id) 各自出现在哪些画布上。
+
+    给概览页用——首页要在「证书快过期」「Agent 离线」这些条目旁边直接标出「它在哪张
+    链路图上」。逐条调 `impact()` 会让一屏异常打出几十次查询，这里一发查完在 Python
+    侧归组：kind 与 id 都用集合过滤，多取到的行是同量级的，比 N 次 OR 查询划算得多。
+
+    返回 {(kind, ref_id): [画布简介, ...]}，没命中的键不出现。
+    """
+    refs = {(kind, int(ref_id)) for kind, ref_id in refs if ref_id}
+    if not refs:
+        return {}
+    nodes = (
+        TopoNode.objects
+        .filter(canvas__in=canvases,
+                kind__in={k for k, _ in refs},
+                ref_id__in={i for _, i in refs})
+        .select_related('canvas__project_group', 'canvas__channel', 'canvas__environment')
+    )
+    grouped = {}
+    for node in nodes:
+        key = (node.kind, node.ref_id)
+        if key not in refs:
+            continue  # 过滤集合是笛卡尔积，这里剔掉不是真正被问到的组合
+        bucket = grouped.setdefault(key, {})
+        canvas = node.canvas
+        # 同一实体在一张画布里只可能有一个节点（唯一约束），但一批 refs 可能命中
+        # 同一张画布多次，按 id 去重让调用方拿到的是「画布清单」而不是「节点清单」
+        bucket[canvas.id] = {
+            'id': canvas.id,
+            'name': canvas.name,
+            'dim_label': canvas.dim_label,
+            'is_prod': canvas.environment.is_prod,
+            'link': {'path': f'/topo/canvases/{canvas.id}', 'query': {}},
+        }
+    return {key: list(value.values()) for key, value in grouped.items()}

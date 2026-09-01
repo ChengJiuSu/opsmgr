@@ -14,6 +14,19 @@
           @click="go(item.link)"
         >
           <span class="item-name">{{ item.name }}</span>
+          <!-- 所在链路图：从「什么坏了」一步跳到「它挂在哪条链路上」。
+               @click.stop 免得连带触发条目自己的跳转 -->
+          <span v-if="item.topo?.length" class="item-topo">
+            <el-tag
+              v-for="canvas in item.topo"
+              :key="canvas.id"
+              size="small"
+              :type="canvas.is_prod ? 'danger' : 'info'"
+              effect="plain"
+              class="topo-tag"
+              @click.stop="go(canvas.link)"
+            >{{ canvas.name }}</el-tag>
+          </span>
           <span class="item-meta">{{ meta(block.key, item) }}</span>
         </li>
         <!-- 明细截断到后端的 ITEM_LIMIT，全量数在标题里，这里补一句免得以为只有这些 -->
@@ -93,6 +106,9 @@ function meta(key, item) {
 
 <style scoped>
 .duty { display: flex; flex-direction: column; gap: 10px; }
+.item-topo { display: inline-flex; gap: 4px; margin-left: 6px; }
+.topo-tag { cursor: pointer; }
+.topo-tag:hover { text-decoration: underline; }
 .block { border-left: 3px solid #e6a23c; background: #fdf6ec; border-radius: 4px; padding: 10px 12px; }
 .block.danger { border-left-color: #f56c6c; background: #fef0f0; }
 
