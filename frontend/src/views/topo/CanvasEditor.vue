@@ -81,7 +81,8 @@
       <!-- 左：调色板 -->
       <aside class="palette">
         <div class="palette-hint">
-          点击类型加入画布 → 选中节点在右侧编辑 → 拖右侧圆点连到另一个节点
+          点击类型加入画布（或在画布空白处右键，点哪儿生哪儿）→ 拖右侧圆点连到
+          另一个节点 → 节点/连线上右键改名、删除、改关系；双击节点就地改名
         </div>
         <div class="palette-group">
           <div class="palette-group-title">平台资源</div>
@@ -123,8 +124,12 @@
           @connect="onConnect"
           @node-drag-stop="onNodeDragStop"
           @node-click="onNodeClick"
+          @node-double-click="onNodeDoubleClick"
+          @node-context-menu="onNodeContextMenu"
           @edge-click="onEdgeClick"
+          @edge-context-menu="onEdgeContextMenu"
           @pane-click="clearSelection"
+          @pane-context-menu="onPaneContextMenu"
         >
           <Background :gap="16" pattern-color="#dfe4ec" />
           <Controls />
@@ -140,7 +145,21 @@
                 <span class="node-kind">{{ data.kindLabel }}</span>
                 <el-icon v-if="data.source === 'ref'" class="node-ref-flag"><Link /></el-icon>
               </div>
-              <div class="node-label">{{ data.label }}</div>
+              <!-- 就地改名：双击或右键菜单进入。mousedown.stop 是必须的——
+                   不拦住的话一点输入框就开始拖节点，文字根本选不中 -->
+              <input
+                v-if="renamingId === id"
+                :ref="setRenameInput"
+                v-model="renameDraft"
+                class="node-rename"
+                maxlength="200"
+                @mousedown.stop
+                @click.stop
+                @keydown.enter.stop.prevent="commitRename"
+                @keydown.esc.stop.prevent="cancelRename"
+                @blur="commitRename"
+              />
+              <div v-else class="node-label">{{ data.label }}</div>
               <div v-if="data.subLabel" class="node-sub">{{ data.subLabel }}</div>
               <div v-if="data.statusLabel" class="node-status">{{ data.statusLabel }}</div>
               <Handle type="target" :position="Position.Left" />
@@ -286,6 +305,17 @@
       </aside>
     </div>
 
+    <!-- 右键菜单：节点 / 连线 / 空白处共用一个实例，菜单项按目标现算 -->
+    <ContextMenu ref="menuRef" :items="menuItems" @select="onMenuSelect" />
+
+    <!-- 所在其它画布（右键菜单里的影响面反查入口） -->
+    <TopoImpactDialog
+      v-model="impactVisible"
+      :kind="impactTarget.kind"
+      :ref-id="impactTarget.refId"
+      :label="impactTarget.label"
+    />
+
     <!-- 克隆弹窗：维度不符的主机会被后端跳过并在结果里报出来 -->
     <el-dialog v-model="cloneVisible" title="克隆画布" width="520px">
       <el-form ref="cloneFormRef" :model="cloneForm" :rules="cloneRules" label-width="100px">
@@ -372,6 +402,8 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import dagre from 'dagre'
 import { debounce } from '../../utils/debounce'
 import { useAuthStore } from '../../stores/auth'
+import ContextMenu from '../../components/ContextMenu.vue'
+import TopoImpactDialog from '../../components/TopoImpactDialog.vue'
 import {
   projectGroupApi, channelApi, environmentApi, fetchDictOptions,
 } from '../../api/assets'
@@ -394,7 +426,8 @@ const canvasId = computed(() => route.params.id)
 
 // getNodes 是画布的权威状态：拖拽后的坐标先落在 store 里，v-model 回写虽然也会同步，
 // 但保存时直接读 store 就不必依赖那次回写的时机
-const { fitView, getNodes } = useVueFlow()
+// screenToFlowCoordinate：把鼠标屏幕坐标换成画布坐标，右键新建的节点才能「点哪儿生哪儿」
+const { fitView, getNodes, screenToFlowCoordinate } = useVueFlow()
 
 //: 值班模式的刷新间隔。30 秒是「大屏挂着看」的量级：再快只是给库加压，
 //: 主机状态与证书天数都不是秒级变化的东西
@@ -413,8 +446,18 @@ const selectedEdgeId = ref('')
 // 值班模式：只读 + 定时刷新。初值取自 URL，所以「大屏那份链接」可以直接分享
 const watchMode = ref(route.query.watch === '1')
 const refreshedAt = ref(null)
+// 右键菜单与就地改名
+const menuRef = ref(null)
+const menuItems = ref([])
+// 菜单作用对象：{ type: 'node'|'edge'|'pane', id?, position? }
+const menuTarget = ref({ type: 'pane' })
+const renamingId = ref('')
+const renameDraft = ref('')
+const impactVisible = ref(false)
+const impactTarget = ref({ kind: 'server', refId: null, label: '' })
 let keySeq = 0
 let watchTimer = null
+let renameInputEl = null
 
 // 外部节点的默认落点：避开左上角已有节点，叠一层偏移防止新节点互相压住
 const NEW_NODE_ORIGIN = { x: 120, y: 40 }
@@ -476,8 +519,9 @@ function stopWatchTimer() {
 function startWatchTimer() {
   stopWatchTimer()
   watchTimer = setInterval(() => {
-    // 有未保存改动时不自动刷新：把人正在画的东西冲掉是最不能接受的
-    if (!dirty.value) reload()
+    // 有未保存改动、或正在改名时不自动刷新：把人正在画/正在写的东西冲掉
+    // 是最不能接受的
+    if (!dirty.value && !renamingId.value) reload()
   }, WATCH_INTERVAL)
 }
 
@@ -582,6 +626,9 @@ function buildEdge(id, source, target, relation) {
 }
 
 function applyGraph(data) {
+  // 整图替换会换掉所有节点对象，改名态指向的那个对象随之作废
+  cancelRename()
+  menuRef.value?.close()
   canvas.value = data.canvas || canvas.value
   nodes.value = (data.nodes || []).map(toFlowNode)
   edges.value = (data.edges || []).map(toFlowEdge)
@@ -621,12 +668,13 @@ function freeSpot() {
   return { x: NEW_NODE_ORIGIN.x + (offset % 240), y: NEW_NODE_ORIGIN.y + offset }
 }
 
-function addExternalNode(kind) {
+function addExternalNode(kind, position = null) {
   const id = nextKey()
   nodes.value.push({
     id,
     type: 'topo',
-    position: freeSpot(),
+    // 右键新建时用光标处的画布坐标，点哪儿生哪儿；从左侧调色板加则退回错开落点
+    position: position || freeSpot(),
     data: {
       dbId: null, source: 'external', kind: kind.kind, kindLabel: kind.label,
       refId: null, label: `新${kind.label}`, subLabel: '', remark: '',
@@ -637,6 +685,8 @@ function addExternalNode(kind) {
   selectedEdgeId.value = ''
   selectedNodeId.value = id
   markDirty()
+  // 新节点默认名是「新XX」，直接进改名态：加一个节点后要做的事十有八九是给它起名
+  nextTick(() => startRename(id))
 }
 
 const pickerVisible = ref(false)
@@ -690,6 +740,245 @@ function pickCandidate(row) {
   markDirty()
 }
 
+// ── 就地改名 ────────────────────────────────────────────
+
+function setRenameInput(el) {
+  renameInputEl = el
+  if (el) nextTick(() => { el.focus(); el.select() })
+}
+
+function startRename(nodeId) {
+  const node = nodes.value.find((n) => n.id === nodeId)
+  if (!node || !editable.value) return
+  if (node.data.source === 'ref') {
+    // 引用型节点的名字取自平台实体，在这里改了保存后仍会被实时值覆盖；
+    // 直接把人送去能真正改名的那个页面
+    ElMessage.info('该节点的名称取自平台资源，请在对应管理页修改')
+    return
+  }
+  selectedEdgeId.value = ''
+  selectedNodeId.value = nodeId
+  renameDraft.value = node.data.label
+  renamingId.value = nodeId
+}
+
+function commitRename() {
+  const nodeId = renamingId.value
+  if (!nodeId) return
+  const node = nodes.value.find((n) => n.id === nodeId)
+  renamingId.value = ''
+  renameInputEl = null
+  const value = renameDraft.value.trim()
+  if (!node) return
+  if (!value) {
+    ElMessage.warning('节点名称不能为空，已保留原名')
+    return
+  }
+  if (value === node.data.label) return
+  node.data.label = value
+  markDirty()
+}
+
+function cancelRename() {
+  renamingId.value = ''
+  renameInputEl = null
+}
+
+// ── 右键菜单 ────────────────────────────────────────────
+
+/** 节点菜单。只读时只留「看」的动作——给一堆点了没反应的菜单项比不给更糟。 */
+function nodeMenuItems(node) {
+  const related = edges.value.filter(
+    (e) => e.source === node.id || e.target === node.id).length
+  const isRef = node.data.source === 'ref'
+  const items = []
+  if (editable.value) {
+    items.push({
+      key: 'rename', label: '重命名',
+      disabled: isRef, hint: isRef ? '取自平台资源' : '',
+    })
+    items.push({
+      key: 'pin', label: node.data.pinned ? '取消固定位置' : '固定位置',
+      checked: node.data.pinned,
+    })
+  }
+  if (isRef && node.data.link) {
+    items.push({ key: 'open', label: '打开原始页' })
+  }
+  if (isRef) {
+    items.push({ key: 'impact', label: '查看所在其它画布' })
+  }
+  items.push({ key: 'copy', label: '复制名称' })
+  if (editable.value) {
+    items.push({ divider: true })
+    items.push({
+      key: 'detach', label: `断开所有连线（${related}）`,
+      disabled: !related, hint: related ? '' : '没有连线',
+    })
+    items.push({ key: 'delete', label: '删除节点', danger: true })
+  }
+  return items
+}
+
+/** 连线菜单：7 种关系直接平铺，改关系不用再绕右侧下拉。 */
+function edgeMenuItems(edge) {
+  if (!editable.value) return [{ key: 'noop', label: '值班模式下只读', disabled: true }]
+  return [
+    {
+      key: 'relation', label: '改关系',
+      children: meta.relations.map((r) => ({
+        key: `relation:${r.value}`, label: r.label,
+        checked: edge.data.relation === r.value,
+      })),
+    },
+    { divider: true },
+    { key: 'delete-edge', label: '删除连线', danger: true },
+  ]
+}
+
+/** 空白处菜单：在光标处新建节点 + 视图操作。 */
+function paneMenuItems() {
+  const items = []
+  if (editable.value) {
+    items.push({
+      key: 'add', label: '在此处新建节点',
+      children: meta.external_groups.flatMap((group) => group.kinds.map((k) => ({
+        key: `add:${k.kind}`, label: `${group.group} · ${k.label}`,
+      }))),
+    })
+    items.push({ key: 'relayout', label: '重新排版' })
+    items.push({ divider: true })
+  }
+  items.push({ key: 'fit', label: '适应视图' })
+  return items
+}
+
+function openMenu(event, target, items) {
+  if (!items.length) return
+  event.preventDefault()
+  // 菜单弹出前先收掉就地编辑：编辑框失焦会提交，避免菜单动作和改名互相盖
+  if (renamingId.value) commitRename()
+  menuTarget.value = target
+  menuItems.value = items
+  menuRef.value?.open(event)
+}
+
+function onNodeContextMenu({ event, node }) {
+  selectedEdgeId.value = ''
+  selectedNodeId.value = node.id
+  openMenu(event, { type: 'node', id: node.id }, nodeMenuItems(node))
+}
+
+function onEdgeContextMenu({ event, edge }) {
+  selectedNodeId.value = ''
+  selectedEdgeId.value = edge.id
+  openMenu(event, { type: 'edge', id: edge.id }, edgeMenuItems(edge))
+}
+
+function onPaneContextMenu(event) {
+  // 落点用画布坐标而不是屏幕坐标：缩放/平移过之后两者差得很远
+  const position = screenToFlowCoordinate({ x: event.clientX, y: event.clientY })
+  openMenu(event, { type: 'pane', position }, paneMenuItems())
+}
+
+function onNodeDoubleClick({ node }) {
+  if (node.data.source === 'ref' && node.data.link) {
+    jumpTo(node.data.link)
+    return
+  }
+  startRename(node.id)
+}
+
+async function onMenuSelect(item) {
+  const target = menuTarget.value
+  const node = target.type === 'node'
+    ? nodes.value.find((n) => n.id === target.id) : null
+  const edge = target.type === 'edge'
+    ? edges.value.find((e) => e.id === target.id) : null
+
+  if (item.key.startsWith('add:')) {
+    addExternalNode(findKind(item.key.slice(4)), target.position)
+    return
+  }
+  if (item.key.startsWith('relation:') && edge) {
+    edge.data.relation = item.key.slice(9)
+    onRelationChange(edge.data.relation)
+    return
+  }
+  switch (item.key) {
+    case 'rename':
+      startRename(target.id)
+      break
+    case 'pin':
+      if (node) {
+        node.data.pinned = !node.data.pinned
+        markDirty()
+      }
+      break
+    case 'open':
+      if (node?.data.link) jumpTo(node.data.link)
+      break
+    case 'impact':
+      if (node) {
+        impactTarget.value = {
+          kind: node.data.kind, refId: node.data.refId, label: node.data.label,
+        }
+        impactVisible.value = true
+      }
+      break
+    case 'copy':
+      if (node) await copyText(node.data.label)
+      break
+    case 'detach':
+      if (node) detachNode(node)
+      break
+    case 'delete':
+      if (node) await removeNode(node)
+      break
+    case 'delete-edge':
+      if (edge) removeEdge(edge)
+      break
+    case 'relayout':
+      relayout()
+      break
+    case 'fit':
+      fitView({ padding: 0.2 })
+      break
+    default:
+      break
+  }
+}
+
+function findKind(kind) {
+  for (const group of meta.external_groups) {
+    const hit = group.kinds.find((k) => k.kind === kind)
+    if (hit) return hit
+  }
+  return { kind, label: kind }
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text)
+    ElMessage.success('已复制')
+  } catch {
+    // 非 HTTPS / 无剪贴板权限时降级：把名字显示出来让人手动复制，
+    // 静默失败会让人以为复制成功了
+    ElMessageBox.alert(text, '手动复制', { type: 'info' })
+  }
+}
+
+function detachNode(node) {
+  const before = edges.value.length
+  edges.value = edges.value.filter(
+    (e) => e.source !== node.id && e.target !== node.id)
+  const removed = before - edges.value.length
+  if (removed) {
+    markDirty()
+    ElMessage.success(`已断开 ${removed} 条连线`)
+  }
+}
+
 // ── 连线与删除 ──────────────────────────────────────────
 
 function onConnect(params) {
@@ -719,27 +1008,56 @@ function onNodeDragStop() {
   markDirty()
 }
 
-async function removeSelectedNode() {
-  const node = selectedNode.value
-  if (!node) return
+/** 删一个节点。带连线才二次确认：孤立节点删错了再加一个就是，
+    带连线的节点删掉会静默改变链路形状，那种错不容易发现。 */
+async function removeNode(node) {
   const related = edges.value.filter((e) => e.source === node.id || e.target === node.id)
-  await ElMessageBox.confirm(
-    related.length
-      ? `删除节点「${node.data.label}」会同时删掉与它相连的 ${related.length} 条连线。继续？`
-      : `确定从画布移除节点「${node.data.label}」吗？`,
-    '提示', { type: 'warning' })
+  if (related.length) {
+    await ElMessageBox.confirm(
+      `删除节点「${node.data.label}」会同时删掉与它相连的 ${related.length} 条连线。继续？`,
+      '提示', { type: 'warning' })
+  }
   edges.value = edges.value.filter((e) => e.source !== node.id && e.target !== node.id)
   nodes.value = nodes.value.filter((n) => n.id !== node.id)
+  if (renamingId.value === node.id) cancelRename()
   clearSelection()
   markDirty()
 }
 
-function removeSelectedEdge() {
-  const edge = selectedEdge.value
-  if (!edge) return
+function removeEdge(edge) {
   edges.value = edges.value.filter((e) => e.id !== edge.id)
   clearSelection()
   markDirty()
+}
+
+async function removeSelectedNode() {
+  if (selectedNode.value) await removeNode(selectedNode.value)
+}
+
+function removeSelectedEdge() {
+  if (selectedEdge.value) removeEdge(selectedEdge.value)
+}
+
+/** Delete / Backspace 删选中的节点或连线。
+
+    自己接而不是交给 vue-flow 的 deleteKeyCode：那条路不走确认框、也不会把改动
+    标成未保存。输入框里按退格当然不能删节点，所以先看事件源。 */
+async function onKeydown(event) {
+  if (event.key !== 'Delete' && event.key !== 'Backspace') return
+  if (!editable.value || renamingId.value) return
+  const tag = (event.target?.tagName || '').toLowerCase()
+  if (tag === 'input' || tag === 'textarea' || event.target?.isContentEditable) return
+  if (selectedNode.value) {
+    event.preventDefault()
+    try {
+      await removeNode(selectedNode.value)
+    } catch {
+      // 确认框取消
+    }
+  } else if (selectedEdge.value) {
+    event.preventDefault()
+    removeEdge(selectedEdge.value)
+  }
 }
 
 // ── 自动排版（dagre，从左到右） ─────────────────────────
@@ -934,6 +1252,7 @@ watch(canvasId, (value, previous) => {
 
 onMounted(async () => {
   window.addEventListener('beforeunload', beforeUnload)
+  window.addEventListener('keydown', onKeydown)
   const metaRes = await getTopoMeta()
   Object.assign(meta, metaRes.data || {})
   await reload()
@@ -941,6 +1260,7 @@ onMounted(async () => {
 })
 onUnmounted(() => {
   window.removeEventListener('beforeunload', beforeUnload)
+  window.removeEventListener('keydown', onKeydown)
   stopWatchTimer()
 })
 </script>
@@ -1031,6 +1351,17 @@ onUnmounted(() => {
 .node-label {
   font-size: 13px; color: #303133; margin-top: 2px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.node-rename {
+  width: 100%;
+  margin-top: 2px;
+  padding: 1px 4px;
+  font-size: 13px;
+  font-family: inherit;
+  color: #303133;
+  border: 1px solid #409eff;
+  border-radius: 2px;
+  outline: none;
 }
 .node-sub, .node-status {
   color: #909399; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
