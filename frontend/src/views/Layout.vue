@@ -23,12 +23,13 @@
         <!-- 菜单可见性按角色矩阵判定（authStore.can，与后端 roles.MODULES 同名）。
              整组都无权限时连父菜单一起藏：留一个点进去全是 403 的空目录没有意义。
              这只是「少让人点到必然 403 的入口」，真正的判定始终在后端 -->
-        <el-sub-menu v-if="authStore.can('cmdb')" index="assets">
+        <el-sub-menu v-if="canAssets" index="assets">
           <template #title>
             <el-icon><Box /></el-icon>
             <span>资产管理</span>
           </template>
-          <el-menu-item index="/assets/servers">服务器</el-menu-item>
+          <el-menu-item v-if="authStore.can('cmdb')" index="/assets/servers">服务器</el-menu-item>
+          <el-menu-item v-if="authStore.can('topo')" index="/topo/canvases">拓扑画布</el-menu-item>
         </el-sub-menu>
         <el-sub-menu v-if="canCloud" index="cloud">
           <template #title>
@@ -182,6 +183,7 @@ const authStore = useAuthStore()
 const collapsed = ref(false)
 
 // 分组菜单的可见性：组内一个子项都看不到时把父菜单也藏掉
+const canAssets = computed(() => authStore.can('cmdb') || authStore.can('topo'))
 const canCloud = computed(() =>
   authStore.can('cloud') || authStore.can('cloud_account', 'write'))
 const canConfig = computed(() => authStore.can('dict') || authStore.can('cmdb'))

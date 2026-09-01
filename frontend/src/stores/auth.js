@@ -32,7 +32,7 @@ export const useAuthStore = defineStore('auth', () => {
   /**
    * 是否具备某模块的某档权限。
    * @param {string} module 模块标识（见后端 roles.MODULES：cmdb / dict / exec / method /
-   *   variable / artifact / credential / cloud / cloud_account / agent / account / system / audit）
+   *   variable / artifact / credential / cloud / cloud_account / topo / agent / account / system / audit）
    * @param {'read'|'create'|'write'} action 默认 read
    */
   function can(module, action = 'read') {

@@ -83,6 +83,7 @@ LEVEL_LABELS = {
 MODULES = {
     'cmdb': '服务器资产（服务器台账、服务器分配与服务规划）',
     'dict': '基础字典（项目组、渠道、环境、云厂商、服务类型）',
+    'topo': '拓扑画布（接入链路图）',
     'exec': '任务执行（任务流定义、执行记录、执行日志与日志文件）',
     'method': '方法库（命令 / playbook / Jenkins 方法模板）',
     'variable': '执行变量（含敏感变量真值）',
@@ -99,7 +100,7 @@ MODULES = {
 #: 页面分组：角色页按这个顺序分块渲染（13 个模块平铺成一行行单选框没法看）。
 #: 与侧边栏菜单同构，配角色的人不用在脑子里做一次「模块标识 → 我点哪个菜单」的翻译。
 MODULE_GROUPS = (
-    ('资产与配置', ('cmdb', 'dict')),
+    ('资产与配置', ('cmdb', 'dict', 'topo')),
     ('任务执行', ('exec', 'method', 'variable', 'artifact', 'credential')),
     ('云控管理', ('cloud', 'cloud_account')),
     ('系统管理', ('agent', 'account', 'system', 'audit')),
@@ -150,7 +151,7 @@ BUILTIN_ROLES = (
         'remark': '日常运维读写；云账号/连接凭据/Agent 只读，用户、角色与系统配置不可见',
         'can_execute': True, 'can_exec_prod': True,
         'permissions': {
-            'cmdb': 'write', 'dict': 'write',
+            'cmdb': 'write', 'dict': 'write', 'topo': 'write',
             'exec': 'write', 'method': 'write', 'variable': 'write', 'artifact': 'write',
             'cloud': 'write',
             'credential': 'read', 'agent': 'read', 'audit': 'read',
@@ -162,7 +163,7 @@ BUILTIN_ROLES = (
         'remark': '资产与字典可查可增；任务可执行但不能改定义、不能改方法、不能碰生产',
         'can_execute': True, 'can_exec_prod': False,
         'permissions': {
-            'cmdb': 'read_create', 'dict': 'read_create',
+            'cmdb': 'read_create', 'dict': 'read_create', 'topo': 'read_create',
             'exec': 'read', 'method': 'read', 'variable': 'read', 'artifact': 'read',
             'cloud': 'read', 'audit': 'read',
             'credential': 'none', 'cloud_account': 'none',

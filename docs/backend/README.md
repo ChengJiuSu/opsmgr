@@ -14,6 +14,7 @@
 | [资产管理模块](modules/assets.md) | 服务器 CRUD 与 CMDB 字典（项目组/渠道/环境/云厂商） |
 | [配置管理模块](modules/config.md) | 服务器归属批量分配、分配概览 |
 | [内部导航页模块](modules/portal.md) | 公司内部系统导航页（/nav.html）的区块/系统/导航列/公告配置 |
+| [拓扑画布模块](modules/topo.md) | 接入链路画布：引用型/外部型节点、整图读写、按维度自动编排 |
 | [任务执行模块](modules/exec.md) | 命令/剧本执行、动态 inventory、服务规划前置校验 |
 | [构建制品与 Jenkins 集成](modules/artifacts.md) | Jenkins 触发构建/日志同步、制品上报（X-API-KEY）、CD 制品变量注入 |
 | [审计模块](modules/audit.md) | 中间件自动审计、只读 API |

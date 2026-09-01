@@ -27,6 +27,19 @@ const router = createRouter({
           meta: { title: '服务器管理', perm: ['cmdb', 'read'] },
         },
         // 云控管理：云账号（仅管理员）+ 域名管理（主域名/解析记录）
+        // 拓扑画布：列表 + 编辑器（编辑器路由带 id，画布本身可分享定位）
+        {
+          path: 'topo/canvases',
+          name: 'TopoCanvases',
+          component: () => import('../views/topo/Canvases.vue'),
+          meta: { title: '拓扑画布', perm: ['topo', 'read'] },
+        },
+        {
+          path: 'topo/canvases/:id(\\d+)',
+          name: 'TopoCanvasEditor',
+          component: () => import('../views/topo/CanvasEditor.vue'),
+          meta: { title: '画布编辑', activeMenu: '/topo/canvases', perm: ['topo', 'read'] },
+        },
         {
           path: 'cloud/accounts',
           name: 'CloudAccounts',

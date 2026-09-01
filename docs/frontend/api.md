@@ -52,6 +52,20 @@ updateServer(id, data)   // PUT    /api/assets/servers/{id}/
 deleteServer(id)         // DELETE /api/assets/servers/{id}/
 ```
 
+### 拓扑画布（`src/api/topo.js`）
+
+```javascript
+getCanvases(params)      // GET    /api/topo/canvases/
+createCanvas(data)       // POST   /api/topo/canvases/
+updateCanvas(id, data)   // PATCH  /api/topo/canvases/{id}/
+deleteCanvas(id)         // DELETE /api/topo/canvases/{id}/
+getGraph(id)             // GET    /api/topo/canvases/{id}/graph/      整图读
+saveGraph(id, data)      // PUT    /api/topo/canvases/{id}/graph/      整图覆盖保存
+autofillCanvas(id)       // POST   /api/topo/canvases/{id}/autofill/   按维度自动编排
+getCandidates(id, p)     // GET    /api/topo/canvases/{id}/candidates/ 可引用资源候选
+getTopoMeta()            // GET    /api/topo/meta/                     节点类型与关系登记表
+```
+
 ### 审计日志（`src/api/audit.js`）
 
 ```javascript
