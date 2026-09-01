@@ -22,7 +22,10 @@
           <el-option v-for="i in dicts.environments" :key="i.id" :label="i.name" :value="i.code" />
         </el-select>
       </div>
-      <el-button v-if="canCreate" type="primary" :icon="Plus" @click="openDialog()">新建画布</el-button>
+      <div class="toolbar-right">
+        <el-button v-if="canCreate" :icon="Upload" @click="openImport">导入 JSON</el-button>
+        <el-button v-if="canCreate" type="primary" :icon="Plus" @click="openDialog()">新建画布</el-button>
+      </div>
     </div>
 
     <!-- 表格 -->
@@ -128,19 +131,76 @@
       <el-button type="primary" :loading="submitting" @click="handleSubmit">确定</el-button>
     </template>
   </el-dialog>
+
+  <!-- 导入弹窗：选文件或直接粘贴导出的 JSON -->
+  <el-dialog v-model="importVisible" title="导入画布" width="600px">
+    <el-upload
+      :auto-upload="false"
+      :show-file-list="false"
+      accept=".json,application/json"
+      :on-change="handleFilePick"
+    >
+      <el-button :icon="Upload">选择导出的 .json 文件</el-button>
+    </el-upload>
+    <el-input
+      v-model="importForm.text"
+      type="textarea"
+      :rows="6"
+      placeholder="也可直接粘贴导出内容"
+      style="margin: 10px 0"
+    />
+    <el-form label-width="120px">
+      <el-form-item label="画布名称">
+        <el-input v-model="importForm.name" placeholder="留空 = 用文件里的名称" />
+      </el-form-item>
+      <el-form-item label="画布标识">
+        <el-input v-model="importForm.slug" placeholder="留空 = 用文件里的标识" />
+      </el-form-item>
+      <el-form-item label="项目组">
+        <el-select v-model="importForm.project_group" clearable style="width:100%"
+                   placeholder="留空 = 按文件里的编码匹配">
+          <el-option v-for="i in dicts.projectGroups" :key="i.id" :label="i.name" :value="i.id" />
+        </el-select>
+      </el-form-item>
+      <el-form-item label="渠道">
+        <el-select v-model="importForm.channel" clearable style="width:100%"
+                   placeholder="留空 = 按文件里的编码匹配">
+          <el-option v-for="i in dicts.channels" :key="i.id" :label="i.name" :value="i.id" />
+        </el-select>
+      </el-form-item>
+      <el-form-item label="环境">
+        <el-select v-model="importForm.environment" clearable style="width:100%"
+                   placeholder="留空 = 按文件里的编码匹配">
+          <el-option v-for="i in dicts.environments" :key="i.id" :label="i.name" :value="i.id" />
+        </el-select>
+      </el-form-item>
+      <el-form-item label="覆盖已存在">
+        <el-switch v-model="importForm.overwrite" :disabled="!canWrite" />
+        <span class="tip">
+          同维度同标识的画布已存在时整份覆盖它（需读写权限）；关闭则直接报冲突
+        </span>
+      </el-form-item>
+    </el-form>
+    <template #footer>
+      <el-button @click="importVisible = false">取消</el-button>
+      <el-button type="primary" :loading="importing" @click="submitImport">导入</el-button>
+    </template>
+  </el-dialog>
 </template>
 
 <script setup>
 import { ref, computed, reactive, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { Plus, Edit, Delete } from '@element-plus/icons-vue'
+import { Plus, Edit, Delete, Upload } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { debounce } from '../../utils/debounce'
 import { useAuthStore } from '../../stores/auth'
 import {
   projectGroupApi, channelApi, environmentApi, fetchDictOptions,
 } from '../../api/assets'
-import { getCanvases, createCanvas, updateCanvas, deleteCanvas } from '../../api/topo'
+import {
+  getCanvases, createCanvas, updateCanvas, deleteCanvas, importCanvas,
+} from '../../api/topo'
 
 const router = useRouter()
 const authStore = useAuthStore()
@@ -235,6 +295,71 @@ async function handleSubmit() {
   }
 }
 
+// ── 导入 ────────────────────────────────────────────────
+
+const importVisible = ref(false)
+const importing = ref(false)
+const importForm = reactive({
+  text: '', name: '', slug: '',
+  project_group: null, channel: null, environment: null, overwrite: false,
+})
+
+function openImport() {
+  Object.assign(importForm, {
+    text: '', name: '', slug: '',
+    project_group: null, channel: null, environment: null, overwrite: false,
+  })
+  importVisible.value = true
+}
+
+// 只读文本，不上传文件：后端导入接口收的是 JSON 体，走 multipart 反而多一层解析
+function handleFilePick(file) {
+  const raw = file.raw
+  if (!raw) return
+  const reader = new FileReader()
+  reader.onload = () => { importForm.text = String(reader.result || '') }
+  reader.onerror = () => ElMessage.error('文件读取失败')
+  reader.readAsText(raw)
+}
+
+async function submitImport() {
+  if (!importForm.text.trim()) {
+    ElMessage.warning('请先选择文件或粘贴导出内容')
+    return
+  }
+  let payload
+  try {
+    payload = JSON.parse(importForm.text)
+  } catch {
+    ElMessage.error('内容不是合法的 JSON')
+    return
+  }
+  const overrides = {}
+  for (const key of ['name', 'slug', 'project_group', 'channel', 'environment']) {
+    if (importForm[key]) overrides[key] = importForm[key]
+  }
+  importing.value = true
+  try {
+    const res = await importCanvas({
+      payload, overrides, overwrite: importForm.overwrite,
+    })
+    importVisible.value = false
+    ElMessage.success(res.msg || '导入完成')
+    // 跳过的节点逐条列出来：只报个数量，人不知道要补哪些
+    const skipped = res.data?.report?.skipped_nodes || []
+    if (skipped.length) {
+      ElMessageBox.alert(
+        skipped.map((s) => `${s.label}（${s.reason}）`).join('\n'),
+        `有 ${skipped.length} 个节点没有落地`,
+        { type: 'warning', customStyle: { whiteSpace: 'pre-line' } },
+      )
+    }
+    fetchData()
+  } finally {
+    importing.value = false
+  }
+}
+
 async function handleDelete(row) {
   await ElMessageBox.confirm(
     `确定删除画布「${row.name}」吗？图上的 ${row.node_count} 个节点与 ${row.edge_count} 条连线会一并删除，` +
@@ -262,7 +387,7 @@ onMounted(async () => {
 
 <style scoped>
 .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
-.toolbar-left { display: flex; gap: 8px; }
+.toolbar-left, .toolbar-right { display: flex; gap: 8px; }
 .mono { font-family: monospace; }
 .region { margin-left: 6px; font-size: 12px; color: #606266; }
 .unset, .muted { color: #909399; font-size: 12px; }

@@ -33,6 +33,17 @@
           自动编排
         </el-button>
         <el-button v-if="canWrite" @click="relayout">重新排版</el-button>
+        <el-dropdown @command="handleMore">
+          <el-button>
+            更多<el-icon><ArrowDown /></el-icon>
+          </el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item command="export">导出 JSON</el-dropdown-item>
+              <el-dropdown-item v-if="canCreate" command="clone">克隆到其它维度</el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
         <el-button
           v-if="canWrite"
           type="primary"
@@ -240,6 +251,49 @@
       </aside>
     </div>
 
+    <!-- 克隆弹窗：维度不符的主机会被后端跳过并在结果里报出来 -->
+    <el-dialog v-model="cloneVisible" title="克隆画布" width="520px">
+      <el-form ref="cloneFormRef" :model="cloneForm" :rules="cloneRules" label-width="100px">
+        <el-form-item label="新名称" prop="name">
+          <el-input v-model="cloneForm.name" />
+        </el-form-item>
+        <el-form-item label="新标识" prop="slug">
+          <el-input v-model="cloneForm.slug" placeholder="如 ingress-path-dev" />
+        </el-form-item>
+        <el-form-item label="项目组">
+          <el-select v-model="cloneForm.project_group" clearable style="width:100%"
+                     placeholder="不改（沿用原画布）">
+            <el-option v-for="i in dicts.projectGroups" :key="i.id" :label="i.name" :value="i.id" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="渠道">
+          <el-select v-model="cloneForm.channel" clearable style="width:100%"
+                     placeholder="不改（沿用原画布）">
+            <el-option v-for="i in dicts.channels" :key="i.id" :label="i.name" :value="i.id" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="环境">
+          <el-select v-model="cloneForm.environment" clearable style="width:100%"
+                     placeholder="不改（沿用原画布）">
+            <el-option v-for="i in dicts.environments" :key="i.id" :label="i.name" :value="i.id" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="地域">
+          <el-input v-model="cloneForm.region" placeholder="留空 = 跨地域" />
+        </el-form-item>
+      </el-form>
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        title="换了维度时，与新维度不符的主机节点会被跳过（域名/解析/证书照常保留），结果里会列出跳过了哪些——GA、负载均衡这层骨架才是克隆真正要复用的部分。"
+      />
+      <template #footer>
+        <el-button @click="cloneVisible = false">取消</el-button>
+        <el-button type="primary" :loading="cloning" @click="submitClone">克隆</el-button>
+      </template>
+    </el-dialog>
+
     <!-- 平台资源选择弹窗 -->
     <el-dialog v-model="pickerVisible" :title="`选择${picker.label}`" width="620px">
       <el-input
@@ -273,18 +327,22 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, reactive, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { VueFlow, Handle, Position, MarkerType, useVueFlow } from '@vue-flow/core'
 import { Background } from '@vue-flow/background'
 import { Controls } from '@vue-flow/controls'
-import { ArrowLeft, Check, Refresh, Link } from '@element-plus/icons-vue'
+import { ArrowLeft, ArrowDown, Check, Refresh, Link } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import dagre from 'dagre'
 import { debounce } from '../../utils/debounce'
 import { useAuthStore } from '../../stores/auth'
 import {
+  projectGroupApi, channelApi, environmentApi, fetchDictOptions,
+} from '../../api/assets'
+import {
   getGraph, saveGraph, autofillCanvas, getCandidates, getTopoMeta,
+  cloneCanvas, exportCanvas,
 } from '../../api/topo'
 
 import '@vue-flow/core/dist/style.css'
@@ -295,6 +353,8 @@ const route = useRoute()
 const router = useRouter()
 const authStore = useAuthStore()
 const canWrite = computed(() => authStore.can('topo', 'write'))
+// 克隆是「另存一张新画布」= 新增，read_create 档就该给
+const canCreate = computed(() => authStore.can('topo', 'create'))
 const canvasId = computed(() => route.params.id)
 
 // getNodes 是画布的权威状态：拖拽后的坐标先落在 store 里，v-model 回写虽然也会同步，
@@ -651,6 +711,98 @@ async function handleAutofill() {
   }
 }
 
+// ── 导出 / 克隆 ─────────────────────────────────────────
+
+const dicts = reactive({ projectGroups: [], channels: [], environments: [] })
+const cloneVisible = ref(false)
+const cloning = ref(false)
+const cloneFormRef = ref()
+const cloneForm = reactive({
+  name: '', slug: '', project_group: null, channel: null, environment: null, region: '',
+})
+const cloneRules = {
+  name: [{ required: true, message: '请输入新画布名称' }],
+  slug: [
+    { required: true, message: '请输入新画布标识' },
+    { pattern: /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/, message: '只能用小写字母、数字与连字符' },
+  ],
+}
+
+function handleMore(command) {
+  if (command === 'export') handleExport()
+  if (command === 'clone') openClone()
+}
+
+async function handleExport() {
+  const res = await exportCanvas(canvasId.value)
+  // 后端吐的是 JSON 对象（引用型节点用自然键），这里落成文件；不走 blob 响应类型是
+  // 为了让统一响应拦截器照常处理错误
+  const blob = new Blob([JSON.stringify(res.data, null, 2)],
+    { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `topo-${canvas.value.slug || canvasId.value}.json`
+  a.click()
+  URL.revokeObjectURL(url)
+  ElMessage.success('已导出')
+}
+
+async function loadDicts() {
+  if (dicts.projectGroups.length) return
+  const [groups, channels, envs] = await Promise.all([
+    fetchDictOptions(projectGroupApi),
+    fetchDictOptions(channelApi),
+    fetchDictOptions(environmentApi),
+  ])
+  dicts.projectGroups = groups.data?.results || []
+  dicts.channels = channels.data?.results || []
+  dicts.environments = envs.data?.results || []
+}
+
+async function openClone() {
+  await loadDicts()
+  Object.assign(cloneForm, {
+    name: `${canvas.value.name} 副本`,
+    slug: `${canvas.value.slug}-copy`,
+    project_group: null, channel: null, environment: null,
+    region: canvas.value.region || '',
+  })
+  cloneVisible.value = true
+  cloneFormRef.value?.clearValidate()
+}
+
+async function submitClone() {
+  await cloneFormRef.value.validate()
+  cloning.value = true
+  try {
+    const body = {}
+    Object.entries(cloneForm).forEach(([key, value]) => {
+      if (value !== null && value !== '') body[key] = value
+    })
+    // region 要能显式清空成「跨地域」，所以空串也照传
+    body.region = cloneForm.region
+    const res = await cloneCanvas(canvasId.value, body)
+    cloneVisible.value = false
+    ElMessage.success(res.msg || '克隆完成')
+    reportSkipped(res.data?.report)
+    router.push({ name: 'TopoCanvasEditor', params: { id: res.data.canvas.id } })
+  } finally {
+    cloning.value = false
+  }
+}
+
+/** 跳过的节点逐条列出来：只报个数量，人不知道要补哪些。 */
+function reportSkipped(report) {
+  const skipped = report?.skipped_nodes || []
+  if (!skipped.length) return
+  ElMessageBox.alert(
+    skipped.map((s) => `${s.label}（${s.reason}）`).join('\n'),
+    `有 ${skipped.length} 个节点没有落地`,
+    { type: 'warning', customStyle: { whiteSpace: 'pre-line' } },
+  )
+}
+
 function goBack() {
   router.push({ name: 'TopoCanvases' })
 }
@@ -661,6 +813,15 @@ function beforeUnload(event) {
   event.preventDefault()
   event.returnValue = ''
 }
+
+// 克隆后会 push 到新画布的同一个组件实例，onMounted 不会再跑一次——
+// 不监听路由参数的话，页面标题换了、图却还是原来那张
+watch(canvasId, (value, previous) => {
+  if (value && previous && value !== previous) {
+    dirty.value = false
+    reload()
+  }
+})
 
 onMounted(async () => {
   window.addEventListener('beforeunload', beforeUnload)

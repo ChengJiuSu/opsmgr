@@ -46,12 +46,16 @@
 apps/topo_mgr/
 ├── models.py       # TopoCanvas / TopoNode / TopoEdge
 │                   # + 节点类型登记表（REF_KINDS / EXTERNAL_KIND_GROUPS）与关系表
-├── graph.py        # 整图取数、整图保存、自动编排；引用型节点的实时解析口径
+├── graph.py        # 整图取数、整图保存、自动编排；引用型节点的实时解析与维度相容口径
+├── impact.py       # 影响面反查：某实体在哪些画布上、上下游是谁
+├── portable.py     # 导出 / 导入 / 克隆；引用型节点的自然键
 ├── serializers.py  # 画布元信息序列化器（节点与连线不走 ModelSerializer）
-├── views.py        # TopoCanvasViewSet（CRUD + graph/autofill/candidates）+ TopoMetaView
-├── urls.py         # meta/ 显式路径在前，其余走 DefaultRouter
+├── views.py        # TopoCanvasViewSet（CRUD + graph/autofill/candidates/export/clone）
+│                   # + TopoMetaView / TopoImportView / TopoImpactView
+├── urls.py         # meta/ import/ impact/ 显式路径在前，其余走 DefaultRouter
 ├── migrations/0001_initial.py
-└── tests.py        # 29 用例：模型约束、CRUD 与权限、整图读写、自动编排、候选与元信息
+└── tests.py        # 49 用例：模型约束、CRUD 与权限、整图读写、自动编排、候选与元信息、
+                    # 维度相容、影响面反查、导出导入、克隆
 ```
 
 RBAC 侧同步改了两处：`apps/auth_mgr/roles.py` 新登记模块 `topo`（归入「资产与
@@ -70,6 +74,10 @@ RBAC 侧同步改了两处：`apps/auth_mgr/roles.py` 新登记模块 `topo`（�
 | PUT | `/api/topo/canvases/{id}/graph/` | 整图覆盖保存 | `topo:write` |
 | POST | `/api/topo/canvases/{id}/autofill/` | 按维度自动编排，幂等 | `topo:read_create` |
 | GET | `/api/topo/canvases/{id}/candidates/` | 可引用的平台资源候选，`?kind=&keyword=` | `topo` 读 |
+| GET | `/api/topo/canvases/{id}/export/` | 整图导出 JSON（引用型节点用自然键） | `topo` 读 |
+| POST | `/api/topo/canvases/{id}/clone/` | 按新维度克隆 | `topo:read_create` |
+| POST | `/api/topo/import/` | 导入导出的 JSON；`overwrite` 需 `topo:write` | `topo:read_create` |
+| GET | `/api/topo/impact/?kind=&ref_id=` | 影响面反查：该实体在哪些画布上、上下游是谁 | `topo` 读 |
 
 维度筛选参数「纯数字按 id、否则按 code」，与主机列表同口径。列表与详情都按登录
 用户的数据范围（`common/dimscope`）收窄：范围外的画布列表看不到，直接猜 id 也
@@ -111,6 +119,76 @@ RBAC 侧同步改了两处：`apps/auth_mgr/roles.py` 新登记模块 `topo`（�
 「第 3 个节点的类型没登记」，用嵌套 serializer 得到的是一坨按下标嵌套的字典，
 运维看不懂。
 
+### 目标维度也要在数据范围内
+
+克隆与导入除了校验来源画布，还要校验**目标维度**（`views.dims_guard`）：范围内的图
+可以被克隆成一张范围外的图，等于借克隆把数据写进自己看不见的地方。校验点在
+`portable.import_graph` 的 `guard` 回调里——目标维度是「文件里的 code + 表单覆盖」叠
+出来的，视图自己再算一遍必然与那里分叉；事后校验更不行，事务已提交，图已经建出来了。
+
+`ScopeDenied` 单独一个异常类型，好让视图回 403 而不是 400：「你没权限写这里」和
+「你的 JSON 有问题」对调用方是两件完全不同的事。
+
+---
+
+## 引用型节点必须与画布维度相容
+
+`graph.dims_ok(kind, obj, canvas)` 一处定义，**三处共用**：整图保存、导入、克隆。
+
+只有主机有维度可判（项目组/渠道/环境，画布填了地域还要对上地域）。域名 / 解析记录 /
+证书身上没有维度字段，一律放行——按名字猜它属于哪个项目组，猜错的后果是「图上凭空
+少一个域名」，比不判更糟。
+
+少判一处的表现就是「dev 画布上画着生产机器」，而那种图比没有图更危险：看图的人会
+照着它操作。整图保存直接报 400 拒绝（前端候选列表本来就只给同维度主机，能走到这一步
+的只有手搓请求）；导入与克隆则**跳过并报告**——真正想复用的是 GA / 负载均衡那层骨架，
+主机本来就该在目标环境重新挑。
+
+---
+
+## 搬运：导出 / 导入 / 克隆（portable.py）
+
+三件事同源：都要把「引用型节点指向哪个实体」表达成**自然键**而不是主键。主键只在本库
+成立——导出的图带到另一台实例、或克隆到另一组维度，`ref_id=17` 毫无意义，
+`{"name": "aws-usw-p1105-01"}` 才有。
+
+| kind | 自然键 |
+|------|--------|
+| `server` | 主机名（全局唯一） |
+| `domain` | 域名 |
+| `dns_record` | 主域名 + 主机记录 + 类型 + 值 + 线路（与 DnsRecord 唯一约束同字段） |
+| `certificate` | 证书名 |
+
+维度也用字典 `code` 而不是 id：换一台实例 id 一定不同，code 是人定的、通常一致。
+导出带 `version`（当前 1）；加字段不改版本，改字段语义才加——那时导入端要能同时认旧
+版，否则同事手里导出的老文件全部作废。
+
+**克隆 = 导出后立刻导入**（带维度覆盖），不另写一套复制逻辑：两套逻辑必然在「引用型
+节点怎么处理」上分叉，而这正是最容易出错的一处。
+
+导入的收敛：同维度同标识已存在时默认拒绝（`overwrite=true` 才覆盖，且要 write 档）；
+端点被跳过的连线一并跳过（留着就是一条指向空气的线）；节点**全部**落不了地时整单
+报错，不留一张空画布。
+
+> 整图保存的顺序是**先删后建**：入参里没带 id 的节点可能引用与「即将被删的老节点」
+> 相同的实体（导入覆盖走的正是这条路，它不知道对面的主键），后删就会先撞上
+> `(canvas, kind, ref_id)` 唯一约束，报一条 IntegrityError 出去。
+
+---
+
+## 影响面反查（impact.py）
+
+`GET /api/topo/impact/?kind=server&ref_id=12` 答「动它会波及什么」：它出现在哪些画布
+上，每处的 `upstream`（谁的流量落到它身上）与 `downstream`（它指向谁）。
+
+这是画布真正的运维价值。画得再漂亮的图，如果只能从画布那一侧打开，它就是一张挂在墙上
+的画；反查让它能从**故障那一侧**被用起来——手上有一台要下线的主机时，人不会先想到
+「去翻一遍拓扑图」，所以入口挂在服务器页与域名页的行操作里。
+
+邻居节点复用 `graph.resolve_refs` / `node_payload`，名称与状态必须和画布上看到的一模
+一样；并且按 kind 批量解析，一台挂在五张图上的主机不该查上几十次库。可见性同样按数据
+范围收窄——反查不该成为绕过项目组范围看别人拓扑的后门。
+
 ---
 
 ## 自动编排（autofill）
@@ -146,10 +224,15 @@ RBAC 侧同步改了两处：`apps/auth_mgr/roles.py` 新登记模块 `topo`（�
 
 ---
 
-## 后续（P1 未做，刻意留给下一期）
+## 后续
 
-- **影响面反查**：给定一台主机/一个域名，反查它在哪些画布上、上下游是谁。边已经
-  带语义、`(kind, ref_id)` 已建索引，接口是加法。这是画布真正的运维价值。
-- 按维度克隆画布（master → dev 同构环境不用重画）、导入导出 JSON。
-- 节点类型字典化（`TopoNodeKind` 表），地域进字典后 `region` 改外键。
-- 节点状态实时上色接进概览页异常深链，让画布能当值班大图用。
+P2 已落地：影响面反查、克隆、导入导出。剩下的候选：
+
+- **节点类型字典化**（`TopoNodeKind` 表）：目前类型是代码常量（`EXTERNAL_KIND_GROUPS`），
+  加一种负载均衡改一行常量。换成表要多一张表、一条种子迁移、一个维护页，换来的是
+  「不发版也能加类型」。10 人平台里这笔账不一定划算——与本项目否决 CAM 式策略语言
+  同一个理由（规模不够）。**待定，不建议先做**。
+- **地域进字典**：`Server.region` 与 `TopoCanvas.region` 都是自由文本，同一个地域写成
+  `us` / `us-west` / `usw` 就会让画布筛不到主机。改成外键要动服务器台账、分配页、
+  CSV 导入导出、画布维度四处，属于 CMDB 的改动而非画布的改动，应当单独排期。
+- 节点状态实时上色接进概览页异常深链，让画布能当值班大图用（P3）。

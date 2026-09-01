@@ -64,6 +64,10 @@ saveGraph(id, data)      // PUT    /api/topo/canvases/{id}/graph/      整图覆
 autofillCanvas(id)       // POST   /api/topo/canvases/{id}/autofill/   按维度自动编排
 getCandidates(id, p)     // GET    /api/topo/canvases/{id}/candidates/ 可引用资源候选
 getTopoMeta()            // GET    /api/topo/meta/                     节点类型与关系登记表
+cloneCanvas(id, data)    // POST   /api/topo/canvases/{id}/clone/      按新维度克隆
+exportCanvas(id)         // GET    /api/topo/canvases/{id}/export/     导出 JSON
+importCanvas(data)       // POST   /api/topo/import/                   导入 JSON
+getTopoImpact(params)    // GET    /api/topo/impact/                   影响面反查
 ```
 
 ### 审计日志（`src/api/audit.js`）

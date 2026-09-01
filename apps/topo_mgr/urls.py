@@ -1,13 +1,15 @@
 from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
-from .views import TopoCanvasViewSet, TopoMetaView
+from .views import TopoCanvasViewSet, TopoImpactView, TopoImportView, TopoMetaView
 
 router = DefaultRouter()
 router.register('canvases', TopoCanvasViewSet, basename='topo-canvas')
 
 urlpatterns = [
-    # 元信息接口放 router 之前：避免被 router 的通配路由吃掉
+    # 显式路径放 router 之前：避免被 router 的通配路由吃掉
     path('meta/', TopoMetaView.as_view(), name='topo-meta'),
+    path('import/', TopoImportView.as_view(), name='topo-import'),
+    path('impact/', TopoImpactView.as_view(), name='topo-impact'),
     path('', include(router.urls)),
 ]

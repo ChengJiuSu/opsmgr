@@ -273,19 +273,47 @@ def _clean_node_input(item, index):
     }
 
 
-def _check_refs_exist(prepared):
-    """引用的实体必须真的在库里：允许存一个指向不存在实体的节点，等于允许造死链。"""
+def dims_ok(kind, obj, canvas):
+    """该实体是否与画布维度相容。
+
+    只有主机有维度可判（项目组/渠道/环境，画布填了地域则还要对上地域），域名 / 解析
+    记录 / 证书身上没有维度字段，一律放行——按名字猜它属于哪个项目组，猜错的后果是
+    「图上凭空少一个域名」，比不判更糟。
+
+    这条规则在三处共用：整图保存、导入、克隆。少判一处的表现就是「dev 画布上画着
+    生产机器」，而那种图比没有图更危险，看图的人会照着它操作。
+    """
+    if kind != 'server':
+        return True
+    if (obj.project_group_id != canvas.project_group_id
+            or obj.channel_id != canvas.channel_id
+            or obj.environment_id != canvas.environment_id):
+        return False
+    return not canvas.region or obj.region == canvas.region
+
+
+def _check_refs_exist(prepared, canvas):
+    """引用的实体必须真的在库里、且与画布维度相容。
+
+    允许存一个指向不存在实体的节点等于允许造死链；允许挂维度不符的主机等于允许把
+    生产机器画到测试画布上。
+    """
     wanted = {}
     for fields in prepared.values():
         if fields['source'] == 'ref':
             wanted.setdefault(fields['kind'], set()).add(fields['ref_id'])
     for kind, ids in wanted.items():
         queryset, _ = REF_SOURCES[kind]
-        found = set(queryset(ids).values_list('id', flat=True))
-        missing = sorted(ids - found)
+        found = {obj.id: obj for obj in queryset(ids)}
+        missing = sorted(ids - set(found))
         if missing:
             raise GraphError(
                 f'引用的{REF_KINDS[kind]}不存在：ID {missing}')
+        mismatched = [obj for obj in found.values() if not dims_ok(kind, obj, canvas)]
+        if mismatched:
+            names = '、'.join(getattr(o, 'name', str(o.id)) for o in mismatched[:5])
+            raise GraphError(
+                f'这些{REF_KINDS[kind]}不属于本画布的维度（{canvas.dim_label}）：{names}')
 
 
 @transaction.atomic
@@ -321,10 +349,19 @@ def save_graph(canvas, payload, user=None):
             raise GraphError(
                 f'同一张画布重复引用了{REF_KINDS[fields["kind"]]}「{fields["label"]}」')
         seen_refs[ref] = key
-    _check_refs_exist(prepared)
+    _check_refs_exist(prepared, canvas)
 
     existing = {n.id: n for n in canvas.nodes.all()}
-    kept_ids = set()
+    # **先删后建**：入参里没带 id 的节点可能引用与「即将被删的老节点」相同的实体
+    # （导入覆盖走的正是这条路——它不知道对面的主键），后删就会先撞上
+    # (canvas, kind, ref_id) 唯一约束，报一条 IntegrityError 出去
+    declared = {int(f['id']) for f in prepared.values()
+                if str(f.get('id') or '').isdigit()}
+    removed = [n for nid, n in existing.items() if nid not in declared]
+    for node in removed:
+        node.delete()  # 级联带走挂在它上面的连线
+        existing.pop(node.id, None)
+
     key_to_node = {}
     for key, fields in prepared.items():
         node_id = fields.pop('id', None)
@@ -332,19 +369,11 @@ def save_graph(canvas, payload, user=None):
         if node is not None:
             for field, value in fields.items():
                 setattr(node, field, value)
-            node.full_clean(exclude=['canvas'])
-            node.save()
-            kept_ids.add(node.id)
         else:
             node = TopoNode(canvas=canvas, **fields)
-            node.full_clean(exclude=['canvas'])
-            node.save()
-            kept_ids.add(node.id)
+        node.full_clean(exclude=['canvas'])
+        node.save()
         key_to_node[key] = node
-
-    removed = [n for nid, n in existing.items() if nid not in kept_ids]
-    for node in removed:
-        node.delete()  # 级联带走挂在它上面的连线
 
     # 连线整体重建
     canvas.edges.all().delete()

@@ -454,3 +454,342 @@ class RoleMatrixTests(TestCase):
         self.assertEqual(Role.objects.get(code='ops_admin').level_for('topo'), 'write')
         self.assertEqual(Role.objects.get(code='ops_member').level_for('topo'),
                          'read_create')
+
+
+class DimsEnforcementTests(BaseTopoTest):
+    def test_graph_save_rejects_out_of_dim_server(self):
+        """维度不符的主机不许挂到画布上：dev 画布上画着生产机器比没有图更危险。"""
+        admin = self._client()
+        other = self._server(name='eu-host', region='eu', private_ip='10.9.9.9')
+        r = admin.put(f'/api/topo/canvases/{self.canvas.id}/graph/', {
+            'nodes': [{'key': 'a', 'source': 'ref', 'kind': 'server',
+                       'ref_id': other.id, 'label': other.name}],
+            'edges': [],
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('不属于本画布的维度', r.json()['msg'])
+
+    def test_graph_save_allows_dimensionless_kinds(self):
+        """域名没有项目组字段，不做维度判定（按名字猜属于哪个项目会猜错）。"""
+        admin = self._client()
+        server = self._server()
+        domain, _ = self._domain_record(server)
+        r = admin.put(f'/api/topo/canvases/{self.canvas.id}/graph/', {
+            'nodes': [{'key': 'd', 'source': 'ref', 'kind': 'domain',
+                       'ref_id': domain.id, 'label': domain.name}],
+            'edges': [],
+        }, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+
+
+class ImpactTests(BaseTopoTest):
+    def _put_chain(self, client, canvas, server, domain):
+        return client.put(f'/api/topo/canvases/{canvas.id}/graph/', {
+            'nodes': [
+                {'key': 'd', 'source': 'ref', 'kind': 'domain', 'ref_id': domain.id,
+                 'label': domain.name},
+                {'key': 'ga', 'source': 'external', 'kind': 'aws_ga', 'label': 'p1105-ga'},
+                {'key': 's', 'source': 'ref', 'kind': 'server', 'ref_id': server.id,
+                 'label': server.name},
+            ],
+            'edges': [
+                {'source': 'd', 'target': 'ga', 'relation': 'resolve'},
+                {'source': 'ga', 'target': 's', 'relation': 'origin'},
+            ],
+        }, format='json')
+
+    def test_impact_lists_canvases_with_neighbours(self):
+        admin = self._client()
+        server = self._server()
+        domain, _ = self._domain_record(server)
+        r = self._put_chain(admin, self.canvas, server, domain)
+        self.assertEqual(r.status_code, 200, r.content)
+
+        r = admin.get(f'/api/topo/impact/?kind=server&ref_id={server.id}')
+        self.assertEqual(r.status_code, 200)
+        data = r.json()['data']
+        self.assertEqual(data['label'], server.name)
+        self.assertEqual(data['total'], 1)
+        hit = data['results'][0]
+        self.assertEqual(hit['canvas']['id'], self.canvas.id)
+        self.assertEqual(hit['canvas']['link']['path'], f'/topo/canvases/{self.canvas.id}')
+        # 上游 = 指向它的（GA 的流量落到这台机上），下游为空
+        self.assertEqual([u['node']['label'] for u in hit['upstream']], ['p1105-ga'])
+        self.assertEqual(hit['upstream'][0]['relation_label'], '源站')
+        self.assertEqual(hit['downstream'], [])
+
+    def test_impact_covers_multiple_canvases(self):
+        admin = self._client()
+        server = self._server()
+        domain, _ = self._domain_record(server)
+        second = TopoCanvas.objects.create(
+            name='第二张', slug='second', project_group=self.group,
+            channel=self.channel, environment=self.env, region='us')
+        self._put_chain(admin, self.canvas, server, domain)
+        self._put_chain(admin, second, server, domain)
+        r = admin.get(f'/api/topo/impact/?kind=server&ref_id={server.id}')
+        self.assertEqual(r.json()['data']['total'], 2)
+
+    def test_impact_neighbour_uses_live_state(self):
+        """邻居节点的名称与状态口径必须与画布一致（同一套 resolve_refs）。"""
+        admin = self._client()
+        server = self._server()
+        domain, _ = self._domain_record(server)
+        self._put_chain(admin, self.canvas, server, domain)
+        r = admin.get(f'/api/topo/impact/?kind=domain&ref_id={domain.id}')
+        hit = r.json()['data']['results'][0]
+        self.assertEqual([d['node']['label'] for d in hit['downstream']], ['p1105-ga'])
+        self.assertEqual(hit['upstream'], [])
+
+    def test_impact_respects_data_scope(self):
+        admin = self._client()
+        server = self._server()
+        domain, _ = self._domain_record(server)
+        self._put_chain(admin, self.canvas, server, domain)
+
+        scoped = User.objects.create(username='scoped_i', is_staff=True)
+        scoped.set_password('Pass!2345xyz')
+        scoped.save()
+        scoped.allowed_project_groups.add(ProjectGroup.objects.create(
+            name='别的组', code='other-i'))
+        c = APIClient()
+        res = c.post('/api/auth/login/',
+                     {'username': 'scoped_i', 'password': 'Pass!2345xyz'}, format='json')
+        c.credentials(HTTP_AUTHORIZATION='Bearer ' + res.json()['access'])
+        r = c.get(f'/api/topo/impact/?kind=server&ref_id={server.id}')
+        self.assertEqual(r.json()['data']['total'], 0)
+
+    def test_impact_validates_params(self):
+        admin = self._client()
+        r = admin.get('/api/topo/impact/?kind=aws_ga&ref_id=1')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('不是可引用的平台资源类型', r.json()['msg'])
+        r = admin.get('/api/topo/impact/?kind=server&ref_id=abc')
+        self.assertEqual(r.status_code, 400)
+
+    def test_impact_of_deleted_entity(self):
+        admin = self._client()
+        r = admin.get('/api/topo/impact/?kind=server&ref_id=99999')
+        data = r.json()['data']
+        self.assertIsNone(data['label'])
+        self.assertEqual(data['total'], 0)
+
+
+class ExportImportTests(BaseTopoTest):
+    def _seed_graph(self, client, canvas=None):
+        canvas = canvas or self.canvas
+        server = self._server()
+        domain, record = self._domain_record(server)
+        r = client.put(f'/api/topo/canvases/{canvas.id}/graph/', {
+            'nodes': [
+                {'key': 'd', 'source': 'ref', 'kind': 'domain', 'ref_id': domain.id,
+                 'label': domain.name, 'x': 0, 'y': 0},
+                {'key': 'ga', 'source': 'external', 'kind': 'aws_ga',
+                 'label': 'p1105-us-ga', 'x': 280, 'y': 0, 'pinned': True},
+                {'key': 's', 'source': 'ref', 'kind': 'server', 'ref_id': server.id,
+                 'label': server.name, 'x': 560, 'y': 0},
+            ],
+            'edges': [
+                {'source': 'd', 'target': 'ga', 'relation': 'resolve'},
+                {'source': 'ga', 'target': 's', 'relation': 'origin'},
+            ],
+        }, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        return server, domain, record
+
+    def test_export_uses_natural_keys_and_codes(self):
+        admin = self._client()
+        server, domain, _ = self._seed_graph(admin)
+        r = admin.get(f'/api/topo/canvases/{self.canvas.id}/export/')
+        self.assertEqual(r.status_code, 200)
+        data = r.json()['data']
+        self.assertEqual(data['version'], 1)
+        # 维度用 code，不是 id：换一台实例 id 一定不同
+        self.assertEqual(data['canvas']['project_group'], 'p1105')
+        self.assertEqual(data['canvas']['environment'], 'prod')
+        refs = {n['kind']: n['ref'] for n in data['nodes'] if n['source'] == 'ref'}
+        self.assertEqual(refs['server'], {'name': server.name})
+        self.assertEqual(refs['domain'], {'name': domain.name})
+        external = next(n for n in data['nodes'] if n['source'] == 'external')
+        self.assertTrue(external['pinned'])
+        self.assertEqual(len(data['edges']), 2)
+
+    def test_import_creates_canvas(self):
+        admin = self._client()
+        self._seed_graph(admin)
+        payload = admin.get(f'/api/topo/canvases/{self.canvas.id}/export/').json()['data']
+        r = admin.post('/api/topo/import/', {
+            'payload': payload,
+            'overrides': {'name': '导入的图', 'slug': 'imported'},
+        }, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        data = r.json()['data']
+        self.assertEqual(data['canvas']['slug'], 'imported')
+        self.assertEqual(data['report']['nodes'], 3)
+        self.assertEqual(data['report']['edges'], 2)
+        self.assertEqual(data['report']['skipped_nodes'], [])
+
+    def test_import_conflict_requires_overwrite(self):
+        admin = self._client()
+        self._seed_graph(admin)
+        payload = admin.get(f'/api/topo/canvases/{self.canvas.id}/export/').json()['data']
+        r = admin.post('/api/topo/import/', {'payload': payload}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('已存在标识为', r.json()['msg'])
+
+        r = admin.post('/api/topo/import/',
+                       {'payload': payload, 'overwrite': True}, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertTrue(r.json()['data']['report']['overwritten'])
+
+    def test_import_overwrite_needs_write_level(self):
+        """新建一张图是 read_create 的正常动作，把别人那张整份冲掉不是。"""
+        admin = self._client()
+        self._seed_graph(admin)
+        payload = admin.get(f'/api/topo/canvases/{self.canvas.id}/export/').json()['data']
+        normal = self._client(is_staff=False)
+        r = normal.post('/api/topo/import/',
+                        {'payload': payload, 'overwrite': True}, format='json')
+        self.assertEqual(r.status_code, 403)
+        # 不覆盖、换个标识则允许（ops_member 回退矩阵是 read_create）
+        r = normal.post('/api/topo/import/', {
+            'payload': payload, 'overrides': {'name': '普通用户建的', 'slug': 'by-member'},
+        }, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+
+    def test_import_skips_unresolvable_and_out_of_dim_refs(self):
+        admin = self._client()
+        self._seed_graph(admin)
+        payload = admin.get(f'/api/topo/canvases/{self.canvas.id}/export/').json()['data']
+        # 导到另一个环境：主机维度不符会被跳过，外部节点与域名照常落地
+        dev = Environment.objects.get(code='dev')
+        r = admin.post('/api/topo/import/', {
+            'payload': payload,
+            'overrides': {'name': 'dev 链路', 'slug': 'dev-path', 'environment': dev.id},
+        }, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        report = r.json()['data']['report']
+        self.assertEqual(report['nodes'], 2)          # 域名 + GA
+        self.assertEqual(len(report['skipped_nodes']), 1)
+        self.assertIn('维度', report['skipped_nodes'][0]['reason'])
+        self.assertEqual(report['skipped_edges'], 1)  # GA → 主机 那条端点没了
+
+    def test_import_reports_missing_resource(self):
+        admin = self._client()
+        self._seed_graph(admin)
+        payload = admin.get(f'/api/topo/canvases/{self.canvas.id}/export/').json()['data']
+        for node in payload['nodes']:
+            if node['kind'] == 'domain':
+                node['ref'] = {'name': 'not-here.example.com'}
+        r = admin.post('/api/topo/import/', {
+            'payload': payload, 'overrides': {'name': 'x', 'slug': 'missing-ref'},
+        }, format='json')
+        report = r.json()['data']['report']
+        self.assertEqual([s['reason'] for s in report['skipped_nodes']],
+                         ['本实例找不到同名资源'])
+
+    def test_import_rejects_unknown_dict_code_and_bad_payload(self):
+        admin = self._client()
+        self._seed_graph(admin)
+        payload = admin.get(f'/api/topo/canvases/{self.canvas.id}/export/').json()['data']
+        broken = {**payload, 'canvas': {**payload['canvas'], 'project_group': 'ghost'}}
+        r = admin.post('/api/topo/import/', {'payload': broken}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('本实例没有项目组', r.json()['msg'])
+
+        cases = [
+            ({'payload': {'version': 99, 'nodes': [{}]}}, '不认识的导出格式版本'),
+            ({'payload': {'nodes': []}}, '没有任何节点'),
+            ({}, '缺少 payload'),
+        ]
+        for body, expect in cases:
+            with self.subTest(expect=expect):
+                r = admin.post('/api/topo/import/', body, format='json')
+                self.assertEqual(r.status_code, 400)
+                self.assertIn(expect, r.json()['msg'])
+
+    def test_import_all_nodes_unresolvable_is_rejected(self):
+        """一个节点都落不了地时不留一张空画布。"""
+        admin = self._client()
+        r = admin.post('/api/topo/import/', {'payload': {
+            'canvas': {'name': '空的', 'slug': 'ghost-only',
+                       'project_group': 'p1105', 'channel': 'starunion',
+                       'environment': 'prod'},
+            'nodes': [{'key': 'a', 'source': 'ref', 'kind': 'server',
+                       'label': 'ghost', 'ref': {'name': 'ghost'}}],
+            'edges': [],
+        }}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('全部无法落地', r.json()['msg'])
+        self.assertFalse(TopoCanvas.objects.filter(slug='ghost-only').exists())
+
+
+class CloneTests(BaseTopoTest):
+    def setUp(self):
+        super().setUp()
+        self.admin = self._client()
+        self.server = self._server()
+        self.domain, _ = self._domain_record(self.server)
+        self.admin.put(f'/api/topo/canvases/{self.canvas.id}/graph/', {
+            'nodes': [
+                {'key': 'ga', 'source': 'external', 'kind': 'aws_ga', 'label': 'ga-1'},
+                {'key': 'lb', 'source': 'external', 'kind': 'aws_alb', 'label': 'alb-1'},
+                {'key': 's', 'source': 'ref', 'kind': 'server', 'ref_id': self.server.id,
+                 'label': self.server.name},
+            ],
+            'edges': [
+                {'source': 'ga', 'target': 'lb', 'relation': 'backend'},
+                {'source': 'lb', 'target': 's', 'relation': 'origin'},
+            ],
+        }, format='json')
+
+    def test_clone_to_another_env_keeps_skeleton(self):
+        """克隆到 dev：GA/LB 骨架与它们之间的连线保留，生产主机跳过并报告。"""
+        dev = Environment.objects.get(code='dev')
+        r = self.admin.post(f'/api/topo/canvases/{self.canvas.id}/clone/', {
+            'name': 'dev 加速链路', 'slug': 'ingress-path-dev', 'environment': dev.id,
+        }, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        data = r.json()['data']
+        self.assertEqual(data['canvas']['environment_code'], 'dev')
+        self.assertEqual(data['report']['nodes'], 2)
+        self.assertEqual(data['report']['edges'], 1)
+        self.assertEqual(len(data['report']['skipped_nodes']), 1)
+        self.assertIn('跳过', r.json()['msg'])
+        # 原画布不受影响
+        self.assertEqual(TopoNode.objects.filter(canvas=self.canvas).count(), 3)
+
+    def test_clone_same_dims_needs_new_slug(self):
+        r = self.admin.post(f'/api/topo/canvases/{self.canvas.id}/clone/', {},
+                            format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('必须指定新的画布名称或标识', r.json()['msg'])
+
+        r = self.admin.post(f'/api/topo/canvases/{self.canvas.id}/clone/',
+                            {'name': '副本'}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('已存在标识为', r.json()['msg'])
+
+    def test_clone_keeps_refs_when_dims_unchanged(self):
+        """同维度另存一张：主机也留着（维度是对得上的）。"""
+        r = self.admin.post(f'/api/topo/canvases/{self.canvas.id}/clone/',
+                            {'name': '副本', 'slug': 'ingress-path-copy'}, format='json')
+        self.assertEqual(r.json()['data']['report']['nodes'], 3)
+        self.assertEqual(r.json()['data']['report']['skipped_nodes'], [])
+
+    def test_clone_target_dims_must_be_in_scope(self):
+        """范围内的图不许被克隆成一张范围外的图。"""
+        other_group = ProjectGroup.objects.create(name='别的组', code='other-c')
+        user = User.objects.create(username='scoped_c', is_staff=True)
+        user.set_password('Pass!2345xyz')
+        user.save()
+        user.allowed_project_groups.add(self.group)
+        c = APIClient()
+        res = c.post('/api/auth/login/',
+                     {'username': 'scoped_c', 'password': 'Pass!2345xyz'}, format='json')
+        c.credentials(HTTP_AUTHORIZATION='Bearer ' + res.json()['access'])
+        r = c.post(f'/api/topo/canvases/{self.canvas.id}/clone/', {
+            'name': '越界副本', 'slug': 'out-of-scope', 'project_group': other_group.id,
+        }, format='json')
+        self.assertEqual(r.status_code, 403)
+        self.assertIn('数据范围', r.json()['msg'])

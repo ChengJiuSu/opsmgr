@@ -156,11 +156,13 @@
         </template>
       </el-table-column>
       <el-table-column prop="remark" label="备注" min-width="100" show-overflow-tooltip />
-      <el-table-column v-if="canWrite" label="操作" width="230" fixed="right">
+      <el-table-column v-if="canWrite || canTopo" label="操作" width="300" fixed="right">
         <template #default="{ row }">
-          <el-button size="small" :loading="syncingId === row.id" @click="handleSync(row)">同步</el-button>
-          <el-button size="small" :icon="Edit" @click="openDialog(row)">编辑</el-button>
-          <el-button size="small" type="danger" :icon="Delete" @click="handleDelete(row)">删除</el-button>
+          <el-button v-if="canWrite" size="small" :loading="syncingId === row.id" @click="handleSync(row)">同步</el-button>
+          <!-- 拓扑：反查这个域名被画进了哪些接入链路 -->
+          <el-button v-if="canTopo" size="small" @click="openImpact(row)">拓扑</el-button>
+          <el-button v-if="canWrite" size="small" :icon="Edit" @click="openDialog(row)">编辑</el-button>
+          <el-button v-if="canWrite" size="small" type="danger" :icon="Delete" @click="handleDelete(row)">删除</el-button>
         </template>
       </el-table-column>
     </el-table>
@@ -402,6 +404,14 @@
       </el-table-column>
     </el-table>
   </el-drawer>
+
+  <!-- 所在拓扑（影响面反查） -->
+  <TopoImpactDialog
+    v-model="impactVisible"
+    kind="domain"
+    :ref-id="impactRow.id"
+    :label="impactRow.name"
+  />
 </template>
 
 <script setup>
@@ -410,6 +420,7 @@ import { useRoute } from 'vue-router'
 import { Plus, Edit, Delete, Download, Clock, Finished, Refresh } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../../stores/auth'
+import TopoImpactDialog from '../../components/TopoImpactDialog.vue'
 import { debounce } from '../../utils/debounce'
 import { getServers } from '../../api/assets'
 import {
@@ -426,6 +437,17 @@ const authStore = useAuthStore()
 // 按钮可见性跟角色矩阵走：域名与证书是 cloud 模块，
 // 云账号下拉另按 cloud_account 判（只读档也能选账号，AccessKey 是打码的）
 const canWrite = computed(() => authStore.can('cloud', 'write'))
+// 拓扑入口另按 topo 模块判：改域名解析前先看它挂在哪条接入链路上
+const canTopo = computed(() => authStore.can('topo'))
+
+// 影响面反查弹窗
+const impactVisible = ref(false)
+const impactRow = ref({})
+
+function openImpact(row) {
+  impactRow.value = row
+  impactVisible.value = true
+}
 const canAccount = computed(() => authStore.can('cloud_account'))
 
 const RECORD_TYPES = ['A', 'AAAA', 'CNAME', 'TXT', 'MX', 'NS', 'SRV', 'CAA']

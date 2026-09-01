@@ -105,10 +105,12 @@
           </template>
         </template>
       </el-table-column>
-      <el-table-column v-if="canWrite" label="操作" width="140" fixed="right">
+      <el-table-column v-if="canWrite || canTopo" label="操作" width="210" fixed="right">
         <template #default="{ row }">
-          <el-button size="small" :icon="Edit" @click="openDialog(row)">编辑</el-button>
-          <el-button size="small" type="danger" :icon="Delete" @click="handleDelete(row)">删除</el-button>
+          <!-- 拓扑：反查这台主机被画进了哪些接入链路，下线前先看上游还有没有流量 -->
+          <el-button v-if="canTopo" size="small" @click="openImpact(row)">拓扑</el-button>
+          <el-button v-if="canWrite" size="small" :icon="Edit" @click="openDialog(row)">编辑</el-button>
+          <el-button v-if="canWrite" size="small" type="danger" :icon="Delete" @click="handleDelete(row)">删除</el-button>
         </template>
       </el-table-column>
     </el-table>
@@ -373,6 +375,14 @@
       <el-button @click="jsResultVisible = false">关闭</el-button>
     </template>
   </el-dialog>
+
+  <!-- 所在拓扑（影响面反查） -->
+  <TopoImpactDialog
+    v-model="impactVisible"
+    kind="server"
+    :ref-id="impactRow.id"
+    :label="impactRow.name"
+  />
 </template>
 
 <script setup>
@@ -388,6 +398,7 @@ import {
 } from '../../api/assets'
 import { getAgents } from '../../api/agents'
 import { useAuthStore } from '../../stores/auth'
+import TopoImpactDialog from '../../components/TopoImpactDialog.vue'
 
 const authStore = useAuthStore()
 // 按钮可见性跟角色矩阵走（后端 roles.MODULES）：cmdb 写档才给增删改，
@@ -396,6 +407,8 @@ const authStore = useAuthStore()
 const canCreate = computed(() => authStore.can('cmdb', 'create'))
 const canWrite = computed(() => authStore.can('cmdb', 'write'))
 const canAgent = computed(() => authStore.can('agent'))
+// 拓扑入口另按 topo 模块判：没有画布权限的人看到一个点开就 403 的按钮只会困惑
+const canTopo = computed(() => authStore.can('topo'))
 
 const loading = ref(false)
 const submitting = ref(false)
@@ -636,6 +649,15 @@ const importMode = ref('skip')
 const importFile = ref(null)
 const importErrors = ref([])
 const uploadRef = ref()
+
+// 影响面反查弹窗
+const impactVisible = ref(false)
+const impactRow = ref({})
+
+function openImpact(row) {
+  impactRow.value = row
+  impactVisible.value = true
+}
 
 function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob)
