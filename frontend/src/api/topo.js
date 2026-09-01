@@ -33,3 +33,6 @@ export const importCanvas = (data) =>
 
 // 影响面反查：这台主机 / 这个域名在哪些画布上、上下游是谁
 export const getTopoImpact = (params) => request.get('/api/topo/impact/', { params })
+
+// 画布健康度汇总（列表页「健康」列与概览页「拓扑异常」块同源）
+export const getTopoHealth = (params) => request.get('/api/topo/health/', { params })

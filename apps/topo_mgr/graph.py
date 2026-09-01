@@ -46,7 +46,48 @@ ROW_HEIGHT = 110
 # 引用型节点：实时解析
 # ──────────────────────────────────────────────────────────
 
+#: 健康度按「最坏一条」定：一台机同时维护中 + Agent 离线，看图的人该先看到红的
+HEALTH_ORDER = ('healthy', 'warning', 'danger')
+#: 证书剩余天数进入警告的阈值。acme 续签窗口 30 天，早于它告警只会天天黄
+#: （与概览页的 CERT_EXPIRY_WARN_DAYS 刻意不同：那是「该续了」，这里是「快断了」）
+CERT_WARN_DAYS = 15
+
+
+def _worst(issues):
+    """一组问题里最严重的级别；没有问题就是健康。"""
+    level = 'healthy'
+    for item in issues:
+        if HEALTH_ORDER.index(item['level']) > HEALTH_ORDER.index(level):
+            level = item['level']
+    return level
+
+
+def _issue(level, text):
+    return {'level': level, 'text': text}
+
+
+def _server_issues(obj):
+    """主机的问题清单。
+
+    执行通道也算健康度的一部分：一台 Agent 离线的主机在图上看着好好的，实际
+    什么命令都下不去——那正是故障当下最需要当场看见的一件事。
+    """
+    issues = []
+    if obj.status == 'stopped':
+        issues.append(_issue('danger', '主机已停止'))
+    elif obj.status == 'maintenance':
+        issues.append(_issue('warning', '主机维护中'))
+    if obj.channel_mode == 'agent':
+        agent = obj.agent
+        if agent is None:
+            issues.append(_issue('danger', '执行通道指定了 Agent，但没有绑定'))
+        elif agent.is_offline:  # status + 心跳新鲜度，见 AgentNode.is_offline
+            issues.append(_issue('danger', f'执行通道 Agent「{agent.name}」离线'))
+    return issues
+
+
 def _server_info(obj):
+    issues = _server_issues(obj)
     return {
         'label': obj.name,
         'sub_label': obj.conn_ip,
@@ -54,8 +95,8 @@ def _server_info(obj):
         'status_label': obj.get_status_display(),
         # 状态语义（healthy/warning/danger）由后端给，前端不必按 kind 各写一套
         # 映射；同一个 status 在两个页面染成两种颜色是最容易出的低级不一致
-        'health': {'running': 'healthy', 'maintenance': 'warning',
-                   'stopped': 'danger'}.get(obj.status, 'unknown'),
+        'health': _worst(issues),
+        'issues': issues,
         'link': {'path': '/assets/servers', 'query': {'keyword': obj.name}},
         'extra': {
             'private_ip': obj.private_ip,
@@ -71,52 +112,80 @@ def _server_info(obj):
     }
 
 
+def _domain_issues(obj):
+    if obj.status == 'expiring':
+        return [_issue('warning', '域名即将到期')]
+    if obj.status == 'expired':
+        return [_issue('danger', '域名已过期')]
+    return []
+
+
 def _domain_info(obj):
+    issues = _domain_issues(obj)
     return {
         'label': obj.name,
         'sub_label': obj.cloud_account.name if obj.cloud_account else '',
         'status': obj.status,
         'status_label': obj.get_status_display(),
-        'health': {'normal': 'healthy', 'expiring': 'warning',
-                   'expired': 'danger'}.get(obj.status, 'unknown'),
+        'health': _worst(issues),
+        'issues': issues,
         'link': {'path': '/cloud/domains', 'query': {'keyword': obj.name}},
         'extra': {'record_count': obj.records.count()},
     }
 
 
+def _dns_record_issues(obj):
+    issues = []
+    if obj.sync_status == 'failed':
+        issues.append(_issue('danger', '解析记录同步失败，厂商侧可能与本地不一致'))
+    elif obj.sync_status == 'pending':
+        issues.append(_issue('warning', '解析记录尚未同步到厂商'))
+    if not obj.enabled:
+        # 图上看着通、实际这条解析是关的：不标出来就会照着图排查半天
+        issues.append(_issue('warning', '解析记录已停用'))
+    return issues
+
+
 def _dns_record_info(obj):
+    issues = _dns_record_issues(obj)
     return {
         'label': obj.fqdn,
         'sub_label': f'{obj.type} → {obj.value}',
         'status': obj.sync_status,
         'status_label': obj.get_sync_status_display(),
-        'health': {'synced': 'healthy', 'pending': 'warning',
-                   'failed': 'danger'}.get(obj.sync_status, 'unknown'),
+        'health': _worst(issues),
+        'issues': issues,
         'link': {'path': '/cloud/domains', 'query': {'keyword': obj.domain.name}},
         'extra': {'type': obj.type, 'value': obj.value, 'line': obj.line,
                   'enabled': obj.enabled},
     }
 
 
+def _certificate_issues(obj, days):
+    if obj.status == 'issuing' and obj.issue_stuck:
+        return [_issue('danger', '证书申请卡住（issuing 已超时）')]
+    if obj.status in ('failed', 'expired'):
+        return [_issue('danger', f'证书{obj.get_status_display()}')]
+    if obj.status in ('pending', 'issuing'):
+        return [_issue('warning', f'证书{obj.get_status_display()}')]
+    if obj.status == 'issued' and days is not None:
+        if days <= 0:
+            return [_issue('danger', '证书已过期')]
+        if days <= CERT_WARN_DAYS:
+            return [_issue('warning', f'证书 {days} 天后过期')]
+    return []
+
+
 def _certificate_info(obj):
-    days = None
-    if obj.expires_at:
-        days = (obj.expires_at - timezone.now()).days
-    health = 'unknown'
-    if obj.status == 'issued':
-        health = 'healthy' if days is None or days > 15 else 'warning'
-        if days is not None and days <= 0:
-            health = 'danger'
-    elif obj.status in ('failed', 'expired'):
-        health = 'danger'
-    elif obj.status in ('pending', 'issuing'):
-        health = 'warning'
+    days = (obj.expires_at - timezone.now()).days if obj.expires_at else None
+    issues = _certificate_issues(obj, days)
     return {
         'label': obj.name,
         'sub_label': f'剩余 {days} 天' if days is not None else '',
         'status': obj.status,
         'status_label': obj.get_status_display(),
-        'health': health,
+        'health': _worst(issues),
+        'issues': issues,
         'link': {'path': '/cloud/certificates', 'query': {'keyword': obj.name}},
         'extra': {'domains': obj.domains, 'expires_at': obj.expires_at,
                   'auto_renew': obj.auto_renew},
@@ -127,7 +196,8 @@ def _certificate_info(obj):
 REF_SOURCES = {
     'server': (
         lambda ids: Server.objects.filter(id__in=ids)
-        .select_related('cloud_provider').prefetch_related('services__service_type'),
+        .select_related('cloud_provider', 'agent')
+        .prefetch_related('services__service_type'),
         _server_info,
     ),
     'domain': (
@@ -190,9 +260,11 @@ def node_payload(node, resolved):
     if info is None:
         # 实体被删了：节点留在图上并标红。静默移除节点会让链路凭空断开，
         # 而看图的人根本不知道这里原来有东西
+        message = f'引用的{REF_KINDS.get(node.kind, node.kind)}已不存在'
         data['ref'] = {'exists': False, 'health': 'danger',
                        'status_label': '已失联',
-                       'message': f'引用的{REF_KINDS.get(node.kind, node.kind)}已不存在'}
+                       'issues': [{'level': 'danger', 'text': message}],
+                       'message': message}
         return data
     data['ref'] = info
     data['label'] = info['label']

@@ -76,6 +76,9 @@ function meta(key, item) {
         item.pause_type_label,
         item.waiting_seconds != null ? `已等待 ${human(item.waiting_seconds)}` : '',
       ].filter(Boolean).join(' · ')
+    case 'topo_issues':
+      // 后端已经把「几个异常 + 头两条原因」压成一句话，前端不再拆
+      return item.detail || ''
     case 'dns_approval':
       // 自己提交的单子后端禁止自批，标出来免得申请人一直等自己
       return [

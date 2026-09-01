@@ -28,11 +28,22 @@
         <span v-if="dirty" class="dirty">未保存</span>
       </div>
       <div class="topbar-right">
+        <!-- 值班模式：只读 + 定时刷新，把这张图当大屏挂着看 -->
+        <el-tooltip content="只读并每 30 秒自动刷新，异常节点高亮" placement="bottom">
+          <el-switch
+            v-model="watchMode"
+            active-text="值班"
+            inactive-text="编辑"
+            inline-prompt
+            style="margin-right:4px"
+            @change="onWatchModeChange"
+          />
+        </el-tooltip>
         <el-button :icon="Refresh" :loading="loading" @click="reload">重新加载</el-button>
-        <el-button v-if="canWrite" :loading="autofilling" @click="handleAutofill">
+        <el-button v-if="editable" :loading="autofilling" @click="handleAutofill">
           自动编排
         </el-button>
-        <el-button v-if="canWrite" @click="relayout">重新排版</el-button>
+        <el-button v-if="editable" @click="relayout">重新排版</el-button>
         <el-dropdown @command="handleMore">
           <el-button>
             更多<el-icon><ArrowDown /></el-icon>
@@ -40,12 +51,12 @@
           <template #dropdown>
             <el-dropdown-menu>
               <el-dropdown-item command="export">导出 JSON</el-dropdown-item>
-              <el-dropdown-item v-if="canCreate" command="clone">克隆到其它维度</el-dropdown-item>
+              <el-dropdown-item v-if="canCreate && !watchMode" command="clone">克隆到其它维度</el-dropdown-item>
             </el-dropdown-menu>
           </template>
         </el-dropdown>
         <el-button
-          v-if="canWrite"
+          v-if="editable"
           type="primary"
           :icon="Check"
           :loading="saving"
@@ -53,6 +64,17 @@
           @click="handleSave"
         >保存</el-button>
       </div>
+    </div>
+
+    <!-- 异常横幅：值班模式下这一条就是「现在要不要动手」的答案 -->
+    <div v-if="watchMode" class="watch-bar" :class="issueSummary.level">
+      <span v-if="issueSummary.danger">{{ issueSummary.danger }} 个节点异常</span>
+      <span v-else-if="issueSummary.warning">{{ issueSummary.warning }} 个节点告警</span>
+      <span v-else>全部正常</span>
+      <span class="watch-meta">
+        最近刷新 {{ refreshedLabel }}
+        <el-button link type="primary" @click="reload">立即刷新</el-button>
+      </span>
     </div>
 
     <div class="body">
@@ -67,7 +89,7 @@
             v-for="item in meta.ref_kinds"
             :key="item.kind"
             class="palette-item"
-            :disabled="!canWrite"
+            :disabled="!editable"
             @click="openPicker(item)"
           >
             <el-icon><Link /></el-icon>{{ item.label }}
@@ -79,7 +101,7 @@
             v-for="item in group.kinds"
             :key="item.kind"
             class="palette-item"
-            :disabled="!canWrite"
+            :disabled="!editable"
             @click="addExternalNode(item)"
           >{{ item.label }}</el-button>
         </div>
@@ -93,9 +115,9 @@
           :default-viewport="{ zoom: 0.9 }"
           :min-zoom="0.2"
           :max-zoom="2"
-          :nodes-draggable="canWrite"
-          :nodes-connectable="canWrite"
-          :edges-updatable="canWrite"
+          :nodes-draggable="editable"
+          :nodes-connectable="editable"
+          :edges-updatable="editable"
           :delete-key-code="null"
           fit-view-on-init
           @connect="onConnect"
@@ -109,7 +131,10 @@
           <template #node-topo="{ id, data }">
             <div
               class="topo-node"
-              :class="[`health-${data.health || 'none'}`, { selected: selectedNodeId === id }]"
+              :class="[
+                `health-${data.health || 'none'}`,
+                { selected: selectedNodeId === id, pulse: watchMode && data.health === 'danger' },
+              ]"
             >
               <div class="node-head">
                 <span class="node-kind">{{ data.kindLabel }}</span>
@@ -144,7 +169,7 @@
               <el-input
                 v-if="selectedNode.data.source === 'external'"
                 v-model="selectedNode.data.label"
-                :disabled="!canWrite"
+                :disabled="!editable"
                 @input="markDirty"
               />
               <!-- 引用型节点的名称由平台实体决定，改这里没有意义（保存后仍以实时值展示） -->
@@ -153,7 +178,7 @@
             <el-form-item label="副标题">
               <el-input
                 v-model="selectedNode.data.subLabel"
-                :disabled="!canWrite || selectedNode.data.source === 'ref'"
+                :disabled="!editable || selectedNode.data.source === 'ref'"
                 @input="markDirty"
               />
             </el-form-item>
@@ -161,6 +186,16 @@
               <el-tag size="small" :type="healthTagType(selectedNode.data.health)">
                 {{ selectedNode.data.statusLabel }}
               </el-tag>
+            </el-form-item>
+            <!-- 为什么是黄的/红的：只给颜色不给原因，看图的人还得自己去翻三个页面 -->
+            <el-form-item v-if="selectedNode.data.issues.length" label="问题">
+              <div class="issues">
+                <div
+                  v-for="(issue, i) in selectedNode.data.issues"
+                  :key="i"
+                  :class="['issue', `health-${issue.level}`]"
+                >{{ issue.text }}</div>
+              </div>
             </el-form-item>
             <el-form-item v-if="selectedNode.data.link" label="原始页">
               <el-link type="primary" @click="jumpTo(selectedNode.data.link)">
@@ -179,7 +214,7 @@
             <el-form-item label="固定位置">
               <el-switch
                 v-model="selectedNode.data.pinned"
-                :disabled="!canWrite"
+                :disabled="!editable"
                 @change="markDirty"
               />
               <span class="tip">开启后「重新排版」不动它</span>
@@ -200,7 +235,7 @@
             style="margin-bottom:12px"
           />
           <el-button
-            v-if="canWrite"
+            v-if="editable"
             type="danger"
             plain
             style="width:100%"
@@ -214,7 +249,7 @@
             <el-form-item label="关系">
               <el-select
                 v-model="selectedEdge.data.relation"
-                :disabled="!canWrite"
+                :disabled="!editable"
                 style="width:100%"
                 @change="onRelationChange"
               >
@@ -234,7 +269,7 @@
             </el-form-item>
           </el-form>
           <el-button
-            v-if="canWrite"
+            v-if="editable"
             type="danger"
             plain
             style="width:100%"
@@ -361,6 +396,10 @@ const canvasId = computed(() => route.params.id)
 // 但保存时直接读 store 就不必依赖那次回写的时机
 const { fitView, getNodes } = useVueFlow()
 
+//: 值班模式的刷新间隔。30 秒是「大屏挂着看」的量级：再快只是给库加压，
+//: 主机状态与证书天数都不是秒级变化的东西
+const WATCH_INTERVAL = 30000
+
 const loading = ref(false)
 const saving = ref(false)
 const autofilling = ref(false)
@@ -371,12 +410,20 @@ const edges = ref([])
 const meta = reactive({ ref_kinds: [], external_groups: [], relations: [] })
 const selectedNodeId = ref('')
 const selectedEdgeId = ref('')
+// 值班模式：只读 + 定时刷新。初值取自 URL，所以「大屏那份链接」可以直接分享
+const watchMode = ref(route.query.watch === '1')
+const refreshedAt = ref(null)
 let keySeq = 0
+let watchTimer = null
 
 // 外部节点的默认落点：避开左上角已有节点，叠一层偏移防止新节点互相压住
 const NEW_NODE_ORIGIN = { x: 120, y: 40 }
 const RELATION_LABELS = computed(() =>
   Object.fromEntries(meta.relations.map((r) => [r.value, r.label])))
+
+// 能不能改：有写权限**且**不在值班模式。值班模式刻意连有权限的人也锁住——
+// 一张定时自动刷新的图上做编辑，下一次刷新就把你的改动冲了
+const editable = computed(() => canWrite.value && !watchMode.value)
 
 const selectedNode = computed(() => nodes.value.find((n) => n.id === selectedNodeId.value))
 const selectedEdge = computed(() => edges.value.find((e) => e.id === selectedEdgeId.value))
@@ -399,6 +446,65 @@ const refExtraRows = computed(() => {
       value: Array.isArray(value) ? value.join('、') : String(value),
     }))
 })
+
+/** 图上的异常汇总：横幅与「立即刷新」共用，不再单独拉一次健康度接口。 */
+const issueSummary = computed(() => {
+  let danger = 0
+  let warning = 0
+  nodes.value.forEach((n) => {
+    if (n.data.health === 'danger') danger += 1
+    else if (n.data.health === 'warning') warning += 1
+  })
+  return {
+    danger,
+    warning,
+    level: danger ? 'danger' : (warning ? 'warning' : 'ok'),
+  }
+})
+
+const refreshedLabel = computed(() => (refreshedAt.value
+  ? new Date(refreshedAt.value).toLocaleTimeString('zh-CN', { hour12: false })
+  : '—'))
+
+function stopWatchTimer() {
+  if (watchTimer) {
+    clearInterval(watchTimer)
+    watchTimer = null
+  }
+}
+
+function startWatchTimer() {
+  stopWatchTimer()
+  watchTimer = setInterval(() => {
+    // 有未保存改动时不自动刷新：把人正在画的东西冲掉是最不能接受的
+    if (!dirty.value) reload()
+  }, WATCH_INTERVAL)
+}
+
+async function onWatchModeChange(value) {
+  if (value && dirty.value) {
+    try {
+      await ElMessageBox.confirm(
+        '进入值班模式会变成只读并定时刷新，当前未保存的改动会丢弃。继续？',
+        '提示', { type: 'warning' })
+    } catch {
+      watchMode.value = false
+      return
+    }
+    dirty.value = false
+    await reload()
+  }
+  // URL 跟着变：值班大屏那份链接可以直接分享，刷新浏览器也还在值班模式
+  router.replace({
+    query: { ...route.query, watch: value ? '1' : undefined },
+  })
+  if (value) {
+    clearSelection()
+    startWatchTimer()
+  } else {
+    stopWatchTimer()
+  }
+}
 
 function markDirty() {
   dirty.value = true
@@ -454,6 +560,7 @@ function toFlowNode(item) {
       statusLabel: item.ref?.status_label || '',
       link: item.ref?.link || null,
       extra: item.ref?.extra || {},
+      issues: item.ref?.issues || [],
       lost: item.ref ? item.ref.exists === false : false,
     },
   }
@@ -479,12 +586,13 @@ function applyGraph(data) {
   nodes.value = (data.nodes || []).map(toFlowNode)
   edges.value = (data.edges || []).map(toFlowEdge)
   dirty.value = false
+  refreshedAt.value = Date.now()
   clearSelection()
   nextTick(() => fitView({ padding: 0.2 }))
 }
 
 async function reload() {
-  if (dirty.value) {
+  if (dirty.value && !watchMode.value) {
     try {
       await ElMessageBox.confirm('画布有未保存的改动，重新加载会丢弃它们。继续？', '提示',
         { type: 'warning' })
@@ -523,7 +631,7 @@ function addExternalNode(kind) {
       dbId: null, source: 'external', kind: kind.kind, kindLabel: kind.label,
       refId: null, label: `新${kind.label}`, subLabel: '', remark: '',
       attrs: {}, pinned: false, health: 'none', statusLabel: '',
-      link: null, extra: {}, lost: false,
+      link: null, extra: {}, issues: [], lost: false,
     },
   })
   selectedEdgeId.value = ''
@@ -572,7 +680,8 @@ function pickCandidate(row) {
       dbId: null, source: 'ref', kind: picker.kind, kindLabel: picker.label,
       refId: row.ref_id, label: row.label, subLabel: row.sub_label || '',
       remark: '', attrs: {}, pinned: false, health: 'none',
-      statusLabel: '保存后显示实时状态', link: null, extra: {}, lost: false,
+      statusLabel: '保存后显示实时状态', link: null, extra: {}, issues: [],
+      lost: false,
     },
   })
   row.on_canvas = true
@@ -828,8 +937,12 @@ onMounted(async () => {
   const metaRes = await getTopoMeta()
   Object.assign(meta, metaRes.data || {})
   await reload()
+  if (watchMode.value) startWatchTimer()
 })
-onUnmounted(() => window.removeEventListener('beforeunload', beforeUnload))
+onUnmounted(() => {
+  window.removeEventListener('beforeunload', beforeUnload)
+  stopWatchTimer()
+})
 </script>
 
 <style scoped>
@@ -844,6 +957,21 @@ onUnmounted(() => window.removeEventListener('beforeunload', beforeUnload))
 .dirty { color: #e6a23c; font-size: 12px; }
 
 .body { flex: 1; display: flex; gap: 8px; min-height: 0; }
+
+/* 值班横幅 */
+.watch-bar {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 6px 12px; margin-bottom: 8px; border-radius: 4px;
+  font-size: 13px; border-left: 3px solid #67c23a; background: #f0f9eb; color: #529b2e;
+}
+.watch-bar.warning { border-left-color: #e6a23c; background: #fdf6ec; color: #b88230; }
+.watch-bar.danger { border-left-color: #f56c6c; background: #fef0f0; color: #c45656; }
+.watch-meta { color: #909399; font-size: 12px; }
+
+.issues { display: flex; flex-direction: column; gap: 2px; }
+.issue { font-size: 12px; line-height: 1.6; }
+.issue.health-warning { color: #e6a23c; }
+.issue.health-danger { color: #f56c6c; }
 
 .palette {
   width: 168px; flex: none; overflow-y: auto; padding: 10px;
@@ -891,6 +1019,12 @@ onUnmounted(() => window.removeEventListener('beforeunload', beforeUnload))
 .topo-node.health-healthy { border-left-color: #67c23a; }
 .topo-node.health-warning { border-left-color: #e6a23c; }
 .topo-node.health-danger { border-left-color: #f56c6c; }
+/* 值班模式下异常节点呼吸高亮：大屏离得远，只靠 4px 色条看不见 */
+.topo-node.pulse { animation: node-pulse 1.6s ease-in-out infinite; }
+@keyframes node-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(245, 108, 108, 0.5); }
+  50% { box-shadow: 0 0 0 6px rgba(245, 108, 108, 0); }
+}
 .node-head { display: flex; justify-content: space-between; align-items: center; }
 .node-kind { color: #409eff; font-weight: 600; }
 .node-ref-flag { color: #909399; }

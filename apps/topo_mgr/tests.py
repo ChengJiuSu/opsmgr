@@ -793,3 +793,144 @@ class CloneTests(BaseTopoTest):
         }, format='json')
         self.assertEqual(r.status_code, 403)
         self.assertIn('数据范围', r.json()['msg'])
+
+
+class HealthTests(BaseTopoTest):
+    def _put(self, client, nodes, edges=None):
+        return client.put(f'/api/topo/canvases/{self.canvas.id}/graph/',
+                          {'nodes': nodes, 'edges': edges or []}, format='json')
+
+    def test_server_issues_cover_status_and_agent(self):
+        """执行通道也算健康度：Agent 离线的主机在图上看着好好的，命令根本下不去。"""
+        from apps.agent_mgr.models import AgentNode
+
+        admin = self._client()
+        agent = AgentNode.objects.create(name='nat-agent', status='offline')
+        server = self._server(status='maintenance', channel_mode='agent', agent=agent)
+        r = self._put(admin, [{'key': 's', 'source': 'ref', 'kind': 'server',
+                               'ref_id': server.id, 'label': server.name}])
+        self.assertEqual(r.status_code, 200, r.content)
+        node = r.json()['data']['nodes'][0]
+        texts = [i['text'] for i in node['ref']['issues']]
+        self.assertEqual(texts, ['主机维护中', '执行通道 Agent「nat-agent」离线'])
+        # 最坏一条定颜色：维护中是黄的，但 Agent 离线是红的
+        self.assertEqual(node['ref']['health'], 'danger')
+
+    def test_disabled_dns_record_is_flagged(self):
+        """图上看着通、实际这条解析是关的：不标出来会照着图排查半天。"""
+        admin = self._client()
+        server = self._server()
+        _, record = self._domain_record(server)
+        record.enabled = False
+        record.sync_status = 'synced'
+        record.save(update_fields=['enabled', 'sync_status'])
+        r = self._put(admin, [{'key': 'r', 'source': 'ref', 'kind': 'dns_record',
+                               'ref_id': record.id, 'label': record.fqdn}])
+        node = r.json()['data']['nodes'][0]
+        self.assertEqual([i['text'] for i in node['ref']['issues']], ['解析记录已停用'])
+        self.assertEqual(node['ref']['health'], 'warning')
+
+    def test_healthy_server_has_no_issues(self):
+        admin = self._client()
+        server = self._server()
+        r = self._put(admin, [{'key': 's', 'source': 'ref', 'kind': 'server',
+                               'ref_id': server.id, 'label': server.name}])
+        node = r.json()['data']['nodes'][0]
+        self.assertEqual(node['ref']['issues'], [])
+        self.assertEqual(node['ref']['health'], 'healthy')
+
+    def test_health_summary_counts_and_sorts(self):
+        admin = self._client()
+        ok_server = self._server(name='ok-host')
+        bad_server = self._server(name='bad-host', private_ip='10.0.0.5',
+                                  status='stopped')
+        self._put(admin, [
+            {'key': 'a', 'source': 'ref', 'kind': 'server', 'ref_id': ok_server.id,
+             'label': ok_server.name},
+            {'key': 'b', 'source': 'ref', 'kind': 'server', 'ref_id': bad_server.id,
+             'label': bad_server.name},
+            {'key': 'x', 'source': 'external', 'kind': 'aws_ga', 'label': 'ga'},
+        ])
+        clean = TopoCanvas.objects.create(
+            name='干净的', slug='clean', project_group=self.group,
+            channel=self.channel, environment=self.env, region='us')
+
+        r = admin.get('/api/topo/health/')
+        self.assertEqual(r.status_code, 200)
+        data = r.json()['data']
+        self.assertEqual(data['danger'], 1)
+        # 有异常的排前面
+        self.assertEqual(data['results'][0]['canvas']['id'], self.canvas.id)
+        first = data['results'][0]
+        # 外部节点既不算健康也不算异常：平台不知道它们的真实状态
+        self.assertEqual(first['total'], 2)
+        self.assertEqual((first['healthy'], first['danger']), (1, 1))
+        self.assertEqual([i['text'] for i in first['issues']], ['主机已停止'])
+        self.assertEqual(data['results'][-1]['canvas']['id'], clean.id)
+
+        r = admin.get('/api/topo/health/?only_issues=true')
+        self.assertEqual(r.json()['data']['total'], 1)
+
+    def test_health_counts_lost_refs(self):
+        admin = self._client()
+        server = self._server()
+        self._put(admin, [{'key': 's', 'source': 'ref', 'kind': 'server',
+                           'ref_id': server.id, 'label': server.name}])
+        server.delete()
+        r = admin.get('/api/topo/health/')
+        bucket = r.json()['data']['results'][0]
+        self.assertEqual((bucket['lost'], bucket['danger']), (1, 1))
+        self.assertEqual(bucket['issues'][0]['text'], '引用的资源已不存在')
+
+    def test_health_respects_data_scope(self):
+        admin = self._client()
+        server = self._server(status='stopped')
+        self._put(admin, [{'key': 's', 'source': 'ref', 'kind': 'server',
+                           'ref_id': server.id, 'label': server.name}])
+        scoped = User.objects.create(username='scoped_h', is_staff=True)
+        scoped.set_password('Pass!2345xyz')
+        scoped.save()
+        scoped.allowed_project_groups.add(ProjectGroup.objects.create(
+            name='别的组', code='other-h'))
+        c = APIClient()
+        res = c.post('/api/auth/login/',
+                     {'username': 'scoped_h', 'password': 'Pass!2345xyz'}, format='json')
+        c.credentials(HTTP_AUTHORIZATION='Bearer ' + res.json()['access'])
+        self.assertEqual(c.get('/api/topo/health/').json()['data']['total'], 0)
+
+    def test_dashboard_surfaces_topo_alert(self):
+        """概览页的「拓扑异常」块与画布上的颜色同源，点进去就是那张图。"""
+        admin = self._client()
+        server = self._server(status='stopped')
+        self._put(admin, [{'key': 's', 'source': 'ref', 'kind': 'server',
+                           'ref_id': server.id, 'label': server.name}])
+        r = admin.get('/api/dashboard/overview/')
+        self.assertEqual(r.status_code, 200)
+        block = next(b for b in r.json()['data']['alerts'] if b['key'] == 'topo_issues')
+        self.assertEqual(block['level'], 'danger')
+        self.assertEqual(block['total'], 1)
+        self.assertEqual(block['link']['path'], '/topo/canvases')
+        self.assertEqual(block['items'][0]['link']['path'],
+                         f'/topo/canvases/{self.canvas.id}')
+        self.assertIn('主机已停止', block['items'][0]['detail'])
+
+    def test_dashboard_hides_block_without_topo_permission(self):
+        """块级权限在后端裁：没有 topo 权限的账号不该从首页读到画布名。"""
+        from apps.auth_mgr.models import Role
+
+        admin = self._client()
+        server = self._server(status='stopped')
+        self._put(admin, [{'key': 's', 'source': 'ref', 'kind': 'server',
+                           'ref_id': server.id, 'label': server.name}])
+        role = Role.objects.create(name='无拓扑', code='no-topo',
+                                   permissions={'cmdb': 'read', 'topo': 'none'})
+        user = User.objects.create(username='no_topo', is_staff=False, role=role)
+        user.set_password('Pass!2345xyz')
+        user.save()
+        c = APIClient()
+        res = c.post('/api/auth/login/',
+                     {'username': 'no_topo', 'password': 'Pass!2345xyz'}, format='json')
+        c.credentials(HTTP_AUTHORIZATION='Bearer ' + res.json()['access'])
+        r = c.get('/api/dashboard/overview/')
+        keys = [b['key'] for b in r.json()['data']['alerts']]
+        self.assertNotIn('topo_issues', keys)

@@ -33,6 +33,8 @@ from apps.asset_mgr.models import Server, ServerService
 from apps.auth_mgr import roles
 from apps.cloud_mgr.models import Certificate, CertDeployment, DnsChangeRequest, DnsRecord, Domain
 from apps.task_exec.models import ExecutionTask, TaskExecutionLog
+from apps.topo_mgr import health as topo_health
+from apps.topo_mgr.models import TopoCanvas
 
 logger = logging.getLogger(__name__)
 
@@ -468,12 +470,39 @@ def exec_trend():
 # ── 组装 ────────────────────────────────────────────────────────────
 
 #: (块名, 依赖模块, builder, 是否要 user)。模块为 None = 不需要权限。
+def topo_alerts(user):
+    """拓扑画布上有异常节点的图。
+
+    条目粒度是**画布**而不是节点：首页要回答的是「哪张链路图在冒烟」，逐节点列出来
+    会把一台机的三个问题铺成三行，把别的异常挤出可见范围。点进去就是那张图，红的
+    节点在图上一眼可见——这也是画布相对「一张异常清单」的全部价值。
+
+    判定完全复用 topo_mgr 那套（同一份 issues 清单），不在这里另写 filter：第二套
+    口径一定会和图上的颜色对不上，「首页说 3 个异常、图上只有 2 个红的」之后就没人
+    再信这个数字。
+    """
+    canvases = TopoCanvas.objects.select_related(
+        'project_group', 'channel', 'environment')
+    # 数据范围与其它块同口径：看不到那张图的人也不该在首页看到它在报警
+    if hasattr(user, 'narrow'):
+        canvases = user.narrow(canvases)
+    items, total = topo_health.alert_items(canvases, limit=ITEM_LIMIT)
+    if not items:
+        return []
+    level = 'danger' if any(i['level'] == 'danger' for i in items) else 'warning'
+    return [_alert(
+        'topo_issues', level, f'{total} 张拓扑画布存在异常节点',
+        items, {'path': '/topo/canvases', 'query': {}}, total=total,
+    )]
+
+
 _ALERT_BUILDERS = (
     ('cert_alerts', 'cloud', cert_alerts, False),
     ('cert_stuck_alerts', 'cloud', cert_stuck_alerts, False),
     ('dns_alerts', 'cloud', dns_alerts, False),
     ('task_failed_alerts', 'exec', task_failed_alerts, False),
     ('agent_alerts', 'agent', agent_alerts, False),
+    ('topo_alerts', 'topo', topo_alerts, True),
 )
 
 _TODO_BUILDERS = (

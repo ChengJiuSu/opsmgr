@@ -47,15 +47,16 @@ apps/topo_mgr/
 ├── models.py       # TopoCanvas / TopoNode / TopoEdge
 │                   # + 节点类型登记表（REF_KINDS / EXTERNAL_KIND_GROUPS）与关系表
 ├── graph.py        # 整图取数、整图保存、自动编排；引用型节点的实时解析与维度相容口径
+├── health.py       # 画布健康度汇总（列表页「健康」列 + 概览页「拓扑异常」块）
 ├── impact.py       # 影响面反查：某实体在哪些画布上、上下游是谁
 ├── portable.py     # 导出 / 导入 / 克隆；引用型节点的自然键
 ├── serializers.py  # 画布元信息序列化器（节点与连线不走 ModelSerializer）
 ├── views.py        # TopoCanvasViewSet（CRUD + graph/autofill/candidates/export/clone）
-│                   # + TopoMetaView / TopoImportView / TopoImpactView
-├── urls.py         # meta/ import/ impact/ 显式路径在前，其余走 DefaultRouter
+│                   # + TopoMetaView / TopoImportView / TopoImpactView / TopoHealthView
+├── urls.py         # meta/ import/ impact/ health/ 显式路径在前，其余走 DefaultRouter
 ├── migrations/0001_initial.py
-└── tests.py        # 49 用例：模型约束、CRUD 与权限、整图读写、自动编排、候选与元信息、
-                    # 维度相容、影响面反查、导出导入、克隆
+└── tests.py        # 59 用例：模型约束、CRUD 与权限、整图读写、自动编排、候选与元信息、
+                    # 维度相容、影响面反查、导出导入、克隆、健康度与概览页联动
 ```
 
 RBAC 侧同步改了两处：`apps/auth_mgr/roles.py` 新登记模块 `topo`（归入「资产与
@@ -78,6 +79,7 @@ RBAC 侧同步改了两处：`apps/auth_mgr/roles.py` 新登记模块 `topo`（�
 | POST | `/api/topo/canvases/{id}/clone/` | 按新维度克隆 | `topo:read_create` |
 | POST | `/api/topo/import/` | 导入导出的 JSON；`overwrite` 需 `topo:write` | `topo:read_create` |
 | GET | `/api/topo/impact/?kind=&ref_id=` | 影响面反查：该实体在哪些画布上、上下游是谁 | `topo` 读 |
+| GET | `/api/topo/health/?only_issues=` | 每张画布的健康度汇总与异常明细 | `topo` 读 |
 
 维度筛选参数「纯数字按 id、否则按 code」，与主机列表同口径。列表与详情都按登录
 用户的数据范围（`common/dimscope`）收窄：范围外的画布列表看不到，直接猜 id 也
@@ -176,6 +178,49 @@ RBAC 侧同步改了两处：`apps/auth_mgr/roles.py` 新登记模块 `topo`（�
 
 ---
 
+## 健康度：节点为什么是黄的 / 红的（P3）
+
+每个引用型节点带一份 `issues`（`[{level, text}]`），节点颜色取其中**最坏一条**
+（`graph._worst`）。只给颜色不给原因，看图的人还得自己去翻三个页面才知道那台机怎么了。
+
+| kind | 判定 |
+|------|------|
+| `server` | 已停止 danger / 维护中 warning；**执行通道** Agent 离线或该绑未绑 danger |
+| `dns_record` | 同步失败 danger / 待同步 warning；**记录已停用** warning |
+| `certificate` | 失败·过期·issuing 卡死 danger；剩余 ≤15 天或待申请中 warning |
+| `domain` | 已过期 danger / 即将到期 warning |
+| 失联（实体被删） | danger |
+
+两处刻意加进来的判定，都是「图上看着通、实际不通」的情形——正是画布该当场答出来的：
+
+- **Agent 离线**：一台 NAT 主机的执行通道断了，图上看着好好的，实际什么命令都下不去；
+- **解析已停用**：解析记录 `enabled=False`，图上那条线还在，实际流量根本不过来。
+
+证书的警告阈值是 15 天（`CERT_WARN_DAYS`），与概览页的 30 天
+（`CERT_EXPIRY_WARN_DAYS`）刻意不同：那边是「该续了」，这里是「快断了」，画布上 30 天
+就开始黄会让图长期挂着黄色，久了没人再看。
+
+### 汇总（health.py）
+
+`GET /api/topo/health/` 给每张画布一份 `{total, healthy, warning, danger, lost, issues}`。
+
+- **复用 `graph.resolve_refs`**（按 kind 批查，4 条 SQL 封顶，与画布张数无关），不为汇总
+  另写 filter：第二套口径一定会和图上的颜色对不上，而「首页说 3 个异常、点进去只有 2 个
+  红的」之后就没人再信这个数字。
+- **只看引用型节点**：外部节点（GA、负载均衡）是手工录入的，平台不知道它们的真实状态，
+  凭空给个「健康」比不给更糟——看图的人会以为那一层被监控着。
+- 单独一个接口而不是塞进画布列表：列表分页且常被筛选，把遍历所有节点的代价绑上去，
+  翻页也得付一次。
+
+### 概览页联动
+
+`dashboard.services.topo_alerts` 复用 `health.alert_items`，在首页异常区加一块「N 张
+拓扑画布存在异常节点」，条目粒度是**画布**（逐节点列会把一台机的三个问题铺成三行，把
+别的异常挤出可见范围），深链直接指进那张图。块级权限按 `topo` 模块裁——没有画布权限的
+账号不该从首页读到画布名。
+
+---
+
 ## 影响面反查（impact.py）
 
 `GET /api/topo/impact/?kind=server&ref_id=12` 答「动它会波及什么」：它出现在哪些画布
@@ -226,7 +271,8 @@ RBAC 侧同步改了两处：`apps/auth_mgr/roles.py` 新登记模块 `topo`（�
 
 ## 后续
 
-P2 已落地：影响面反查、克隆、导入导出。剩下的候选：
+P2 已落地：影响面反查、克隆、导入导出。P3 已落地：健康度与值班模式（见上）。
+剩下的候选：
 
 - **节点类型字典化**（`TopoNodeKind` 表）：目前类型是代码常量（`EXTERNAL_KIND_GROUPS`），
   加一种负载均衡改一行常量。换成表要多一张表、一条种子迁移、一个维护页，换来的是
@@ -235,4 +281,5 @@ P2 已落地：影响面反查、克隆、导入导出。剩下的候选：
 - **地域进字典**：`Server.region` 与 `TopoCanvas.region` 都是自由文本，同一个地域写成
   `us` / `us-west` / `usw` 就会让画布筛不到主机。改成外键要动服务器台账、分配页、
   CSV 导入导出、画布维度四处，属于 CMDB 的改动而非画布的改动，应当单独排期。
-- 节点状态实时上色接进概览页异常深链，让画布能当值班大图用（P3）。
+P3 已落地：健康度明细（含 Agent 在线与解析停用）、健康度汇总接口、概览页「拓扑异常」
+块、前端值班模式。

@@ -54,6 +54,21 @@
           <span class="muted">{{ row.node_count }} 节点 / {{ row.edge_count }} 连线</span>
         </template>
       </el-table-column>
+      <el-table-column label="健康" width="120">
+        <template #default="{ row }">
+          <!-- 健康度是单独一发请求补上的，没回来之前显示占位而不是「正常」：
+               把「还不知道」显示成「没问题」是最不该有的谎 -->
+          <span v-if="!health[row.id]" class="unset">—</span>
+          <el-tag v-else-if="health[row.id].danger" size="small" type="danger">
+            {{ health[row.id].danger }} 异常
+          </el-tag>
+          <el-tag v-else-if="health[row.id].warning" size="small" type="warning">
+            {{ health[row.id].warning }} 警告
+          </el-tag>
+          <el-tag v-else-if="health[row.id].total" size="small" type="success">正常</el-tag>
+          <span v-else class="unset">无平台资源</span>
+        </template>
+      </el-table-column>
       <el-table-column prop="description" label="说明" min-width="140" show-overflow-tooltip>
         <template #default="{ row }">
           <span v-if="row.description">{{ row.description }}</span>
@@ -199,7 +214,7 @@ import {
   projectGroupApi, channelApi, environmentApi, fetchDictOptions,
 } from '../../api/assets'
 import {
-  getCanvases, createCanvas, updateCanvas, deleteCanvas, importCanvas,
+  getCanvases, createCanvas, updateCanvas, deleteCanvas, importCanvas, getTopoHealth,
 } from '../../api/topo'
 
 const router = useRouter()
@@ -215,6 +230,9 @@ const page = ref(1)
 const pageSize = ref(20)
 const filter = reactive({ keyword: '', project_group: '', channel: '', env: '' })
 const dicts = reactive({ projectGroups: [], channels: [], environments: [] })
+// 画布 id → 健康度汇总。单独一发请求：汇总要遍历所有引用型节点，绑进列表会让翻页
+// 也付一次这个代价；慢了最多是那一列晚出来，不拖住表格
+const health = ref({})
 const dialogVisible = ref(false)
 const editRow = ref(null)
 const formRef = ref()
@@ -259,6 +277,17 @@ async function fetchData() {
     total.value = res.data?.total || 0
   } finally {
     loading.value = false
+  }
+  fetchHealth()
+}
+
+async function fetchHealth() {
+  try {
+    const res = await getTopoHealth()
+    health.value = Object.fromEntries(
+      (res.data?.results || []).map((item) => [item.canvas.id, item]))
+  } catch {
+    // 健康度拉不到不影响列表本身：这一列留占位就是了
   }
 }
 

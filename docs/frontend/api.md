@@ -68,6 +68,7 @@ cloneCanvas(id, data)    // POST   /api/topo/canvases/{id}/clone/      按新维
 exportCanvas(id)         // GET    /api/topo/canvases/{id}/export/     导出 JSON
 importCanvas(data)       // POST   /api/topo/import/                   导入 JSON
 getTopoImpact(params)    // GET    /api/topo/impact/                   影响面反查
+getTopoHealth(params)    // GET    /api/topo/health/                   画布健康度汇总
 ```
 
 ### 审计日志（`src/api/audit.js`）

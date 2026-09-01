@@ -23,6 +23,7 @@ from common.response import fail, ok
 
 # 别名导入：`graph` 在 ViewSet 里是 @action 方法名，同名会读着别扭
 from . import graph as graph_svc
+from . import health as health_svc
 from . import impact as impact_svc
 from . import portable
 from .models import (
@@ -238,6 +239,38 @@ class TopoImportView(APIView):
             return fail(str(exc))
         return ok({'canvas': TopoCanvasSerializer(canvas).data, 'report': report},
                   msg=_report_msg('已导入', report))
+
+
+class TopoHealthView(APIView):
+    """画布健康度汇总：列表页的「健康」列与概览页的「拓扑异常」块共用。
+
+    单独一个接口而不是塞进画布列表：列表是分页的、常被高频筛选，健康度要遍历所有
+    引用型节点，两者绑在一起会让翻页也付一次汇总的代价。前端拉完列表再补这一发，
+    汇总慢了最多是那一列晚出来，不拖住表格。
+    """
+
+    permission_classes = [module_perm('topo')]
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter('only_issues', bool,
+                             description='只回传有异常/警告的画布'),
+        ],
+        responses=OpenApiTypes.OBJECT)
+    def get(self, request):
+        canvases = TopoCanvas.objects.select_related(
+            'project_group', 'channel', 'environment')
+        if hasattr(request.user, 'narrow'):
+            canvases = request.user.narrow(canvases)
+        results = health_svc.summarize(canvases)
+        if request.query_params.get('only_issues') == 'true':
+            results = [r for r in results if r['danger'] or r['warning']]
+        return ok({
+            'total': len(results),
+            'danger': sum(1 for r in results if r['danger']),
+            'warning': sum(1 for r in results if r['warning'] and not r['danger']),
+            'results': results,
+        })
 
 
 class TopoImpactView(APIView):
