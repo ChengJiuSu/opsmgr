@@ -213,7 +213,7 @@
                   class="svc-tag"
                   :class="svc.status"
                   :title="serviceTitle(svc)"
-                >{{ svc.name }}×{{ svc.process_count }}</span>
+                >{{ serviceLabel(svc) }}</span>
                 <el-tooltip
                   v-if="nodeServices(data).length > SERVICE_TAG_LIMIT"
                   placement="top"
@@ -291,17 +291,18 @@
             </el-form-item>
             <!-- 服务单列一栏：通用 extra 行只能显示「名字、名字」，
                  但这里要的是状态 + 进程名 + 进程数 -->
-            <el-form-item v-if="selectedNodeServices.length" label="部署服务">
+            <el-form-item v-if="selectedNodeServices.length" label="服务进程">
               <div class="svc-list">
                 <div v-for="svc in selectedNodeServices" :key="svc.code" class="svc-row">
                   <el-tag
                     size="small"
                     :type="svc.status === 'deployed' ? 'success' : 'warning'"
                     :effect="svc.status === 'deployed' ? 'light' : 'plain'"
-                  >{{ svc.name }}</el-tag>
+                  >{{ svc.process_name || svc.name }}</el-tag>
                   <span class="svc-meta">
                     {{ svc.process_count }} 进程
-                    <template v-if="svc.process_name">· {{ svc.process_name }}</template>
+                    <template v-if="svc.process_name">· {{ svc.name }}</template>
+                    · {{ svc.status_label }}
                   </span>
                 </div>
               </div>
@@ -580,9 +581,23 @@ function nodeServices(data) {
   return data?.extra?.services || []
 }
 
+/** 卡片上那一格：**进程名**优先（nginx-01×4）。
+
+    进程名才是这台机上实际跑的那个东西的标识（「服务器分配」页自动编号，
+    同云厂商+项目组+环境+渠道内按服务类型递增），排查时要 grep 的就是它；
+    服务类型名（「战斗服」）是分类，同一类在不同机器上重名，写在卡片上等于
+    没说这台机跑的是哪一个。没规划进程名的旧记录回落到类型名。
+
+    口径与「服务器分配」页的「服务进程（规划/部署）」列一致：`名字 ×进程数`。 */
+function serviceLabel(svc) {
+  return `${svc.process_name || svc.name}×${svc.process_count}`
+}
+
 function serviceTitle(svc) {
-  const parts = [`${svc.name}×${svc.process_count}`, svc.status_label]
-  if (svc.process_name) parts.push(svc.process_name)
+  const parts = [serviceLabel(svc)]
+  // 类型名放 hover：卡片要短，但「nginx-01 是干什么的」也得能问出来
+  if (svc.process_name) parts.push(svc.name)
+  parts.push(svc.status_label)
   return parts.join(' · ')
 }
 
