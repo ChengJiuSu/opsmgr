@@ -151,6 +151,10 @@
         >
           <Background :gap="16" pattern-color="#dfe4ec" />
           <Controls />
+          <!-- 自定义连线：加宽交互描边 + 关系文字本身可点可右键（见 TopoEdge.vue） -->
+          <template #edge-topo="edgeProps">
+            <TopoEdge v-bind="edgeProps" />
+          </template>
           <template #node-topo="{ id, data }">
             <div
               class="topo-node"
@@ -485,7 +489,9 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
+import {
+  ref, reactive, computed, watch, provide, onMounted, onUnmounted, nextTick,
+} from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { VueFlow, Handle, Position, MarkerType, useVueFlow } from '@vue-flow/core'
 import { Background } from '@vue-flow/background'
@@ -498,6 +504,7 @@ import dagre from 'dagre'
 import { debounce } from '../../utils/debounce'
 import { useAuthStore } from '../../stores/auth'
 import ContextMenu from '../../components/ContextMenu.vue'
+import TopoEdge from './TopoEdge.vue'
 import TopoImpactDialog from '../../components/TopoImpactDialog.vue'
 import {
   projectGroupApi, channelApi, environmentApi, fetchDictOptions,
@@ -880,6 +887,8 @@ function buildEdge(id, source, target, relation) {
     id,
     source,
     target,
+    // 自定义类型：默认连线的 1px 描边与不可点的标签层，右键根本点不到（见 TopoEdge.vue）
+    type: 'topo',
     label: RELATION_LABELS.value[relation] || relation,
     markerEnd: MarkerType.ArrowClosed,
     data: { relation },
@@ -1134,17 +1143,18 @@ function nodeMenuItems(node) {
   return items
 }
 
-/** 连线菜单：7 种关系直接平铺，改关系不用再绕右侧下拉。 */
+/** 连线菜单：7 种关系**直接平铺**（当前值打勾），不做二级菜单。
+
+    关系是这个菜单唯一的高频动作，藏进「改关系 ›」要多一次悬停对准；连线本身又细，
+    鼠标从菜单项往子菜单挪的路上很容易划出去。7 行铺开一眼就点到。 */
 function edgeMenuItems(edge) {
   if (!editable.value) return [{ key: 'noop', label: '值班模式下只读', disabled: true }]
   return [
-    {
-      key: 'relation', label: '改关系',
-      children: meta.relations.map((r) => ({
-        key: `relation:${r.value}`, label: r.label,
-        checked: edge.data.relation === r.value,
-      })),
-    },
+    ...meta.relations.map((r) => ({
+      key: `relation:${r.value}`,
+      label: r.label,
+      checked: edge.data.relation === r.value,
+    })),
     { divider: true },
     { key: 'delete-edge', label: '删除连线', danger: true },
   ]
@@ -1193,10 +1203,26 @@ function onNodeContextMenu({ event, node }) {
 }
 
 function onEdgeContextMenu({ event, edge }) {
-  selectedNodeId.value = ''
-  selectedEdgeId.value = edge.id
-  openMenu(event, { type: 'edge', id: edge.id }, edgeMenuItems(edge))
+  openEdgeMenu(event, edge.id)
 }
+
+/** 连线菜单入口。两条路通到这里：右键连线本身（vue-flow 的 edgeContextMenu）、
+    右键关系文字（TopoEdge 里的标签，那层收不到 vue-flow 的事件）。 */
+function openEdgeMenu(event, edgeId) {
+  const edge = edges.value.find((e) => e.id === edgeId)
+  if (!edge) return
+  selectedNodeId.value = ''
+  selectedEdgeId.value = edgeId
+  openMenu(event, { type: 'edge', id: edgeId }, edgeMenuItems(edge))
+}
+
+function selectEdge(edgeId) {
+  selectedNodeId.value = ''
+  selectedEdgeId.value = edgeId
+}
+
+provide('topoOpenEdgeMenu', openEdgeMenu)
+provide('topoSelectEdge', selectEdge)
 
 function onPaneContextMenu(event) {
   // 落点用画布坐标而不是屏幕坐标：缩放/平移过之后两者差得很远
