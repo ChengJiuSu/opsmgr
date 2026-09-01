@@ -172,6 +172,10 @@ class TopoNode(models.Model):
     # 未失联时展示一律以实时读到的名字为准（见 graph.build_graph）
     label = models.CharField('显示名称', max_length=200)
     sub_label = models.CharField('副标题', max_length=200, blank=True)
+    # 图上这个节点自己的展示细节，自由字段。当前被前端识别的键：
+    #   kind_label —— 覆盖节点卡片上那行类型标签（默认取 EXTERNAL_KIND_GROUPS /
+    #                 REF_KINDS 里登记的名字）。只影响展示，真实类型始终是 kind
+    # 加新键前先看一眼这里，别把已有语义的键改了用途
     attrs = models.JSONField('自定义属性', default=dict, blank=True)
     x = models.FloatField('画布 X 坐标', default=0)
     y = models.FloatField('画布 Y 坐标', default=0)

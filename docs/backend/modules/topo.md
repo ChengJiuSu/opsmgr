@@ -14,7 +14,7 @@
 | 概念 | 说明 |
 |------|------|
 | `TopoCanvas` | 一张画布，绑定一组维度（项目组/渠道/环境/地域）；同组合允许多张，用 `slug` 区分 |
-| `TopoNode` | 画布上的节点，分引用型（`source=ref`）与外部型（`source=external`） |
+| `TopoNode` | 画布上的节点，分引用型（`source=ref`）与外部型（`source=external`）；`attrs` 存展示细节，已被识别的键见模型注释（当前只有 `kind_label`） |
 | `TopoEdge` | 节点之间的有向关系，`relation` 带语义（解析/后端/源站/回源/落地/挂载/关联） |
 
 ### 画布不是第五套资产台账

@@ -151,13 +151,32 @@
               ]"
             >
               <div class="node-head">
-                <span class="node-kind">{{ data.kindLabel }}</span>
+                <!-- 类型标签也可改：图上那行蓝字是给人看的分组名（「AWS · GA 加速器」），
+                     真实类型由 data.kind 决定，改这行不影响任何判定 -->
+                <input
+                  v-if="renamingId === id && renameField === 'kindLabel'"
+                  :ref="setRenameInput"
+                  v-model="renameDraft"
+                  class="node-rename node-rename-kind"
+                  maxlength="40"
+                  @mousedown.stop
+                  @click.stop
+                  @keydown.enter.stop.prevent="commitRename"
+                  @keydown.esc.stop.prevent="cancelRename"
+                  @blur="commitRename"
+                />
+                <span
+                  v-else
+                  class="node-kind"
+                  :title="editable ? '双击修改类型标签' : ''"
+                  @dblclick.stop="startRename(id, 'kindLabel')"
+                >{{ data.kindLabel }}</span>
                 <el-icon v-if="data.source === 'ref'" class="node-ref-flag"><Link /></el-icon>
               </div>
               <!-- 就地改名：双击或右键菜单进入。mousedown.stop 是必须的——
                    不拦住的话一点输入框就开始拖节点，文字根本选不中 -->
               <input
-                v-if="renamingId === id"
+                v-if="renamingId === id && renameField === 'label'"
                 :ref="setRenameInput"
                 v-model="renameDraft"
                 class="node-rename"
@@ -168,7 +187,11 @@
                 @keydown.esc.stop.prevent="cancelRename"
                 @blur="commitRename"
               />
-              <div v-else class="node-label">{{ data.label }}</div>
+              <div
+                v-else
+                class="node-label"
+                @dblclick.stop="onLabelDblClick(id)"
+              >{{ data.label }}</div>
               <div v-if="data.subLabel" class="node-sub">{{ data.subLabel }}</div>
               <div v-if="data.statusLabel" class="node-status">{{ data.statusLabel }}</div>
               <Handle type="target" :position="Position.Left" />
@@ -188,10 +211,21 @@
           <div class="inspector-title">节点信息</div>
           <el-form label-width="72px" label-position="left" size="small">
             <el-form-item label="类型">
-              <el-tag size="small">{{ selectedNode.data.kindLabel }}</el-tag>
+              <el-tag size="small">{{ selectedNode.data.kindLabelDefault }}</el-tag>
               <el-tag size="small" effect="plain" style="margin-left:4px">
                 {{ selectedNode.data.source === 'ref' ? '平台资源' : '外部资源' }}
               </el-tag>
+            </el-form-item>
+            <!-- 图上那行蓝字。清空即恢复默认，不留一行空白 -->
+            <el-form-item label="类型标签">
+              <el-input
+                :model-value="selectedNode.data.kindLabel"
+                :placeholder="selectedNode.data.kindLabelDefault"
+                :disabled="!editable"
+                maxlength="40"
+                clearable
+                @change="onKindLabelChange"
+              />
             </el-form-item>
             <el-form-item label="名称">
               <el-input
@@ -467,6 +501,8 @@ const menuItems = ref([])
 // 菜单作用对象：{ type: 'node'|'edge'|'pane', id?, position? }
 const menuTarget = ref({ type: 'pane' })
 const renamingId = ref('')
+// 就地编辑的目标字段：'label'（名称）| 'kindLabel'（蓝色那行类型标签）
+const renameField = ref('label')
 const renameDraft = ref('')
 const impactVisible = ref(false)
 const impactTarget = ref({ kind: 'server', refId: null, label: '' })
@@ -710,7 +746,9 @@ function toFlowNode(item) {
       dbId: item.id,
       source: item.source,
       kind: item.kind,
-      kindLabel: item.kind_label,
+      // 展示用标签：优先图上存的自定义值，否则用后端登记表给的默认名
+      kindLabel: (item.attrs || {}).kind_label || item.kind_label,
+      kindLabelDefault: item.kind_label,
       refId: item.ref_id,
       label: item.label,
       subLabel: item.sub_label,
@@ -797,6 +835,7 @@ function addExternalNode(kind, position = null) {
     position: position || freeSpot(),
     data: {
       dbId: null, source: 'external', kind: kind.kind, kindLabel: kind.label,
+      kindLabelDefault: kind.label,
       refId: null, label: `新${kind.label}`, subLabel: '', remark: '',
       attrs: {}, pinned: false, health: 'none', statusLabel: '',
       link: null, extra: {}, issues: [], lost: false,
@@ -806,7 +845,7 @@ function addExternalNode(kind, position = null) {
   selectedNodeId.value = id
   markDirty()
   // 新节点默认名是「新XX」，直接进改名态：加一个节点后要做的事十有八九是给它起名
-  nextTick(() => startRename(id))
+  nextTick(() => startRename(id, 'label'))
 }
 
 const pickerVisible = ref(false)
@@ -849,6 +888,7 @@ function pickCandidate(row) {
     position: freeSpot(),
     data: {
       dbId: null, source: 'ref', kind: picker.kind, kindLabel: picker.label,
+      kindLabelDefault: picker.label,
       refId: row.ref_id, label: row.label, subLabel: row.sub_label || '',
       remark: '', attrs: {}, pinned: false, health: 'none',
       statusLabel: '保存后显示实时状态', link: null, extra: {}, issues: [],
@@ -868,29 +908,47 @@ function setRenameInput(el) {
   if (el) nextTick(() => { el.focus(); el.select() })
 }
 
-function startRename(nodeId) {
+/** 双击名称：外部节点就地改名，引用型节点去它的原始页（名字本来就该在那边改）。 */
+function onLabelDblClick(nodeId) {
+  const node = nodes.value.find((n) => n.id === nodeId)
+  if (!node) return
+  if (node.data.source === 'ref') {
+    if (node.data.link) jumpTo(node.data.link)
+    return
+  }
+  startRename(nodeId, 'label')
+}
+
+function startRename(nodeId, field = 'label') {
   const node = nodes.value.find((n) => n.id === nodeId)
   if (!node || !editable.value) return
-  if (node.data.source === 'ref') {
-    // 引用型节点的名字取自平台实体，在这里改了保存后仍会被实时值覆盖；
-    // 直接把人送去能真正改名的那个页面
+  // 名称：引用型节点的名字取自平台实体，在这里改了保存后仍会被实时值覆盖，
+  // 直接把人送去能真正改名的那个页面。类型标签只是给人看的分组名，两类都能改
+  if (field === 'label' && node.data.source === 'ref') {
     ElMessage.info('该节点的名称取自平台资源，请在对应管理页修改')
     return
   }
   selectedEdgeId.value = ''
   selectedNodeId.value = nodeId
-  renameDraft.value = node.data.label
+  renameField.value = field
+  renameDraft.value = field === 'kindLabel' ? node.data.kindLabel : node.data.label
   renamingId.value = nodeId
 }
 
 function commitRename() {
   const nodeId = renamingId.value
+  const field = renameField.value
   if (!nodeId) return
   const node = nodes.value.find((n) => n.id === nodeId)
   renamingId.value = ''
   renameInputEl = null
   const value = renameDraft.value.trim()
   if (!node) return
+  if (field === 'kindLabel') {
+    // 清空 = 恢复后端登记的默认标签，而不是留一行空白蓝字
+    setKindLabel(node, value)
+    return
+  }
   if (!value) {
     ElMessage.warning('节点名称不能为空，已保留原名')
     return
@@ -898,6 +956,30 @@ function commitRename() {
   if (value === node.data.label) return
   pushHistory()
   node.data.label = value
+  markDirty()
+}
+
+/** 右侧面板改类型标签：用 @change（失焦/回车）而不是 @input——
+    每敲一个字入一次历史栈的话，撤销要按几十下。 */
+function onKindLabelChange(value) {
+  if (selectedNode.value) setKindLabel(selectedNode.value, value)
+}
+
+/** 写自定义类型标签。空值 = 清掉覆盖，回到 `/api/topo/meta/` 给的那个名字。
+
+    存在 attrs.kind_label 里而不是新加一列：attrs 就是为「图上这个节点自己的展示
+    细节」留的自由字段，加一列意味着一次迁移 + 序列化器 + 导出格式变更，而这个值
+    不参与任何判定（真实类型始终是 data.kind）。 */
+function setKindLabel(node, value) {
+  const next = (value || '').trim()
+  const current = node.data.attrs?.kind_label || ''
+  if (next === current) return
+  pushHistory()
+  const attrs = { ...(node.data.attrs || {}) }
+  if (next) attrs.kind_label = next
+  else delete attrs.kind_label
+  node.data.attrs = attrs
+  node.data.kindLabel = next || node.data.kindLabelDefault
   markDirty()
 }
 
@@ -919,6 +1001,10 @@ function nodeMenuItems(node) {
       key: 'rename', label: '重命名',
       disabled: isRef, hint: isRef ? '取自平台资源' : '',
     })
+    items.push({ key: 'rename-kind', label: '修改类型标签' })
+    if (node.data.attrs?.kind_label) {
+      items.push({ key: 'reset-kind', label: '恢复默认类型标签' })
+    }
     items.push({
       key: 'pin', label: node.data.pinned ? '取消固定位置' : '固定位置',
       checked: node.data.pinned,
@@ -1041,7 +1127,13 @@ async function onMenuSelect(item) {
   }
   switch (item.key) {
     case 'rename':
-      startRename(target.id)
+      startRename(target.id, 'label')
+      break
+    case 'rename-kind':
+      startRename(target.id, 'kindLabel')
+      break
+    case 'reset-kind':
+      if (node) setKindLabel(node, '')
       break
     case 'pin':
       if (node) {
@@ -1533,11 +1625,16 @@ onUnmounted(() => {
   50% { box-shadow: 0 0 0 6px rgba(245, 108, 108, 0); }
 }
 .node-head { display: flex; justify-content: space-between; align-items: center; }
-.node-kind { color: #409eff; font-weight: 600; }
+.node-kind { color: #409eff; font-weight: 600; cursor: text; }
 .node-ref-flag { color: #909399; }
 .node-label {
   font-size: 13px; color: #303133; margin-top: 2px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.node-rename-kind {
+  font-size: 12px;
+  font-weight: 600;
+  color: #409eff;
 }
 .node-rename {
   width: 100%;

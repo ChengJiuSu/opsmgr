@@ -1042,3 +1042,38 @@ class DashboardTopoLinkTests(BaseTopoTest):
         self._expiring_cert('nowhere')
         block = self._block(admin, 'cert_expiring')
         self.assertNotIn('topo', block['items'][0])
+
+
+class NodeAttrsTests(BaseTopoTest):
+    def test_kind_label_override_survives_round_trip(self):
+        """前端把自定义类型标签存在 attrs.kind_label 里，后端原样收发。
+
+        这一条锁住的是「不需要为展示标签加一列」这个决定：attrs 已经是自由字段，
+        加列意味着迁移 + 序列化器 + 导出格式一起动，而这个值不参与任何判定。
+        """
+        admin = self._client()
+        url = f'/api/topo/canvases/{self.canvas.id}/graph/'
+        r = admin.put(url, {'nodes': [{
+            'key': 'ga', 'source': 'external', 'kind': 'aws_ga', 'label': 'p1105-ga',
+            'attrs': {'kind_label': 'AWS · 全球加速'},
+        }], 'edges': []}, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        node = r.json()['data']['nodes'][0]
+        self.assertEqual(node['attrs'], {'kind_label': 'AWS · 全球加速'})
+        # kind_label 字段本身仍是登记表给的默认名，真实类型不受影响
+        self.assertEqual(node['kind_label'], 'GA 加速器')
+        self.assertEqual(node['kind'], 'aws_ga')
+
+        node = TopoNode.objects.get(canvas=self.canvas)
+        self.assertEqual(node.attrs['kind_label'], 'AWS · 全球加速')
+
+    def test_export_carries_attrs(self):
+        """导出/克隆也要带着它，否则换个维度重画一遍标签全丢。"""
+        admin = self._client()
+        admin.put(f'/api/topo/canvases/{self.canvas.id}/graph/', {'nodes': [{
+            'key': 'ga', 'source': 'external', 'kind': 'aws_ga', 'label': 'p1105-ga',
+            'attrs': {'kind_label': 'AWS · 全球加速'},
+        }], 'edges': []}, format='json')
+        r = admin.get(f'/api/topo/canvases/{self.canvas.id}/export/')
+        self.assertEqual(r.json()['data']['nodes'][0]['attrs'],
+                         {'kind_label': 'AWS · 全球加速'})
