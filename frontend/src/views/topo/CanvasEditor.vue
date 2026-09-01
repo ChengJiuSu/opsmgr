@@ -29,6 +29,15 @@
       </div>
       <div class="topbar-right">
         <!-- 值班模式：只读 + 定时刷新，把这张图当大屏挂着看 -->
+        <el-tooltip content="在主机节点上显示它跑哪些服务" placement="bottom">
+          <el-switch
+            v-model="showServices"
+            active-text="服务"
+            inline-prompt
+            style="margin-right:4px"
+            @change="onShowServicesChange"
+          />
+        </el-tooltip>
         <el-tooltip content="只读并每 30 秒自动刷新，异常节点高亮" placement="bottom">
           <el-switch
             v-model="watchMode"
@@ -194,6 +203,25 @@
               >{{ data.label }}</div>
               <div v-if="data.subLabel" class="node-sub">{{ data.subLabel }}</div>
               <div v-if="data.statusLabel" class="node-status">{{ data.statusLabel }}</div>
+              <!-- 服务标签：注明这台机负责跑哪些服务。deployed 实心、planned 虚线，
+                   一眼分清「在跑」和「还没上」。超过 3 个折叠成 +n，全铺开的话卡片
+                   会比别的节点高一倍，图直接乱 -->
+              <div v-if="showServices && nodeServices(data).length" class="node-services">
+                <span
+                  v-for="svc in nodeServices(data).slice(0, SERVICE_TAG_LIMIT)"
+                  :key="svc.code"
+                  class="svc-tag"
+                  :class="svc.status"
+                  :title="serviceTitle(svc)"
+                >{{ svc.name }}×{{ svc.process_count }}</span>
+                <el-tooltip
+                  v-if="nodeServices(data).length > SERVICE_TAG_LIMIT"
+                  placement="top"
+                  :content="serviceSummary(nodeServices(data))"
+                >
+                  <span class="svc-tag more">+{{ nodeServices(data).length - SERVICE_TAG_LIMIT }}</span>
+                </el-tooltip>
+              </div>
               <Handle type="target" :position="Position.Left" />
               <Handle type="source" :position="Position.Right" />
             </div>
@@ -259,6 +287,23 @@
                   :key="i"
                   :class="['issue', `health-${issue.level}`]"
                 >{{ issue.text }}</div>
+              </div>
+            </el-form-item>
+            <!-- 服务单列一栏：通用 extra 行只能显示「名字、名字」，
+                 但这里要的是状态 + 进程名 + 进程数 -->
+            <el-form-item v-if="selectedNodeServices.length" label="部署服务">
+              <div class="svc-list">
+                <div v-for="svc in selectedNodeServices" :key="svc.code" class="svc-row">
+                  <el-tag
+                    size="small"
+                    :type="svc.status === 'deployed' ? 'success' : 'warning'"
+                    :effect="svc.status === 'deployed' ? 'light' : 'plain'"
+                  >{{ svc.name }}</el-tag>
+                  <span class="svc-meta">
+                    {{ svc.process_count }} 进程
+                    <template v-if="svc.process_name">· {{ svc.process_name }}</template>
+                  </span>
+                </div>
               </div>
             </el-form-item>
             <el-form-item v-if="selectedNode.data.link" label="原始页">
@@ -478,6 +523,13 @@ const canvasId = computed(() => route.params.id)
 // screenToFlowCoordinate：把鼠标屏幕坐标换成画布坐标，右键新建的节点才能「点哪儿生哪儿」
 const { fitView, getNodes, screenToFlowCoordinate } = useVueFlow()
 
+//: 主机卡片上最多铺几个服务标签，多的收成 +n。一台机六个服务全铺开，卡片会比
+//: 别的节点高一倍，整张图的行距就乱了
+const SERVICE_TAG_LIMIT = 3
+//: 「显示服务」是按人记的看图偏好，存 localStorage——与概览页区块显隐同口径，
+//: 不进后端：它不影响任何人看到的数据，只影响这台浏览器上卡片有多高
+const SHOW_SERVICES_KEY = 'topo.showServices'
+
 //: 值班模式的刷新间隔。30 秒是「大屏挂着看」的量级：再快只是给库加压，
 //: 主机状态与证书天数都不是秒级变化的东西
 const WATCH_INTERVAL = 30000
@@ -494,6 +546,7 @@ const selectedNodeId = ref('')
 const selectedEdgeId = ref('')
 // 值班模式：只读 + 定时刷新。初值取自 URL，所以「大屏那份链接」可以直接分享
 const watchMode = ref(route.query.watch === '1')
+const showServices = ref(readShowServices())
 const refreshedAt = ref(null)
 // 右键菜单与就地改名
 const menuRef = ref(null)
@@ -522,19 +575,57 @@ const editable = computed(() => canWrite.value && !watchMode.value)
 const selectedNode = computed(() => nodes.value.find((n) => n.id === selectedNodeId.value))
 const selectedEdge = computed(() => edges.value.find((e) => e.id === selectedEdgeId.value))
 const lostCount = computed(() => nodes.value.filter((n) => n.data.lost).length)
+// 主机节点上的服务清单。实时读来的，存在 ref.extra 里（见 graph._server_services）
+function nodeServices(data) {
+  return data?.extra?.services || []
+}
+
+function serviceTitle(svc) {
+  const parts = [`${svc.name}×${svc.process_count}`, svc.status_label]
+  if (svc.process_name) parts.push(svc.process_name)
+  return parts.join(' · ')
+}
+
+function serviceSummary(services) {
+  return services.map(serviceTitle).join('\n')
+}
+
+const selectedNodeServices = computed(() => nodeServices(selectedNode.value?.data))
+
+function readShowServices() {
+  try {
+    const saved = localStorage.getItem(SHOW_SERVICES_KEY)
+    return saved === null ? true : saved === '1'
+  } catch {
+    // 隐私模式 / 禁用站点数据时读不到，默认开着
+    return true
+  }
+}
+
+function onShowServicesChange(value) {
+  try {
+    localStorage.setItem(SHOW_SERVICES_KEY, value ? '1' : '0')
+  } catch {
+    // 存不下就只在本次会话生效，不值得为此报错
+  }
+}
+
 const canUndo = computed(() => editable.value && undoStack.value.length > 0)
 const canRedo = computed(() => editable.value && redoStack.value.length > 0)
 
 // 引用型节点的实时附加信息（主机 IP / 服务、证书域名等），按 kind 挑要展示的几项
 const REF_EXTRA_LABELS = {
   private_ip: '私网 IP', public_ip: '公网 IP', region: '地域',
-  cloud_provider: '云厂商', services: '已部署服务', record_count: '解析记录数',
+  cloud_provider: '云厂商', record_count: '解析记录数',
   type: '记录类型', value: '记录值', line: '解析线路',
   domains: '证书域名', expires_at: '过期时间',
 }
+//: 这几个键有自己的渲染，不能落进通用「键: 值」行里
+const REF_EXTRA_SKIP = new Set(['services', 'cloud_provider_code'])
 const refExtraRows = computed(() => {
   const extra = selectedNode.value?.data?.extra || {}
   return Object.entries(extra)
+    .filter(([key]) => !REF_EXTRA_SKIP.has(key))
     .filter(([, value]) => value !== '' && value !== null && value !== undefined
       && !(Array.isArray(value) && !value.length))
     .map(([key, value]) => ({
@@ -1340,13 +1431,24 @@ async function onKeydown(event) {
 
 // ── 自动排版（dagre，从左到右） ─────────────────────────
 
+/** 节点卡片的估算高度，只给 dagre 布点用。 */
+function nodeHeight(node) {
+  const base = 78
+  if (!showServices.value || !nodeServices(node.data).length) return base
+  return base + 22
+}
+
 function relayout() {
   if (!nodes.value.length) return
   pushHistory()
   const g = new dagre.graphlib.Graph()
   g.setDefaultEdgeLabel(() => ({}))
   g.setGraph({ rankdir: 'LR', nodesep: 40, ranksep: 90 })
-  nodes.value.forEach((n) => g.setNode(n.id, { width: 220, height: 78 }))
+  // 高度要跟着卡片实际高度走：服务标签行让主机卡片高一截，按固定值布点会叠在一起
+  nodes.value.forEach((n) => g.setNode(n.id, {
+    width: 220,
+    height: nodeHeight(n),
+  }))
   edges.value.forEach((e) => g.setEdge(e.source, e.target))
   dagre.layout(g)
   nodes.value = nodes.value.map((n) => {
@@ -1354,7 +1456,7 @@ function relayout() {
     if (n.data.pinned) return n
     const laid = g.node(n.id)
     return laid
-      ? { ...n, position: { x: laid.x - 110, y: laid.y - 39 } }
+      ? { ...n, position: { x: laid.x - 110, y: laid.y - nodeHeight(n) / 2 } }
       : n
   })
   markDirty()
@@ -1647,6 +1749,25 @@ onUnmounted(() => {
   border-radius: 2px;
   outline: none;
 }
+.node-services { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 4px; }
+.svc-tag {
+  padding: 0 4px;
+  font-size: 11px;
+  line-height: 16px;
+  border-radius: 2px;
+  white-space: nowrap;
+}
+/* 已部署 = 实心绿，规划中 = 虚线黄，与列表页 el-tag 配色同口径 */
+.svc-tag.deployed { color: #529b2e; background: #f0f9eb; border: 1px solid #d1edc4; }
+.svc-tag.planned {
+  color: #b88230; background: #fdf6ec; border: 1px dashed #f3d19e;
+}
+.svc-tag.more { color: #606266; background: #f4f4f5; border: 1px solid #e9e9eb; cursor: default; }
+
+.svc-list { display: flex; flex-direction: column; gap: 4px; }
+.svc-row { display: flex; align-items: center; gap: 6px; }
+.svc-meta { font-size: 12px; color: #909399; }
+
 .node-sub, .node-status {
   color: #909399; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }

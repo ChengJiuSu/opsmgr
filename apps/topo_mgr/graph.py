@@ -66,6 +66,35 @@ def _issue(level, text):
     return {'level': level, 'text': text}
 
 
+#: 服务标签在图上的排序：已部署的排前面（那才是「现在在跑什么」），
+#: 同状态按服务类型字典的排序，与字典维护页看到的顺序一致。
+#: offline 不进图——已下线的服务留在链路图上是噪音
+SERVICE_STATUS_ORDER = {'deployed': 0, 'planned': 1}
+
+
+def _server_services(obj):
+    """主机上的服务清单（结构化，供节点卡片上的服务标签与右侧面板共用）。
+
+    只读 asset_mgr.ServerService，画布不建第二份服务台账——与「画布不是第五套资产
+    台账」同一条口径。刻意**带上 planned**：图上区分「已部上」和「规划了还没部」，
+    正是画链路时最想核对的一件事。
+
+    进程名放这里但不上卡片：卡片要短，`战斗服×4` 就够认；`battle_server` 这类
+    进程名给右侧面板与 hover 用。
+    """
+    items = [s for s in obj.services.all() if s.status in SERVICE_STATUS_ORDER]
+    items.sort(key=lambda s: (SERVICE_STATUS_ORDER[s.status],
+                              s.service_type.sort_order, s.service_type.name))
+    return [{
+        'name': s.service_type.name,
+        'code': s.service_type.code,
+        'status': s.status,
+        'status_label': s.get_status_display(),
+        'process_name': s.process_name,
+        'process_count': s.process_count,
+    } for s in items]
+
+
 def _server_issues(obj):
     """主机的问题清单。
 
@@ -104,10 +133,7 @@ def _server_info(obj):
             'region': obj.region,
             'cloud_provider': obj.cloud_provider.name if obj.cloud_provider else '',
             'cloud_provider_code': obj.cloud_provider.code if obj.cloud_provider else '',
-            'services': [
-                f'{s.service_type.name}×{s.process_count}'
-                for s in obj.services.all() if s.status == 'deployed'
-            ],
+            'services': _server_services(obj),
         },
     }
 

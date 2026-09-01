@@ -1077,3 +1077,76 @@ class NodeAttrsTests(BaseTopoTest):
         r = admin.get(f'/api/topo/canvases/{self.canvas.id}/export/')
         self.assertEqual(r.json()['data']['nodes'][0]['attrs'],
                          {'kind_label': 'AWS · 全球加速'})
+
+
+class ServerServiceLabelTests(BaseTopoTest):
+    """节点卡片上的服务标签取数口径（asset_mgr.ServerService，画布只读）。"""
+
+    def _service(self, server, name, code, status='deployed', order=0, count=1,
+                 process_name=''):
+        from apps.asset_mgr.models import ServerService, ServiceType
+
+        service_type = ServiceType.objects.create(name=name, code=code, sort_order=order)
+        return ServerService.objects.create(
+            server=server, service_type=service_type, status=status,
+            process_count=count, process_name=process_name)
+
+    def _node(self, client, server):
+        r = client.put(f'/api/topo/canvases/{self.canvas.id}/graph/', {
+            'nodes': [{'key': 's', 'source': 'ref', 'kind': 'server',
+                       'ref_id': server.id, 'label': server.name}],
+            'edges': [],
+        }, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        return r.json()['data']['nodes'][0]
+
+    def test_services_are_structured_and_sorted(self):
+        """已部署在前，同状态按服务类型字典排序；带进程名与进程数。"""
+        admin = self._client()
+        server = self._server()
+        self._service(server, '网关', 'gateway', 'deployed', order=2, count=1,
+                      process_name='gate_server')
+        self._service(server, '战斗服', 'battle', 'deployed', order=1, count=4,
+                      process_name='battle_server')
+        self._service(server, '跨服', 'cross', 'planned', order=3, count=2)
+        node = self._node(admin, server)
+        services = node['ref']['extra']['services']
+        self.assertEqual([s['name'] for s in services], ['战斗服', '网关', '跨服'])
+        self.assertEqual(services[0], {
+            'name': '战斗服', 'code': 'battle', 'status': 'deployed',
+            'status_label': '已部署', 'process_name': 'battle_server',
+            'process_count': 4,
+        })
+        # planned 也上图：区分「已部上」与「规划了还没部」正是画链路时要核对的
+        self.assertEqual(services[-1]['status'], 'planned')
+
+    def test_offline_services_excluded(self):
+        """已下线的服务留在链路图上是噪音。"""
+        admin = self._client()
+        server = self._server()
+        self._service(server, '老战斗服', 'battle-old', 'offline')
+        self._service(server, '战斗服', 'battle', 'deployed')
+        node = self._node(admin, server)
+        self.assertEqual([s['code'] for s in node['ref']['extra']['services']],
+                         ['battle'])
+
+    def test_planned_services_do_not_affect_health(self):
+        """规划缺口是计划问题不是运行故障：新规划的机器不该一上图就黄。"""
+        admin = self._client()
+        server = self._server()
+        self._service(server, '战斗服', 'battle', 'planned')
+        node = self._node(admin, server)
+        self.assertEqual(node['ref']['health'], 'healthy')
+        self.assertEqual(node['ref']['issues'], [])
+
+    def test_service_list_is_live_not_snapshot(self):
+        """服务改了状态，图上刷一次就跟着变——不存快照。"""
+        admin = self._client()
+        server = self._server()
+        service = self._service(server, '战斗服', 'battle', 'planned')
+        self._node(admin, server)
+        service.status = 'deployed'
+        service.save(update_fields=['status'])
+        r = admin.get(f'/api/topo/canvases/{self.canvas.id}/graph/')
+        services = r.json()['data']['nodes'][0]['ref']['extra']['services']
+        self.assertEqual(services[0]['status'], 'deployed')
