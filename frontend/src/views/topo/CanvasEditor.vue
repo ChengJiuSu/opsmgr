@@ -39,6 +39,14 @@
             @change="onWatchModeChange"
           />
         </el-tooltip>
+        <el-button-group v-if="editable">
+          <el-tooltip content="撤销（Ctrl+Z）" placement="bottom">
+            <el-button :icon="RefreshLeft" :disabled="!canUndo" @click="undo" />
+          </el-tooltip>
+          <el-tooltip content="重做（Ctrl+Shift+Z）" placement="bottom">
+            <el-button :icon="RefreshRight" :disabled="!canRedo" @click="redo" />
+          </el-tooltip>
+        </el-button-group>
         <el-button :icon="Refresh" :loading="loading" @click="reload">重新加载</el-button>
         <el-button v-if="editable" :loading="autofilling" @click="handleAutofill">
           自动编排
@@ -122,6 +130,7 @@
           :delete-key-code="null"
           fit-view-on-init
           @connect="onConnect"
+          @node-drag-start="onNodeDragStart"
           @node-drag-stop="onNodeDragStop"
           @node-click="onNodeClick"
           @node-double-click="onNodeDoubleClick"
@@ -189,7 +198,8 @@
                 v-if="selectedNode.data.source === 'external'"
                 v-model="selectedNode.data.label"
                 :disabled="!editable"
-                @input="markDirty"
+                @focus="beginTextEdit"
+                @input="onTextInput"
               />
               <!-- 引用型节点的名称由平台实体决定，改这里没有意义（保存后仍以实时值展示） -->
               <span v-else class="mono">{{ selectedNode.data.label }}</span>
@@ -198,7 +208,8 @@
               <el-input
                 v-model="selectedNode.data.subLabel"
                 :disabled="!editable || selectedNode.data.source === 'ref'"
-                @input="markDirty"
+                @focus="beginTextEdit"
+                @input="onTextInput"
               />
             </el-form-item>
             <el-form-item v-if="selectedNode.data.statusLabel" label="状态">
@@ -226,15 +237,16 @@
                 v-model="selectedNode.data.remark"
                 type="textarea"
                 :rows="2"
-                :disabled="!canWrite"
-                @input="markDirty"
+                :disabled="!editable"
+                @focus="beginTextEdit"
+                @input="onTextInput"
               />
             </el-form-item>
             <el-form-item label="固定位置">
               <el-switch
                 v-model="selectedNode.data.pinned"
                 :disabled="!editable"
-                @change="markDirty"
+                @change="onPinToggle"
               />
               <span class="tip">开启后「重新排版」不动它</span>
             </el-form-item>
@@ -270,7 +282,8 @@
                 v-model="selectedEdge.data.relation"
                 :disabled="!editable"
                 style="width:100%"
-                @change="onRelationChange"
+                @focus="relationBefore = selectedEdge.data.relation"
+                @change="onRelationSelect"
               >
                 <el-option
                   v-for="r in meta.relations"
@@ -397,7 +410,9 @@ import { useRoute, useRouter } from 'vue-router'
 import { VueFlow, Handle, Position, MarkerType, useVueFlow } from '@vue-flow/core'
 import { Background } from '@vue-flow/background'
 import { Controls } from '@vue-flow/controls'
-import { ArrowLeft, ArrowDown, Check, Refresh, Link } from '@element-plus/icons-vue'
+import {
+  ArrowLeft, ArrowDown, Check, Refresh, RefreshLeft, RefreshRight, Link,
+} from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import dagre from 'dagre'
 import { debounce } from '../../utils/debounce'
@@ -471,6 +486,8 @@ const editable = computed(() => canWrite.value && !watchMode.value)
 const selectedNode = computed(() => nodes.value.find((n) => n.id === selectedNodeId.value))
 const selectedEdge = computed(() => edges.value.find((e) => e.id === selectedEdgeId.value))
 const lostCount = computed(() => nodes.value.filter((n) => n.data.lost).length)
+const canUndo = computed(() => editable.value && undoStack.value.length > 0)
+const canRedo = computed(() => editable.value && redoStack.value.length > 0)
 
 // 引用型节点的实时附加信息（主机 IP / 服务、证书域名等），按 kind 挑要展示的几项
 const REF_EXTRA_LABELS = {
@@ -550,8 +567,108 @@ async function onWatchModeChange(value) {
   }
 }
 
+// ── 撤销 / 重做 ─────────────────────────────────────────
+//
+// 快照式而不是命令式：图上就几十个节点，整份深拷贝的代价可以忽略，而命令式要为
+// 每种操作写一对 do/undo，删节点还得记住它身上的连线——写十种就有十种写错的机会。
+//
+// 栈底是「刚从服务端加载/保存完」的那一份，所以撤销栈空 = 回到了那个状态，
+// dirty 可以直接跟着栈深走，不用另猜。
+
+const HISTORY_LIMIT = 50
+const undoStack = ref([])
+const redoStack = ref([])
+// 拖拽的前一态在 drag-start 就得抓（drag-stop 时坐标已经变了），
+// 但只有真的挪动过才入栈，否则一次单击也会留下一条历史
+let dragSnapshot = null
+// 文本框的前一态：聚焦时暂存，真的敲了字才入栈——点一下输入框不该留下一条空历史
+let textEditSnapshot = null
+
+/** 当前图的快照。坐标从 VueFlow store 取——拖拽后的位置先落在那里。 */
+function snapshot() {
+  const placed = new Map(getNodes.value.map((n) => [n.id, n.position]))
+  return {
+    nodes: nodes.value.map((n) => ({
+      id: n.id,
+      type: n.type,
+      position: { ...(placed.get(n.id) || n.position) },
+      data: JSON.parse(JSON.stringify(n.data)),
+    })),
+    edges: edges.value.map((e) => ({ ...e, data: { ...e.data } })),
+  }
+}
+
+/** 记一步。必须在改动**之前**调用：栈里存的是「改之前长什么样」。 */
+function pushHistory(snap = null) {
+  undoStack.value.push(snap || snapshot())
+  if (undoStack.value.length > HISTORY_LIMIT) undoStack.value.shift()
+  // 新的改动会让原来的重做分支失效，与所有编辑器一致
+  redoStack.value = []
+}
+
+function restore(snap) {
+  // 节点对象整份换掉，指向旧对象的改名态与菜单必须先收
+  cancelRename()
+  menuRef.value?.close()
+  clearSelection()
+  nodes.value = snap.nodes
+  edges.value = snap.edges
+  // 刻意不 fitView：人正盯着某一块看，撤销时视口跳一下比不跳更难受
+}
+
+function clearHistory() {
+  undoStack.value = []
+  redoStack.value = []
+  dragSnapshot = null
+  textEditSnapshot = null
+}
+
+function undo() {
+  if (!editable.value || !undoStack.value.length) return
+  redoStack.value.push(snapshot())
+  restore(undoStack.value.pop())
+  // 栈空 = 回到了加载/保存时那一份，此时「未保存」这个标记就该消失
+  dirty.value = undoStack.value.length > 0
+}
+
+function redo() {
+  if (!editable.value || !redoStack.value.length) return
+  undoStack.value.push(snapshot())
+  restore(redoStack.value.pop())
+  dirty.value = true
+}
+
 function markDirty() {
   dirty.value = true
+}
+
+// 下拉打开前的关系值：el-select 的 @change 只给新值，撤销要的是旧值
+const relationBefore = ref('')
+function beginTextEdit() {
+  textEditSnapshot = snapshot()
+}
+
+function onTextInput() {
+  if (textEditSnapshot) {
+    pushHistory(textEditSnapshot)
+    textEditSnapshot = null   // 一次聚焦只记一步，不是每敲一个字记一步
+  }
+  markDirty()
+}
+
+function onRelationSelect(value) {
+  onRelationChange(value, relationBefore.value || null)
+}
+
+/** 右侧面板的「固定位置」开关。v-model 先改了值，所以快照按取反重建那一份。 */
+function onPinToggle(value) {
+  const node = selectedNode.value
+  if (!node) return
+  const snap = snapshot()
+  const hit = snap.nodes.find((n) => n.id === node.id)
+  if (hit) hit.data.pinned = !value
+  pushHistory(snap)
+  markDirty()
 }
 
 function healthTagType(health) {
@@ -629,6 +746,8 @@ function applyGraph(data) {
   // 整图替换会换掉所有节点对象，改名态指向的那个对象随之作废
   cancelRename()
   menuRef.value?.close()
+  // 服务端刚给的这一份是新基线：撤到这里就到底了，再往前撤没有意义
+  clearHistory()
   canvas.value = data.canvas || canvas.value
   nodes.value = (data.nodes || []).map(toFlowNode)
   edges.value = (data.edges || []).map(toFlowEdge)
@@ -669,6 +788,7 @@ function freeSpot() {
 }
 
 function addExternalNode(kind, position = null) {
+  pushHistory()
   const id = nextKey()
   nodes.value.push({
     id,
@@ -721,6 +841,7 @@ function pickCandidate(row) {
     ElMessage.warning('该资源已在画布上')
     return
   }
+  pushHistory()
   const id = nextKey()
   nodes.value.push({
     id,
@@ -775,6 +896,7 @@ function commitRename() {
     return
   }
   if (value === node.data.label) return
+  pushHistory()
   node.data.label = value
   markDirty()
 }
@@ -841,6 +963,15 @@ function paneMenuItems() {
   const items = []
   if (editable.value) {
     items.push({
+      key: 'undo', label: '撤销', disabled: !canUndo.value,
+      hint: canUndo.value ? '' : '没有可撤销的操作',
+    })
+    items.push({
+      key: 'redo', label: '重做', disabled: !canRedo.value,
+      hint: canRedo.value ? '' : '没有可重做的操作',
+    })
+    items.push({ divider: true })
+    items.push({
       key: 'add', label: '在此处新建节点',
       children: meta.external_groups.flatMap((group) => group.kinds.map((k) => ({
         key: `add:${k.kind}`, label: `${group.group} · ${k.label}`,
@@ -901,8 +1032,11 @@ async function onMenuSelect(item) {
     return
   }
   if (item.key.startsWith('relation:') && edge) {
-    edge.data.relation = item.key.slice(9)
-    onRelationChange(edge.data.relation)
+    if (edge.data.relation !== item.key.slice(9)) {
+      pushHistory()
+      edge.data.relation = item.key.slice(9)
+      onRelationChange(edge.data.relation)
+    }
     return
   }
   switch (item.key) {
@@ -911,6 +1045,7 @@ async function onMenuSelect(item) {
       break
     case 'pin':
       if (node) {
+        pushHistory()
         node.data.pinned = !node.data.pinned
         markDirty()
       }
@@ -937,6 +1072,12 @@ async function onMenuSelect(item) {
       break
     case 'delete-edge':
       if (edge) removeEdge(edge)
+      break
+    case 'undo':
+      undo()
+      break
+    case 'redo':
+      redo()
       break
     case 'relayout':
       relayout()
@@ -970,10 +1111,12 @@ async function copyText(text) {
 
 function detachNode(node) {
   const before = edges.value.length
+  const snap = snapshot()
   edges.value = edges.value.filter(
     (e) => e.source !== node.id && e.target !== node.id)
   const removed = before - edges.value.length
   if (removed) {
+    pushHistory(snap)  // 一条没断就不记：菜单里那项本来也会置灰
     markDirty()
     ElMessage.success(`已断开 ${removed} 条连线`)
   }
@@ -990,6 +1133,7 @@ function onConnect(params) {
     ElMessage.warning('这两个节点之间已有同类型连线，请改用其它关系')
     return
   }
+  pushHistory()
   const id = `new-edge-${params.source}-${params.target}-${Date.now()}`
   edges.value.push(buildEdge(id, params.source, params.target, relation))
   selectedNodeId.value = ''
@@ -997,14 +1141,40 @@ function onConnect(params) {
   markDirty()
 }
 
-function onRelationChange(value) {
+function onRelationChange(value, previous = null) {
   const edge = selectedEdge.value
   if (!edge) return
+  if (previous !== null) {
+    // 右侧下拉走这条路：v-model 已经把 relation 改掉了，快照里塞回旧值
+    const snap = snapshot()
+    const hit = snap.edges.find((e) => e.id === edge.id)
+    if (hit) hit.data.relation = previous
+    pushHistory(snap)
+  }
   edge.label = RELATION_LABELS.value[value] || value
   markDirty()
 }
 
+function onNodeDragStart() {
+  dragSnapshot = snapshot()
+}
+
 function onNodeDragStop() {
+  const before = dragSnapshot
+  dragSnapshot = null
+  if (!before) {
+    markDirty()
+    return
+  }
+  const now = new Map(getNodes.value.map((n) => [n.id, n.position]))
+  const moved = before.nodes.some((n) => {
+    const pos = now.get(n.id)
+    return pos && (Math.round(pos.x) !== Math.round(n.position.x)
+      || Math.round(pos.y) !== Math.round(n.position.y))
+  })
+  // 单击节点也会走 drag-start/stop：没挪动就不该留下一条历史，也不该标未保存
+  if (!moved) return
+  pushHistory(before)
   markDirty()
 }
 
@@ -1017,6 +1187,7 @@ async function removeNode(node) {
       `删除节点「${node.data.label}」会同时删掉与它相连的 ${related.length} 条连线。继续？`,
       '提示', { type: 'warning' })
   }
+  pushHistory()  // 确认之后再记，取消掉的确认不该留下一条历史
   edges.value = edges.value.filter((e) => e.source !== node.id && e.target !== node.id)
   nodes.value = nodes.value.filter((n) => n.id !== node.id)
   if (renamingId.value === node.id) cancelRename()
@@ -1025,6 +1196,7 @@ async function removeNode(node) {
 }
 
 function removeEdge(edge) {
+  pushHistory()
   edges.value = edges.value.filter((e) => e.id !== edge.id)
   clearSelection()
   markDirty()
@@ -1043,10 +1215,24 @@ function removeSelectedEdge() {
     自己接而不是交给 vue-flow 的 deleteKeyCode：那条路不走确认框、也不会把改动
     标成未保存。输入框里按退格当然不能删节点，所以先看事件源。 */
 async function onKeydown(event) {
-  if (event.key !== 'Delete' && event.key !== 'Backspace') return
-  if (!editable.value || renamingId.value) return
   const tag = (event.target?.tagName || '').toLowerCase()
-  if (tag === 'input' || tag === 'textarea' || event.target?.isContentEditable) return
+  const typing = tag === 'input' || tag === 'textarea' || event.target?.isContentEditable
+
+  // 撤销/重做：输入框里交给浏览器自己的文本撤销，别抢
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z' && !typing) {
+    event.preventDefault()
+    if (event.shiftKey) redo()
+    else undo()
+    return
+  }
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'y' && !typing) {
+    event.preventDefault()
+    redo()
+    return
+  }
+
+  if (event.key !== 'Delete' && event.key !== 'Backspace') return
+  if (!editable.value || renamingId.value || typing) return
   if (selectedNode.value) {
     event.preventDefault()
     try {
@@ -1064,6 +1250,7 @@ async function onKeydown(event) {
 
 function relayout() {
   if (!nodes.value.length) return
+  pushHistory()
   const g = new dagre.graphlib.Graph()
   g.setDefaultEdgeLabel(() => ({}))
   g.setGraph({ rankdir: 'LR', nodesep: 40, ranksep: 90 })
