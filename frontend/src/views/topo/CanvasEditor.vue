@@ -137,6 +137,7 @@
           :nodes-connectable="editable"
           :edges-updatable="editable"
           :delete-key-code="null"
+          connection-mode="loose"
           fit-view-on-init
           @connect="onConnect"
           @node-drag-start="onNodeDragStart"
@@ -226,8 +227,17 @@
                   <span class="svc-tag more">+{{ nodeServices(data).length - SERVICE_TAG_LIMIT }}</span>
                 </el-tooltip>
               </div>
-              <Handle type="target" :position="Position.Left" />
-              <Handle type="source" :position="Position.Right" />
+              <!-- 四向连接点：竖着的关系（解析记录 → 证书）若只能右出左进，线会绕
+                   一个大弯从卡片侧面兜过去，图上看着像连错了。connection-mode=loose
+                   下每个点都能当起点也能当终点，所以一个方向只画一个 Handle -->
+              <Handle
+                v-for="pos in HANDLE_POSITIONS"
+                :key="pos.id"
+                :id="pos.id"
+                type="source"
+                :position="pos.position"
+                class="topo-handle"
+              />
             </div>
           </template>
         </VueFlow>
@@ -530,6 +540,17 @@ const canvasId = computed(() => route.params.id)
 // 但保存时直接读 store 就不必依赖那次回写的时机
 // screenToFlowCoordinate：把鼠标屏幕坐标换成画布坐标，右键新建的节点才能「点哪儿生哪儿」
 const { fitView, getNodes, screenToFlowCoordinate } = useVueFlow()
+
+//: 节点四周的连接点。id 直接用方位词，落库后一眼能读懂（TopoEdge.source_handle）
+const HANDLE_POSITIONS = [
+  { id: 'left', position: Position.Left },
+  { id: 'right', position: Position.Right },
+  { id: 'top', position: Position.Top },
+  { id: 'bottom', position: Position.Bottom },
+]
+//: 没记连接点的老数据按「右出左进」画，与加连接点之前的走线一致
+const DEFAULT_SOURCE_HANDLE = 'right'
+const DEFAULT_TARGET_HANDLE = 'left'
 
 //: 主机卡片上最多铺几个服务标签，多的收成 +n。一台机六个服务全铺开，卡片会比
 //: 别的节点高一倍，整张图的行距就乱了
@@ -879,16 +900,19 @@ function toFlowNode(item) {
 }
 
 function toFlowEdge(item) {
-  return buildEdge(`e${item.id}`, `n${item.source}`, `n${item.target}`, item.relation)
+  return buildEdge(`e${item.id}`, `n${item.source}`, `n${item.target}`, item.relation,
+                   { source: item.source_handle, target: item.target_handle })
 }
 
-function buildEdge(id, source, target, relation) {
+function buildEdge(id, source, target, relation, handles = {}) {
   return {
     id,
     source,
     target,
     // 自定义类型：默认连线的 1px 描边与不可点的标签层，右键根本点不到（见 TopoEdge.vue）
     type: 'topo',
+    sourceHandle: handles.source || DEFAULT_SOURCE_HANDLE,
+    targetHandle: handles.target || DEFAULT_TARGET_HANDLE,
     label: RELATION_LABELS.value[relation] || relation,
     markerEnd: MarkerType.ArrowClosed,
     data: { relation },
@@ -1350,6 +1374,8 @@ function detachNode(node) {
 
 function onConnect(params) {
   const relation = 'custom'
+  // 去重看的是「哪两个节点 + 什么关系」，不看连接点：同一对节点之间同一种关系
+  // 换个方向再连一条，图上就是两条重合的线，后端唯一约束也会拦
   const exists = edges.value.some(
     (e) => e.source === params.source && e.target === params.target
       && e.data.relation === relation)
@@ -1359,7 +1385,8 @@ function onConnect(params) {
   }
   pushHistory()
   const id = `new-edge-${params.source}-${params.target}-${Date.now()}`
-  edges.value.push(buildEdge(id, params.source, params.target, relation))
+  edges.value.push(buildEdge(id, params.source, params.target, relation,
+                             { source: params.sourceHandle, target: params.targetHandle }))
   selectedNodeId.value = ''
   selectedEdgeId.value = id
   markDirty()
@@ -1530,6 +1557,8 @@ async function handleSave() {
         source: e.source,
         target: e.target,
         relation: e.data.relation,
+        source_handle: e.sourceHandle || '',
+        target_handle: e.targetHandle || '',
       })),
     }
     const res = await saveGraph(canvasId.value, payload)
@@ -1790,6 +1819,16 @@ onUnmounted(() => {
   border-radius: 2px;
   outline: none;
 }
+/* 连接点：平时是个小灰点不抢视线，鼠标进到卡片上再放大变蓝，好瞄 */
+.topo-handle {
+  width: 8px;
+  height: 8px;
+  background: #c0c4cc;
+  border: 1px solid #fff;
+  transition: width 0.1s, height 0.1s, background 0.1s;
+}
+.topo-node:hover .topo-handle { width: 11px; height: 11px; background: #409eff; }
+
 .node-services { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 4px; }
 .svc-tag {
   padding: 0 4px;

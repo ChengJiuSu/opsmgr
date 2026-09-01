@@ -158,7 +158,8 @@ def export_graph(canvas):
         'nodes': node_items,
         'edges': [
             {'source': node_keys[e.source_id], 'target': node_keys[e.target_id],
-             'relation': e.relation, 'label': e.label, 'attrs': e.attrs or {}}
+             'relation': e.relation, 'label': e.label, 'attrs': e.attrs or {},
+             'source_handle': e.source_handle, 'target_handle': e.target_handle}
             for e in canvas.edges.all()
         ],
     }
@@ -294,7 +295,10 @@ def import_graph(payload, overrides=None, user=None, overwrite=False, guard=None
         save_edges.append({'source': src, 'target': dst,
                            'relation': item.get('relation') or 'custom',
                            'label': item.get('label') or '',
-                           'attrs': item.get('attrs') or {}})
+                           'attrs': item.get('attrs') or {},
+                           # 连接点跟着走：不带的话克隆出来的图走线全弹回左右两侧
+                           'source_handle': item.get('source_handle') or '',
+                           'target_handle': item.get('target_handle') or ''})
 
     stats = graph.save_graph(
         canvas,

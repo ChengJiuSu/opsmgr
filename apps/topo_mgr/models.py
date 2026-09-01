@@ -89,6 +89,11 @@ RELATIONS = (
 )
 RELATION_LABELS = dict(RELATIONS)
 
+#: 连线可以挂在节点卡片的哪个连接点上。空串 = 没指定，前端按默认（右出左进）画。
+#: 四个方向都开是为了排版：一条竖着的关系（解析记录 → 证书）若只能右出左进，
+#: 线会绕一个大弯从卡片侧面兜过去，图上看着像连错了
+HANDLES = ('', 'left', 'right', 'top', 'bottom')
+
 
 class TopoCanvas(models.Model):
     """一张拓扑画布。"""
@@ -250,6 +255,10 @@ class TopoEdge(models.Model):
     target = models.ForeignKey(
         TopoNode, verbose_name='终点', on_delete=models.CASCADE, related_name='in_edges')
     relation = models.CharField('关系', max_length=16, choices=RELATIONS, default='custom')
+    # 连接点：连线从起点的哪一侧出、进终点的哪一侧。纯排版信息，不影响任何语义判定，
+    # 但必须落库——不存的话保存一次，人手调好的走线全部弹回左右两侧
+    source_handle = models.CharField('起点连接点', max_length=10, blank=True)
+    target_handle = models.CharField('终点连接点', max_length=10, blank=True)
     label = models.CharField('连线文字', max_length=50, blank=True)
     attrs = models.JSONField('自定义属性', default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -276,6 +285,11 @@ class TopoEdge(models.Model):
     def clean(self):
         if self.source_id and self.source_id == self.target_id:
             raise ValidationError('连线的起点与终点不能是同一个节点')
+        for field, value in (('起点', self.source_handle), ('终点', self.target_handle)):
+            if value not in HANDLES:
+                raise ValidationError(
+                    f'{field}连接点「{value}」非法；可选：'
+                    f'{"、".join(h or "（默认）" for h in HANDLES)}')
         for field, node in (('起点', self.source), ('终点', self.target)):
             if node is not None and node.canvas_id != self.canvas_id:
                 raise ValidationError(f'连线{field}不在本画布上')

@@ -21,7 +21,7 @@ from django.utils import timezone
 from apps.asset_mgr.models import Server
 from apps.cloud_mgr.models import CertDeployment, Certificate, DnsRecord, Domain
 
-from .models import ALL_KINDS, EXTERNAL_KINDS, REF_KINDS, TopoEdge, TopoNode
+from .models import ALL_KINDS, EXTERNAL_KINDS, HANDLES, REF_KINDS, TopoEdge, TopoNode
 
 #: 自动编排的分层：kind → 列号。图从左到右就是一条请求链路
 #: （域名 → 解析 → 加速/负载均衡 → 主机），所以列号即「离用户多远」。
@@ -311,6 +311,8 @@ def build_graph(canvas):
                 'target': e.target_id,
                 'relation': e.relation,
                 'relation_label': e.get_relation_display(),
+                'source_handle': e.source_handle,
+                'target_handle': e.target_handle,
                 'label': e.label,
                 'attrs': e.attrs or {},
             }
@@ -496,10 +498,17 @@ def save_graph(canvas, payload, user=None):
         attrs = item.get('attrs') or {}
         if not isinstance(attrs, dict):
             raise GraphError(f'{where}的 attrs 必须是对象')
+        handles = {}
+        for field in ('source_handle', 'target_handle'):
+            value = item.get(field) or ''
+            if value not in HANDLES:
+                raise GraphError(f'{where}的 {field}「{value}」不是合法连接点')
+            handles[field] = value
         edges.append(TopoEdge(
             canvas=canvas,
             source=key_to_node[src_key], target=key_to_node[dst_key],
             relation=relation, label=(item.get('label') or '')[:50], attrs=attrs,
+            **handles,
         ))
     TopoEdge.objects.bulk_create(edges)
 

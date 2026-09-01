@@ -15,7 +15,7 @@
 |------|------|
 | `TopoCanvas` | 一张画布，绑定一组维度（项目组/渠道/环境/地域）；同组合允许多张，用 `slug` 区分 |
 | `TopoNode` | 画布上的节点，分引用型（`source=ref`）与外部型（`source=external`）；`attrs` 存展示细节，已被识别的键见模型注释（当前只有 `kind_label`） |
-| `TopoEdge` | 节点之间的有向关系，`relation` 带语义（解析/后端/源站/回源/落地/挂载/关联） |
+| `TopoEdge` | 节点之间的有向关系，`relation` 带语义（解析/后端/源站/回源/落地/挂载/关联）；`source_handle`/`target_handle` 记走线从哪一侧出入 |
 
 ### 画布不是第五套资产台账
 
@@ -54,7 +54,7 @@ apps/topo_mgr/
 ├── views.py        # TopoCanvasViewSet（CRUD + graph/autofill/candidates/export/clone）
 │                   # + TopoMetaView / TopoImportView / TopoImpactView / TopoHealthView
 ├── urls.py         # meta/ import/ impact/ health/ 显式路径在前，其余走 DefaultRouter
-├── migrations/0001_initial.py
+├── migrations/  # 0001 建表、0002 连线连接点
 └── tests.py        # 65 用例：模型约束、CRUD 与权限、整图读写、自动编排、候选与元信息、
                     # 维度相容、影响面反查、导出导入、克隆、健康度、概览页双向联动
 ```
@@ -113,7 +113,8 @@ RBAC 侧同步改了两处：`apps/auth_mgr/roles.py` 新登记模块 `topo`（�
 | 引用的实体必须存在 | `graph._check_refs_exist` | 否则等于允许造死链；报错指名道姓给出缺失 ID |
 | 同一实体一图一次 | `UniqueConstraint(canvas, kind, ref_id)` + 保存前中文校验 | 出现两次会让影响面反查数出两条链路，而实际只有一条 |
 | 连线不自环、不跨画布 | `CheckConstraint` + `TopoEdge.clean()` | 跨画布的连线在任一张图上都画不出来，属于脏数据 |
-| 连线不重复 | `UniqueConstraint(canvas, source, target, relation)` | 同关系的重复连线只是把线画粗，没有信息量 |
+| 连线不重复 | `UniqueConstraint(canvas, source, target, relation)` | 同关系的重复连线只是把线画粗，没有信息量。**不含连接点**：同一对节点同一种关系换个方向再连一条，图上就是两条重合的线 |
+| 连接点合法 | `models.HANDLES` + `TopoEdge.clean()` + 整图入参校验 | 只认 left/right/top/bottom 与空串（空 = 未指定，前端按右出左进画） |
 | 画布标识唯一 | 序列化器 `validate`（关闭自动校验器） | 自动生成的唯一性校验器会要求 `region` 在 PATCH 里也必须出现 |
 | 维度字典删除保护 | 外键 `PROTECT` | 项目组/渠道/环境被画布引用时删不掉 |
 
@@ -171,6 +172,10 @@ RBAC 侧同步改了两处：`apps/auth_mgr/roles.py` 新登记模块 `topo`（�
 导入的收敛：同维度同标识已存在时默认拒绝（`overwrite=true` 才覆盖，且要 write 档）；
 端点被跳过的连线一并跳过（留着就是一条指向空气的线）；节点**全部**落不了地时整单
 报错，不留一张空画布。
+
+连线的 `source_handle` / `target_handle` 是**纯排版信息**，不参与任何语义判定，但必须
+落库：不存的话人手调好的走线保存一次就全弹回左右两侧，而「排得开」正是画布能被看懂的
+前提。导出与克隆同样携带——否则克隆出来的图等于白排一遍版。
 
 > 整图保存的顺序是**先删后建**：入参里没带 id 的节点可能引用与「即将被删的老节点」
 > 相同的实体（导入覆盖走的正是这条路，它不知道对面的主键），后删就会先撞上

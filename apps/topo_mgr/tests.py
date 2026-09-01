@@ -1150,3 +1150,81 @@ class ServerServiceLabelTests(BaseTopoTest):
         r = admin.get(f'/api/topo/canvases/{self.canvas.id}/graph/')
         services = r.json()['data']['nodes'][0]['ref']['extra']['services']
         self.assertEqual(services[0]['status'], 'deployed')
+
+
+class EdgeHandleTests(BaseTopoTest):
+    """连线的连接点（上下左右）。纯排版信息，但必须落库。"""
+
+    def _two_nodes(self, extra_edge=None):
+        return {
+            'nodes': [
+                {'key': 'a', 'source': 'external', 'kind': 'aws_ga', 'label': 'ga'},
+                {'key': 'b', 'source': 'external', 'kind': 'aws_alb', 'label': 'alb'},
+            ],
+            'edges': [extra_edge or {'source': 'a', 'target': 'b', 'relation': 'backend'}],
+        }
+
+    def test_handles_round_trip(self):
+        """竖着连的线要能存下「从下面出、从上面进」，否则保存一次就弹回左右两侧。"""
+        admin = self._client()
+        url = f'/api/topo/canvases/{self.canvas.id}/graph/'
+        r = admin.put(url, self._two_nodes({
+            'source': 'a', 'target': 'b', 'relation': 'backend',
+            'source_handle': 'bottom', 'target_handle': 'top',
+        }), format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        edge = r.json()['data']['edges'][0]
+        self.assertEqual((edge['source_handle'], edge['target_handle']),
+                         ('bottom', 'top'))
+
+        r = admin.get(url)
+        edge = r.json()['data']['edges'][0]
+        self.assertEqual((edge['source_handle'], edge['target_handle']),
+                         ('bottom', 'top'))
+
+    def test_handles_default_to_empty(self):
+        """不带连接点照样能存（自动编排生成的边就不带），前端按右出左进画。"""
+        admin = self._client()
+        r = admin.put(f'/api/topo/canvases/{self.canvas.id}/graph/',
+                      self._two_nodes(), format='json')
+        edge = r.json()['data']['edges'][0]
+        self.assertEqual((edge['source_handle'], edge['target_handle']), ('', ''))
+
+    def test_illegal_handle_rejected(self):
+        admin = self._client()
+        r = admin.put(f'/api/topo/canvases/{self.canvas.id}/graph/', self._two_nodes({
+            'source': 'a', 'target': 'b', 'relation': 'backend',
+            'source_handle': 'middle',
+        }), format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('不是合法连接点', r.json()['msg'])
+
+    def test_export_and_clone_carry_handles(self):
+        """克隆出来的图走线要跟原图一样，否则等于白排一遍版。"""
+        admin = self._client()
+        admin.put(f'/api/topo/canvases/{self.canvas.id}/graph/', self._two_nodes({
+            'source': 'a', 'target': 'b', 'relation': 'backend',
+            'source_handle': 'bottom', 'target_handle': 'top',
+        }), format='json')
+
+        r = admin.get(f'/api/topo/canvases/{self.canvas.id}/export/')
+        exported = r.json()['data']['edges'][0]
+        self.assertEqual((exported['source_handle'], exported['target_handle']),
+                         ('bottom', 'top'))
+
+        r = admin.post(f'/api/topo/canvases/{self.canvas.id}/clone/',
+                       {'name': '副本', 'slug': 'handle-copy'}, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        clone = TopoCanvas.objects.get(slug='handle-copy')
+        edge = clone.edges.get()
+        self.assertEqual((edge.source_handle, edge.target_handle), ('bottom', 'top'))
+
+    def test_model_clean_rejects_illegal_handle(self):
+        node_a = TopoNode.objects.create(canvas=self.canvas, source='external',
+                                         kind='custom', label='a')
+        node_b = TopoNode.objects.create(canvas=self.canvas, source='external',
+                                         kind='custom', label='b')
+        edge = TopoEdge(canvas=self.canvas, source=node_a, target=node_b,
+                        relation='custom', source_handle='sideways')
+        with self.assertRaises(ValidationError):
+            edge.clean()
