@@ -56,7 +56,7 @@
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="最后登录" width="150">
+      <el-table-column label="最后登录" width="170" show-overflow-tooltip>
         <template #default="{ row }">{{ formatTime(row.last_login) }}</template>
       </el-table-column>
       <el-table-column label="操作" width="340" fixed="right">

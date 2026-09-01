@@ -2,6 +2,7 @@ import logging
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import update_last_login
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
 from django.db.models import Q
@@ -105,6 +106,10 @@ class LoginView(TokenObtainPairView):
             logger.info('用户 %s 密码通过，等待 MFA 校验', user.username)
             return Response({'mfa_required': True, 'mfa_token': token, 'expires_in': ttl})
 
+        # 只在真正发访问令牌时记录：上面的 MFA 挑战分支只过了密码，还不算登录成功。
+        # simplejwt 的 UPDATE_LAST_LOGIN 做不到这个区分，还会让刷新令牌也写一次库
+        update_last_login(None, user)
+
         data = dict(serializer.validated_data)
         if services.required_for(user):
             # 在强制范围内却没绑：正常发令牌（amr 只有 pwd），但前端要立刻跳
@@ -174,6 +179,7 @@ class MfaVerifyView(APIView):
         if ip:
             reset(SCOPE_IP, ip)
         logger.info('用户 %s 通过 MFA 校验（%s）', user.username, method)
+        update_last_login(None, user)
         data = issue_after_mfa(user)
         if method == 'recovery':
             data['recovery_codes_left'] = services.status(user)['recovery_codes_left']

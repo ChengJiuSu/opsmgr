@@ -56,6 +56,16 @@ class LoginRateLimitTests(TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertIn('access', r.json())
 
+    def test_success_updates_last_login(self):
+        """simplejwt 默认不写 last_login，用户管理页的「最后登录」全靠这一笔。"""
+        self.assertEqual(self._login().status_code, 200)
+        user = User.objects.get(username='alice')
+        self.assertIsNotNone(user.last_login)
+
+    def test_failed_login_does_not_update_last_login(self):
+        self._login(password=WRONG)
+        self.assertIsNone(User.objects.get(username='alice').last_login)
+
     def test_locked_after_limit(self):
         for _ in range(3):
             self.assertEqual(self._login(password=WRONG).status_code, 401)
@@ -393,6 +403,20 @@ class MfaLoginTests(TestCase):
         r = self.client.post('/api/auth/login/',
                              {'username': 'dave', 'password': WRONG}, format='json')
         self.assertEqual(r.status_code, 401)
+
+    def test_last_login_written_only_after_second_factor(self):
+        """密码这步只发挑战票据，还不算登录成功，last_login 要等 MFA 过了再写。"""
+        User.objects.filter(pk=self.user.pk).update(last_login=None)
+        body = self._password_step()
+        self.user.refresh_from_db()
+        self.assertIsNone(self.user.last_login)
+
+        r = self.client.post('/api/auth/mfa/verify/',
+                             {'mfa_token': body['mfa_token'],
+                              'code': self._code(self.secret, 1)}, format='json')
+        self.assertEqual(r.status_code, 200)
+        self.user.refresh_from_db()
+        self.assertIsNotNone(self.user.last_login)
 
 
 
