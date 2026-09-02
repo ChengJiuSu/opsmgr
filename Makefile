@@ -76,3 +76,25 @@ build: backend static frontend
 	printf 'build_ts=%s\ncommit=%s\ndeploy_env=%s\n' \
 	    '$(BUILD_TS)' '$(GIT_COMMIT)' '$(DEPLOY_ENV)' > $(OUTPUT_DIR)/BUILD_INFO
 	echo "产物已就绪: $(OUTPUT_DIR)"
+
+# 测试
+test:
+	rm -rf $(OUTPUT_DIR)
+	mkdir -p $(OUTPUT_DIR)
+	tar -cf - \
+	    --exclude='./$(VENV)' \
+	    --exclude='./frontend/node_modules' \
+	    --exclude='./output' \
+	    --exclude='./logs' \
+	    --exclude='./media' \
+	    --exclude='./.git' \
+	    --exclude='*.sqlite3' \
+	    --exclude='*.sqlite3.backup-*' \
+	    --exclude='__pycache__' \
+	    ./apps ./common ./ops_manager ./deploy ./ansible ./docs \
+	    ./manage.py ./requirements.txt ./staticfiles ./frontend/dist \
+	  | tar -xf - -C $(OUTPUT_DIR)
+	# 版本信息随包走，部署后可核对
+	printf 'build_ts=%s\ncommit=%s\ndeploy_env=%s\n' \
+	    '$(BUILD_TS)' '$(GIT_COMMIT)' '$(DEPLOY_ENV)' > $(OUTPUT_DIR)/BUILD_INFO
+	echo "产物已就绪: $(OUTPUT_DIR)"
