@@ -214,36 +214,39 @@
   <!-- 分配服务弹窗：把未规划服务的主机纳入分配（本页表格只显示已规划主机） -->
   <el-dialog v-model="allocateDialogVisible" title="分配服务" width="560px">
     <el-alert type="info" :closable="false" show-icon style="margin-bottom:16px">
-      本页仅显示已规划服务的主机；在此为「未规划服务」的主机分配服务类型后，主机将出现在列表中并获得任务执行权限
+      本页仅显示已规划服务的主机；在此为「未规划服务」的主机分配服务类型后，主机将出现在列表中并获得任务执行权限。<br>
+      分配按「项目组 × 渠道 × 环境」维度进行，需先选齐这三个条件再选主机
     </el-alert>
     <el-form label-width="90px">
-      <!-- 主机筛选：按项目组/渠道/环境按需拉取候选主机；切换筛选不清空已选（支持跨项目/渠道/环境累计勾选） -->
-      <el-form-item label="主机筛选">
+      <!-- 主机筛选：项目组/渠道/环境为强条件，三个都选齐才拉取候选主机（分配的唯一性维度即这三个） -->
+      <el-form-item label="主机筛选" required>
         <div class="allocate-filter">
-          <el-select v-model="allocateFilter.project_group" placeholder="项目组" clearable style="flex:1" @change="loadUnplannedServers">
+          <el-select v-model="allocateFilter.project_group" placeholder="项目组" clearable style="flex:1" @change="handleAllocateFilterChange">
             <el-option v-for="o in dicts.projectGroups" :key="o.id" :label="o.name" :value="o.code" />
           </el-select>
-          <el-select v-model="allocateFilter.channel" placeholder="渠道" clearable style="flex:1" @change="loadUnplannedServers">
+          <el-select v-model="allocateFilter.channel" placeholder="渠道" clearable style="flex:1" @change="handleAllocateFilterChange">
             <el-option v-for="o in dicts.channels" :key="o.id" :label="o.name" :value="o.code" />
           </el-select>
-          <el-select v-model="allocateFilter.env" placeholder="环境" clearable style="flex:1" @change="loadUnplannedServers">
+          <el-select v-model="allocateFilter.env" placeholder="环境" clearable style="flex:1" @change="handleAllocateFilterChange">
             <el-option v-for="o in dicts.environments" :key="o.id" :label="o.name" :value="o.code" />
           </el-select>
         </div>
+        <div v-if="!allocateFilterReady" class="form-tip">项目组、渠道、环境均为必选，选齐后才能选择主机</div>
       </el-form-item>
-      <el-form-item label="目标主机">
+      <el-form-item label="目标主机" required>
         <el-select
           v-model="allocateForm.serverIds"
           multiple
           filterable
           style="width:100%"
           :loading="allocateLoading"
-          placeholder="选择未规划服务的主机"
+          :disabled="!allocateFilterReady"
+          :placeholder="allocateFilterReady ? '选择未规划服务的主机' : '请先选择项目组 / 渠道 / 环境'"
         >
-          <el-option v-for="s in allocateOptions" :key="s.id" :label="serverOptionLabel(s)" :value="s.id" />
+          <el-option v-for="s in unplannedServers" :key="s.id" :label="serverOptionLabel(s)" :value="s.id" />
         </el-select>
-        <div v-if="!allocateLoading && !unplannedServers.length" class="form-tip">
-          当前筛选条件下没有未规划服务的主机{{ allocateForm.serverIds.length ? '（已选主机保留在上方）' : '' }}
+        <div v-if="allocateFilterReady && !allocateLoading && !unplannedServers.length" class="form-tip">
+          当前条件下没有未规划服务的主机
         </div>
       </el-form-item>
       <el-form-item label="服务类型">
@@ -364,10 +367,8 @@ const allocateDialogVisible = ref(false)
 const allocateLoading = ref(false)
 // 分配服务弹窗的候选主机：当前筛选条件下未规划任何服务的主机
 const unplannedServers = ref([])
-// 弹窗内的主机筛选条件（项目组/渠道/环境，按 code 传参）
+// 弹窗内的主机筛选条件（项目组/渠道/环境，按 code 传参；三者均为必选强条件）
 const allocateFilter = reactive({ project_group: '', channel: '', env: '' })
-// 已加载过的主机缓存（id → 主机对象）：切换筛选后已选主机仍能正确显示名称
-const allocateSeen = new Map()
 const serviceDialogVisible = ref(false)
 // 服务管理弹窗当前操作的服务器行
 const serviceRow = ref(null)
@@ -561,23 +562,28 @@ async function handlePlan() {
 }
 
 // ---------- 分配服务（未规划主机纳管） ----------
-// 候选项 = 当前筛选结果 + 已选但不在当前筛选内的主机（从缓存取，保证跨筛选累计勾选时标签正常显示）
-const allocateOptions = computed(() => {
-  const current = unplannedServers.value
-  const currentIds = new Set(current.map((s) => s.id))
-  const kept = allocateForm.serverIds
-    .filter((id) => !currentIds.has(id) && allocateSeen.has(id))
-    .map((id) => allocateSeen.get(id))
-  return [...kept, ...current]
-})
-
-// 已选但被筛掉的主机在标签中标注归属，便于确认跨项目/环境勾选无误
+// 候选项即当前三维度条件下未规划服务的主机（切换条件会清空已选，无需跨筛选缓存）
 function serverOptionLabel(s) {
-  const dims = [s.project_group_name, s.environment_name].filter(Boolean).join('/')
-  return `${s.name} (${s.public_ip || s.private_ip})${dims ? ` - ${dims}` : ''}`
+  return `${s.name} (${s.public_ip || s.private_ip})`
+}
+
+// 三个强条件维度都选齐才允许选主机：分配是「项目组 × 渠道 × 环境」维度下的规划，
+// 少一个维度选出来的是跨维度混合清单
+const allocateFilterReady = computed(
+  () => !!(allocateFilter.project_group && allocateFilter.channel && allocateFilter.env),
+)
+
+// 切换任一维度即清空已选：避免把上一组条件下勾好的主机带进新条件提交
+function handleAllocateFilterChange() {
+  allocateForm.serverIds = []
+  loadUnplannedServers()
 }
 
 async function loadUnplannedServers() {
+  if (!allocateFilterReady.value) {
+    unplannedServers.value = []
+    return
+  }
   allocateLoading.value = true
   try {
     const params = { unassigned: 'service_type', page_size: 200 }
@@ -586,25 +592,27 @@ async function loadUnplannedServers() {
     })
     const res = await getServers(params)
     unplannedServers.value = res.data?.results || []
-    unplannedServers.value.forEach((s) => allocateSeen.set(s.id, s))
   } finally {
     allocateLoading.value = false
   }
 }
 
-async function openAllocateDialog() {
+function openAllocateDialog() {
   allocateForm.serverIds = []
   allocateForm.serviceTypeIds = []
   allocateForm.processCount = 1
   allocateFilter.project_group = ''
   allocateFilter.channel = ''
   allocateFilter.env = ''
-  allocateSeen.clear()
+  unplannedServers.value = []
   allocateDialogVisible.value = true
-  loadUnplannedServers()
 }
 
 async function handleAllocate() {
+  if (!allocateFilterReady.value) {
+    ElMessage.warning('请先选择项目组、渠道、环境')
+    return
+  }
   if (!allocateForm.serverIds.length || !allocateForm.serviceTypeIds.length) {
     ElMessage.warning('请选择目标主机和服务类型')
     return

@@ -14,9 +14,11 @@
 - 前端「配置管理」菜单 = 五个字典维护页 + 服务器分配页（字典 CRUD 接口仍在 `/api/assets/` 下）
 - 服务器分配页**仅展示已规划服务的主机**（列表带 `assigned=service_type`）；
   未规划的新主机通过页内「分配服务」表单（或新增主机时的分配服务下拉）纳管。
-  分配服务表单支持按项目组/渠道/环境筛选候选主机（复用服务器列表的
-  `project_group`/`channel`/`env` + `unassigned=service_type` 组合参数按需拉取），
-  切换筛选不清空已选主机，可跨项目/渠道/环境累计勾选后一次提交
+  分配服务表单的**项目组 / 渠道 / 环境为强条件**：三个都选齐才拉取候选主机
+  （复用服务器列表的 `project_group`/`channel`/`env` + `unassigned=service_type`
+  组合参数），选齐前「目标主机」下拉禁用。分配是「项目组 × 渠道 × 环境」维度下的
+  规划结果，少一个维度选出来的是跨维度混合清单；切换任一维度会清空已选主机，
+  避免把上一组条件下勾好的主机带进新条件提交
 - 服务器逐台编辑仍走资产管理的服务器接口；本模块解决"圈选一批 → 统一归属/规划"的场景
 - **部署前置规划**：部署类平台方法（`method_mgr.Method.service_type`）执行前，
   task_exec 会校验目标主机已存在该服务类型的 planned/deployed 记录，未规划则拦截
@@ -142,6 +144,9 @@ POST /api/config/services/process/   修改进程数（只允许调大）
 
 另支持 `service_type=<id|code>`、`service_status=<planned|deployed|offline>` 组合筛选，
 以及 `assigned=service_type`（仅返回有服务记录的主机，服务器分配页列表数据源）。
+以上参数取值非法一律 400（不静默忽略）；**机读凭证**（X-API-KEY）使用服务/分配类
+筛选时必须同时带 `project_group` + `channel` + `env`，详见
+`docs/backend/modules/assets.md` 的「机读通道」。
 
 ---
 

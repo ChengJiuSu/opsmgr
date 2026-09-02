@@ -112,6 +112,11 @@ region         = CharField(max_length=50, blank=True)
 与 task_exec 执行权限校验口径一致）。
 `ServerSerializer` 附带 `services` 摘要（服务类型 + 状态 + 进程名/进程数）。
 
+**筛选值强校验**（`_validate_params`）：`status` / `service_status` / `assigned` /
+`unassigned` / `executable` 取值不在枚举内直接 400，不再静默忽略——`assigned=nginx`
+（本意是 `service_type=nginx`）被丢掉时，调用方拿到的是「没按服务类型筛过」的结果，
+却以为筛过了。
+
 ### 新增主机时分配服务
 
 创建服务器可携带可选参数 `service_type_ids`（启用中的服务类型 id 数组），
@@ -210,14 +215,25 @@ region         = CharField(max_length=50, blank=True)
 见 `docs/backend/modules/auth.md`）：
 
 ```bash
+# 普通主机清单：筛选参数可选，不带则返回凭证范围内的全部
 curl -H "X-API-KEY: ak_xxx.yyy" \
-  "https://ops.example.com/api/assets/servers/?project_group=main-game&executable=true"
+  "https://ops.example.com/api/assets/servers/?project_group=main-game"
+
+# 查「分配结果」（带服务/分配类筛选）必须带齐项目组 + 渠道 + 环境
+curl -H "X-API-KEY: ak_xxx.yyy" \
+  "https://ops.example.com/api/assets/servers/?project_group=main-game&channel=official&env=prod&executable=true"
 ```
 
-两点约束：
+三点约束：
 
 - **只读**。`user_or_scope(..., read_only=True)` 只放行安全方法——凭证认证绕过了
   MFA 与 sudo，一个 `asset:read` 的 key 能 POST 主机比漏配权限更糟；
 - **按凭证数据范围收窄可见集**（`get_queryset` 里先 `credential.narrow(qs)` 再叠
   常规筛选）。收窄而不是拒绝：调用方忘了带筛选参数时拿到的是「我的全部」，
-  不是「全公司的全部」。
+  不是「全公司的全部」；
+- **查分配结果必须带齐三个归属维度**。带 `assigned` / `service_type` /
+  `service_status` / `executable` 任一参数时，`project_group` + `channel` + `env`
+  必须同时指定，缺任一维度返回 400。分配是「项目组 × 渠道 × 环境」维度下的规划结果，
+  缺渠道时返回的是跨渠道混合清单，脚本照着它操作会打错机器。
+  登录用户（后台页面）不受此限——人在页面上看得到渠道列，且需要按单一维度浏览；
+  这条强条件与「服务器分配」页「分配服务」弹窗的必选项一致。

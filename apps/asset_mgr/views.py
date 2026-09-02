@@ -11,6 +11,7 @@ from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema
 from rest_framework import viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import ValidationError as ApiValidationError
 from rest_framework.views import APIView
 
 from apps.auth_mgr.apikey import (
@@ -141,6 +142,39 @@ class ServerViewSet(viewsets.ModelViewSet):
         ('channel', 'channel'),
         ('cloud_provider', 'cloud_provider'),
     )
+    # 服务/分配维度筛选参数：命中任一即认为调用方在查「分配结果」
+    SERVICE_FILTER_PARAMS = ('assigned', 'service_type', 'service_status', 'executable')
+    # 分配的唯一性维度（与「服务器分配」页强条件一致）：机读凭证查分配结果时必须全部指定
+    ALLOCATION_DIMS = (('project_group', '项目组'), ('channel', '渠道'), ('env', '环境'))
+
+    def _validate_params(self, params, is_machine_read):
+        """筛选参数强校验：非法值直接 400，不再静默忽略。
+
+        静默忽略比报错更糟——`assigned=nginx`（应为 `service_type=nginx`）会被丢掉，
+        调用方拿到的是「没按服务类型筛过」的结果，却以为筛过了。
+        """
+        allowed = {
+            'status': [key for key, _ in Server.STATUS_CHOICES],
+            'service_status': [key for key, _ in ServerService.STATUS_CHOICES],
+            'assigned': ['service_type'],
+            'unassigned': [field for _, field in self.DICT_FILTERS] + ['any', 'service_type'],
+            'executable': ['true', 'false'],
+        }
+        for param, choices in allowed.items():
+            value = params.get(param)
+            if value and value not in choices:
+                hint = '；按服务类型筛选请用 service_type=<id|code>' if param == 'assigned' else ''
+                raise ApiValidationError(
+                    f'{param} 取值非法：{value}，可选 {"/".join(choices)}{hint}')
+        # 机读凭证查分配结果必须带齐三个维度：分配是「项目组 × 渠道 × 环境」维度下的
+        # 规划结果，缺渠道时返回的是跨渠道混合清单，脚本照着它操作会打错机器。
+        # 登录用户（后台页面）不受限——人在页面上看得到渠道列，且需要按单一维度浏览
+        if is_machine_read and any(params.get(p) for p in self.SERVICE_FILTER_PARAMS):
+            missing = [label for param, label in self.ALLOCATION_DIMS if not params.get(param)]
+            if missing:
+                names = '/'.join(param for param, _ in self.ALLOCATION_DIMS)
+                raise ApiValidationError(
+                    f'查询服务分配结果必须同时指定{"、".join(missing)}（{names}）')
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -157,6 +191,7 @@ class ServerViewSet(viewsets.ModelViewSet):
             # 会在没有登录态的情况下走一遍 get_queryset
             qs = self.request.user.narrow(qs)
         params = self.request.query_params
+        self._validate_params(params, is_machine_read=credential is not None)
         status = params.get('status')
         keyword = params.get('keyword')
         if status:

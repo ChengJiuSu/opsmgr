@@ -1265,6 +1265,22 @@ class CredentialDimScopeTests(TestCase):
         r = self._get('/api/assets/servers/', key)
         self.assertEqual(r.json()['data']['total'], 2)
 
+    def test_service_filter_requires_all_allocation_dims(self):
+        """机读凭证查分配结果必须带齐项目组/渠道/环境——缺渠道拿到的是跨渠道混合清单。"""
+        _, key = self._credential('ds-alloc', ['asset:read'])
+        r = self._get('/api/assets/servers/?service_status=deployed&project_group=ds-a&env=ds-test', key)
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('渠道', r.json()['msg'])
+
+        url = ('/api/assets/servers/?service_status=deployed'
+               '&project_group=ds-a&channel=ds-official&env=ds-test')
+        self.assertEqual(self._get(url, key).status_code, 200)
+
+    def test_plain_list_without_service_filter_not_restricted(self):
+        """不查分配结果时维持原口径：忘带筛选参数拿到的是「我的全部」，不是 400。"""
+        _, key = self._credential('ds-plain', ['asset:read'])
+        self.assertEqual(self._get('/api/assets/servers/', key).status_code, 200)
+
     # ── 变量解析 ──────────────────────────────────────────
     def _resolved_url(self, pg, env):
         return (f'/api/exec/variables/resolved/?project_group={pg.code}'

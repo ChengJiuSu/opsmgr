@@ -233,6 +233,22 @@ class ServerApiTests(BaseApiTest):
         r = self.admin.get('/api/assets/servers/', {'assigned': 'service_type'})
         self.assertEqual([i['name'] for i in r.json()['data']['results']], ['planned-01'])
 
+    def test_server_list_invalid_filter_value_rejected(self):
+        """非法筛选值 400 而不是静默忽略：assigned=nginx 被丢掉时调用方以为自己筛过了。"""
+        r = self.admin.get('/api/assets/servers/', {'assigned': 'nginx'})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('service_type', r.json()['msg'])
+
+        for param, value in (('service_status', 'online'), ('unassigned', 'env'),
+                             ('status', 'dead'), ('executable', 'yes')):
+            r = self.admin.get('/api/assets/servers/', {param: value})
+            self.assertEqual(r.status_code, 400, f'{param}={value} 应被拒绝')
+
+    def test_server_list_service_filter_open_for_login_user(self):
+        """登录用户（后台页面）不受三维度强条件约束：页面要按单一维度浏览。"""
+        r = self.admin.get('/api/assets/servers/', {'assigned': 'service_type'})
+        self.assertEqual(r.status_code, 200)
+
     def test_server_list_executable_filter(self):
         """executable=true 仅返回已规划/已部署服务的主机（任务表单数据源），offline 不算。"""
         from .models import ServerService, ServiceType
