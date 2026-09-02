@@ -28,3 +28,6 @@ staticfiles/
 
 # 构建制品落盘目录（ARTIFACT_ROOT 默认 media/artifacts）
 media/
+
+# CI 打包产物目录（Makefile build 目标输出，共享库据此生成 md5 与 tar 包）
+output/
