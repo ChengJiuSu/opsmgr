@@ -11,7 +11,7 @@
 #       共享库的步骤 4/5 以该目录为输入生成 md5 清单并打包。
 # ============================================================================
 
-SHELL := /usr/bin/env bash
+SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
 .ONESHELL:
 
