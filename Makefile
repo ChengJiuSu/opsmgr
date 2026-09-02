@@ -92,7 +92,7 @@ test:
 	    --exclude='*.sqlite3.backup-*' \
 	    --exclude='__pycache__' \
 	    ./apps ./common ./ops_manager ./deploy ./ansible ./docs \
-	    ./manage.py ./requirements.txt ./staticfiles ./frontend/dist \
+	    ./manage.py ./requirements.txt  \
 	  | tar -xf - -C $(OUTPUT_DIR)
 	# 版本信息随包走，部署后可核对
 	printf 'build_ts=%s\ncommit=%s\ndeploy_env=%s\n' \
