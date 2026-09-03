@@ -33,11 +33,15 @@ daphne>=4.1
 requests>=2.32.0
 
 # 数据库（生产 MySQL）
-mysqlclient>=2.2.0
+# 下界 2.2.1：Django 6.0 的 mysql 后端在 import 期就断言 mysqlclient>=2.2.1
+# （django/db/backends/mysql/base.py），低于此版本启动即 ImproperlyConfigured。
+# 唯一需要编译的依赖，wheel 由 deploy/docker/Dockerfile.builder 在 ubuntu:24.04
+# 里预编，链接 libmysqlclient.so.21；换构建基线务必同步目标机运行时库。
+mysqlclient>=2.2.1
 
-# 代码质量
-black>=24.0.0
-isort>=5.13.0
+# WSGI 服务器（生产 gunicorn；原先散在 Makefile/Dockerfile 的 pip 命令行里，
+# 不进声明文件就锁不住版本）
+gunicorn>=22.0
 
 # API 文档（可选）
 drf-spectacular>=0.28.0

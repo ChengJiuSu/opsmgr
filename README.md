@@ -48,8 +48,8 @@
 
 ### 环境要求
 
-- Python >= 3.10
-- Node.js >= 18
+- Python 3.14（生产基线；轮子按主次版本编，换版本需重建 wheelhouse）
+- Node.js 22（`frontend/package.json` 的 engines 已锁 `>=22 <25`）
 
 ### 后端启动
 
@@ -58,9 +58,15 @@
 python -m venv venv
 source venv/bin/activate        # Windows: venv\Scripts\activate
 
-# 2. 安装依赖（开发环境无需 mysqlclient）
-pip install Django djangorestframework djangorestframework-simplejwt \
-    django-cors-headers python-decouple drf-spectacular daphne channels requests
+# 2. 安装依赖
+#    requirements.lock 是钉死版本的锁文件，与生产、与 CI 产物完全一致，优先用它。
+#    本机装不上 mysqlclient（缺 default-libmysqlclient-dev）时，开发用 sqlite
+#    并不需要它，可临时排除：
+#      grep -v '^mysqlclient' requirements.lock > /tmp/req.dev && pip install -r /tmp/req.dev
+pip install -r requirements.lock
+
+# 代码风格工具另装（black / isort / pip-tools）
+pip install -r requirements-dev.txt
 
 # 3. 数据库迁移
 python manage.py migrate   # 拉取新代码后若带了新迁移，需重跑

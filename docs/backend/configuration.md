@@ -93,15 +93,30 @@ Redis 本身是健康的，`redis-cli ping` 正常，容易误判成 Redis 故�
 export DJANGO_SETTINGS_MODULE=ops_manager.settings.prod
 ```
 
-生产环境需额外配置 MySQL 连接（`mysqlclient`）：
+生产环境需 MySQL 驱动 `mysqlclient`（Django 6.0 的 mysql 后端在 import 期就
+断言 `mysqlclient>=2.2.1`，低于此版本启动即 `ImproperlyConfigured`；PyMySQL
+的兼容 shim 只上报 1.4.3，**不能替代**）。
+
+走 Jenkins CD 的机器【不需要】装编译工具链 —— 轮子由 CI 在
+`deploy/docker/Dockerfile.builder` 里预编好随制品走（见 deploy/README.md 的
+「依赖交付」）。目标机只需要运行时共享库：
 
 ```bash
-# 安装系统依赖（Ubuntu/Debian）
-apt-get install -y default-libmysqlclient-dev pkg-config
-
-# 安装 Python 包
-pip install mysqlclient
+sudo apt-get install -y libmysqlclient21
 ```
+
+只在源码树部署（`deploy/deploy.sh` / `deploy/update.sh`）时才需要现编：
+
+```bash
+sudo apt-get install -y default-libmysqlclient-dev pkg-config build-essential
+pip install -r requirements.lock
+```
+
+⚠ `mysqlclient` 的轮子链接的是构建机的 MySQL 客户端库：Ubuntu 的
+`default-libmysqlclient-dev` 指向 MySQL（`libmysqlclient.so.21`），Debian 的
+指向 MariaDB（`libmariadb.so.3`）。用 `python:3.14-slim`（Debian）编出来的轮子
+搬到 Ubuntu 生产机上会在 `import MySQLdb` 时才报找不到 so，构建期毫无征兆。
+构建镜像基线必须与生产机一致。
 
 ---
 

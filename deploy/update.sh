@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # OpsManager 日常更新脚本（在目标服务器上、项目根目录执行）
 #   bash deploy/update.sh
+#
+# ⚠ 这是【无 CI 场景】的 git 拉取更新路径：联网装依赖、本机构建前端。
+#   走 Jenkins 的正式 CD 用 deploy/install.sh 装制品包（离线、不编译）。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -10,7 +13,8 @@ echo "==> 拉取最新代码"
 git pull --ff-only
 
 echo "==> 更新后端依赖"
-venv/bin/pip install -r requirements.txt
+# 按锁文件装，保证和 CI 产物、和其他实例装出同一套版本
+venv/bin/pip install -r requirements.lock
 
 echo "==> 数据库迁移"
 venv/bin/python manage.py migrate --noinput

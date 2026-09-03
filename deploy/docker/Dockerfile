@@ -15,9 +15,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# 依赖层单独缓存：requirements 未变化时重建跳过 pip install
-COPY requirements.txt .
-RUN pip install -r requirements.txt gunicorn
+# 依赖层单独缓存：lock 未变化时重建跳过 pip install。
+# 按 requirements.lock 而非 requirements.txt 装：后者全是下界约束，
+# 同一 commit 隔一周重建会装出不同版本的 Django / ansible-core。
+COPY requirements.lock .
+RUN pip install -r requirements.lock
 
 COPY . .
 

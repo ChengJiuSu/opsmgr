@@ -9,3 +9,7 @@ db.sqlite3*
 *.pyc
 __pycache__
 .env
+wheelhouse
+.ci-venv
+output
+staticfiles

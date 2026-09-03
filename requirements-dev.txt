@@ -1,0 +1,10 @@
+# 开发/CI 侧工具依赖，不进生产 wheelhouse。
+#   venv/bin/pip install -r requirements-dev.txt
+-r requirements.txt
+
+# 代码质量
+black>=24.0.0
+isort>=5.13.0
+
+# 依赖锁定（生成 requirements.lock，见 Makefile 的 lock 目标）
+pip-tools>=7.4

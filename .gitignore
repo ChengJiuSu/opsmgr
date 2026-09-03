@@ -31,3 +31,9 @@ media/
 
 # CI 打包产物目录（Makefile build 目标输出，共享库据此生成 md5 与 tar 包）
 output/
+
+# 依赖 wheelhouse（Makefile wheels 目标生成，随 output/ 一起打包，不入库）
+wheelhouse/
+
+# CI 侧构建 venv（shebang 指向容器内路径，只在构建容器里可用）
+.ci-venv/

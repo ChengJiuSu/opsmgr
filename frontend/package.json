@@ -3,6 +3,11 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "//engines": "锁 Node 大版本：CI 用 node:22-bookworm-slim（Makefile 的 NODE_IMAGE），本地务必对齐，vite 8 对 Node 版本敏感",
+  "engines": {
+    "node": ">=22 <25",
+    "npm": ">=10"
+  },
   "scripts": {
     "dev": "vite",
     "build": "vite build",
