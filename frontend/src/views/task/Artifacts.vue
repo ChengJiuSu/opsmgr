@@ -24,35 +24,35 @@
     </el-alert>
 
     <el-table v-loading="loading" :data="tableData" stripe>
-      <el-table-column label="项目组 / 渠道 / 环境" min-width="170" show-overflow-tooltip>
+      <el-table-column label="项目组 / 渠道 / 环境" min-width="190" show-overflow-tooltip>
         <template #default="{ row }">
           {{ row.project_group_name }} / {{ row.channel_name }} / {{ row.environment_name }}
         </template>
       </el-table-column>
-      <el-table-column prop="version" label="版本" min-width="110" show-overflow-tooltip>
-        <template #default="{ row }"><code>{{ row.version }}</code></template>
+      <el-table-column prop="version" label="版本" min-width="180" show-overflow-tooltip>
+        <template #default="{ row }"><code class="mono">{{ row.version }}</code></template>
       </el-table-column>
-      <el-table-column prop="original_name" label="文件名" min-width="160" show-overflow-tooltip />
-      <el-table-column label="MD5" width="140">
+      <el-table-column prop="original_name" label="文件名" min-width="220" show-overflow-tooltip />
+      <el-table-column label="MD5" width="300">
         <template #default="{ row }">
-          <el-tooltip :content="row.md5" placement="top">
-            <code class="md5" @click="copyMd5(row)">{{ row.md5.slice(0, 10) }}…</code>
+          <el-tooltip content="点击复制 MD5" placement="top">
+            <code class="mono md5" @click="copyMd5(row)">{{ row.md5 }}</code>
           </el-tooltip>
         </template>
       </el-table-column>
-      <el-table-column label="大小" width="90">
+      <el-table-column label="大小" width="100" align="right">
         <template #default="{ row }">{{ humanSize(row.size) }}</template>
       </el-table-column>
-      <el-table-column label="Jenkins" min-width="130" show-overflow-tooltip>
+      <el-table-column label="Jenkins" min-width="200" show-overflow-tooltip>
         <template #default="{ row }">
           <span v-if="row.jenkins_job">{{ row.jenkins_job }}<template v-if="row.build_number"> #{{ row.build_number }}</template></span>
           <span v-else class="muted">—</span>
         </template>
       </el-table-column>
-      <el-table-column prop="reported_at" label="上报时间" width="160">
+      <el-table-column prop="reported_at" label="上报时间" width="170">
         <template #default="{ row }">{{ formatTime(row.reported_at) }}</template>
       </el-table-column>
-      <el-table-column label="操作" width="160" fixed="right">
+      <el-table-column label="操作" width="150" fixed="right" align="center">
         <template #default="{ row }">
           <el-button size="small" :icon="Download" @click="handleDownload(row)">下载</el-button>
           <el-button v-if="canWrite" size="small" type="danger" :icon="Delete" @click="handleDelete(row)" />
@@ -177,5 +177,7 @@ onMounted(() => {
 .toolbar-left { display: flex; gap: 8px; }
 .muted { color: #c0c4cc; }
 code { background: #f5f7fa; padding: 1px 6px; border-radius: 3px; font-size: 12px; }
-.md5 { cursor: pointer; }
+.mono { font-family: Menlo, Consolas, "Courier New", monospace; letter-spacing: 0; white-space: nowrap; }
+.md5 { cursor: pointer; color: #606266; }
+.md5:hover { color: var(--el-color-primary); }
 </style>
