@@ -17,7 +17,6 @@
 | `ws-ops-manager.conf` | daphne supervisor 配置（`/ws/` 执行日志推送 + ops-agent 接入） |
 | `ops-manager-celery.conf` | celery worker supervisor 配置（默认队列：证书签发/分发） |
 | `ops-manager-celery-exec.conf` | **任务执行专用** celery worker（队列 `task_exec`，`TASK_EXEC_BACKEND=celery` 时必须） |
-| `ops-manager-celery.service` | celery worker systemd 单元（备选托管方式） |
 | `ops-manager-celery-beat.conf` | celery beat supervisor 配置（证书自动续签调度，只起一个实例） |
 | `docker/` | 后端容器化：Dockerfile + entrypoint（compose 文件在仓库根） |
 | `docker/Dockerfile.builder` | CI 依赖构建镜像（预编 wheelhouse / 生成 lock），不进生产 |
@@ -285,29 +284,24 @@ venv/bin/python manage.py collectstatic --noinput
 
 Docker 部署无需手工执行：backend 入口每次启动都会跑 `migrate`。
 
-## 切换 celery 任务后端（可选）
+## celery 任务后端
+
+生产必须启用（理由见「任务执行为什么必须走 celery」）。
 
 1. 装 Redis，`.env` 设 `TASK_EXEC_BACKEND=celery`、`REDIS_URL=redis://127.0.0.1:6379/0`。
-2. **必须部署 worker**（缺了它任务只入队不执行，页面上是一条永远「申请中」的证书，
-   且没有任何报错）。按 web 用的托管方式二选一 —— supervisor：
+2. **必须部署 worker**（缺了它任务只入队不执行，页面上是一条永远「执行中」的任务
+   或永远「申请中」的证书，且没有任何报错）：
 
    ```bash
-   sudo cp deploy/ops-manager-celery.conf /etc/supervisor/conf.d/
+   sudo cp deploy/ops-manager-celery.conf /etc/supervisor/conf.d/        # 默认队列：证书签发/分发
+   sudo cp deploy/ops-manager-celery-exec.conf /etc/supervisor/conf.d/   # 队列 task_exec：任务执行
    sudo cp deploy/ops-manager-celery-beat.conf /etc/supervisor/conf.d/   # 自动续签调度，可选
    sudo supervisorctl reread && sudo supervisorctl update
    sudo supervisorctl status | grep celery
    ```
 
-   或 systemd（仅 worker 保留了单元文件，beat 只走 supervisor）：
-
-   ```bash
-   sudo cp deploy/ops-manager-celery.service /etc/systemd/system/
-   sudo systemctl daemon-reload
-   sudo systemctl enable --now ops-manager-celery
-   ```
-
-   两边都要按实际部署改路径、运行用户、`PATH`（须含 `venv/bin` 与 `~/.acme.sh`）
-   与 `HOME`；worker 与 web 用同一个运行用户，否则找不到 acme.sh、签出的文件属主也错。
+   按实际部署改路径、运行用户、`PATH`（须含 `venv/bin` 与 `~/.acme.sh`）与 `HOME`；
+   worker 与 web 用同一个运行用户，否则找不到 acme.sh、签出的文件属主也错。
    两个坑：supervisor 的续行是**缩进**不是反斜杠（写 `\` 会当字面参数传给 celery）；
    `stopwaitsecs` 默认 10s 会把正在跑的 acme.sh 砍掉，配置里已给到 930s。
 3. 重启 `ops-manager` 服务。
@@ -336,8 +330,8 @@ Docker 部署无需手工执行：backend 入口每次启动都会跑 `migrate`�
      `ops-manager-celery-exec.conf` 里），让 web 在 CPU 争抢中优先。
 - **证书一直「申请中」/ 任务点了没反应**（celery 模式）：worker 没跑。
   `venv/bin/celery -A ops_manager inspect ping` 报 `No nodes replied` +
-  `redis-cli -n 0 llen celery` 不为 0 即可确认。装上
-  `ops-manager-celery.conf`（supervisor）或 `ops-manager-celery.service`（systemd，见上节）。残留状态用
+  `redis-cli -n 0 llen celery` 不为 0 即可确认（任务执行看 `llen task_exec`）。
+  装上 `ops-manager-celery.conf` / `ops-manager-celery-exec.conf`（见上节）。残留状态用
   `manage.py reap_stuck_cert_tasks` 收成失败；队列里的陈旧任务先
   `redis-cli -n 0 del celery` 清掉，否则 worker 一起来就把过期任务全跑一遍。
 - **制品下载地址错误**：`.env` 的 `SITE_BASE_URL` 未配置为对外可达地址。

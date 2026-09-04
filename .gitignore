@@ -37,3 +37,8 @@ wheelhouse/
 
 # CI 侧构建 venv（shebang 指向容器内路径，只在构建容器里可用）
 .ci-venv/
+
+# nginx 运行态目录（本机 docker 化 nginx 的实配置、证书与备份）。
+# 里面有 TLS 私钥与 .env，只有 .env 被上面的规则覆盖——整个目录一并排除，
+# 免得哪次 `git add -A deploy` 把私钥带进历史。
+deploy/nginx/
