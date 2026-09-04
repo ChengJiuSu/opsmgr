@@ -5,6 +5,7 @@
 """
 import json
 import os
+import random
 import shutil
 import sys
 import tempfile
@@ -33,7 +34,7 @@ from common.testing import grant_sudo
 
 from .models import Credential, ExecutionTask, ExecVariable, TaskExecutionLog, TaskStep
 from . import live, runner
-from .live import PREVIEW_LIMIT, LiveSink
+from .live import PREVIEW_LIMIT, SEP, LiveSink, join_len, join_tail, preview_of
 from .runner import _inventory_content
 from .tasks import OUTPUT_PREVIEW_LIMIT
 
@@ -1612,6 +1613,46 @@ class LiveSinkTests(TestCase):
         sink.flush(force=True)
         self.assertIn('done', self._db_output())
 
+    def test_join_helpers_match_full_join(self):
+        """join_len / join_tail 必须与 SEP.join(parts) 切尾逐字等价。
+
+        flush 热路径不再拼完整输出，长度与尾部都由这两个函数算。口径一旦有偏差，
+        落盘会错位、WebSocket 增量会串位，而这种错只在特定分段长度下显形，
+        所以这里用随机分段 + 全部 limit 穷举校验。
+        """
+        rng = random.Random(20260904)
+        for _ in range(200):
+            parts = [''.join(rng.choice('ab\n') for _ in range(rng.randint(0, 9)))
+                     for _ in range(rng.randint(0, 5))]
+            full = SEP.join(parts)
+            self.assertEqual(join_len(parts), len(full), parts)
+            for limit in range(len(full) + 3):
+                expected = full[-limit:] if limit else ''
+                self.assertEqual(join_tail(parts, limit), expected, (parts, limit))
+
+    def test_live_block_trimmed_but_preview_exact(self):
+        """实时块超过 PREVIEW_LIMIT 会裁头，但预览内容与不裁时逐字一致。
+
+        裁剪是为了让 flush 不再 O(n)（见 LiveSink._trim）。它的正确性边界很窄：
+        保留量必须 ≥ PREVIEW_LIMIT，否则尾部凑不满，只能去前面的模块补，预览
+        就掺进了不该出现的内容。
+        """
+        chunk = 'y' * 4096
+        count = PREVIEW_LIMIT // len(chunk) + 6      # 确保超上限，走到裁剪分支
+        self.sink.bind(['H0\nfinished'])
+        self.sink.begin(('a', 1), 'H1', order=1)
+        for _ in range(count):
+            self.sink.feed(('a', 1), chunk)
+        self.sink.flush(force=True)
+
+        body = chunk * count
+        expected = preview_of(SEP.join(['H0\nfinished', f'H1\n{body}']))
+        self.assertEqual(self._db_output(), expected)
+
+        entry = self.sink._live[('a', 1)]
+        self.assertGreater(entry['dropped'], 0, '未走到裁剪分支，用例失去意义')
+        self.assertGreaterEqual(entry['size'] - entry['dropped'], PREVIEW_LIMIT)
+
 
 @override_settings(TASK_EXEC_BACKEND='sync', TASK_FAILURE_WAIT_TIMEOUT=0)
 class StreamedTaskLogTests(TestCase):
@@ -1661,9 +1702,11 @@ class StreamedTaskLogTests(TestCase):
         snapshots = []
         original = LiveSink._save_preview
 
-        def spy(sink_self, preview):
+        # **kwargs：_save_preview 带 write_log 参数（执行日志表只在 force 时跟着写），
+        # 这里只关心预览内容，原样转发即可
+        def spy(sink_self, preview, **kwargs):
             snapshots.append(preview)
-            original(sink_self, preview)
+            original(sink_self, preview, **kwargs)
 
         try:
             with override_settings(ANSIBLE_PROJECT_DIR=proj, TASK_LOG_DIR=proj):

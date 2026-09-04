@@ -31,6 +31,7 @@ from common.sudo import SudoRequired
 from .models import Credential, ExecutionTask, ExecVariable
 from .serializers import (
     CredentialSerializer,
+    ExecutionTaskListSerializer,
     ExecutionTaskSerializer,
     ExecVariableSerializer,
     ExecVariableVersionSerializer,
@@ -340,6 +341,12 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
     serializer_class = ExecutionTaskSerializer
     permission_classes = [module_perm('exec')]
     http_method_names = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options']
+
+    def get_serializer_class(self):
+        # 列表去掉 output（每行最多 6 万字符的日志预览，列表不展示它）
+        if self.action == 'list':
+            return ExecutionTaskListSerializer
+        return super().get_serializer_class()
 
     def get_queryset(self):
         qs = super().get_queryset()

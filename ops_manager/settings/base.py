@@ -402,6 +402,10 @@ TASK_EXEC_BACKEND = config('TASK_EXEC_BACKEND', default='thread')
 # 模块失败后等待人工处理（重试/跳过/中止）的超时秒数，超时按中止处理；
 # 0 = 不等待（失败即中止）。系统配置 task.failure_wait_timeout 可运行时覆盖。
 TASK_FAILURE_WAIT_TIMEOUT = config('TASK_FAILURE_WAIT_TIMEOUT', default=600, cast=int)
+# 并行组内同时执行的模块数上限。不设上限时一个 N 模块的并行组会起 N 个
+# ansible 进程，每个再按 task.forks（默认 10）派生 —— 5 个模块就是 50 个进程，
+# 小机器上足以把 CPU 打满，连带拖慢 web。超出上限的模块排队等前面的跑完。
+TASK_PARALLEL_MAX = config('TASK_PARALLEL_MAX', default=5, cast=int)
 
 # ── 任务执行日志 ──────────────────────────────────────────
 # 每次执行的完整日志流式落盘目录（输出可能含敏感回显，禁止暴露到静态文件路径）

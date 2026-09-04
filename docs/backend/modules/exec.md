@@ -158,13 +158,24 @@ ansible 输出不再等模块跑完才可见：`common.ansible.run_stream` 以
 **伪终端（pty）**启动 ansible（posix），子进程视输出为终端 → 行级 flush
 且 `force_color` 生效，读到的分片经 `on_data` 回调交给 `live.LiveSink`：
 
-- **实时预览**：分片节流（0.5s 或 2KB）写 `ExecutionTask.output` 与
-  `TaskExecutionLog.output`，存尾部 60000 字符（超出加截断标注）：既是
-  WebSocket 连接时的快照来源，也是轮询回退（`output?offset=`，1s）的数据源；
+- **实时推送与预览（两级节流）**：WebSocket 推送便宜且延迟敏感，节流 0.5s / 2KB；
+  写库贵（一次最多 60000 字符的 TEXT 更新）且只是轮询回退通道，节流 1s。
+  预览写 `ExecutionTask.output`（存尾部 60000 字符，超出加截断标注），
+  `TaskExecutionLog.output` 只在 `force`（模块起止、阶段收尾）时跟着写一份
+  —— 执行中没人读它，详情接口在执行结束回填 `log_file` 后直接读落盘全量；
 - **完整落盘**：每次执行流式写 `TASK_LOG_DIR/<task_id>/<log_id>.log`
   （0600，父目录 0700），**所有执行都落盘**（旧行为仅超长才落盘），执行
   记录详情接口读该文件返回全量。落盘以「已完成模块」为粒度追加（前缀式 append，
   天然去重，并行组不会交错），实时性由写库预览承担；
+- **热路径不拼完整输出**：完整输出可能几 MB，而每次 flush 只要尾部 60000 字符。
+  `SEP.join(全部分段)` 再切尾是 O(总长度)，按 2KB 粒度反复调用就成了 O(n²)
+  （10MB 输出约 5000 次全量重拼 = 几十 GB 字符串拷贝，纯 Python 持着 GIL，
+  足以吃满一个核）。所以 flush 只走 `live.join_len` / `live.join_tail`
+  （代价 O(60000)，与总长度无关），且**正在执行的实时块只保留尾部 60000 字符**
+  （`LiveSink._trim`，丢弃量记进 `dropped` 用于还原真实总长度）——实时块本来
+  就在模块结束时整块丢弃，完整输出由 outputs 与落盘文件保全。完整拼接只留给
+  冷路径 `LiveSink.render()`（执行异常收尾取 partial）。实测同一 10MB 场景
+  46s → 0.2s；
 - **超时**：`threading.Timer` 到点按**进程组**终止（SIGTERM → 3s → SIGKILL），
   ansible 派生的 ssh 子进程一并回收，返回 rc=124；
 - **颜色**：日志内保留 ANSI 颜色码，前端 `utils/ansi.js` 转成 span 着色
@@ -186,9 +197,9 @@ ansible 输出不再等模块跑完才可见：`common.ansible.run_stream` 以
   之后收 `{"kind":"delta", output}` 增量与 `{"kind":"status", ...}` 状态变化
   （running / paused / 终态，来自 `live.push_status`）。客户端可发
   `{"type":"ping"}`，服务端回 `{"kind":"pong"}`。
-- **增量语义**：sink 以 render 全文长度为基准发增量；临时提示（失败等待）、
-  并行组多块交错、模块结束交还 outputs 时改发整段（`kind=full`，尾部预览），
-  客户端按 kind 决定追加还是替换。
+- **增量语义**：sink 以完整输出长度为基准发增量；临时提示（失败等待）、
+  并行组多块交错、模块结束交还 outputs、增量超出尾部覆盖范围时改发整段
+  （`kind=full`，尾部预览），客户端按 kind 决定追加还是替换。
 - **回退**：连接建立时先 `group_add` 探测 channel layer，未配/连不上 Redis
   直接拒握手（4503）；`live.push` 失败只告警并停止后续推送。前端
   `utils/taskLogStream.js` 在握手失败、连接中断、或 60s 收不到任何帧（含
@@ -340,6 +351,10 @@ Ansible 项目目录内执行剧本：
 - pause 模块禁止标记并行（序列化器校验），强制独立成阶段。
 - 与任务级 `exec_mode` 正交：exec_mode 管模块内主机并发（--forks），
   run_parallel 管模块之间并发。
+- **组内并发上限** `settings.TASK_PARALLEL_MAX`（默认 5，环境变量同名可覆盖）：
+  每个模块起一个 ansible 进程、再按 `--forks`（默认 10）派生子进程，不封顶时
+  5 个模块就是 50 个进程，小机器上足以打满 CPU 并连带拖慢 web。超出上限的模块
+  在线程池里排队，语义不变（仍是全组跑完再汇总）。
 - steps_result 每项新增 `parallel` 布尔，前端日志树以 ∥ 标记。
 
 ## 暂停确认（pause 模块）

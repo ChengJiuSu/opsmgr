@@ -893,6 +893,10 @@ def _exec_parallel_stage(pairs, task, total, sink, attempt=1):
         finally:
             dj_connection.close()  # 线程私有连接，退出前释放
 
-    with ThreadPoolExecutor(max_workers=len(pairs)) as pool:
+    # 并发数封顶（settings.TASK_PARALLEL_MAX）：每个模块都会起一个 ansible 进程、
+    # 再按 --forks 派生子进程，不封顶时组一大就把整台机的 CPU 吃光。
+    # 超出上限的模块在池里排队，语义不变（仍是「全组跑完再汇总」）。
+    limit = max(1, getattr(settings, 'TASK_PARALLEL_MAX', 5) or 1)
+    with ThreadPoolExecutor(max_workers=min(len(pairs), limit)) as pool:
         futures = [pool.submit(_worker, step, idx) for step, idx in pairs]
         return [f.result() for f in futures]
