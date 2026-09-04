@@ -185,6 +185,39 @@ class ArtifactDownloadTests(ArtifactTestBase):
         self.assertEqual(r['X-Accel-Redirect'], f'/_artifacts/{quote(art.file_path)}')
         self.assertIn('attachment', r['Content-Disposition'])
 
+    def test_download_default_filename_is_original_name(self):
+        art = self._make_artifact()
+        r = APIClient().get(f'/api/artifacts/{art.id}/download/', {'sig': art.download_sig()})
+        self.assertIn(art.original_name, r['Content-Disposition'])
+
+    def test_download_filename_override(self):
+        art = self._make_artifact()
+        r = APIClient().get(f'/api/artifacts/{art.id}/download/',
+                            {'sig': art.download_sig(), 'filename': 'app-1.2.3.tar.gz'})
+        self.assertIn('app-1.2.3.tar.gz', r['Content-Disposition'])
+
+    def test_download_filename_sanitized(self):
+        """filename 不进签名，必须当不可信输入洗：路径、换行、空值都不能进响应头。"""
+        art = self._make_artifact()
+        for raw, expect in (
+            ('../../etc/passwd', 'passwd'),
+            ('a\r\nX-Injected: 1', 'aX-Injected 1'),
+            ('///', art.original_name),
+        ):
+            r = APIClient().get(f'/api/artifacts/{art.id}/download/',
+                                {'sig': art.download_sig(), 'filename': raw})
+            disposition = r['Content-Disposition']
+            self.assertNotIn('\n', disposition)
+            self.assertIn(expect, disposition)
+
+    @override_settings(ARTIFACT_XACCEL_PREFIX='/_artifacts/')
+    def test_download_xaccel_filename_override(self):
+        art = self._make_artifact()
+        r = APIClient().get(f'/api/artifacts/{art.id}/download/',
+                            {'sig': art.download_sig(), 'filename': 'pkg.tgz'})
+        self.assertIn('pkg.tgz', r['Content-Disposition'])
+        self.assertEqual(r['X-Accel-Redirect'], f'/_artifacts/{quote(art.file_path)}')
+
     @override_settings(ARTIFACT_XACCEL_PREFIX='/_artifacts/')
     def test_download_xaccel_still_checks_sig(self):
         """内部重定向绕不开鉴权：签名不对不能吐出 X-Accel-Redirect。"""

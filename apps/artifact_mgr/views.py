@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import logging
 import os
+import re
 import unicodedata
 from urllib.parse import quote
 
@@ -32,6 +33,25 @@ from .serializers import ArtifactReportSerializer, ArtifactSerializer
 logger = logging.getLogger('apps.artifact_mgr')
 
 
+# 下载文件名允许的字符：其余一律剔除。放行集合刻意收窄到「包名会用到的」，
+# 因为这个值直接进 Content-Disposition 响应头——换行会导致 HTTP 头注入，
+# 路径分隔符会让部分客户端把它当成目录写到别处。
+FILENAME_ALLOWED = re.compile(r'[^0-9A-Za-z\u4e00-\u9fff._+@()\[\]\- ]')
+FILENAME_MAX = 200
+
+
+def safe_filename(raw, fallback):
+    """清洗下载文件名，洗空则退回 fallback。
+
+    调用方（CD 脚本、浏览器）可以用 ?filename= 覆盖落盘名，但这个值不进签名，
+    等于「拿到合法 sig 的人可任意指定」，所以只能当展示用的字符串对待：
+    先取 basename 去掉路径，再按白名单过字符，最后截长度。
+    """
+    name = os.path.basename((raw or '').strip().replace('\\', '/'))
+    name = FILENAME_ALLOWED.sub('', name).strip(' .')[:FILENAME_MAX]
+    return name or fallback
+
+
 def content_disposition(filename):
     """RFC 6266 附件头：ASCII 回退 + filename* 兼容非 ASCII 包名。"""
     ascii_name = unicodedata.normalize('NFKD', filename).encode('ascii', 'ignore').decode()
@@ -39,7 +59,7 @@ def content_disposition(filename):
     return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(filename)}'
 
 
-def xaccel_response(prefix, artifact):
+def xaccel_response(prefix, artifact, filename):
     """把制品下载交给 nginx：空响应体 + X-Accel-Redirect 内部路径。
 
     Django 这边只做鉴权和拼 header，几毫秒就把 worker 还回去；实际的几十 MB
@@ -52,7 +72,7 @@ def xaccel_response(prefix, artifact):
     del response['Content-Type']
     response['X-Accel-Redirect'] = location
     response['X-Accel-Buffering'] = 'yes'
-    response['Content-Disposition'] = content_disposition(artifact.original_name)
+    response['Content-Disposition'] = content_disposition(filename)
     return response
 
 
@@ -201,7 +221,10 @@ class ArtifactDownloadView(APIView):
         if not os.path.isfile(path):
             return fail('制品文件已丢失，请联系管理员', status=404)
 
+        # ?filename= 可覆盖落盘名，默认用后台展示的原始文件名
+        filename = safe_filename(request.query_params.get('filename'), artifact.original_name)
+
         prefix = (settings.ARTIFACT_XACCEL_PREFIX or '').strip()
         if prefix:
-            return xaccel_response(prefix, artifact)
-        return FileResponse(open(path, 'rb'), as_attachment=True, filename=artifact.original_name)
+            return xaccel_response(prefix, artifact, filename)
+        return FileResponse(open(path, 'rb'), as_attachment=True, filename=filename)
