@@ -547,4 +547,4 @@ steps_result / 失败处理（retry/skip/abort）流程。
 1. agent 代码：**独立仓库**（`~/workspace/ops-agent`）。
 2. 出口主机到内网主机 **SSH 已免密**（密钥驻留 agent 主机，符合 3.4 设计）。
 3. 生产 **nginx 前置**：`deploy/nginx.conf` 已加 `/ws/` → daphne(8001) 分流，
-   daphne 单元 `deploy/ops-manager-ws.service`。
+   daphne 托管配置 `deploy/ws-ops-manager.conf`（supervisor）。

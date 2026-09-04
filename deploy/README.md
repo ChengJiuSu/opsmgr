@@ -19,7 +19,6 @@
 | `ops-manager-celery-exec.conf` | **任务执行专用** celery worker（队列 `task_exec`，`TASK_EXEC_BACKEND=celery` 时必须） |
 | `ops-manager-celery.service` | celery worker systemd 单元（备选托管方式） |
 | `ops-manager-celery-beat.conf` | celery beat supervisor 配置（证书自动续签调度，只起一个实例） |
-| `ops-manager-celery-beat.service` | celery beat systemd 单元（同上，备选托管方式） |
 | `docker/` | 后端容器化：Dockerfile + entrypoint（compose 文件在仓库根） |
 | `docker/Dockerfile.builder` | CI 依赖构建镜像（预编 wheelhouse / 生成 lock），不进生产 |
 | `nginx.conf` | nginx 站点配置 |
@@ -299,13 +298,12 @@ Docker 部署无需手工执行：backend 入口每次启动都会跑 `migrate`�
    sudo supervisorctl status | grep celery
    ```
 
-   或 systemd：
+   或 systemd（仅 worker 保留了单元文件，beat 只走 supervisor）：
 
    ```bash
    sudo cp deploy/ops-manager-celery.service /etc/systemd/system/
-   sudo cp deploy/ops-manager-celery-beat.service /etc/systemd/system/
    sudo systemctl daemon-reload
-   sudo systemctl enable --now ops-manager-celery ops-manager-celery-beat
+   sudo systemctl enable --now ops-manager-celery
    ```
 
    两边都要按实际部署改路径、运行用户、`PATH`（须含 `venv/bin` 与 `~/.acme.sh`）
