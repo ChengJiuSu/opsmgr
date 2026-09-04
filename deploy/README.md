@@ -14,7 +14,7 @@
 | `deploy.sh` | 无 CI 场景，首次从源码树部署：venv、联网装依赖、迁移、collectstatic、前端构建 |
 | `update.sh` | 无 CI 场景，日常更新：拉代码、迁移、构建、重启服务 |
 | `ops-manager.conf` | gunicorn supervisor 配置 |
-| `ops-manager-wss.conf` | daphne supervisor 配置（`/ws/` 执行日志推送 + ops-agent 接入） |
+| `ops-manager-ws.conf` | daphne supervisor 配置（`/ws/` 执行日志推送 + ops-agent 接入） |
 | `ops-manager-celery.conf` | celery worker supervisor 配置（默认队列：证书签发/分发） |
 | `ops-manager-celery-exec.conf` | **任务执行专用** celery worker（队列 `task_exec`，`TASK_EXEC_BACKEND=celery` 时必须） |
 | `ops-manager-celery-beat.conf` | celery beat supervisor 配置（证书自动续签调度，只起一个实例） |
@@ -141,7 +141,7 @@ bash deploy/deploy.sh
 
 # 后端托管（supervisor，改路径/用户/程序名后安装）
 sudo cp deploy/ops-manager.conf /etc/supervisor/conf.d/            # gunicorn
-sudo cp deploy/ops-manager-wss.conf /etc/supervisor/conf.d/        # daphne（/ws/ 日志推送）
+sudo cp deploy/ops-manager-ws.conf /etc/supervisor/conf.d/        # daphne（/ws/ 日志推送）
 sudo cp deploy/ops-manager-celery.conf /etc/supervisor/conf.d/     # 证书签发/分发
 sudo cp deploy/ops-manager-celery-exec.conf /etc/supervisor/conf.d/  # 任务执行（必须）
 sudo supervisorctl reread && sudo supervisorctl update
@@ -152,7 +152,7 @@ sudo nginx -t && sudo systemctl reload nginx
 
 ### daphne（`/ws/`）不是可选项
 
-`ops-manager-wss.conf` 承载两件事：执行日志的 WebSocket 实时推送、ops-agent 接入。
+`ops-manager-ws.conf` 承载两件事：执行日志的 WebSocket 实时推送、ops-agent 接入。
 不部署它，`/ws/` 是 502，前端会退回**每秒一次**的日志轮询接口 —— 恰好在任务执行
 期间给后端加压，正是要避免的方向。nginx.conf 已内置 `/ws/` → `127.0.0.1:8001` 分流。
 
@@ -176,7 +176,7 @@ worker 进程里，生产上会有三个后果：
 （默认 `celery` 队列，acme.sh DNS 验证上限 900s）共用，否则一个正在签发的证书能把
 后面排队的 ansible 任务堵十几分钟。
 
-部署路径与配置内路径不一致时，同步修改 `ops-manager.conf`、`ops-manager-wss.conf`、
+部署路径与配置内路径不一致时，同步修改 `ops-manager.conf`、`ops-manager-ws.conf`、
 两个 celery 配置与 `nginx.conf`。
 
 ## Docker Compose 部署（后端，可选内置 MySQL）
