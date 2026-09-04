@@ -1,7 +1,9 @@
 # 部署指南
 
-生产架构：nginx（前端静态 + 反向代理）+ gunicorn（Django API）+ MySQL。
-任务执行默认 thread 后端，无需 Redis；切 celery 时另起 worker。
+生产架构：nginx（前端静态 + 反向代理）+ gunicorn（Django API）+ MySQL + Redis。
+任务执行走 celery 独立 worker（`TASK_EXEC_BACKEND=celery`）：ansible 不在 web
+进程里跑，执行多久都不影响后台响应。代码默认值是 thread（本地开发免 Redis），
+生产**不要**用它，理由见「任务执行为什么必须走 celery」。
 
 ## 目录内容
 
@@ -11,11 +13,11 @@
 | `install.sh` | **CD 主路径**：装 Jenkins 制品包，离线装依赖、迁移、重启 |
 | `deploy.sh` | 无 CI 场景，首次从源码树部署：venv、联网装依赖、迁移、collectstatic、前端构建 |
 | `update.sh` | 无 CI 场景，日常更新：拉代码、迁移、构建、重启服务 |
-| `ops-manager.conf` | gunicorn supervisor 配置（默认托管方式） |
-| `ops-manager.service` | gunicorn systemd 单元（备选托管方式） |
-| `ops-manager-ws.service` | daphne systemd 单元（/ws/ ops-agent 接入，启用 agent 时部署） |
-| `ops-manager-celery.conf` | celery worker supervisor 配置（`TASK_EXEC_BACKEND=celery` 时必须） |
-| `ops-manager-celery.service` | celery worker systemd 单元（同上，备选托管方式） |
+| `ops-manager.conf` | gunicorn supervisor 配置 |
+| `ws-ops-manager.conf` | daphne supervisor 配置（`/ws/` 执行日志推送 + ops-agent 接入） |
+| `ops-manager-celery.conf` | celery worker supervisor 配置（默认队列：证书签发/分发） |
+| `ops-manager-celery-exec.conf` | **任务执行专用** celery worker（队列 `task_exec`，`TASK_EXEC_BACKEND=celery` 时必须） |
+| `ops-manager-celery.service` | celery worker systemd 单元（备选托管方式） |
 | `ops-manager-celery-beat.conf` | celery beat supervisor 配置（证书自动续签调度，只起一个实例） |
 | `ops-manager-celery-beat.service` | celery beat systemd 单元（同上，备选托管方式） |
 | `docker/` | 后端容器化：Dockerfile + entrypoint（compose 文件在仓库根） |
@@ -139,36 +141,45 @@ cd /opt/devops-manager
 cp deploy/env.example .env && vim .env       # SECRET_KEY / ALLOWED_HOSTS / DB / SITE_BASE_URL
 bash deploy/deploy.sh
 
-# 后端托管（默认 supervisor，改路径/用户/程序名后安装）
-sudo cp deploy/ops-manager.conf /etc/supervisor/conf.d/
+# 后端托管（supervisor，改路径/用户/程序名后安装）
+sudo cp deploy/ops-manager.conf /etc/supervisor/conf.d/            # gunicorn
+sudo cp deploy/ws-ops-manager.conf /etc/supervisor/conf.d/         # daphne（/ws/ 日志推送）
+sudo cp deploy/ops-manager-celery.conf /etc/supervisor/conf.d/     # 证书签发/分发
+sudo cp deploy/ops-manager-celery-exec.conf /etc/supervisor/conf.d/  # 任务执行（必须）
 sudo supervisorctl reread && sudo supervisorctl update
 
 sudo cp deploy/nginx.conf /etc/nginx/conf.d/ops-manager.conf   # 改 server_name / 路径
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
-备选 systemd 托管：
+### daphne（`/ws/`）不是可选项
 
-```bash
-sudo cp deploy/ops-manager.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now ops-manager
-```
+`ws-ops-manager.conf` 承载两件事：执行日志的 WebSocket 实时推送、ops-agent 接入。
+不部署它，`/ws/` 是 502，前端会退回**每秒一次**的日志轮询接口 —— 恰好在任务执行
+期间给后端加压，正是要避免的方向。nginx.conf 已内置 `/ws/` → `127.0.0.1:8001` 分流。
 
-### 启用 ops-agent（NAT 出口执行代理，可选）
+agent 侧部署见独立仓库 ops-agent 的 README 与 `docs/ops-agent-design.md`。
 
-agent 经 WebSocket（`/ws/agent/`）接入，需额外起 daphne（ASGI）并确保
-Redis 可用（channel layer；与 celery 共用同一 `REDIS_URL`）：
+### 任务执行为什么必须走 celery
 
-```bash
-sudo cp deploy/ops-manager-ws.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now ops-manager-ws
-```
+`TASK_EXEC_BACKEND=thread`（代码默认）把 ansible 子进程和日志汇聚放在 gunicorn
+worker 进程里，生产上会有三个后果：
 
-nginx.conf 已内置 `/ws/` → `127.0.0.1:8001` 分流；agent 侧部署见
-独立仓库 ops-agent 的 README 与 `docs/ops-agent-design.md`。
+1. **后台整体变慢**：ansible 一跑，那个 worker 就在和 API 抢 GIL 与 CPU。现象是
+   全站延迟 + 前端 `timeout of 10000ms exceeded`，而**服务端没有任何报错**
+   （超时是浏览器侧断的，服务端只看到连接被对端关闭）。
+2. **任务会被静默杀掉**：worker 处理请求期间不向 gunicorn arbiter 打点，请求超过
+   `--timeout` 时 arbiter 杀掉整个 worker，住在里面的 ansible 线程一起死，任务
+   永远停在 running。
+3. **内存翻倍**：ansible 从 web worker fork 出来，worker 越多越吃内存。
 
-部署路径与配置内路径不一致时，同步修改 `ops-manager.conf`（或 `ops-manager.service`）与 `nginx.conf`。
-supervisor 程序名改动时，`update.sh` 重启用 `SUPERVISOR_PROGRAM=<程序名>` 覆盖（默认 `ops-manager-01`）。
+切 celery 后 web 进程只建 `TaskExecutionLog` + 投递 Redis，执行全在
+`ops-manager-celery-exec` 里。它用**独立队列 `task_exec`**，不与证书签发
+（默认 `celery` 队列，acme.sh DNS 验证上限 900s）共用，否则一个正在签发的证书能把
+后面排队的 ansible 任务堵十几分钟。
+
+部署路径与配置内路径不一致时，同步修改 `ops-manager.conf`、`ws-ops-manager.conf`、
+两个 celery 配置与 `nginx.conf`。
 
 ## Docker Compose 部署（后端，可选内置 MySQL）
 
@@ -312,6 +323,19 @@ Docker 部署无需手工执行：backend 入口每次启动都会跑 `migrate`�
   `showmigrations | grep '\[ \]'` 确认没有未应用的迁移。
 - **登录 401 / 静态 404**：nginx `location` 路径与实际部署路径不符，或未 `collectstatic`。
 - **任务执行超时被断开**：nginx `proxy_read_timeout` 与 gunicorn `--timeout` 均需 ≥600s，已在配置中给出。
+- **执行 ansible 期间整个后台变慢、前端报 `timeout of Nms exceeded`，但服务端无报错**：
+  按顺序查这四条 ——
+  1. `TASK_EXEC_BACKEND` 是不是还是 `thread`（见上节，这是首要原因）；
+  2. 内存。单个 Django 进程 RSS ≈ 116MB，gunicorn worker 数 × 116MB 超过
+     `free -m` 的 available 就会换页：**load 很低但请求要等几秒**是换页的典型特征。
+     解法是 `--preload`（app 在 fork 前加载一次，worker 间 COW 共享）+ 降 worker 数、
+     用 `--threads` 补并发，而不是按核数堆 worker；
+  3. 请求耗时到底花在哪：看 nginx 的 `rt=` 与 `urt=`（`nginx.conf` 的 `timing` 格式）。
+     `rt` 涨而 `urt` 不涨 = 没有空闲 worker 在排队；两者一起涨 = 单接口自己慢。
+     gunicorn 侧 `--access-logformat` 带了 `pid=`，可看出是否只有某个 worker 慢；
+  4. ansible 自己把机器打满：`runner.py` 并发模式默认 `--forks 10`，并行组还会
+     同时起多个 playbook。核少的机器上给执行 worker 加 `nice -n 10`（已在
+     `ops-manager-celery-exec.conf` 里），让 web 在 CPU 争抢中优先。
 - **证书一直「申请中」/ 任务点了没反应**（celery 模式）：worker 没跑。
   `venv/bin/celery -A ops_manager inspect ping` 报 `No nodes replied` +
   `redis-cli -n 0 llen celery` 不为 0 即可确认。装上

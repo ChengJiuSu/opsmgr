@@ -7,10 +7,17 @@ export const createTask = (data) => request.post('/api/exec/tasks/', data)
 export const updateTask = (id, data) => request.patch(`/api/exec/tasks/${id}/`, data)
 export const deleteTask = (id) => request.delete(`/api/exec/tasks/${id}/`)
 export const getMatchedServers = (id) => request.get(`/api/exec/tasks/${id}/matched_servers/`)
-export const executeTask = (id, data) => request.post(`/api/exec/tasks/${id}/execute/`, data)
-// 执行中日志轮询：带 offset 时后端只回传新增部分（delta=true 则前端追加）
+// 发起执行前后端要实时匹配主机（matched_servers）+ 逐模块前置校验，主机多时是秒级，
+// 给 120s（真正的 ansible 执行是异步的，这个接口只负责投递）
+export const executeTask = (id, data) =>
+  request.post(`/api/exec/tasks/${id}/execute/`, data, { timeout: 120000 })
+// 执行中日志轮询：带 offset 时后端只回传新增部分（delta=true 则前端追加）。
+// 1 秒一轮，超时要短于轮询间隔的量级——拖到基础超时会让请求堆叠，下一轮本来就会补上
 export const getTaskOutput = (id, offset = 0) =>
-  request.get(`/api/exec/tasks/${id}/output/`, { params: offset ? { offset } : {} })
+  request.get(`/api/exec/tasks/${id}/output/`, {
+    params: offset ? { offset } : {},
+    timeout: 8000,
+  })
 // 暂停确认：任务流停在「暂停确认」模块时继续（continue）或中止（abort）
 export const confirmTask = (id, action) => request.post(`/api/exec/tasks/${id}/confirm/`, { action })
 export const getTaskLogs = (id) => request.get(`/api/exec/tasks/${id}/logs/`)

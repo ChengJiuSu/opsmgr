@@ -2,7 +2,10 @@
 
 支持三种后端（settings.TASK_EXEC_BACKEND）：
   - 'thread'（默认）：后台线程异步执行，无需 Redis/Celery，适合开发/小规模。
-  - 'celery'：投递到 Celery worker，适合生产。
+    注意 ansible 子进程与 O(n) 的日志汇聚都跑在 web 进程里，会和 API 抢 GIL 与
+    CPU —— 生产用它会让后台响应随任务输出量一起变慢，故生产应选 celery。
+  - 'celery'：投递到独立队列 TASK_EXEC_QUEUE，由专用 worker 消费（部署见
+    deploy/ops-manager-celery-exec.conf），执行与 web 进程彻底分家。
   - 'sync'：当前请求线程内同步执行，便于测试。
 
 每次执行（含重跑）在 TaskExecutionLog 落一条日志记录：dispatch 时创建（pending），
@@ -25,6 +28,11 @@ logger = logging.getLogger('apps.task_exec')
 
 # 数据库内输出预览上限（字符），完整输出见落盘文件
 OUTPUT_PREVIEW_LIMIT = PREVIEW_LIMIT
+
+# 任务执行专用队列。不与证书签发/分发（默认 celery 队列）共用：acme.sh 的 DNS
+# 验证上限 900s，一个正在签发的证书会把后面排队的 ansible 任务堵十几分钟，而
+# 页面上只是一条「执行中」且无报错的任务。消费者的 -Q 必须与此一致。
+TASK_EXEC_QUEUE = 'task_exec'
 
 
 def execute_task(task_id, log_id=None):
@@ -109,7 +117,7 @@ def dispatch(task, triggered_by=None, trigger_type='execute'):
     if backend == 'sync':
         execute_task(task.id, log.id)
     elif backend == 'celery':
-        run_execution_task.delay(task.id, log.id)
+        run_execution_task.apply_async(args=[task.id, log.id], queue=TASK_EXEC_QUEUE)
     else:
         _run_in_thread(task.id, log.id)
     return log
@@ -126,3 +134,7 @@ try:
 except ImportError:  # celery 未安装时提供占位，避免导入错误
     def run_execution_task(task_id, log_id=None):  # type: ignore
         raise RuntimeError('Celery 未安装，无法使用 celery 后端。请改用 thread/sync。')
+
+    # dispatch 走 apply_async 投队列，占位函数也得有这个属性，否则抛的是
+    # AttributeError，而不是上面那句人能看懂的话
+    run_execution_task.apply_async = lambda *args, **kwargs: run_execution_task()

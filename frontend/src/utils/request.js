@@ -5,13 +5,17 @@ import { requestSudo } from './sudo'
 
 const baseURL = import.meta.env.VITE_API_BASE_URL || ''
 
+// 基础超时 30s。原值 10s 太紧：发起执行要先做实时维度匹配 + 前置校验，
+// 后端本身就可能几秒起，10s 会把「后端在正常干活」误报成
+// "timeout of 10000ms exceeded"。更慢的出网型接口（JumpServer 逐台注册、
+// 云控同步）与更该快失败的高频轮询，都在各自的 api/*.js 里单独覆盖。
 const request = axios.create({
   baseURL,
-  timeout: 10000,
+  timeout: 30000,
 })
 
 // 刷新 token 专用实例：不走业务拦截器，避免递归
-const rawAxios = axios.create({ baseURL, timeout: 10000 })
+const rawAxios = axios.create({ baseURL, timeout: 30000 })
 
 // 不做静默刷新的接口（自身 401 即视为登录态失效）
 const NO_REFRESH_PATHS = ['/api/auth/login/', '/api/auth/token/refresh/', '/api/auth/logout/']
