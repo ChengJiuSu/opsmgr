@@ -1,0 +1,88 @@
+# =============================================================================
+# OpsManager 前置 nginx —— Docker Compose 部署（HTTP + HTTPS）
+# -----------------------------------------------------------------------------
+# 网络模式说明：
+#   后端 Gunicorn 由宿主机 Supervisor 托管，监听 127.0.0.1:8000（仅 loopback）。
+#   容器内 127.0.0.1 指向容器自身，bridge 模式无法连到只监听 loopback 的进程，
+#   故使用 network_mode: host，与原宿主机部署行为一致。
+# =============================================================================
+
+services:
+  nginx:
+    image: ${OPS_NGINX_IMAGE:-nginx:1.27-alpine}
+    container_name: ${OPS_CONTAINER_NAME:-ops_manager_nginx}
+    restart: unless-stopped
+
+    network_mode: host
+
+    environment:
+      # 仅替换 OPS_ 前缀变量，保护 $host / $uri 等 nginx 内置变量
+      NGINX_ENVSUBST_FILTER: "^OPS_"
+      OPS_HTTP_PORT: ${OPS_HTTP_PORT}
+      OPS_HTTPS_PORT: ${OPS_HTTPS_PORT}
+      OPS_SERVER_NAME: ${OPS_SERVER_NAME}
+      OPS_UPSTREAM_ADDR: ${OPS_UPSTREAM_ADDR}
+      OPS_CLIENT_MAX_BODY_SIZE: ${OPS_CLIENT_MAX_BODY_SIZE}
+      OPS_PROXY_TIMEOUT: ${OPS_PROXY_TIMEOUT}
+      OPS_APP_ROOT: ${OPS_APP_ROOT}
+      OPS_TLS_CERT: ${OPS_TLS_CERT}
+      OPS_TLS_KEY: ${OPS_TLS_KEY}
+      OPS_TLS_CHAIN: ${OPS_TLS_CHAIN}
+      TZ: ${TZ:-Asia/Shanghai}
+
+    volumes:
+      # 配置模板（只读）。容器启动时由 envsubst 渲染到 /etc/nginx/conf.d/
+      - ./conf/templates:/etc/nginx/templates:ro
+
+      # 可复用配置片段（安全响应头等），不参与 envsubst 渲染
+      - ./conf/snippets:/etc/nginx/snippets:ro
+
+      # TLS 证书目录（只读）。续期由宿主机 acme.sh / certbot 负责，
+      # 写入宿主机 ./certs 后 reload 容器即可生效。
+      - ./certs:/etc/nginx/certs:ro
+
+      # ACME http-01 校验 webroot。使用 DNS-01 时该目录保持为空。
+      - ./acme_webroot:/var/www/acme:ro
+
+      # 应用静态资源：容器内路径与宿主机保持一致，模板中 root/alias 无需转换
+      - ${OPS_APP_ROOT}/frontend/dist:${OPS_APP_ROOT}/frontend/dist:ro
+      - ${OPS_APP_ROOT}/staticfiles:${OPS_APP_ROOT}/staticfiles:ro
+      - ${OPS_APP_ROOT}/media:${OPS_APP_ROOT}/media:ro
+
+      # 日志落盘到宿主机，交由宿主机 logrotate 轮转
+      - ./logs:/var/log/nginx
+
+      - /etc/localtime:/etc/localtime:ro
+
+      # 资源路径
+      #- /home/homelab/apps/devops-manager/:${OPS_APP_ROOT}
+
+    healthcheck:
+      # 走 HTTP 端点，避免自签证书导致 wget 校验失败
+      test: ["CMD", "wget", "-qO-", "http://ops-manager.linuxlab.space/nginx-health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    # 最小权限：master 需 root 绑定 80/443，worker 自动降权为 nginx 用户
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - NET_BIND_SERVICE
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    labels:
+      com.opsmanager.service: "nginx"
+      com.opsmanager.role: "edge-proxy"

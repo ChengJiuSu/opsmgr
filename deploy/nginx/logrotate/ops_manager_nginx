@@ -1,0 +1,24 @@
+# =============================================================================
+# OpsManager 容器化 nginx 日志轮转规则
+# 安装：sudo cp logrotate/ops_manager_nginx /etc/logrotate.d/ops_manager_nginx
+# 验证：sudo logrotate -d /etc/logrotate.d/ops_manager_nginx
+#
+# 说明：日志由容器写入宿主机 ./logs 目录，宿主机的 nginx 默认 logrotate 规则
+#       不会覆盖到这里，必须单独配置；轮转后需向容器内 nginx 发 USR1 重开文件，
+#       否则 nginx 仍持有已被 rename 的旧 fd，新文件一直是 0 字节。
+# =============================================================================
+
+/home/ubuntu/apps/nginx_ops_manager/logs/*.log {
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    dateext
+    dateformat -%Y%m%d
+    sharedscripts
+    postrotate
+        /usr/bin/docker exec ops_manager_nginx nginx -s reopen > /dev/null 2>&1 || true
+    endscript
+}
