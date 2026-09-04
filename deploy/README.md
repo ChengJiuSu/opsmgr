@@ -20,7 +20,7 @@
 | `ops-manager-celery-beat.conf` | celery beat supervisor 配置（证书自动续签调度，只起一个实例） |
 | `docker/` | 后端容器化：Dockerfile + entrypoint（compose 文件在仓库根） |
 | `docker/Dockerfile.builder` | CI 依赖构建镜像（预编 wheelhouse / 生成 lock），不进生产 |
-| `nginx.conf` | nginx 站点配置 |
+| `nginx/` | 前置 nginx（容器化）：docker compose + envsubst 模板 + 安全头片段 + logrotate |
 
 ## 依赖交付：CI 预编 wheelhouse，目标机离线装
 
@@ -146,15 +146,19 @@ sudo cp deploy/ops-manager-celery.conf /etc/supervisor/conf.d/     # 证书签�
 sudo cp deploy/ops-manager-celery-exec.conf /etc/supervisor/conf.d/  # 任务执行（必须）
 sudo supervisorctl reread && sudo supervisorctl update
 
-sudo cp deploy/nginx.conf /etc/nginx/conf.d/ops-manager.conf   # 改 server_name / 路径
-sudo nginx -t && sudo systemctl reload nginx
+# 前置 nginx（容器化，见 deploy/nginx/）
+cp deploy/nginx/.env.example deploy/nginx/.env
+vim deploy/nginx/.env          # 域名、证书路径、OPS_APP_ROOT、上游地址
+(cd deploy/nginx && docker compose up -d)
+sudo cp deploy/nginx/logrotate/ops_manager_nginx /etc/logrotate.d/   # 改日志目录路径
 ```
 
 ### daphne（`/ws/`）不是可选项
 
 `ops-manager-ws.conf` 承载两件事：执行日志的 WebSocket 实时推送、ops-agent 接入。
 不部署它，`/ws/` 是 502，前端会退回**每秒一次**的日志轮询接口 —— 恰好在任务执行
-期间给后端加压，正是要避免的方向。nginx.conf 已内置 `/ws/` → `127.0.0.1:8001` 分流。
+期间给后端加压，正是要避免的方向。nginx 侧的 `/ws/` → `127.0.0.1:8001` 分流已内置在
+`nginx/conf/templates/ops_manager.conf.template`。
 
 agent 侧部署见独立仓库 ops-agent 的 README 与 `docs/ops-agent-design.md`。
 
@@ -177,7 +181,7 @@ worker 进程里，生产上会有三个后果：
 后面排队的 ansible 任务堵十几分钟。
 
 部署路径与配置内路径不一致时，同步修改 `ops-manager.conf`、`ops-manager-ws.conf`、
-两个 celery 配置与 `nginx.conf`。
+两个 celery 配置，以及 `nginx/.env` 的 `OPS_APP_ROOT`。
 
 ## Docker Compose 部署（后端，可选内置 MySQL）
 
@@ -322,7 +326,7 @@ Docker 部署无需手工执行：backend 入口每次启动都会跑 `migrate`�
      `free -m` 的 available 就会换页：**load 很低但请求要等几秒**是换页的典型特征。
      解法是 `--preload`（app 在 fork 前加载一次，worker 间 COW 共享）+ 降 worker 数、
      用 `--threads` 补并发，而不是按核数堆 worker；
-  3. 请求耗时到底花在哪：看 nginx 的 `rt=` 与 `urt=`（`nginx.conf` 的 `timing` 格式）。
+  3. 请求耗时到底花在哪：看 nginx 的 `rt=` 与 `urt=`（模板里的 `ops_timing` 格式）。
      `rt` 涨而 `urt` 不涨 = 没有空闲 worker 在排队；两者一起涨 = 单接口自己慢。
      gunicorn 侧 `--access-logformat` 带了 `pid=`，可看出是否只有某个 worker 慢；
   4. ansible 自己把机器打满：`runner.py` 并发模式默认 `--forks 10`，并行组还会

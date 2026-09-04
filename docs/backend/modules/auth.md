@@ -504,8 +504,8 @@ fail-closed：配置不对时拒绝，而不是放过去。
 | 抗扫描 | 强，流量进不来应用 | 弱，已经打到 Django |
 
 实践：内部脚本（出口 IP 固定）两层都配；公网 Webhook 只配 per-key 白名单，别在
-防火墙上限制（否则每加一个 Webhook 就要动网络）。nginx 侧示例见 `deploy/nginx.conf`
-末尾的注释块。
+防火墙上限制（否则每加一个 Webhook 就要动网络）。nginx 侧示例见
+`deploy/nginx/conf/templates/ops_manager.conf.template` 里 `/api` 之后的注释块。
 
 ### 模型 ApiCredential（表 `auth_api_credential`）
 

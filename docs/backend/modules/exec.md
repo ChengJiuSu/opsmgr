@@ -206,7 +206,7 @@ ansible 输出不再等模块跑完才可见：`common.ansible.run_stream` 以
   pong）时回退到 `output?offset=` 轮询，功能等价。
 - **部署**：执行进程（WSGI/celery worker）与 WebSocket 进程（daphne）不同
   进程，跨进程推送**依赖 Redis channel layer**（`CHANNEL_LAYERS`）；nginx
-  `/ws/` 已反代到 daphne 8001（见 `deploy/nginx.conf`）。dev 的 runserver
+  `/ws/` 已反代到 daphne 8001（见 `deploy/nginx/conf/templates/ops_manager.conf.template`）。dev 的 runserver
   自带 ASGI，同端口即可，vite 已代理 `/ws`。
 
 ### 执行现场归档（debug 复现）

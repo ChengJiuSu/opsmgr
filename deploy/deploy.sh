@@ -48,8 +48,8 @@ cat <<'EOF'
   1. sudo cp deploy/ops-manager.conf /home/ubuntu/apps/supervisor/conf.d
      （改路径/用户/程序名）/home/ubuntu/scripts/manager.sh update devops-manager-01
      另需 ops-manager-ws.conf（daphne）与两个 celery worker，见 deploy/README.md
-  2. sudo cp deploy/nginx.conf /etc/nginx/conf.d/ops-manager.conf
-     （改 server_name / 路径）sudo nginx -t && sudo systemctl reload nginx
+  2. cp deploy/nginx/.env.example deploy/nginx/.env && vim deploy/nginx/.env
+     （域名 / 证书路径 / OPS_APP_ROOT）cd deploy/nginx && docker compose up -d
   3. 浏览器登录，「系统配置」页维护 jenkins.url / jenkins.user / jenkins.api_token
 日常更新用 deploy/update.sh。
 EOF

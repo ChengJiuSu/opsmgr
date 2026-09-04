@@ -159,6 +159,31 @@ server {
         proxy_buffering off;
         proxy_request_buffering off;
     }
+
+    # 机读接口的网络层粗粒度兜底（可选，与后台 per-key IP 白名单叠加）。
+    #
+    # 分工：per-key 白名单管「哪把 key 能从哪来」，防火墙/nginx 管「这些路径
+    # 根本不该从公网被摸到」。前者拦不住扫描流量（校验发生在应用层），后者做不到
+    # 按 key 区分（同一台机器上多把 key 长得一样）——两层不可互相替代。
+    #
+    # 只放行内网与已知出口的场景，取消注释并按实际网段调整；对接公网 Webhook
+    # （GitHub/云厂商，源 IP 段大且会变）时不要在这里限制，交给 per-key 白名单。
+    # location ~ ^/api/(exec/tasks/[0-9]+/trigger|artifacts/report)/ {
+    #     allow 10.0.0.0/8;        # 内网
+    #     allow 203.0.113.9;       # CI 出口
+    #     deny all;
+    #
+    #     access_log /var/log/nginx/ops-manager.api.access.log ops_timing;
+    #     proxy_pass http://ops_manager_backend;
+    #     proxy_http_version 1.1;
+    #     proxy_set_header Connection "";
+    #     proxy_set_header Host              $host;
+    #     proxy_set_header X-Real-IP         $remote_addr;
+    #     proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    #     proxy_set_header X-Forwarded-Proto $scheme;
+    #     proxy_read_timeout  ${OPS_PROXY_TIMEOUT};
+    #     proxy_send_timeout  ${OPS_PROXY_TIMEOUT};
+    # }
     
     # 制品文件内部重定向：只能由后端 X-Accel-Redirect 命中（internal），
     # 外部直接访问 /_artifacts/... 返回 404。后端 settings 里的

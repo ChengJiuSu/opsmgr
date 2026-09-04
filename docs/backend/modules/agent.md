@@ -162,4 +162,5 @@ cert_deploy / jenkins）、`task.cancel`、`log.ack`、`result.ack`、`error`。
 - Channels + Redis channel layer（复用 celery 同一 Redis）；`daphne` 在
   INSTALLED_APPS 首位，开发 runserver 即 ASGI 同端口可测 WebSocket。
 - 生产：daphne 监听 127.0.0.1:8001 承载 `/ws/`，nginx 按路径分流
-  （见 deploy/nginx.conf 与 deploy/README 说明），HTTP 仍走现有 WSGI。
+  （见 `deploy/nginx/conf/templates/ops_manager.conf.template` 与 deploy/README
+  说明），HTTP 仍走现有 WSGI。
