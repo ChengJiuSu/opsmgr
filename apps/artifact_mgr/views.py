@@ -3,9 +3,11 @@ import hashlib
 import hmac
 import logging
 import os
+import unicodedata
+from urllib.parse import quote
 
 from django.conf import settings
-from django.http import FileResponse
+from django.http import FileResponse, HttpResponse
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema
 from rest_framework import mixins, viewsets
@@ -28,6 +30,30 @@ from .models import Artifact
 from .serializers import ArtifactReportSerializer, ArtifactSerializer
 
 logger = logging.getLogger('apps.artifact_mgr')
+
+
+def content_disposition(filename):
+    """RFC 6266 附件头：ASCII 回退 + filename* 兼容非 ASCII 包名。"""
+    ascii_name = unicodedata.normalize('NFKD', filename).encode('ascii', 'ignore').decode()
+    ascii_name = ascii_name.replace('"', '') or 'artifact'
+    return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(filename)}'
+
+
+def xaccel_response(prefix, artifact):
+    """把制品下载交给 nginx：空响应体 + X-Accel-Redirect 内部路径。
+
+    Django 这边只做鉴权和拼 header，几毫秒就把 worker 还回去；实际的几十 MB
+    由 nginx sendfile 发出，慢客户端拖住的是 nginx 连接而不是 gunicorn worker。
+    Content-Length / Content-Type / Accept-Ranges 全部留给 nginx 生成，这里显式
+    置空 Content-Type，否则 Django 会带上默认的 text/html 覆盖掉 nginx 的判断。
+    """
+    location = f"{prefix.rstrip('/')}/{quote(artifact.file_path.replace(os.sep, '/'))}"
+    response = HttpResponse(content_type='')
+    del response['Content-Type']
+    response['X-Accel-Redirect'] = location
+    response['X-Accel-Buffering'] = 'yes'
+    response['Content-Disposition'] = content_disposition(artifact.original_name)
+    return response
 
 
 class ArtifactViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin,
@@ -174,4 +200,8 @@ class ArtifactDownloadView(APIView):
         path = artifact.abs_path()
         if not os.path.isfile(path):
             return fail('制品文件已丢失，请联系管理员', status=404)
+
+        prefix = (settings.ARTIFACT_XACCEL_PREFIX or '').strip()
+        if prefix:
+            return xaccel_response(prefix, artifact)
         return FileResponse(open(path, 'rb'), as_attachment=True, filename=artifact.original_name)

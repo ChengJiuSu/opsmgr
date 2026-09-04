@@ -432,6 +432,15 @@ ARTIFACT_RETENTION_DAYS = config('ARTIFACT_RETENTION_DAYS', default=90, cast=int
 # 为什么要保底：长期不发版的环境（如预发）里所有制品都会超期，全清掉之后
 # 该环境连「回滚到上一个版本」都做不到了
 ARTIFACT_KEEP_LATEST = config('ARTIFACT_KEEP_LATEST', default=3, cast=int)
+# 下载交给 nginx 内部重定向（X-Accel-Redirect）的路径前缀，如 /_artifacts/。
+# 为什么必须有：制品是几十~几百 MB 的包，gunicorn 是 sync worker，
+# FileResponse 逐块吐包会让一个 worker 被慢客户端占住整段下载时间；叠加 nginx
+# 侧的 proxy_buffering off，worker 直接按客户端带宽被拖住，4 个 worker 很容易
+# 被几个下载吃光，表现就是下载中途断（nginx 日志 upstream prematurely closed）。
+# 配上之后 Django 只回一个空响应带 header，文件由 nginx sendfile 直发，
+# 顺带白拿 Range 断点续传。留空（开发环境）回退 FileResponse。
+# nginx 侧需要一个 internal location 把该前缀 alias 到 ARTIFACT_ROOT。
+ARTIFACT_XACCEL_PREFIX = config('ARTIFACT_XACCEL_PREFIX', default='')
 
 # ── Ansible 集中管理项目 ──────────────────────────────────
 # 平台方法（ansible_playbook provider）在此目录内执行既有剧本并通过 --tags 触发；

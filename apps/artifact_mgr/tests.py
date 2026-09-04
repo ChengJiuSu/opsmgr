@@ -5,6 +5,7 @@ import shutil
 import tempfile
 import time
 from datetime import timedelta
+from urllib.parse import quote
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
@@ -173,6 +174,24 @@ class ArtifactDownloadTests(ArtifactTestBase):
         os.remove(art.abs_path())
         r = APIClient().get(f'/api/artifacts/{art.id}/download/', {'sig': art.download_sig()})
         self.assertEqual(r.status_code, 404)
+
+    @override_settings(ARTIFACT_XACCEL_PREFIX='/_artifacts/')
+    def test_download_xaccel(self):
+        """开了前缀就只回 header，文件体交给 nginx——响应必须是空体。"""
+        art = self._make_artifact()
+        r = APIClient().get(f'/api/artifacts/{art.id}/download/', {'sig': art.download_sig()})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.content, b'')
+        self.assertEqual(r['X-Accel-Redirect'], f'/_artifacts/{quote(art.file_path)}')
+        self.assertIn('attachment', r['Content-Disposition'])
+
+    @override_settings(ARTIFACT_XACCEL_PREFIX='/_artifacts/')
+    def test_download_xaccel_still_checks_sig(self):
+        """内部重定向绕不开鉴权：签名不对不能吐出 X-Accel-Redirect。"""
+        art = self._make_artifact()
+        r = APIClient().get(f'/api/artifacts/{art.id}/download/', {'sig': 'f' * 64})
+        self.assertEqual(r.status_code, 403)
+        self.assertNotIn('X-Accel-Redirect', r)
 
 
 class ArtifactViewSetTests(ArtifactTestBase):
