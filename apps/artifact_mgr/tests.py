@@ -90,7 +90,9 @@ class ArtifactReportTests(ArtifactTestBase):
         self.assertEqual(art.file_path, os.path.join('at-proj', 'at-official', 'at-test', '1.0.0', 'app.tar.gz'))
         with open(art.abs_path(), 'rb') as f:
             self.assertEqual(f.read(), content)
-        self.assertIn(f'/api/artifacts/{art.id}/download/?sig=', r.json()['data']['download_url'])
+        # 文件名进路径末段：命令行 curl -O / wget 直接落原名，无需额外参数
+        self.assertIn(f'/api/artifacts/{art.id}/download/{art.original_name}?sig=',
+                      r.json()['data']['download_url'])
 
     def test_report_md5_mismatch_removes_file(self):
         r = self._report(md5='0' * 32)
@@ -189,6 +191,21 @@ class ArtifactDownloadTests(ArtifactTestBase):
         art = self._make_artifact()
         r = APIClient().get(f'/api/artifacts/{art.id}/download/', {'sig': art.download_sig()})
         self.assertIn(art.original_name, r['Content-Disposition'])
+
+    def test_download_named_path(self):
+        """URL 末段带名：curl -O 靠它命名，且不影响签名校验。"""
+        art = self._make_artifact()
+        r = APIClient().get(f'/api/artifacts/{art.id}/download/{art.original_name}',
+                            {'sig': art.download_sig()})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(art.original_name, r['Content-Disposition'])
+
+    def test_download_named_path_wins_over_query(self):
+        art = self._make_artifact()
+        r = APIClient().get(f'/api/artifacts/{art.id}/download/from-path.tgz',
+                            {'sig': art.download_sig(), 'filename': 'from-query.tgz'})
+        self.assertIn('from-path.tgz', r['Content-Disposition'])
+        self.assertNotIn('from-query.tgz', r['Content-Disposition'])
 
     def test_download_filename_override(self):
         art = self._make_artifact()

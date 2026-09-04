@@ -199,7 +199,7 @@ class ArtifactDownloadView(APIView):
     throttle_classes = [ApiKeyThrottle]
 
     @extend_schema(responses=OpenApiTypes.BINARY)
-    def get(self, request, pk):
+    def get(self, request, pk, filename=None):
         artifact = Artifact.objects.filter(pk=pk).first()
         if artifact is None:
             return fail('制品不存在', status=404)
@@ -221,8 +221,10 @@ class ArtifactDownloadView(APIView):
         if not os.path.isfile(path):
             return fail('制品文件已丢失，请联系管理员', status=404)
 
-        # ?filename= 可覆盖落盘名，默认用后台展示的原始文件名
-        filename = safe_filename(request.query_params.get('filename'), artifact.original_name)
+        # 落盘名优先级：URL 路径末段 > ?filename= > 后台展示的原始文件名。
+        # 路径末段那条是给 curl -O / wget 用的，它们不看 Content-Disposition。
+        filename = safe_filename(filename or request.query_params.get('filename'),
+                                 artifact.original_name)
 
         prefix = (settings.ARTIFACT_XACCEL_PREFIX or '').strip()
         if prefix:

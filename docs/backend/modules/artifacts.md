@@ -121,7 +121,7 @@ manager（需要 Jenkins 所在内网能出公网；不能出网时得另做 age
 | GET | `/api/artifacts/{id}/` | 登录用户 | 详情（含 `download_url`） |
 | DELETE | `/api/artifacts/{id}/` | 管理员 | 删除记录并清理磁盘文件 |
 | POST | `/api/artifacts/report/` | API 凭证 `artifact:report`（旧全局 key 兜底） | CI 上报（multipart，见下） |
-| GET | `/api/artifacts/{id}/download/?sig=…` | 登录用户 / API 凭证 `artifact:download` / URL 签名 | 附件下载；`sig=hmac_sha256(api_key, "{id}:{md5}")`；可选 `filename=` 覆盖落盘名 |
+| GET | `/api/artifacts/{id}/download/{文件名}?sig=…` | 登录用户 / API 凭证 `artifact:download` / URL 签名 | 附件下载；`sig=hmac_sha256(api_key, "{id}:{md5}")`；文件名可省略（旧 URL 兼容），也可用 `?filename=` 指定 |
 
 > **鉴权为 API 凭证**（`ak_xxx.yyy`，带 per-key IP 白名单、作用域、数据范围、可轮换可
 > 停用）。签发与语义见 `docs/backend/modules/auth.md` 的「API 凭证」章节。
@@ -216,12 +216,21 @@ python manage.py clean_artifacts             # 实际清理
 
 ## 下载文件名
 
-默认取 `original_name`（就是列表页「文件名」那列），经 `Content-Disposition`
-下发（RFC 6266，`filename` ASCII 回退 + `filename*` 带 UTF-8 原名）。客户端要
-落原名需自己认这个头：`curl -OJ` 或 `wget --content-disposition`；`curl -o 名字`
-是显式覆盖，与服务端无关。
+`download_url()` 生成的地址把文件名放在**路径末段**：
+`/api/artifacts/{id}/download/{original_name}?sig=…`。
 
-`?filename=` 可覆盖落盘名。**这个值不进签名**，等于「拿到合法 sig 的人可任意
+为什么放路径里：`curl -O` 和 `wget` 默认按 URL 末段命名，**不认**
+`Content-Disposition`（要认得加 `curl -OJ` / `wget --content-disposition`）。
+放进路径后，目标机上 `curl -O "$package_url"` 不带任何额外参数就落原名——CD 脚本
+和人工排障都少一步。
+
+同时仍下发 `Content-Disposition`（RFC 6266，`filename` ASCII 回退 + `filename*`
+带 UTF-8 原名），浏览器点下载走的是它。
+
+落盘名优先级：**URL 路径末段 > `?filename=` > `original_name`**。省略路径末段的
+旧 URL（`/download/?sig=…`）仍然可用，已签发但没用掉的签名地址不受影响。
+
+`?filename=` 与路径末段两个入口。**这个值不进签名**，等于「拿到合法 sig 的人可任意
 指定」，所以服务端按不可信输入清洗（`safe_filename`）：先取 basename 去掉路径，
 再按白名单过字符（换行进响应头就是 HTTP 头注入），最后截 200 字，洗空退回
 `original_name`。

@@ -1124,7 +1124,9 @@ class ArtifactInjectTests(TestCase):
         self.assertTrue(cmd[idxs[0] + 1].startswith('@'))  # 走变量文件而非命令行 JSON
         self.assertEqual(variables['package_version'], '1.1.0')
         self.assertEqual(variables['package_md5'], 'b' * 32)
-        self.assertIn(f'/api/artifacts/{latest.id}/download/?sig=', variables['package_url'])
+        # 文件名进 URL 路径末段（目标机 curl -O 直接落原名）
+        self.assertIn(f'/api/artifacts/{latest.id}/download/{latest.original_name}?sig=',
+                      variables['package_url'])
 
     def test_no_artifact_no_injection(self):
         c = self._client()

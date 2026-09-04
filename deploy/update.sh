@@ -29,6 +29,6 @@ echo "==> 重启后端服务"
 # supervisor 托管（deploy/ops-manager.conf）；程序名不同时以环境变量覆盖：
 #   SUPERVISOR_PROGRAM=xxx bash deploy/update.sh
 # 仍用 systemd（deploy/ops-manager.service）时改回：sudo systemctl restart ops-manager
-/home/ubuntu/scripts/manager.sh restart ops-manager-01
+/home/homelab/scripts/manager.sh restart all
 
 echo "更新完成：$(git log -1 --oneline)"

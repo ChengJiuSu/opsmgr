@@ -10,6 +10,7 @@ import hmac
 import logging
 import os
 import re
+from urllib.parse import quote
 
 from django.conf import settings
 from django.db import models
@@ -129,4 +130,7 @@ class Artifact(models.Model):
     def download_url(self):
         """带签名的绝对下载地址（SITE_BASE_URL 拼 host，供无 request 上下文的注入场景）。"""
         base = settings.SITE_BASE_URL.rstrip('/')
-        return f'{base}/api/artifacts/{self.id}/download/?sig={self.download_sig()}'
+        # 文件名进路径末段：curl -O / wget 按 URL 末段命名，这样命令行拉包不用
+        # 再显式指定输出名（它们默认不认 Content-Disposition）
+        name = quote(self.original_name)
+        return f'{base}/api/artifacts/{self.id}/download/{name}?sig={self.download_sig()}'
