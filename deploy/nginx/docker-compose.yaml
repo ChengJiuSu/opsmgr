@@ -47,7 +47,12 @@ services:
       # 应用静态资源：容器内路径与宿主机保持一致，模板中 root/alias 无需转换
       - ${OPS_APP_ROOT}/frontend/dist:${OPS_APP_ROOT}/frontend/dist:ro
       - ${OPS_APP_ROOT}/staticfiles:${OPS_APP_ROOT}/staticfiles:ro
-      - ${OPS_APP_ROOT}/media:${OPS_APP_ROOT}/media:ro
+
+      # 只挂 media/artifacts，不挂整个 media。nginx 需要它是因为制品下载走
+      # X-Accel-Redirect（internal 的 /_artifacts/ 直接发文件）。
+      # MEDIA_ROOT 下还有 media/acme —— ACME_HOME 默认值，存 TLS 私钥和 ACME
+      # 账号私钥，容器里根本不该看得见。配置写错时这层挂载是最后一道兜底。
+      - ${OPS_APP_ROOT}/media/artifacts:${OPS_APP_ROOT}/media/artifacts:ro
 
       # 日志落盘到宿主机，交由宿主机 logrotate 轮转
       - ./logs:/var/log/nginx

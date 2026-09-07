@@ -217,9 +217,15 @@ server {
         access_log off;
     }
 
-    # ---- 制品下载走 /api 签名接口，media 仅兜底 -------------------------------
+    # ---- /media/ 一律不对外提供 -------------------------------------------------
+    # 曾经这里是 `alias ${OPS_APP_ROOT}/media/`，等于把整个 MEDIA_ROOT 挂上公网。
+    # MEDIA_ROOT 下不止制品：
+    #   media/artifacts/  —— 直出会绕开 /api/artifacts/<id>/download/ 的签名鉴权
+    #   media/acme/       —— ACME_HOME 默认值，里面有 TLS 私钥与 ACME 账号私钥
+    # 制品下载只走上面的签名接口（后端吐 X-Accel-Redirect，nginx 从内部的
+    # /_artifacts/ 发文件）。不要再把这个 location 改回 alias。
     location /media/ {
-        alias ${OPS_APP_ROOT}/media/;
         access_log off;
+        return 404;
     }
 }
