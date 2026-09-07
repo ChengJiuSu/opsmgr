@@ -31,7 +31,7 @@ from django.conf import settings
 
 from common.ansible import resolve_within, run_stream
 
-from .live import PREVIEW_LIMIT, SECRET_MASK_MIN_LEN, LiveSink, mask_secrets, push_status
+from .live import SECRET_MASK_MIN_LEN, LiveSink, mask_secrets, push_status
 
 logger = logging.getLogger('apps.task_exec')
 
@@ -596,8 +596,7 @@ _STEP_HANDLERS = {
     'method': _run_method_step,
 }
 
-# 执行进度预览上限（live.PREVIEW_LIMIT）；暂停确认轮询间隔（秒）
-PROGRESS_PREVIEW_LIMIT = PREVIEW_LIMIT
+# 暂停确认轮询间隔（秒）
 PAUSE_POLL_INTERVAL = 2
 # 模块失败后等待人工处理（重试/跳过/中止）的默认超时（秒），超时按中止处理
 FAILURE_WAIT_TIMEOUT_DEFAULT = 600

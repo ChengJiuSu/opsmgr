@@ -34,7 +34,7 @@ from common.testing import grant_sudo
 
 from .models import Credential, ExecutionTask, ExecVariable, TaskExecutionLog, TaskStep
 from . import live, runner
-from .live import PREVIEW_LIMIT, SEP, LiveSink, join_len, join_tail, preview_of
+from .live import DB_PREVIEW_LIMIT, PREVIEW_LIMIT, SEP, LiveSink, join_len, join_tail, preview_of
 from .runner import _inventory_content
 from .tasks import OUTPUT_PREVIEW_LIMIT
 
@@ -2192,6 +2192,29 @@ class LiveSinkBroadcastTests(TestCase):
             self.sink.flush(force=True)
         self.assertTrue(all(p['kind'] == 'full' for p in self.pushes[1:]))
         self.assertIn('等待人工处理', self.pushes[1]['output'])
+
+    def test_db_preview_narrower_than_push_window(self):
+        """写库按 DB_PREVIEW_LIMIT 收窄，整段推送仍给到实时窗口 PREVIEW_LIMIT。
+
+        两个上限拆开的全部意义在这条：库内那份只是「WebSocket 不可用时的轮询
+        回退」与「日志文件过保留期后的兜底」，没必要每次 flush 都往 MySQL 写满
+        一个实时窗口的 TEXT。两份必须是同一份尾部的不同窗口，不能各自截各自的。
+        """
+        body = 'z' * (PREVIEW_LIMIT * 2)
+        with self._patch_push():
+            self.sink.begin(('a', 1), 'H1', order=1)
+            self.sink.begin(('b', 1), 'H2', order=2)   # 并行组 → 每次都整段推送
+            self.sink.feed(('a', 1), body)
+            self.sink.flush(force=True)
+
+        note = len(live.TRUNCATE_NOTE)
+        pushed = [p for p in self.pushes if p['kind'] == 'full'][-1]['output']
+        self.assertEqual(len(pushed), PREVIEW_LIMIT + note)
+
+        db_out = ExecutionTask.objects.values_list('output', flat=True).get(pk=self.task.pk)
+        self.assertEqual(len(db_out), DB_PREVIEW_LIMIT + note)
+        # 库内那份是推送那份的后缀：同一尾部，只是窗口更窄
+        self.assertTrue(pushed.endswith(db_out[note:]))
 
     def test_broken_channel_stops_pushing(self):
         with mock.patch('apps.task_exec.live.push', return_value=False) as m:

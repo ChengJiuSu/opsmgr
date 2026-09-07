@@ -350,9 +350,9 @@ class ExecutionTaskSerializer(serializers.ModelSerializer):
 class ExecutionTaskListSerializer(ExecutionTaskSerializer):
     """列表序列化器：与详情同结构，但**不含 output**。
 
-    output 是执行日志的尾部预览，上限 PREVIEW_LIMIT（6 万字符）。列表页在有任务
-    执行中时每 5 秒轮询一次 page_size=20，带上它最坏一次要序列化并传 1.2MB
-    JSON —— 而列表根本不展示日志，实时日志走 tasks/<id>/output/ 那个增量接口。
+    output 是执行日志的尾部预览，上限 live.DB_PREVIEW_LIMIT。列表页在有任务
+    执行中时每 5 秒轮询一次 page_size=20，带上它每次都要多序列化并传一遍 20 份
+    预览 —— 而列表根本不展示日志，实时日志走 tasks/<id>/output/ 那个增量接口。
     """
 
     class Meta(ExecutionTaskSerializer.Meta):

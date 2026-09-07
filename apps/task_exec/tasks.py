@@ -22,12 +22,12 @@ from django.db import connection
 from django.utils import timezone
 
 from . import runner
-from .live import PREVIEW_LIMIT, LiveSink, log_rel_path, preview_of, push, push_status
+from .live import DB_PREVIEW_LIMIT, PREVIEW_LIMIT, LiveSink, log_rel_path, preview_of, push, push_status
 
 logger = logging.getLogger('apps.task_exec')
 
 # 数据库内输出预览上限（字符），完整输出见落盘文件
-OUTPUT_PREVIEW_LIMIT = PREVIEW_LIMIT
+OUTPUT_PREVIEW_LIMIT = DB_PREVIEW_LIMIT
 
 # 任务执行专用队列。不与证书签发/分发（默认 celery 队列）共用：acme.sh 的 DNS
 # 验证上限 900s，一个正在签发的证书会把后面排队的 ansible 任务堵十几分钟，而
@@ -85,8 +85,11 @@ def execute_task(task_id, log_id=None):
         log.log_file = rel_path if abs_path.exists() else ''
         log.save(update_fields=['return_code', 'output', 'status', 'finished_at', 'log_file', 'steps_result'])
 
-        # 收尾推送：整段最终输出 + 终态（客户端据此停连接并刷新执行记录）
-        push(task.pk, {'kind': 'full', 'output': preview, 'offset': len(preview)})
+        # 收尾推送：整段最终输出 + 终态（客户端据此停连接并刷新执行记录）。
+        # 推送按实时窗口取尾部，比写库那份宽——面板上收尾后还要能往回翻几屏，
+        # 而库里那份只是轮询回退与文件过期后的兜底。
+        final_push = preview_of(output, PREVIEW_LIMIT)
+        push(task.pk, {'kind': 'full', 'output': final_push, 'offset': len(final_push)})
         push_status(task.pk)
 
 

@@ -35,8 +35,19 @@ from channels.layers import get_channel_layer
 
 logger = logging.getLogger('apps.task_exec')
 
-# 数据库内输出预览上限（字符），与 tasks.OUTPUT_PREVIEW_LIMIT 同口径
-PREVIEW_LIMIT = 60000
+# ── 两个预览上限（刻意拆开，口径不同）────────────────────
+# PREVIEW_LIMIT：**实时窗口**。实时块保留的尾部长度（_trim）、WebSocket 整段
+#   重发（'kind': 'full'）的体积上限。并行组每次 flush 都要整段重发（多块交错
+#   无法当增量发），所以这个值直接决定推送带宽：0.5s 推一次全窗口，60000 就是
+#   120KB/s 经 Redis 再进 WebSocket。前端收 delta 时本地是追加的，本地可见长度
+#   不受此限，只有整段重发才回落到这个窗口。
+# DB_PREVIEW_LIMIT：**写库上限**。落进 ExecutionTask.output /
+#   TaskExecutionLog.output 的尾部长度。它只是「WebSocket 不可用时的轮询回退」
+#   与「日志文件过保留期后的残留兜底」，不是主展示通道——全量日志在
+#   TASK_LOG_DIR 的落盘文件里。原来与实时窗口共用 60000，等于每秒往 MySQL 写
+#   一次 60KB TEXT（binlog 跟着 60KB/s），而页面根本不读它。
+PREVIEW_LIMIT = 16000
+DB_PREVIEW_LIMIT = 8000
 
 # 打码的最短明文长度：太短的值（"1"、"on"）在输出里到处都是，全替换会把日志
 # 打成马赛克，反而看不出执行做了什么
@@ -66,12 +77,14 @@ SEP = '\n\n'
 
 # ── 两级节流：推送与写库分开 ────────────────────────────────
 # WebSocket 推送便宜（一段增量文本进 channel layer），延迟敏感，保持亚秒级；
-# 写库贵（一次最多 PREVIEW_LIMIT 字符的 TEXT 更新），而它只是 WebSocket 不可用时
-# 的回退通道（前端轮询间隔 1s），没必要跟着推送的频率走。
+# 写库贵（一次最多 DB_PREVIEW_LIMIT 字符的 TEXT 更新），而它只是 WebSocket
+# 不可用时的回退通道（前端轮询间隔 1s），没必要跟着推送的频率走。
 # 合成一个节流时，要么写库跟着推送变频繁，要么推送跟着写库变迟钝，两头都不对。
+# DB_INTERVAL 取 3s 而非 1s：轮询回退端每秒拉一次，最坏看到 3s 前的尾部，而
+# 回退本身已是降级通道；换来的是写库量再降 2/3。
 PUSH_INTERVAL = 0.5
 PUSH_BYTES = 2048
-DB_INTERVAL = 1.0
+DB_INTERVAL = 3.0
 TRUNCATE_NOTE = '…（日志过长，此处仅显示尾部；执行结束后在执行记录详情查看完整日志）\n\n'
 
 
@@ -108,21 +121,30 @@ def join_tail(parts, limit):
     return ''.join(reversed(chunks))
 
 
-def preview_of(text):
+def preview_of(text, limit=DB_PREVIEW_LIMIT):
     """取尾部预览：超限时截断并标注，避免前端拿到超大字符串。
 
     收尾路径（tasks.execute_task）用它——那里本来就有完整输出在手。执行中的
     flush 走 _preview，避免为了取尾部而先拼出一个几 MB 的完整串。
+
+    limit 默认写库口径（DB_PREVIEW_LIMIT）；收尾推送传 PREVIEW_LIMIT，让面板
+    留住更长的尾部。
     """
     text = text or ''
-    if len(text) <= PREVIEW_LIMIT:
+    if len(text) <= limit:
         return text
-    return TRUNCATE_NOTE + text[-PREVIEW_LIMIT:]
+    return TRUNCATE_NOTE + text[-limit:]
 
 
-def _preview(total, tail):
-    """由（完整输出总长度、末尾 PREVIEW_LIMIT 字符）组出预览，与 preview_of 同口径。"""
-    return TRUNCATE_NOTE + tail if total > PREVIEW_LIMIT else tail
+def _preview(total, tail, limit=DB_PREVIEW_LIMIT):
+    """由（完整输出总长度、尾部片段）组出预览，与 preview_of 同口径。
+
+    tail 是 join_tail(parts, PREVIEW_LIMIT) 的结果（实时窗口），写库时要再收窄
+    到 limit —— 再切一次只有 O(limit)，比为了写库单独拼一次尾部便宜。
+    """
+    if total <= limit:
+        return tail
+    return TRUNCATE_NOTE + tail[-limit:]
 
 
 def log_rel_path(task_id, log_id):
@@ -346,7 +368,7 @@ class LiveSink:
         # 写库与推送都可能阻塞（DB / channel layer），放锁外
         if db_due:
             # 执行日志表只在 force（模块起止、阶段收尾）时跟着写一份：任务表
-            # 才是前端轮询读的对象，两张表都按推送频率写 60KB TEXT 纯属浪费。
+            # 才是前端轮询读的对象，两张表都按推送频率写整份预览纯属浪费。
             self._save_preview(_preview(total, tail), write_log=force)
         if push_due:
             self._broadcast(total, tail, extra_used=bool(extra))
@@ -370,7 +392,8 @@ class LiveSink:
             if not reset and not chunk:
                 return
             self._ws_len, self._ws_reset = total, False
-        payload = ({'kind': 'full', 'output': _preview(total, tail), 'offset': total}
+        payload = ({'kind': 'full', 'output': _preview(total, tail, PREVIEW_LIMIT),
+                    'offset': total}
                    if reset else {'kind': 'delta', 'output': chunk, 'offset': total})
         if not push(self.task_id, payload):
             self._ws_broken = True  # 通道不可用：不再重试，前端自行回退轮询
@@ -379,7 +402,7 @@ class LiveSink:
         """写实时预览。write_log=False 时只写任务表（前端轮询读的就是它）。
 
         执行日志表是「历史记录」，执行中没人读它的 output（详情接口在执行结束
-        回填 log_file 后直接读落盘全量），跟着推送频率一起写等于把同一份 60KB
+        回填 log_file 后直接读落盘全量），跟着推送频率一起写等于把同一份预览
         TEXT 写两遍。
         """
         from .models import ExecutionTask, TaskExecutionLog

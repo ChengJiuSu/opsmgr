@@ -343,7 +343,7 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
     http_method_names = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options']
 
     def get_serializer_class(self):
-        # 列表去掉 output（每行最多 6 万字符的日志预览，列表不展示它）
+        # 列表去掉 output（每行都带一份日志预览，而列表不展示它）
         if self.action == 'list':
             return ExecutionTaskListSerializer
         return super().get_serializer_class()
@@ -531,7 +531,7 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
         每秒重传整段日志；输出已达预览上限（尾部截断，前缀会漂移）或 offset
         越界时回退整段（delta=false），前端按 delta 决定追加还是替换。
         """
-        from .live import PREVIEW_LIMIT
+        from .live import DB_PREVIEW_LIMIT
 
         task = self.get_object()
         out = task.output or ''
@@ -539,7 +539,7 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
             offset = max(0, int(request.query_params.get('offset') or 0))
         except (TypeError, ValueError):
             offset = 0
-        delta = 0 < offset <= len(out) and len(out) < PREVIEW_LIMIT
+        delta = 0 < offset <= len(out) and len(out) < DB_PREVIEW_LIMIT
         return ok({
             'id': task.id,
             'status': task.status,
