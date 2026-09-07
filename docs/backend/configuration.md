@@ -112,6 +112,22 @@ sudo apt-get install -y default-libmysqlclient-dev pkg-config build-essential
 pip install -r requirements.lock
 ```
 
+#### 数据库连接复用（CONN_MAX_AGE）
+
+`prod.py` 显式设 `CONN_MAX_AGE`（`DB_CONN_MAX_AGE`，默认 60s）并开
+`CONN_HEALTH_CHECKS`。Django 默认 `0` = **每个请求新建再关闭一条 MySQL 连接**，
+一个页面十几个接口就是十几次 TCP 连接 + 认证握手；平时看不出来，任务执行把
+CPU 抢走时它直接体现成「打开页面明显卡顿」。
+
+两个配套约束：
+
+- 复用后每个 gunicorn 线程各持一条常驻连接（4 worker × 8 threads = 最多 32），
+  加 daphne 与两个 celery worker，**MySQL `max_connections` 需 ≥200**：
+  `SHOW VARIABLES LIKE 'max_connections';`
+- 值不要超过 MySQL `wait_timeout`。复用的连接可能已被服务端单方面掐掉，
+  `CONN_HEALTH_CHECKS`（Django 4.1+）在请求开头探活并换新，否则第一个用到它的
+  请求会吃一个 `MySQL server has gone away`。
+
 ⚠ `mysqlclient` 的轮子链接的是构建机的 MySQL 客户端库：Ubuntu 的
 `default-libmysqlclient-dev` 指向 MySQL（`libmysqlclient.so.21`），Debian 的
 指向 MariaDB（`libmariadb.so.3`）。用 `python:3.14-slim`（Debian）编出来的轮子
