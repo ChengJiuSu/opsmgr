@@ -139,7 +139,7 @@
         <div class="output-meta">
           <span v-if="logPanel.current">返回码：{{ logPanel.current.return_code ?? '-' }}</span>
           <span v-if="currentServers" class="muted">{{ currentServers }}</span>
-          <el-tag v-if="logPanel.polling" type="info" size="small">实时刷新中…</el-tag>
+          <el-tag v-if="following" type="info" size="small">实时刷新中…</el-tag>
           <span class="output-expand">
             <el-button size="small" :icon="FullScreen" @click="outputFullVisible = true">全屏查看</el-button>
             <el-button size="small" :icon="TopRight" @click="openLogPage">独立页打开</el-button>
@@ -164,7 +164,8 @@
         <StepOutput
           :output="logPanel.output"
           :steps-result="logPanel.current?.steps_result || []"
-          :follow="logPanel.polling"
+          :follow="following"
+          :log-id="logPanel.current?.id"
           class="output-host"
         />
       </div>
@@ -185,7 +186,7 @@
         <span class="output-meta" style="margin-bottom:0">
           <span v-if="logPanel.current">返回码：{{ logPanel.current.return_code ?? '-' }}</span>
           <span v-if="currentServers" class="muted">{{ currentServers }}</span>
-          <el-tag v-if="logPanel.polling" type="info" size="small">实时刷新中…</el-tag>
+          <el-tag v-if="following" type="info" size="small">实时刷新中…</el-tag>
         </span>
       </div>
     </template>
@@ -207,7 +208,8 @@
     <StepOutput
       :output="logPanel.output"
       :steps-result="logPanel.current?.steps_result || []"
-      :follow="logPanel.polling"
+      :follow="following"
+      :log-id="logPanel.current?.id"
       class="output-host output-host-full"
     />
   </el-dialog>
@@ -702,6 +704,7 @@ import {
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../../stores/auth'
 import { openTaskLogStream } from '../../utils/taskLogStream'
+import { createLogBuffer, applyFull, applyDelta, resetBuffer } from '../../utils/taskLogBuffer'
 import StepOutput from '../../components/StepOutput.vue'
 import FlowGraph from '../../components/FlowGraph.vue'
 import {
@@ -1331,6 +1334,13 @@ const outputFullVisible = ref(false)
 let pollTimer = null
 let listTimer = null
 let stream = null   // WebSocket 日志流（不可用时为 null，走 pollTimer）
+let selectSeq = 0   // 选中序号：异步取详情返回时用它丢弃已被覆盖的旧请求
+// 正在看「执行中」那条记录：看历史记录时通道仍开着（状态/模块表照收，暂停操作条
+// 不会因为翻了一眼历史就消失），但日志帧不再往展示缓冲里写
+const liveTail = ref(false)
+const following = computed(() => logPanel.polling && liveTail.value)
+// 实时日志缓冲：按绝对偏移把窗口帧拼成越来越长的完整日志（见 utils/taskLogBuffer）
+const buf = createLogBuffer()
 
 // 面板工作区高度：按「面板滚动到屏幕顶部时正好铺满一屏」一次性计算的固定值（与当前滚动位置无关，
 // 滚动过程中不重算，避免页面高度随滚动变化产生漂移感），仅窗口尺寸变化时更新，小屏保底 360px。
@@ -1373,16 +1383,24 @@ async function openLogs(row, { live = false } = {}) {
   logPanel.task = row
   logPanel.current = null
   logPanel.output = ''
+  liveTail.value = false
+  resetBuffer(buf)
   await refreshLogs()
   await nextTick()
   updateOutputHeight()
   logPanelRef.value?.$el?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-  if (live || ['running', 'pending', 'paused'].includes(row.status)) startFollow()
+  // selectLog 选中「执行中」的最新记录时已经开跟随了，这里只兜住刚发起执行
+  // （列表状态还没变成 running）的情况
+  if (!logPanel.polling && (live || ['running', 'pending', 'paused'].includes(row.status))) {
+    liveTail.value = true
+    startFollow()
+  }
 }
 
 function closeLogs() {
   logPanel.task = null
   outputFullVisible.value = false
+  liveTail.value = false
   stopFollow()
 }
 
@@ -1434,40 +1452,59 @@ async function refreshLogs() {
 
 async function selectLog(log) {
   if (!log || !logPanel.task) return
+  const seq = ++selectSeq
+  const taskId = logPanel.task.id
   logPanel.current = log
+  // 「是否执行中」看这条记录自己的状态，不看任务快照（快照可能是上一次执行留下的
+  // 终态，据此判断会把执行中的记录当历史去读详情，页面上就是「暂无输出」）
   const isLatest = logPanel.logs[0]?.id === log.id
-  const running = ['pending', 'running', 'paused'].includes(logPanel.task.status)
-  if (isLatest && running) {
-    // 最新一次且执行中：输出走轻量轮询实时刷新
-    logPanel.output = logPanel.task.output || '（执行中，等待输出…）'
+  const live = ['pending', 'running', 'paused'].includes(log.status || logPanel.task.status)
+  if (isLatest && live) {
+    // 最新一次且执行中：输出走实时通道（WebSocket / 轮询回退），重连以取回完整快照
+    logPanel.output = '（执行中，等待输出…）'
+    liveTail.value = true
+    startFollow()
     return
   }
-  const res = await getTaskLogDetail(logPanel.task.id, log.id)
+  liveTail.value = false
+  const res = await getTaskLogDetail(taskId, log.id)
+  if (seq !== selectSeq || logPanel.task?.id !== taskId) return  // 期间已切走：丢弃
   logPanel.current = res.data
   logPanel.output = res.data?.output || '（暂无输出）'
 }
 
-// 实时刷新状态：outOffset = 轮询已拉取长度；hasRaw = 当前展示的是真实日志（非占位）
-let outOffset = 0
-let hasRaw = false
-
 // ── 实时日志：WebSocket 优先，失败回退轮询 ────────────────
+function render() {
+  logPanel.output = buf.text || '（执行中，等待输出…）'
+}
+
+function applySteps(steps) {
+  // 执行中的模块表（含后续 pending 模块）随推送更新，任务流树据此保持完整
+  if (logPanel.current) logPanel.current = { ...logPanel.current, steps_result: steps || [] }
+}
+
 function startFollow() {
   stopFollow()
   if (!logPanel.task) return
   logPanel.polling = true
-  hasRaw = false
+  resetBuffer(buf)
   const taskId = logPanel.task.id
   stream = openTaskLogStream(taskId, {
-    onFull: (text) => {
+    onFull: (frame) => {
       if (logPanel.task?.id !== taskId) return stopFollow()
-      logPanel.output = text || '（执行中，等待输出…）'
-      hasRaw = !!text
+      if (!liveTail.value) return
+      applyFull(buf, frame)
+      render()
     },
-    onDelta: (chunk) => {
+    onDelta: (frame) => {
       if (logPanel.task?.id !== taskId) return stopFollow()
-      if (hasRaw) logPanel.output += chunk
-      else { logPanel.output = chunk; hasRaw = true }
+      if (!liveTail.value) return
+      applyDelta(buf, frame)
+      render()
+    },
+    onSteps: (steps) => {
+      if (logPanel.task?.id !== taskId) return stopFollow()
+      applySteps(steps)
     },
     onStatus: (data) => {
       if (logPanel.task?.id !== taskId) return stopFollow()
@@ -1501,24 +1538,23 @@ function startPolling() {
   stopPolling()
   if (!logPanel.task) return
   logPanel.polling = true
-  outOffset = 0
-  hasRaw = false
+  resetBuffer(buf)
   const taskId = logPanel.task.id
   pollTimer = setInterval(async () => {
     try {
-      const res = await getTaskOutput(taskId, hasRaw ? outOffset : 0)
+      const res = await getTaskOutput(taskId, buf.offset)
       if (logPanel.task?.id !== taskId) return stopPolling()
       const data = res.data || {}
-      // output/offset/delta 属于日志流，不能并进任务对象（否则增量片段会污染 task.output）
-      const { output: _o, offset: _f, delta: _d, ...taskFields } = data
+      // 日志流字段不能并进任务对象（否则增量片段会污染 task.output）
+      const { output: _o, head: _h, start: _s, offset: _f, delta: _d,
+              steps_result: steps, ...taskFields } = data
       logPanel.task = { ...logPanel.task, ...taskFields }
-      if (data.delta) {
-        if (data.output) logPanel.output += data.output   // 只回传新增部分，追加
-      } else {
-        logPanel.output = data.output || '（执行中，等待输出…）'
+      if (liveTail.value) {
+        if (data.delta) applyDelta(buf, data)
+        else applyFull(buf, data)
+        render()
       }
-      outOffset = data.offset || 0
-      hasRaw = hasRaw || !!data.output
+      if (steps) applySteps(steps)
       if (data.status === 'success' || data.status === 'failed') {
         stopPolling()
         fetchData()

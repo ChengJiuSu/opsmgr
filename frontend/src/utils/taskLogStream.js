@@ -18,11 +18,13 @@ function wsUrl(taskId) {
 /**
  * 打开日志流。
  * @param {number} taskId
- * @param {object} handlers onFull(text)/onDelta(text)/onStatus(data)/onFallback(reason)
+ * @param {object} handlers onFull(frame)/onDelta(frame)/onSteps(steps)/onStatus(data)/onFallback(reason)
+ *   onFull/onDelta 收到的是整帧（含 head/output/start/offset 绝对偏移信息，
+ *   由 utils/taskLogBuffer 拼接），不是裸文本。
  * @returns {{close: Function}} 调用 close() 主动断开（不会触发 onFallback）
  */
 export function openTaskLogStream(taskId, handlers = {}) {
-  const { onFull, onDelta, onStatus, onFallback } = handlers
+  const { onFull, onDelta, onSteps, onStatus, onFallback } = handlers
   const token = localStorage.getItem('access_token') || ''
   let socket = null
   let pingTimer = null
@@ -74,11 +76,14 @@ export function openTaskLogStream(taskId, handlers = {}) {
     }
     armWatchdog()  // 任何下行帧（含 pong）都算连接活着
     if (msg.kind === 'full') {
-      onFull?.(msg.output || '')
-      // 快照同时带状态，首帧即可切出暂停操作条
+      onFull?.(msg)
+      // 快照同时带模块表与状态，首帧即可画出任务流树、切出暂停操作条
+      if (msg.steps) onSteps?.(msg.steps)
       if (msg.status) onStatus?.(msg)
     } else if (msg.kind === 'delta') {
-      onDelta?.(msg.output || '')
+      onDelta?.(msg)
+    } else if (msg.kind === 'steps') {
+      onSteps?.(msg.steps || [])
     } else if (msg.kind === 'status') {
       onStatus?.(msg)
     }

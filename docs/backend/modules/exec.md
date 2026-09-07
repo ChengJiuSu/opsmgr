@@ -163,8 +163,10 @@ ansible 输出不再等模块跑完才可见：`common.ansible.run_stream` 以
   长度、以及整段重发（`kind: full`）的体积都按它算。并行组每次 flush 都要整段
   重发（多块交错发不成增量），所以这个值直接决定推送带宽。
   写库贵且只是回退通道，节流 3s，窗口另算：`live.DB_PREVIEW_LIMIT`（8000 字符）
-  写 `ExecutionTask.output`，超出加截断标注。两个窗口是同一份尾部的宽窄之分
-  （库内那份是推送那份的后缀），不是各自截各自的。
+  写 `ExecutionTask.output`，超出加截断标注，并同时写
+  `ExecutionTask.output_offset`（完整输出总长度）——预览只是尾部，读的一端要靠它
+  才能算出这段文本在完整输出里的位置（见下文实时通道的绝对偏移语义）。
+  两个窗口是同一份尾部的宽窄之分（库内那份是推送那份的后缀），不是各自截各自的。
   `TaskExecutionLog.output` 只在 `force`（模块起止、阶段收尾）时跟着写一份
   —— 执行中没人读它，详情接口在执行结束回填 `log_file` 后直接读落盘全量。
   **为什么拆**：原来两者共用 60000，等于每秒往 MySQL 写一次 60KB TEXT
@@ -201,13 +203,27 @@ ansible 输出不再等模块跑完才可见：`common.ansible.run_stream` 以
 - **鉴权**：token 走 **子协议** `['jwt', <access_token>]`（不进 URL 与 nginx
   访问日志），兼容 `?token=`；校验到有效启用用户即放行（任务详情登录可读）。
   失败关 4401，任务不存在关 4404。
-- **消息**：连接先收 `{"kind":"full", output, offset, status, ...}` 快照，
-  之后收 `{"kind":"delta", output}` 增量与 `{"kind":"status", ...}` 状态变化
+- **消息**：连接先收 `{"kind":"full", head, output, start, offset, steps, status, ...}`
+  快照，之后收 `{"kind":"delta", output, offset}` 增量、
+  `{"kind":"steps", steps}` 模块表变化与 `{"kind":"status", ...}` 状态变化
   （running / paused / 终态，来自 `live.push_status`）。客户端可发
   `{"type":"ping"}`，服务端回 `{"kind":"pong"}`。
-- **增量语义**：sink 以完整输出长度为基准发增量；临时提示（失败等待）、
-  并行组多块交错、模块结束交还 outputs、增量超出尾部覆盖范围时改发整段
-  （`kind=full`，尾部预览），客户端按 kind 决定追加还是替换。
+- **绝对偏移语义**：`start`/`offset` 是**完整输出里的字符位置**，`full` 帧的
+  `output` 覆盖区间 `[start, offset)`。客户端（`utils/taskLogBuffer.js`）按偏移把
+  这段盖回本地那份更长的日志，只替换窗口覆盖的尾段。**为什么必须带偏移**：临时
+  提示（失败等待）、并行组多块交错、模块结束交还 outputs、增量超出尾部覆盖范围
+  都会改发 `full`，而 `full` 只有一个实时窗口那么长；客户端若整份替换，跑到第二个
+  模块时第一个模块的日志就当场消失。`start` 也可能偏大（并行组各块各自裁过头部，
+  拼起来缺中段），客户端对不上就把这段接在已有内容之后并标出缺口，历史一样不丢。
+- **快照补历史**：执行中的快照不是库内预览而已：`live.read_live_output` 以本次执行
+  的**落盘文件**（已完成模块的完整输出）为历史、库内预览为当前模块尾部，按
+  `ExecutionTask.output_offset`（完整输出总长度）算重叠后拼成连续日志。切到别的
+  执行记录再切回来会重连本通道，没有这一步就只剩当前模块。当前模块自身已超出窗口
+  时中间那段取不回来，此时快照给 `head`（历史）+ 缺口提示 + `output`（尾段）。
+- **模块表**：`runner.run` 开跑即把整张模块表（含尚未执行的 `pending` 项）写进
+  `TaskExecutionLog.steps_result` 并推送，模块起止各更新一次。面板的任务流树读的
+  就是这份表——执行中也能看到后面还有哪些模块要输出，且先前模块滑出实时窗口后树上
+  的节点不会消失。
 - **回退**：连接建立时先 `group_add` 探测 channel layer，未配/连不上 Redis
   直接拒握手（4503）；`live.push` 失败只告警并停止后续推送。前端
   `utils/taskLogStream.js` 在握手失败、连接中断、或 60s 收不到任何帧（含
@@ -415,7 +431,7 @@ POST                /api/exec/tasks/{id}/trigger/ 接口/Webhook 触发（API �
                                                   生产环境任务须带 body {confirm_production:true}；
                                                   主机范围恒为「维度匹配到的全部主机」，日志 trigger_type='api'
 POST                /api/exec/tasks/{id}/confirm/ 人工处理暂停：确认模块 continue/abort；失败等待 retry/skip/abort（仅管理员）
-GET                 /api/exec/tasks/{id}/output/  轻量轮询：状态与输出；?offset=N 只回增量（delta=true 时前端追加，返回新 offset）
+GET                 /api/exec/tasks/{id}/output/  轻量轮询（WebSocket 回退）：状态、模块表与输出；?offset=N 为完整输出里的绝对偏移，窗口覆盖时只回增量（delta=true），否则以落盘文件重建可见日志并给出 head/start
 GET                 /api/exec/tasks/{id}/logs/    执行历史列表（含主机数/执行方式/逐模块结果 steps_result）
 GET                 /api/exec/tasks/{id}/logs/{log_id}/  单条日志详情（完整输出 + 主机快照）
 GET                 /api/exec/tasks/{id}/logs/{log_id}/scene/  执行现场归档（exec read）：

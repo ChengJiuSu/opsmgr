@@ -147,9 +147,97 @@ def _preview(total, tail, limit=DB_PREVIEW_LIMIT):
     return TRUNCATE_NOTE + tail[-limit:]
 
 
+def split_note(preview):
+    """拆掉预览头部的截断说明，返回 (是否截断, 正文)。
+
+    正文长度是算绝对偏移的依据（start = 总长度 - len(正文)），说明文字不能算进去。
+    """
+    preview = preview or ''
+    if preview.startswith(TRUNCATE_NOTE):
+        return True, preview[len(TRUNCATE_NOTE):]
+    return False, preview
+
+
 def log_rel_path(task_id, log_id):
     """执行日志落盘相对路径（相对 settings.TASK_LOG_DIR）。"""
     return str(Path(str(task_id)) / f'{log_id}.log')
+
+
+# 「执行中可见日志」的重建上限（字符）。落盘文件可能几十 MB，而这份重建结果要整段
+# 过 channel layer（Redis）再进 WebSocket 帧、或塞进一次轮询响应，不能按文件大小走。
+# 20 万字符约几千行 ansible 输出，够往回翻很多屏；更早的内容执行结束后在本页看全量。
+LIVE_WINDOW_LIMIT = 200000
+# 落盘文件单次最多读这么多字节（UTF-8 中文约 3 字节/字符，够铺满上面那个窗口）
+FILE_READ_LIMIT = LIVE_WINDOW_LIMIT * 4
+
+
+def _tail(text, limit=LIVE_WINDOW_LIMIT):
+    return text if len(text) <= limit else text[-limit:]
+
+
+def read_live_output(task):
+    """组出「执行中」可见的最长日志，及其绝对偏移。
+
+    实时窗口（库内尾部预览）只有 DB_PREVIEW_LIMIT 字符，跑到第二个模块时第一个
+    模块就滑出窗口了——而**已完成模块的完整输出**执行期间就已流式落盘。所以这里
+    以落盘文件为「历史」、库内预览为「当前模块尾部」，两段按绝对偏移拼接：
+
+      head   已知但不与尾段相连的前段（落盘文件内容，缺口时非空）
+      output 尾段正文，覆盖绝对区间 [start, offset)
+      offset 完整输出总长度（= 服务端偏移基准）
+
+    返回的 head 为空时 output 即从 0 开始的连续全文（常见情况）。前端把
+    (head, output, start) 拼成展示文本，并用 start 给后续增量帧定位。
+    """
+    truncated, body = split_note(task.output or '')
+    total = task.output_offset or (len(body) if not truncated else 0)
+    if total < len(body):        # 老数据/未回填偏移：只能按「预览即全文」处理
+        total = len(body)
+    start = total - len(body)
+    if not start:
+        return {'head': '', 'output': body, 'start': 0, 'offset': total}
+
+    file_text, complete = _read_running_log_file(task)
+    if file_text is None:
+        return {'head': '', 'output': body, 'start': start, 'offset': total}
+    file_len = len(file_text)
+    if complete and start <= file_len:
+        # 预览与落盘部分有重叠：去掉重叠后接上，得到连续的一段（够长则从 0 开始）
+        whole = file_text + body[file_len - start:]
+        visible = _tail(whole)
+        return {'head': '', 'output': visible,
+                'start': total - len(visible), 'offset': total}
+    # 当前模块自身的输出已超出实时窗口（或落盘文件本身已超出重建上限，只取到尾部
+    # 因而算不出重叠位置）：前段照给，中间按缺口处理
+    return {'head': _tail(file_text), 'output': body, 'start': start, 'offset': total}
+
+
+def _read_running_log_file(task):
+    """读本次执行已落盘的日志（已完成模块的完整输出），返回 (文本, 是否读全)。
+
+    执行中的 TaskExecutionLog.log_file 还没回填（收尾才写），所以按最新一条执行
+    记录的 id 直接拼路径。不可读时返回 (None, False)。
+
+    只读尾部 FILE_READ_LIMIT 字节：文件可能几十 MB，而重建结果最多也就
+    LIVE_WINDOW_LIMIT 字符。读不全时字符总长度未知（拼不出重叠位置），调用方
+    据 complete=False 走「前段 + 缺口」那条路。
+    """
+    from django.conf import settings
+
+    log_id = task.logs.order_by('-created_at', '-id').values_list('pk', flat=True).first()
+    if not log_id:
+        return None, False
+    path = Path(settings.TASK_LOG_DIR) / log_rel_path(task.pk, log_id)
+    try:
+        size = path.stat().st_size
+        with path.open('rb') as fh:
+            if size > FILE_READ_LIMIT:
+                fh.seek(size - FILE_READ_LIMIT)
+                # 尾部起点可能切在一个多字节字符中间，errors='replace' 顶掉那半个字符
+                return fh.read().decode('utf-8', 'replace'), False
+            return fh.read().decode('utf-8', 'replace'), True
+    except OSError:
+        return None, False
 
 
 def push(task_id, payload):
@@ -214,11 +302,43 @@ class LiveSink:
         self._ws_len = 0        # 已推送的完整输出长度（增量基准）
         self._ws_reset = False  # 下次推送整段（模块切换后文本可能被重排）
         self._ws_broken = False
+        self._steps = None      # runner 的逐模块结果列表（同一对象，含未执行的 pending）
 
     # ── 生命周期 ────────────────────────────────────────────
     def bind(self, outputs):
         """绑定 runner 的已完成模块输出列表（同一对象，后续只读）。"""
         self._outputs = outputs
+
+    def bind_steps(self, steps):
+        """绑定 runner 的逐模块结果列表（含尚未执行的 pending 项）并立刻发布一次。
+
+        执行中就把整张模块表（含后续待执行模块）落到执行日志记录上，面板据此画出
+        完整的任务流树 —— 否则执行中只能靠解析日志里已出现的模块头，跑一个才看见
+        一个，且先前模块滑出实时窗口后连树上的节点都会消失。
+        """
+        self._steps = steps
+        self.publish_steps()
+
+    def step_status(self, index, **fields):
+        """更新第 index 个模块（1 起）的状态并发布（模块起止各一次，量很小）。"""
+        if not self._steps or not 1 <= index <= len(self._steps):
+            return
+        self._steps[index - 1].update(fields)
+        self.publish_steps()
+
+    def publish_steps(self):
+        """把当前模块表写进执行日志记录并推给面板。"""
+        if self._steps is None:
+            return
+        from .models import TaskExecutionLog
+
+        steps = [dict(item) for item in self._steps]
+        if self.log_id:
+            try:
+                TaskExecutionLog.objects.filter(pk=self.log_id).update(steps_result=steps)
+            except Exception as exc:  # noqa: BLE001 - 写库失败不中断执行
+                logger.warning('任务 %s 模块表写库失败：%s', self.task_id, exc)
+        push(self.task_id, {'kind': 'steps', 'steps': steps})
 
     @staticmethod
     def _new_block(order=0, header=''):
@@ -369,22 +489,30 @@ class LiveSink:
         if db_due:
             # 执行日志表只在 force（模块起止、阶段收尾）时跟着写一份：任务表
             # 才是前端轮询读的对象，两张表都按推送频率写整份预览纯属浪费。
-            self._save_preview(_preview(total, tail), write_log=force)
+            self._save_preview(_preview(total, tail), total, write_log=force)
         if push_due:
             self._broadcast(total, tail, extra_used=bool(extra))
 
     def _broadcast(self, total, tail, extra_used):
-        """把新增片段推给 WebSocket 客户端（前缀被破坏时整段重发）。
+        """把新增片段推给 WebSocket 客户端（前缀被破坏时重发实时窗口）。
 
         total 为完整输出长度，tail 为其末尾 PREVIEW_LIMIT 字符——增量都落在尾部，
         所以从 tail 里切即可，无需持有完整输出。
+
+        重发帧带 start（= 这段文本的绝对起点）：客户端按绝对偏移把它盖回自己那份
+        更长的日志上，只替换窗口内的尾段，窗口之外已收到的模块不受影响。没有
+        start 时客户端只能整份换成一个 16000 字符的窗口，先前模块当场消失——这正
+        是「执行第二个模块时第一个模块的日志看不见」的由来。
+
+        start 也可能偏大（并行组里多个实时块各自裁过头部，拼起来缺中段），客户端
+        对不上就把这段接在已有内容之后并标出缺口，历史一样不丢。
         """
         if self._ws_broken:
             return
         with self._lock:
             delta_len = total - self._ws_len
-            # 临时提示会消失、并行组多块交错插入、长度回退：都不再是 append，整段重发。
-            # 增量超出 tail 覆盖范围时同样整段重发（切不出来，且这么大的增量本就
+            # 临时提示会消失、并行组多块交错插入、长度回退：都不再是 append，重发窗口。
+            # 增量超出 tail 覆盖范围时同样重发（切不出来，且这么大的增量本就
             # 不适合当 delta 发）
             reset = (self._ws_reset or extra_used or len(self._live) > 1
                      or delta_len < 0 or delta_len > len(tail))
@@ -392,23 +520,27 @@ class LiveSink:
             if not reset and not chunk:
                 return
             self._ws_len, self._ws_reset = total, False
-        payload = ({'kind': 'full', 'output': _preview(total, tail, PREVIEW_LIMIT),
+        payload = ({'kind': 'full', 'output': tail, 'start': max(0, total - len(tail)),
                     'offset': total}
                    if reset else {'kind': 'delta', 'output': chunk, 'offset': total})
         if not push(self.task_id, payload):
             self._ws_broken = True  # 通道不可用：不再重试，前端自行回退轮询
 
-    def _save_preview(self, preview, write_log=True):
-        """写实时预览。write_log=False 时只写任务表（前端轮询读的就是它）。
+    def _save_preview(self, preview, total, write_log=True):
+        """写实时预览与输出总长度。write_log=False 时只写任务表（轮询读的就是它）。
 
         执行日志表是「历史记录」，执行中没人读它的 output（详情接口在执行结束
         回填 log_file 后直接读落盘全量），跟着推送频率一起写等于把同一份预览
         TEXT 写两遍。
+
+        total 一起落库（output_offset）：预览只是尾部，读的一端要靠它才能算出这段
+        文本在完整输出里的位置，进而与落盘文件拼成连续日志（read_live_output）。
         """
         from .models import ExecutionTask, TaskExecutionLog
 
         try:
-            ExecutionTask.objects.filter(pk=self.task_id).update(output=preview)
+            ExecutionTask.objects.filter(pk=self.task_id).update(
+                output=preview, output_offset=total)
             if write_log and self.log_id:
                 TaskExecutionLog.objects.filter(pk=self.log_id).update(output=preview)
         except Exception as exc:  # noqa: BLE001 - 写库失败只丢一次实时预览，不中断执行

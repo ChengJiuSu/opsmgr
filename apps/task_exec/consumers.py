@@ -9,9 +9,15 @@
 用户即可放行。
 
 推送消息（服务端 → 客户端）：
-  {"kind": "full",   "output": <全量/尾部预览>, "offset": n}
-  {"kind": "delta",  "output": <新增片段>,      "offset": n}
+  {"kind": "full",   "output": <尾段正文>, "start": n, "offset": n,
+                     "head": <与尾段不相连的前段，仅快照帧可能有>}
+  {"kind": "delta",  "output": <新增片段>, "offset": n}
+  {"kind": "steps",  "steps": [<逐模块结果，含未执行的 pending>]}
   {"kind": "status", "status": ..., "pause_type": ..., "return_code": ..., "duration": ...}
+
+full 帧的 output 覆盖完整输出的绝对区间 [start, offset)：客户端据此把它盖回自己
+那份更长的日志（只换窗口内的尾段），而不是整份替换成一个实时窗口——后者会让先前
+模块的日志在执行中途消失。
 """
 import logging
 from urllib.parse import parse_qs
@@ -118,18 +124,30 @@ class TaskLogConsumer(AsyncJsonWebsocketConsumer):
 
     @database_sync_to_async
     def _snapshot(self):
-        """当前输出快照与状态（任务不存在返回 None）。"""
+        """当前输出快照与状态（任务不存在返回 None）。
+
+        执行中的快照不能只给库内尾部预览：切到别的执行记录再切回来会重连本通道，
+        那时预览里往往只剩当前模块，先前模块的日志就「不见了」。live.read_live_output
+        以落盘文件补回已完成模块的完整输出，并给出绝对偏移供后续增量落位。
+        """
+        from .live import read_live_output
         from .models import ExecutionTask
 
         task = ExecutionTask.objects.filter(pk=self.task_id).first()
         if task is None:
             return None
-        output = task.output or ''
+        live = read_live_output(task)
         return {
-            'output': output,
-            'offset': len(output),
+            **live,
+            'steps': self._latest_steps(task),
             'status': task.status,
             'pause_type': task.pause_type,
             'return_code': task.return_code,
             'duration': task.duration,
         }
+
+    @staticmethod
+    def _latest_steps(task):
+        """最新一次执行的模块表（执行中即含 pending 的完整任务流）。"""
+        return (task.logs.order_by('-created_at', '-id')
+                .values_list('steps_result', flat=True).first() or [])

@@ -13,7 +13,7 @@
           </el-tag>
         </span>
         <span class="header-right">
-          <el-tag v-if="polling" type="info" size="small">实时刷新中…</el-tag>
+          <el-tag v-if="following" type="info" size="small">实时刷新中…</el-tag>
           <el-button size="small" :icon="Refresh" @click="init">刷新</el-button>
           <el-button size="small" type="primary" :icon="CopyDocument" @click="copyLink">复制链接</el-button>
         </span>
@@ -77,7 +77,8 @@
         <StepOutput
           :output="output"
           :steps-result="current?.steps_result || []"
-          :follow="polling"
+          :follow="following"
+          :log-id="current?.id"
           class="output-host"
         />
       </div>
@@ -115,6 +116,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { getTask, getTaskLogs, getTaskLogDetail, getTaskLogScene, getTaskOutput, confirmTask } from '../../api/tasks'
 import { useAuthStore } from '../../stores/auth'
 import { openTaskLogStream } from '../../utils/taskLogStream'
+import { createLogBuffer, applyFull, applyDelta, resetBuffer } from '../../utils/taskLogBuffer'
 import StepOutput from '../../components/StepOutput.vue'
 
 const route = useRoute()
@@ -135,7 +137,15 @@ const output = ref('')
 const polling = ref(false)
 const logTableRef = ref()
 let pollTimer = null
+let listTimer = null
 let stream = null   // WebSocket 日志流（不可用时为 null，走 pollTimer）
+let selectSeq = 0   // 选中序号：异步取详情返回时用它丢弃已被覆盖的旧请求
+// 正在看「执行中」那条记录：看历史记录时通道仍开着（状态/模块表照收，暂停操作条
+// 不会因为翻了一眼历史就消失），但日志帧不再往展示缓冲里写
+const liveTail = ref(false)
+const following = computed(() => polling.value && liveTail.value)
+// 实时日志缓冲：按绝对偏移把窗口帧拼成越来越长的完整日志（见 utils/taskLogBuffer）
+const buf = createLogBuffer()
 
 const statusType = (s) => ({ pending: 'info', running: 'warning', paused: 'primary', success: 'success', failed: 'danger' }[s] || 'info')
 const formatTime = (t) => (t ? t.slice(0, 19).replace('T', ' ') : '')
@@ -157,7 +167,9 @@ const currentServers = computed(() => {
 
 async function init() {
   loading.value = true
+  liveTail.value = false
   stopFollow()
+  stopListTimer()
   try {
     const [t, l] = await Promise.all([getTask(taskId), getTaskLogs(taskId)])
     task.value = t.data
@@ -178,42 +190,51 @@ async function init() {
 
 async function selectLog(log) {
   if (!log) return
+  const seq = ++selectSeq
   current.value = log
   if (String(log.id) !== String(route.params.logId)) {
     router.replace({ name: 'TaskLog', params: { taskId, logId: log.id } })
   }
+  // 「是否执行中」看这条记录自己的状态，不看任务快照：任务快照可能是上一次执行
+  // 留下的终态，据此判断会把执行中的记录当历史记录去读详情，而执行中的详情里
+  // 只有一份还没回填的预览（页面上就是「暂无输出」，刷新才好）
   const isLatest = logs.value[0]?.id === log.id
-  const running = ['pending', 'running', 'paused'].includes(task.value?.status)
-  if (isLatest && running) {
-    // 最新一次且执行中：优先 WebSocket 推送，不可用回退轮询
-    output.value = task.value?.output || '（执行中，等待输出…）'
+  const live = ['pending', 'running', 'paused'].includes(
+    log.status || task.value?.status,
+  )
+  if (isLatest && live) {
+    // 最新一次且执行中：优先 WebSocket 推送，不可用回退轮询（重连以取回完整快照）
+    output.value = '（执行中，等待输出…）'
+    liveTail.value = true
     startFollow()
+    startListTimer()
     return
   }
-  stopFollow()
+  liveTail.value = false
   const res = await getTaskLogDetail(taskId, log.id)
+  if (seq !== selectSeq) return   // 期间已切到别的记录：丢弃这次结果
   current.value = res.data
   output.value = res.data?.output || '（暂无输出）'
 }
 
-// 实时刷新状态：outOffset = 轮询已拉取长度；hasRaw = 当前展示的是真实日志（非占位）
-let outOffset = 0
-let hasRaw = false
-
 // ── 实时日志：WebSocket 优先，失败回退轮询 ────────────────
+function render() {
+  output.value = buf.text || '（执行中，等待输出…）'
+}
+
+function applySteps(steps) {
+  // 执行中的模块表（含后续 pending 模块）随推送更新，任务流树据此保持完整
+  if (current.value) current.value = { ...current.value, steps_result: steps || [] }
+}
+
 function startFollow() {
   stopFollow()
   polling.value = true
-  hasRaw = false
+  resetBuffer(buf)
   stream = openTaskLogStream(taskId, {
-    onFull: (text) => {
-      output.value = text || '（执行中，等待输出…）'
-      hasRaw = !!text
-    },
-    onDelta: (chunk) => {
-      if (hasRaw) output.value += chunk
-      else { output.value = chunk; hasRaw = true }
-    },
+    onFull: (frame) => { if (liveTail.value) { applyFull(buf, frame); render() } },
+    onDelta: (frame) => { if (liveTail.value) { applyDelta(buf, frame); render() } },
+    onSteps: applySteps,
     onStatus: applyStatus,
     onFallback: () => {
       stream = null
@@ -245,22 +266,21 @@ function stopFollow() {
 function startPolling() {
   stopPolling()
   polling.value = true
-  outOffset = 0
-  hasRaw = false
+  resetBuffer(buf)
   pollTimer = setInterval(async () => {
     try {
-      const res = await getTaskOutput(taskId, hasRaw ? outOffset : 0)
+      const res = await getTaskOutput(taskId, buf.offset)
       const data = res.data || {}
-      // output/offset/delta 属于日志流，不能并进任务对象（否则增量片段会污染 task.output）
-      const { output: _o, offset: _f, delta: _d, ...taskFields } = data
+      // 日志流字段不能并进任务对象（否则增量片段会污染 task.output）
+      const { output: _o, head: _h, start: _s, offset: _f, delta: _d,
+              steps_result: steps, ...taskFields } = data
       task.value = { ...task.value, ...taskFields }
-      if (data.delta) {
-        if (data.output) output.value += data.output   // 只回传新增部分，追加
-      } else {
-        output.value = data.output || '（执行中，等待输出…）'
+      if (liveTail.value) {
+        if (data.delta) applyDelta(buf, data)
+        else applyFull(buf, data)
+        render()
       }
-      outOffset = data.offset || 0
-      hasRaw = hasRaw || !!data.output
+      if (steps) applySteps(steps)
       if (data.status === 'success' || data.status === 'failed') {
         stopPolling()
         init() // 执行完成：刷新日志列表并定位最新记录
@@ -269,6 +289,27 @@ function startPolling() {
       stopPolling()
     }
   }, 1000)
+}
+
+// 执行中定时刷新记录列表：本页停留期间又发起了新执行时，列表与「执行中」
+// 那条记录才会自己冒出来（否则要手动刷新）
+function startListTimer() {
+  stopListTimer()
+  listTimer = setInterval(async () => {
+    const res = await getTaskLogs(taskId)
+    const rows = res.data || []
+    if (rows[0] && rows[0].id !== logs.value[0]?.id) {
+      init()   // 又发起了一次执行：整页重来（定位到新记录并重新跟随）
+      return
+    }
+    // 就地更新（保持行对象身份）：表格的当前选中行与滚动位置都不受影响
+    const byId = new Map(rows.map((r) => [r.id, r]))
+    logs.value.forEach((row) => Object.assign(row, byId.get(row.id) || {}))
+  }, 5000)
+}
+
+function stopListTimer() {
+  if (listTimer) { clearInterval(listTimer); listTimer = null }
 }
 
 function stopPolling() {
@@ -344,7 +385,7 @@ async function copyLink() {
 }
 
 onMounted(init)
-onUnmounted(stopFollow)
+onUnmounted(() => { stopFollow(); stopListTimer() })
 </script>
 
 <style scoped>

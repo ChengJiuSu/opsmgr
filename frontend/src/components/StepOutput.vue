@@ -48,15 +48,19 @@ import { ansiToHtml, stripAnsi } from '../utils/ansi'
 
 const props = defineProps({
   output: { type: String, default: '' },
-  // 执行日志的逐模块结果（steps_result）：提供完整模块列表与状态（含 skipped）
+  // 执行日志的逐模块结果（steps_result）：提供完整模块列表与状态
+  // （执行中即含 pending 的后续模块，由 runner 开跑时一次建好）
   stepsResult: { type: Array, default: () => [] },
   // 实时轮询中：自动选中最新模块并滚动到底部（用户手动点选后不再抢焦点）
   follow: { type: Boolean, default: false },
+  // 当前执行记录 id：切换记录时重置选中（不重置的话会带着上一条记录选中的模块
+  // 序号去看新记录，撞上没有该模块的记录就是一片「暂无输出」）
+  logId: { type: [Number, String], default: null },
 })
 
 const ALL = '__all__'
-const STATUS_TAG = { success: 'success', failed: 'danger', skipped: 'info' }
-const STATUS_LABEL = { success: '成功', failed: '失败', skipped: '跳过' }
+const STATUS_TAG = { success: 'success', failed: 'danger', skipped: 'info', pending: 'info' }
+const STATUS_LABEL = { success: '成功', failed: '失败', skipped: '跳过', pending: '待执行' }
 // 失败后被人工跳过的模块（任务流继续但本次执行仍记失败）
 const statusLabel = (mod) =>
   mod.status === 'failed' && mod.skippedOver ? '失败·已跳过' : STATUS_LABEL[mod.status] || mod.status
@@ -142,23 +146,32 @@ function select(key) {
   userPinned.value = true
 }
 
-// 跟随模式：新输出到达自动选中最新模块并滚到底（用户点选过则只滚动不抢选中）
+// 选中的模块在当前记录里不存在（切换记录、模块表变短）：退回「全部日志」，
+// 否则日志区会空着而看不出原因
+watch(modules, (list) => {
+  if (selected.value !== ALL && !list.some((m) => m.index === selected.value)) {
+    selected.value = ALL
+  }
+})
+
+// 切换执行记录：回到「全部日志」并交还自动跟随
+watch(() => props.logId, () => {
+  selected.value = ALL
+  userPinned.value = false
+})
+
+// 跟随模式：新输出到达自动选中正在执行的模块并滚到底（用户点选过则只滚动不抢选中）
 watch(() => props.output, async () => {
   if (!props.follow) return
   if (!userPinned.value) {
+    // 模块表里的 running 项优先（执行中就有完整模块表），否则退回已出现的最后一段
+    const running = modules.value.find((m) => m.status === 'running')
     const secs = parsed.value.sections
-    if (secs.length) selected.value = secs[secs.length - 1].index
+    if (running) selected.value = running.index
+    else if (secs.length) selected.value = secs[secs.length - 1].index
   }
   await nextTick()
   if (paneRef.value) paneRef.value.scrollTop = paneRef.value.scrollHeight
-})
-
-// 切换日志记录：重置为全部视图
-watch(() => props.stepsResult, () => {
-  if (!props.follow) {
-    selected.value = ALL
-    userPinned.value = false
-  }
 })
 </script>
 

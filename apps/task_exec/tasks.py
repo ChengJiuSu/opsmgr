@@ -52,7 +52,10 @@ def execute_task(task_id, log_id=None):
     started_at = timezone.now()
     task.status = log.status = 'running'
     task.started_at = log.started_at = started_at
-    task.save(update_fields=['status', 'started_at'])
+    # 上一次执行的输出预览必须清掉：实时面板会把「库内尾部预览」与「本次执行的落盘
+    # 文件」按 output_offset 拼接，留着上次的预览会拼出一段前后不属于同一次执行的日志
+    task.output, task.output_offset = '', 0
+    task.save(update_fields=['status', 'started_at', 'output', 'output_offset'])
     log.save(update_fields=['status', 'started_at'])
     push_status(task.pk)  # 开跑：推送 running（WebSocket 客户端已在等）
 
@@ -77,7 +80,9 @@ def execute_task(task_id, log_id=None):
         preview = preview_of(output)
 
         task.return_code, task.output, task.status, task.finished_at = rc, preview, status, finished_at
-        task.save(update_fields=['return_code', 'output', 'status', 'finished_at'])
+        task.output_offset = len(output)
+        task.save(update_fields=[
+            'return_code', 'output', 'output_offset', 'status', 'finished_at'])
 
         log.return_code, log.output, log.status, log.finished_at = rc, preview, status, finished_at
         log.steps_result = steps_result
@@ -88,8 +93,12 @@ def execute_task(task_id, log_id=None):
         # 收尾推送：整段最终输出 + 终态（客户端据此停连接并刷新执行记录）。
         # 推送按实时窗口取尾部，比写库那份宽——面板上收尾后还要能往回翻几屏，
         # 而库里那份只是轮询回退与文件过期后的兜底。
-        final_push = preview_of(output, PREVIEW_LIMIT)
-        push(task.pk, {'kind': 'full', 'output': final_push, 'offset': len(final_push)})
+        final_tail = output[-PREVIEW_LIMIT:] if len(output) > PREVIEW_LIMIT else output
+        push(task.pk, {
+            'kind': 'full', 'output': final_tail,
+            'start': len(output) - len(final_tail), 'offset': len(output),
+        })
+        push(task.pk, {'kind': 'steps', 'steps': steps_result})
         push_status(task.pk)
 
 

@@ -525,31 +525,47 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['get'])
     def output(self, request, pk=None):
-        """轻量轮询接口：仅返回状态与输出（支持增量拉取）。
+        """轻量轮询接口：仅返回状态与输出（WebSocket 不可用时的回退通道）。
 
-        带 ?offset=N 时只回传 N 之后的新增字符（delta=true），避免执行中
-        每秒重传整段日志；输出已达预览上限（尾部截断，前缀会漂移）或 offset
-        越界时回退整段（delta=false），前端按 delta 决定追加还是替换。
+        offset 是**完整输出里的绝对偏移**（与 WebSocket 帧同一套口径）：带
+        ?offset=N 且服务端实时窗口还覆盖着 N 时，只回传 N 之后的新增字符
+        （delta=true）；否则重建可见日志（delta=false，含 head/start），由前端按
+        绝对偏移把这段盖回本地那份更长的日志上。
         """
-        from .live import DB_PREVIEW_LIMIT
+        from .live import read_live_output, split_note
 
         task = self.get_object()
-        out = task.output or ''
         try:
             offset = max(0, int(request.query_params.get('offset') or 0))
         except (TypeError, ValueError):
             offset = 0
-        delta = 0 < offset <= len(out) and len(out) < DB_PREVIEW_LIMIT
+        _, body = split_note(task.output or '')
+        total = max(task.output_offset or 0, len(body))
+        start = total - len(body)
+        if offset and start <= offset <= total:
+            # 常态：客户端没落后于实时窗口，只补新增部分（不必读落盘文件）
+            live = {'head': '', 'output': body[offset - start:], 'start': offset, 'offset': total}
+            delta = True
+        else:
+            # 首次拉取或已落后出窗口：以落盘文件补回已完成模块，重建可见日志
+            live = read_live_output(task)
+            delta = False
         return ok({
             'id': task.id,
             'status': task.status,
             'pause_type': task.pause_type,
             'return_code': task.return_code,
-            'output': out[offset:] if delta else out,
-            'offset': len(out),
+            'steps_result': self._latest_steps(task),
             'delta': delta,
             'duration': task.duration,
+            **live,
         })
+
+    @staticmethod
+    def _latest_steps(task):
+        """最新一次执行的模块表（执行中即含 pending 的完整任务流）。"""
+        return (task.logs.order_by('-created_at', '-id')
+                .values_list('steps_result', flat=True).first() or [])
 
     @action(detail=True, methods=['get'])
     def logs(self, request, pk=None):

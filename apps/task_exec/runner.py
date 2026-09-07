@@ -698,41 +698,48 @@ def run(task, sink=None):
         return 1, '任务未配置任何模块，请编辑任务后重试。', []
 
     sink = sink or LiveSink(task.pk)
-    outputs, results = [], []
+    stages = _build_stages(steps)
+    outputs = []
+    # 整张模块表先按 pending 建好（不是跑一个 append 一个）：执行中面板就能画出完整
+    # 任务流，看到后面还有哪些模块要输出；每项按模块序号原地更新（results[idx-1]）
+    results = [
+        {
+            'order': step.order, 'name': step.name, 'task_type': step.task_type,
+            'status': 'pending', 'return_code': None, 'duration': None,
+            'server_count': None, 'parallel': len(stage) > 1, 'attempts': 1,
+        }
+        for stage in stages for step in stage
+    ]
     sink.bind(outputs)
+    sink.bind_steps(results)
     total = len(steps)
     flow_rc = None  # 首个失败模块的 rc（含被跳过的失败），决定任务流最终状态
     aborted = False
     abort_note = ''
     pos = 0  # 已消费的模块数（模块序号 = pos + 组内偏移）
-    for stage in _build_stages(steps):
+    for stage in stages:
         parallel = len(stage) > 1
+        pairs = [(step, pos + offset) for offset, step in enumerate(stage, 1)]
         if aborted:
-            for step in stage:
-                results.append({
-                    'order': step.order, 'name': step.name, 'task_type': step.task_type,
-                    'status': 'skipped', 'return_code': None, 'duration': None,
-                    'server_count': None, 'parallel': parallel,
-                })
+            for step, idx in pairs:
+                results[idx - 1].update({'status': 'skipped'})
+            sink.publish_steps()
             pos += len(stage)
             continue
 
-        pairs = [(step, pos + offset) for offset, step in enumerate(stage, 1)]
         entries = _exec_stage(pairs, task, total, sink, parallel)
 
+        idx_by_id = {step.id: idx for step, idx in pairs}
         result_by_id = {}
         for step, header, rc, out, duration, server_count in entries:
             outputs.append(f'{header}\n{out}')
-            item = {
-                'order': step.order, 'name': step.name, 'task_type': step.task_type,
+            item = results[idx_by_id[step.id] - 1]
+            item.update({
                 'status': 'success' if rc == 0 else 'failed', 'return_code': rc,
                 'duration': duration, 'server_count': server_count,
-                'parallel': parallel, 'attempts': 1,
-            }
-            results.append(item)
+            })
             result_by_id[step.id] = item
-
-        idx_by_id = {step.id: idx for step, idx in pairs}
+        sink.publish_steps()
         failed_entries = [e for e in entries if e[2] != 0]
 
         # 暂停确认模块的中止/超时：直接终止任务流，不提供重试/跳过
@@ -768,12 +775,14 @@ def run(task, sink=None):
                         'duration': duration, 'server_count': server_count,
                         'attempts': attempt,
                     })
+                sink.publish_steps()
                 failed_entries = [e for e in entries if e[2] != 0]
             elif action == 'skip':
                 if flow_rc is None:
                     flow_rc = failed_entries[0][2]
                 for e in failed_entries:
                     result_by_id[e[0].id]['skipped_over'] = True
+                sink.publish_steps()
                 outputs.append(f'⤼ 已人工确认跳过失败模块「{names}」，继续执行后续模块（本次执行仍记失败）。')
                 failed_entries = []
             else:  # abort / timeout / abort_now（未开启失败等待）
@@ -835,6 +844,7 @@ def _exec_step(step, task, idx, total, sink, parallel, attempt=1):
     started = time.monotonic()
     retry_mark = f' · 重试#{attempt - 1}' if attempt > 1 else ''
     live_key = (step.id, attempt)
+    sink.step_status(idx, status='running', attempts=attempt)
     # 敏感变量明文：注册给 sink 过滤实时输出，并在下面对完整输出兜一遍。
     # 两处都要——实时块与模块完整输出走的是不同的持久化路径。
     secrets = set() if step.task_type == 'pause' else step_secret_values(step)

@@ -586,6 +586,38 @@ class ExecutionAPITests(TestCase):
         finally:
             shutil.rmtree(proj, ignore_errors=True)
 
+    def test_step_table_published_with_pending_steps(self):
+        """执行中就发布整张模块表：跑第一个模块时，后续模块已在表里（pending）。
+
+        面板的任务流树读的就是这份表——否则执行中只能靠解析日志里已出现的模块头，
+        跑一个才看见一个，看不到后面还有哪些模块要输出。
+        """
+        if not ANSIBLE:
+            self.skipTest('ansible 未安装')
+        c = self._client()
+        task_id = self._create_task(c, steps=[
+            self._step(name='第一步', command='echo one'),
+            self._step(order=2, name='第二步', command='echo two'),
+        ])
+        published = []
+        original = LiveSink.publish_steps
+
+        def spy(sink_self):
+            if sink_self._steps is not None:
+                published.append([(x['name'], x['status']) for x in sink_self._steps])
+            original(sink_self)
+
+        with mock.patch.object(LiveSink, 'publish_steps', spy):
+            r = c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
+        self.assertEqual(r.status_code, 200)
+        # 开跑即有完整模块表
+        self.assertEqual(published[0], [('第一步', 'pending'), ('第二步', 'pending')])
+        # 存在「第一步在跑 / 已完成，第二步还排着」的中间快照
+        self.assertTrue(any(
+            snap[0][1] in ('running', 'success') and snap[1][1] == 'pending'
+            for snap in published), published)
+        self.assertEqual(published[-1], [('第一步', 'success'), ('第二步', 'success')])
+
     def test_flow_aborts_on_step_failure(self):
         """模块失败即中止：后续模块标记 skipped，任务失败。"""
         if not ANSIBLE:
@@ -1702,11 +1734,11 @@ class StreamedTaskLogTests(TestCase):
         snapshots = []
         original = LiveSink._save_preview
 
-        # **kwargs：_save_preview 带 write_log 参数（执行日志表只在 force 时跟着写），
-        # 这里只关心预览内容，原样转发即可
-        def spy(sink_self, preview, **kwargs):
+        # *args/**kwargs：_save_preview 还带 total（输出总长度）与 write_log（执行日志表
+        # 只在 force 时跟着写），这里只关心预览内容，原样转发即可
+        def spy(sink_self, preview, *args, **kwargs):
             snapshots.append(preview)
-            original(sink_self, preview, **kwargs)
+            original(sink_self, preview, *args, **kwargs)
 
         try:
             with override_settings(ANSIBLE_PROJECT_DIR=proj, TASK_LOG_DIR=proj):
@@ -1752,14 +1784,110 @@ class StreamedTaskLogTests(TestCase):
             self.assertFalse(data['delta'])
             self.assertEqual(data['output'], '0123456789')
 
-    def test_output_api_full_when_preview_saturated(self):
-        """预览已达上限（尾部截断，前缀漂移）时禁用增量，回退整段。"""
+    def test_output_api_offsets_are_absolute(self):
+        """预览被尾部截断时，offset 仍是完整输出里的绝对位置（不是预览内偏移）。"""
         c = self._client()
         task = ExecutionTask.objects.create(name='sat', created_by=self.admin, status='running')
-        ExecutionTask.objects.filter(pk=task.pk).update(output='y' * (PREVIEW_LIMIT + 10))
-        data = c.get(f'/api/exec/tasks/{task.id}/output/', {'offset': 5}).json()['data']
+        body = 'y' * 100
+        ExecutionTask.objects.filter(pk=task.pk).update(
+            output=live.TRUNCATE_NOTE + body, output_offset=1000)
+
+        # 窗口内：只补新增部分，start 为绝对偏移
+        data = c.get(f'/api/exec/tasks/{task.id}/output/', {'offset': 950}).json()['data']
+        self.assertTrue(data['delta'])
+        self.assertEqual(data['output'], 'y' * 50)
+        self.assertEqual((data['start'], data['offset']), (950, 1000))
+
+        # 已落后出窗口：重建可见日志，并如实报出这段文本的绝对起点
+        data = c.get(f'/api/exec/tasks/{task.id}/output/', {'offset': 10}).json()['data']
         self.assertFalse(data['delta'])
-        self.assertEqual(len(data['output']), PREVIEW_LIMIT + 10)
+        self.assertEqual(data['output'], body)
+        self.assertEqual((data['start'], data['offset']), (900, 1000))
+
+    def test_live_output_splices_finished_steps_from_disk(self):
+        """执行中：实时窗口只剩当前模块时，已完成模块从落盘文件补回。
+
+        对应「执行第二个模块时第一个模块的日志看不见」——历史在文件里，窗口只留尾部。
+        """
+        proj = tempfile.mkdtemp(prefix='task_logs_')
+        try:
+            with override_settings(TASK_LOG_DIR=proj):
+                task = ExecutionTask.objects.create(
+                    name='live', created_by=self.admin, status='running')
+                log = TaskExecutionLog.objects.create(task=task, status='running')
+                finished = '═══ 模块 1/2：报数 ═══\nstep_one_output'
+                path = os.path.join(proj, str(task.pk))
+                os.makedirs(path, exist_ok=True)
+                with open(os.path.join(path, f'{log.pk}.log'), 'w') as f:
+                    f.write(finished)
+                # 库内预览只剩尾部（当前模块 + 上一模块的末几个字符，即与落盘部分重叠）
+                running = '═══ 模块 2/2：更新 ═══\nstep_two_output'
+                tail = finished[-5:] + live.SEP + running
+                total = len(finished) + len(live.SEP) + len(running)
+                ExecutionTask.objects.filter(pk=task.pk).update(
+                    output=live.TRUNCATE_NOTE + tail, output_offset=total)
+                task.refresh_from_db()
+
+                out = live.read_live_output(task)
+                self.assertEqual(out['head'], '')
+                self.assertEqual(out['start'], 0)
+                self.assertEqual(out['offset'], total)
+                self.assertIn('step_one_output', out['output'])
+                self.assertIn('step_two_output', out['output'])
+        finally:
+            shutil.rmtree(proj, ignore_errors=True)
+
+    def test_live_output_caps_disk_read(self):
+        """落盘文件超出重建上限：只取尾部当前段（算不出重叠，按缺口处理）。"""
+        proj = tempfile.mkdtemp(prefix='task_logs_')
+        try:
+            with override_settings(TASK_LOG_DIR=proj):
+                task = ExecutionTask.objects.create(
+                    name='big', created_by=self.admin, status='running')
+                log = TaskExecutionLog.objects.create(task=task, status='running')
+                path = os.path.join(proj, str(task.pk))
+                os.makedirs(path, exist_ok=True)
+                with open(os.path.join(path, f'{log.pk}.log'), 'w') as f:
+                    f.write('a' * 500 + 'tail_marker')
+                tail = 'z' * 100
+                total = 100_000
+                ExecutionTask.objects.filter(pk=task.pk).update(
+                    output=live.TRUNCATE_NOTE + tail, output_offset=total)
+                task.refresh_from_db()
+
+                with mock.patch.object(live, 'FILE_READ_LIMIT', 20):
+                    out = live.read_live_output(task)
+                self.assertEqual(out['head'], ('a' * 500 + 'tail_marker')[-20:])
+                self.assertEqual(out['output'], tail)
+                self.assertEqual((out['start'], out['offset']), (total - 100, total))
+        finally:
+            shutil.rmtree(proj, ignore_errors=True)
+
+    def test_live_output_marks_gap_when_current_step_overflows(self):
+        """当前模块自身就超出窗口：已完成模块仍给出（head），中间缺口如实标出。"""
+        proj = tempfile.mkdtemp(prefix='task_logs_')
+        try:
+            with override_settings(TASK_LOG_DIR=proj):
+                task = ExecutionTask.objects.create(
+                    name='gap', created_by=self.admin, status='running')
+                log = TaskExecutionLog.objects.create(task=task, status='running')
+                finished = '═══ 模块 1/2：报数 ═══\nstep_one_output'
+                path = os.path.join(proj, str(task.pk))
+                os.makedirs(path, exist_ok=True)
+                with open(os.path.join(path, f'{log.pk}.log'), 'w') as f:
+                    f.write(finished)
+                tail = 'z' * 100
+                total = len(finished) + 10_000
+                ExecutionTask.objects.filter(pk=task.pk).update(
+                    output=live.TRUNCATE_NOTE + tail, output_offset=total)
+                task.refresh_from_db()
+
+                out = live.read_live_output(task)
+                self.assertEqual(out['head'], finished)
+                self.assertEqual(out['output'], tail)
+                self.assertEqual((out['start'], out['offset']), (total - 100, total))
+        finally:
+            shutil.rmtree(proj, ignore_errors=True)
 
 
 @override_settings(TASK_EXEC_BACKEND='sync', TASK_FAILURE_WAIT_TIMEOUT=0)
@@ -2208,13 +2336,16 @@ class LiveSinkBroadcastTests(TestCase):
             self.sink.flush(force=True)
 
         note = len(live.TRUNCATE_NOTE)
-        pushed = [p for p in self.pushes if p['kind'] == 'full'][-1]['output']
-        self.assertEqual(len(pushed), PREVIEW_LIMIT + note)
+        frame = [p for p in self.pushes if p['kind'] == 'full'][-1]
+        # 推送帧是纯正文（截断说明由前端自己渲染，混进正文会算错绝对偏移）
+        self.assertEqual(len(frame['output']), PREVIEW_LIMIT)
+        self.assertEqual(frame['start'], frame['offset'] - PREVIEW_LIMIT)
 
-        db_out = ExecutionTask.objects.values_list('output', flat=True).get(pk=self.task.pk)
-        self.assertEqual(len(db_out), DB_PREVIEW_LIMIT + note)
+        row = ExecutionTask.objects.values('output', 'output_offset').get(pk=self.task.pk)
+        self.assertEqual(len(row['output']), DB_PREVIEW_LIMIT + note)
+        self.assertEqual(row['output_offset'], frame['offset'])
         # 库内那份是推送那份的后缀：同一尾部，只是窗口更窄
-        self.assertTrue(pushed.endswith(db_out[note:]))
+        self.assertTrue(frame['output'].endswith(row['output'][note:]))
 
     def test_broken_channel_stops_pushing(self):
         with mock.patch('apps.task_exec.live.push', return_value=False) as m:

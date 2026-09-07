@@ -294,6 +294,11 @@ class ExecutionTask(models.Model):
     status = models.CharField('状态', max_length=20, choices=STATUS_CHOICES, default='pending')
     return_code = models.IntegerField('返回码', null=True, blank=True)
     output = models.TextField('执行输出', blank=True)
+    # output 是**尾部**预览（上限 live.DB_PREVIEW_LIMIT），本字段记完整输出的总长度：
+    # 于是 output 正文覆盖的绝对区间 = [output_offset - len(正文), output_offset)。
+    # 实时面板据此把「落盘文件里的已完成模块」与「库内尾部预览」拼成连续日志，
+    # 并让 WebSocket 增量帧按绝对偏移落位（见 live.read_live_output）
+    output_offset = models.PositiveBigIntegerField('输出总长度（字符）', default=0)
     # 暂停信号：paused 时由确认接口按 pause_type 写动作（continue/abort 或
     # retry/skip/abort），runner 轮询消费后清空
     pause_action = models.CharField('暂停处理动作', max_length=20, blank=True, default='')
