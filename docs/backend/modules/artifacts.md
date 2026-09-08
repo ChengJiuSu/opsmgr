@@ -182,7 +182,41 @@ curl -sf -H "X-API-KEY: ${OPS_API_KEY}" \
 
 - 大压缩包上传需调大反向代理限制（nginx `client_max_body_size`）。
 - `SITE_BASE_URL` 未配置时 `package_url` 为 `http://127.0.0.1:8000`，CD 主机拉包会失败。
-- 制品目录随版本增长，暂无自动清理（管理员可在制品管理页删除旧版本）。
+- 制品目录随版本增长，日常回收靠 `clean_artifacts`（见下节），需挂 cron / celery beat；
+  临时清理也可在制品管理页删除旧版本。
+
+### 升级到「服务类型」版本（2026-09）的顺序
+
+**必须先 `migrate` 再切 CI**，顺序反了会静默错发包：
+
+1. 部署新代码 + `python manage.py migrate` + 重启进程（生产是 supervisor）；
+2. 确认 `python manage.py showmigrations artifact_mgr` 里
+   `0002_artifact_service_type` 为 `[X]`；
+3. Jenkins 共享库切到带 `service_type` 的上报脚本版本；
+4. 各服务**各重新上报一次**制品——存量记录服务类型为空，按服务类型取包取不到它们。
+
+**为什么顺序不能反**（2026-09-08 实际踩到）：后端没迁移时，上报请求里多出来的
+`service_type` 字段被 DRF 当未知字段**静默丢弃**，既不报错也不入库；制品于是全落成
+「服务类型为空」，取包仍按三维度取最新 —— 先构建 manager、后构建 nginx，manager 的
+部署模块拿到的是 nginx 的包。表现是「部署成功但装错了代码」，比报错难发现得多。
+
+排查用（生产机上跑，看制品与模块两侧的服务类型是否都落上了）：
+
+```bash
+./venv/bin/python manage.py shell -c "
+from apps.artifact_mgr.models import Artifact
+from apps.task_exec.models import TaskStep
+for a in Artifact.objects.order_by('-id')[:6]:
+    print(a.id, a.version, a.service_type.code if a.service_type_id else '空', a.file_path)
+for s in TaskStep.objects.select_related('task','service_type').order_by('-id')[:10]:
+    print(s.task.name, s.name, s.service_type.code if s.service_type_id else '空')
+"
+```
+
+- 制品服务类型为`空` → 上报时后端还是旧代码，或上报脚本没带 `service_type`；
+- `file_path` 只有 3 段目录（少了服务类型那段）→ 同上，旧代码时期上报的；
+- 模块服务类型为`空` → 存量任务模块，取包**不按服务类型过滤**（旧口径），编辑任务给
+  模块补上服务类型再保存即可。
 
 ---
 
