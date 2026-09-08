@@ -62,9 +62,10 @@ const HEADER_RE = /^═══ 模块 (\d+)\/(\d+)：(.+?)═══\s*$/
 const stripHeader = (line) => (line ? (stripAnsi(line).match(HEADER_RE)?.[3] || '').trim() : '')
 
 const paneRef = ref()
-// null = 未手动点选，由 current 自动落在正在执行的模块（无则第一个）；
-// 一旦点选就固定在那个模块，不再被执行进度抢走焦点
+// 当前选中的模块序号。执行中自动跟随（跟随结果也写进这里，见下面的 watch），
+// 用户点选后 userPinned 置位，执行进度不再抢焦点
 const selected = ref(null)
+const userPinned = ref(false)
 
 // ── 输出解析：按模块头拆分 ───────────────────────────────
 const parsed = computed(() => {
@@ -121,9 +122,12 @@ const modules = computed(() => {
   }))
 })
 
-// 实际展示的模块序号：手动点选优先，其次正在执行的模块，再其次**最后一个跑过的**
-// 模块。最后一个跑过的（而不是第一个）：执行结束时页面会重新加载这条记录的完整
-// 日志，落回第一个模块等于把用户正在看的那一屏冲掉——刚跑完的那个模块才是他在看的
+const runningIndex = computed(() => modules.value.find((m) => m.status === 'running')?.index ?? null)
+
+// 实际展示的模块序号：选中的那个（只要还在列表里），否则正在执行的，否则最后一个
+// 跑过的（status 非 pending），否则第一个。「最后一个跑过的」而不是「第一个」：
+// 执行结束时页面会重新加载这条记录的完整日志，落回第一个模块等于把用户正在看的
+// 那一屏冲掉——刚跑完的那个模块才是他在看的
 const current = computed(() => {
   const list = modules.value
   if (selected.value != null && list.some((m) => m.index === selected.value)) return selected.value
@@ -132,6 +136,13 @@ const current = computed(() => {
     || list[0]
   return auto?.index ?? null
 })
+
+// 执行中跟随正在执行的模块，并把结果**写进 selected**（不只是算出来）：执行结束
+// 时这条记录会被重新拉一次完整日志，届时模块表里已经没有 running 项，只靠当场
+// 计算就会飘走（回到第一个模块）。写进 selected 后停在原处，与手动点选同一套逻辑
+watch(runningIndex, (idx) => {
+  if (idx != null && !userPinned.value) selected.value = idx
+}, { immediate: true })
 
 const currentMeta = computed(() =>
   modules.value.find((m) => m.index === current.value) || null,
@@ -167,11 +178,13 @@ const currentHtml = computed(() => ansiToHtml(currentBody.value))
 
 function select(index) {
   selected.value = index
+  userPinned.value = true
 }
 
-// 切换执行记录：交还自动选中（current 会落到执行中的模块或第一个模块）
+// 切换执行记录：交还自动选中（current 会落到执行中的模块、否则最后一个跑过的）
 watch(() => props.logId, () => {
   selected.value = null
+  userPinned.value = false
 })
 
 // 跟随模式：新输出到达自动选中正在执行的模块并滚到底（用户点选过则只滚动不抢选中）
