@@ -1,20 +1,12 @@
 <template>
-  <!-- 任务流日志：左侧模块树（任务流 → 模块），右侧为选中模块的执行日志 -->
+  <!-- 任务流日志：左侧模块列表，右侧为选中模块的执行日志（日志只按模块看，无「全部」视图） -->
   <div class="step-output">
     <div v-if="modules.length" class="flow-tree">
       <div
-        class="tree-node tree-root"
-        :class="{ active: selected === ALL }"
-        @click="select(ALL)"
-      >
-        <span class="node-dot root-dot" />
-        <span class="node-title">任务流（全部日志）</span>
-      </div>
-      <div
         v-for="mod in modules"
         :key="mod.index"
-        class="tree-node tree-leaf"
-        :class="{ active: selected === mod.index }"
+        class="tree-node"
+        :class="{ active: current === mod.index }"
         @click="select(mod.index)"
       >
         <span class="node-dot" :class="`dot-${mod.status || 'pending'}`" />
@@ -58,7 +50,6 @@ const props = defineProps({
   logId: { type: [Number, String], default: null },
 })
 
-const ALL = '__all__'
 const STATUS_TAG = { success: 'success', failed: 'danger', skipped: 'info', pending: 'info' }
 const STATUS_LABEL = { success: '成功', failed: '失败', skipped: '跳过', pending: '待执行' }
 // 失败后被人工跳过的模块（任务流继续但本次执行仍记失败）
@@ -69,9 +60,9 @@ const statusLabel = (mod) =>
 const HEADER_RE = /^═══ 模块 (\d+)\/(\d+)：(.+?)═══\s*$/
 
 const paneRef = ref()
-const selected = ref(ALL)
-// 用户手动点选后，follow 不再自动切换选中模块
-const userPinned = ref(false)
+// null = 未手动点选，由 current 自动落在正在执行的模块（无则第一个）；
+// 一旦点选就固定在那个模块，不再被执行进度抢走焦点
+const selected = ref(null)
 
 // ── 输出解析：按模块头拆分 ───────────────────────────────
 const parsed = computed(() => {
@@ -126,50 +117,45 @@ const modules = computed(() => {
   }))
 })
 
+// 实际展示的模块序号：手动点选优先，否则正在执行的模块，再否则第一个
+const current = computed(() => {
+  const list = modules.value
+  if (selected.value != null && list.some((m) => m.index === selected.value)) return selected.value
+  return (list.find((m) => m.status === 'running') || list[0])?.index ?? null
+})
+
 const currentMeta = computed(() =>
-  selected.value === ALL ? null : modules.value.find((m) => m.index === selected.value) || null,
+  modules.value.find((m) => m.index === current.value) || null,
 )
 
 const currentBody = computed(() => {
-  if (selected.value === ALL) return props.output || '（暂无输出）'
   const mod = currentMeta.value
-  if (!mod) return '（暂无输出）'
-  if (mod.section) return mod.section.body || '（暂无输出）'
-  if (mod.status === 'skipped') return '（该模块因前序失败被跳过，未执行）'
-  return '（等待执行…）'
+  // 没有模块（旧记录、任务未配置模块、执行前的占位文案）：原样显示整段输出
+  if (!mod) return props.output || '（暂无输出）'
+  // 模块头之前的内容（如日志缺口提示）挂在第一个模块上，否则无处可看
+  const lead = mod.index === modules.value[0]?.index && parsed.value.preamble
+    ? `${parsed.value.preamble}\n\n`
+    : ''
+  if (mod.section) return lead + (mod.section.body || '（暂无输出）')
+  if (mod.status === 'skipped') return lead + '（该模块因前序失败被跳过，未执行）'
+  return lead + '（等待执行…）'
 })
 
 const currentHtml = computed(() => ansiToHtml(currentBody.value))
 
-function select(key) {
-  selected.value = key
-  userPinned.value = true
+function select(index) {
+  selected.value = index
 }
 
-// 选中的模块在当前记录里不存在（切换记录、模块表变短）：退回「全部日志」，
-// 否则日志区会空着而看不出原因
-watch(modules, (list) => {
-  if (selected.value !== ALL && !list.some((m) => m.index === selected.value)) {
-    selected.value = ALL
-  }
-})
-
-// 切换执行记录：回到「全部日志」并交还自动跟随
+// 切换执行记录：交还自动选中（current 会落到执行中的模块或第一个模块）
 watch(() => props.logId, () => {
-  selected.value = ALL
-  userPinned.value = false
+  selected.value = null
 })
 
 // 跟随模式：新输出到达自动选中正在执行的模块并滚到底（用户点选过则只滚动不抢选中）
 watch(() => props.output, async () => {
   if (!props.follow) return
-  if (!userPinned.value) {
-    // 模块表里的 running 项优先（执行中就有完整模块表），否则退回已出现的最后一段
-    const running = modules.value.find((m) => m.status === 'running')
-    const secs = parsed.value.sections
-    if (running) selected.value = running.index
-    else if (secs.length) selected.value = secs[secs.length - 1].index
-  }
+  // 未手动点选时 current 自己就跟着执行中的模块走，这里只负责滚到底
   await nextTick()
   if (paneRef.value) paneRef.value.scrollTop = paneRef.value.scrollHeight
 })
@@ -205,16 +191,10 @@ watch(() => props.output, async () => {
 }
 .tree-node:hover { background: #2c2c2c; }
 .tree-node.active { background: #094771; color: #fff; }
-.tree-leaf {
-  margin-left: 14px;
-  border-left: 1px solid #444;  /* 任务流树的连接线 */
-  padding-left: 16px;
-}
 .node-dot {
   width: 8px; height: 8px; border-radius: 50%;
   flex-shrink: 0; background: #6b6b6b;
 }
-.root-dot { background: #409eff; }
 .dot-success { background: #67c23a; }
 .dot-failed { background: #f56c6c; }
 .dot-skipped { background: #6b6b6b; }
