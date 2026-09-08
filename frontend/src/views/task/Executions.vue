@@ -1463,7 +1463,6 @@ async function selectLog(log) {
   // 终态，据此判断会把执行中的记录当历史去读详情，页面上就是「暂无输出」）
   const isLatest = logPanel.logs[0]?.id === log.id
   const live = ['pending', 'running', 'paused'].includes(log.status || logPanel.task.status)
-  dbg('selectLog', { id: log.id, isLatest, live, status: log.status })
   if (isLatest && live) {
     // 最新一次且执行中：输出走实时通道（WebSocket / 轮询回退），重连以取回完整快照
     logPanel.output = '（执行中，等待输出…）'
@@ -1478,17 +1477,6 @@ async function selectLog(log) {
   logPanel.output = res.data?.output || '（暂无输出）'
 }
 
-// 排查用开关：控制台执行 localStorage.taskLogDebug = '1' 后刷新页面，
-// 面板这边的关键节点也会打到控制台（与 StepOutput 的输出对照看）
-const dbg = (...args) => {
-  try {
-    if (new URLSearchParams(location.search).get('logdebug') === '1'
-        || localStorage.getItem('taskLogDebug') === '1') {
-      console.log('[logPanel]', ...args)
-    }
-  } catch { /* 隐私模式读不到 localStorage，忽略 */ }
-}
-
 // ── 实时日志：WebSocket 优先，失败回退轮询 ────────────────
 function render() {
   logPanel.output = buf.text || '（执行中，等待输出…）'
@@ -1496,7 +1484,6 @@ function render() {
 
 function applySteps(steps) {
   // 执行中的模块表（含后续 pending 模块）随推送更新，模块列表据此保持完整
-  dbg('applySteps', (steps || []).map((x, i) => `${i + 1}:${x.status}`).join(','))
   if (logPanel.current) logPanel.current = { ...logPanel.current, steps_result: steps || [] }
 }
 
@@ -1575,7 +1562,6 @@ function stopFollow() {
 // **不能走 refreshLogs()**：那会替换表格数据、重新 setCurrentRow、重新选中记录，
 // 面板看着像刷新了一次，日志区还会退回第一个模块——而用户看的是刚跑完的那个模块。
 async function finish() {
-  dbg('finish:enter', { logId: logPanel.current?.id })
   stopFollow()
   fetchData()   // 外层任务列表（与面板选中无关）
   const taskId = logPanel.task?.id
@@ -1595,11 +1581,6 @@ async function finish() {
     Object.assign(logPanel.current, detail.data)
     logPanel.output = detail.data.output || '（暂无输出）'
   }
-  dbg('finish:done', {
-    logId: logPanel.current?.id,
-    steps: (logPanel.current?.steps_result || []).map((x, i) => `${i + 1}:${x.status}`).join(','),
-    outLen: (logPanel.output || '').length,
-  })
 }
 
 /** 拉一次输出（轮询回退与推送静默兜底共用）。返回是否已到终态。 */
