@@ -61,10 +61,17 @@ const HEADER_RE = /^═══ 模块 (\d+)\/(\d+)：(.+?)═══\s*$/
 // steps_result 里发布的模块头是整行（带 ═══），标题区只要中间那段
 const stripHeader = (line) => (line ? (stripAnsi(line).match(HEADER_RE)?.[3] || '').trim() : '')
 
+// 选中态按执行记录缓存在**模块作用域**：这个组件会被重挂（日志面板整块由
+// v-if 控制、全屏浮层里还有第二个实例、父级列表刷新可能重建节点），重挂后组件内
+// 的 selected 就回到初值，视图于是跳回第一个模块。缓存让重挂后恢复原选中。
+// 只留最近 MAX_CACHE 条，避免长时间停留累积。
+const SELECTED_BY_LOG = new Map()
+const MAX_CACHE = 20
+
 const paneRef = ref()
 // 当前选中的模块序号。执行中自动跟随（跟随结果也写进这里，见下面的 watch），
 // 用户点选后 userPinned 置位，执行进度不再抢焦点
-const selected = ref(null)
+const selected = ref(SELECTED_BY_LOG.get(props.logId) ?? null)
 const userPinned = ref(false)
 
 // ── 输出解析：按模块头拆分 ───────────────────────────────
@@ -188,11 +195,41 @@ function select(index) {
   userPinned.value = true
 }
 
-// 切换执行记录：交还自动选中（current 会落到执行中的模块、否则最后一个跑过的）
-watch(() => props.logId, () => {
-  selected.value = null
+// 切换执行记录：取回该记录上次的选中（没有就交还自动选中）
+watch(() => props.logId, (logId) => {
+  selected.value = SELECTED_BY_LOG.get(logId) ?? null
   userPinned.value = false
 })
+
+// 选中态写回缓存（重挂后由上面的初值/watch 取回）
+watch([selected, () => props.logId], ([index, logId]) => {
+  if (logId == null) return
+  if (index == null) SELECTED_BY_LOG.delete(logId)
+  else SELECTED_BY_LOG.set(logId, index)
+  while (SELECTED_BY_LOG.size > MAX_CACHE) {
+    SELECTED_BY_LOG.delete(SELECTED_BY_LOG.keys().next().value)
+  }
+})
+
+// 排查用开关：浏览器控制台执行 localStorage.taskLogDebug = '1' 后刷新页面，
+// 选中态的每次变化都会打到控制台（定位「执行结束跳回第一个模块」）
+const debugOn = (() => {
+  try {
+    return localStorage.getItem('taskLogDebug') === '1'
+  } catch {
+    return false
+  }
+})()
+if (debugOn) {
+  watch(
+    () => [current.value, selected.value, autoIndex.value, props.logId, props.follow,
+           modules.value.map((m) => `${m.index}:${m.status}`).join(','),
+           (props.output || '').length].join(' | '),
+    (line) => console.log('[StepOutput] current|selected|auto|logId|follow|modules|outLen =', line),
+    { immediate: true },
+  )
+  console.log('[StepOutput] mounted, logId =', props.logId)
+}
 
 // 跟随模式：新输出到达自动选中正在执行的模块并滚到底（用户点选过则只滚动不抢选中）
 watch(() => props.output, async () => {
