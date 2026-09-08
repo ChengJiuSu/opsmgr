@@ -469,8 +469,12 @@ class TaskExecutionLog(models.Model):
     servers_snapshot = models.JSONField('执行主机快照', default=list, blank=True)
     exec_mode = models.CharField('执行方式', max_length=20, blank=True)
     # 逐模块执行结果：[{order,name,task_type,status,return_code,duration,server_count,
-    # attempts,skipped_over}]，skipped=被失败中止；attempts=执行次数（含重试）；
-    # skipped_over=失败后被人工跳过（任务流继续但最终仍记失败）
+    # attempts,skipped_over,header}]，skipped=被失败中止；attempts=执行次数（含重试）；
+    # skipped_over=失败后被人工跳过（任务流继续但最终仍记失败）；
+    # header=该模块在日志里的模块头那行（转 running 时写入，面板据此把无头的实时
+    # 尾段归到正确的模块，见 live.read_live_output）。
+    # 执行期间就按 pending → running → 终态逐步更新（不是跑完才落一次），面板的
+    # 模块列表读的就是它
     steps_result = models.JSONField('模块执行结果', default=list, blank=True)
     triggered_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,

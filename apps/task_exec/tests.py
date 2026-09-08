@@ -604,19 +604,23 @@ class ExecutionAPITests(TestCase):
 
         def spy(sink_self):
             if sink_self._steps is not None:
-                published.append([(x['name'], x['status']) for x in sink_self._steps])
+                published.append([dict(x) for x in sink_self._steps])
             original(sink_self)
 
         with mock.patch.object(LiveSink, 'publish_steps', spy):
             r = c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
         self.assertEqual(r.status_code, 200)
+        names = [[(x['name'], x['status']) for x in snap] for snap in published]
         # 开跑即有完整模块表
-        self.assertEqual(published[0], [('第一步', 'pending'), ('第二步', 'pending')])
+        self.assertEqual(names[0], [('第一步', 'pending'), ('第二步', 'pending')])
         # 存在「第一步在跑 / 已完成，第二步还排着」的中间快照
         self.assertTrue(any(
             snap[0][1] in ('running', 'success') and snap[1][1] == 'pending'
-            for snap in published), published)
-        self.assertEqual(published[-1], [('第一步', 'success'), ('第二步', 'success')])
+            for snap in names), names)
+        self.assertEqual(names[-1], [('第一步', 'success'), ('第二步', 'success')])
+        # running 状态同时发布模块头：日志窗口滚过头部后靠它把尾段归到本模块
+        running = next(snap[0] for snap in published if snap[0]['status'] == 'running')
+        self.assertIn('模块 1/2：第一步', running['header'])
 
     def test_flow_aborts_on_step_failure(self):
         """模块失败即中止：后续模块标记 skipped，任务失败。"""
@@ -1834,6 +1838,44 @@ class StreamedTaskLogTests(TestCase):
                 self.assertEqual(out['offset'], total)
                 self.assertIn('step_one_output', out['output'])
                 self.assertIn('step_two_output', out['output'])
+        finally:
+            shutil.rmtree(proj, ignore_errors=True)
+
+    def test_live_output_keeps_running_step_header(self):
+        """尾段的模块头已滚出窗口时，快照把它补在前段末尾。
+
+        不补的话那段日志会被面板算到上一个模块名下，正在执行的模块反而「暂无输出」
+        —— 执行中途打开日志页看到的就是这个。
+        """
+        proj = tempfile.mkdtemp(prefix='task_logs_')
+        try:
+            with override_settings(TASK_LOG_DIR=proj):
+                task = ExecutionTask.objects.create(
+                    name='hdr', created_by=self.admin, status='running')
+                running_header = '═══ 模块 2/2：更新（Playbook · 全局范围 1 台）═══'
+                log = TaskExecutionLog.objects.create(
+                    task=task, status='running',
+                    steps_result=[
+                        {'name': '报数', 'status': 'success'},
+                        {'name': '更新', 'status': 'running', 'header': running_header},
+                    ],
+                )
+                finished = '═══ 模块 1/2：报数 ═══\nstep_one_output'
+                path = os.path.join(proj, str(task.pk))
+                os.makedirs(path, exist_ok=True)
+                with open(os.path.join(path, f'{log.pk}.log'), 'w') as f:
+                    f.write(finished)
+                # 当前模块自身输出已超窗口：预览里只剩尾部，没有模块头
+                tail = 'z' * 100
+                total = len(finished) + 50_000
+                ExecutionTask.objects.filter(pk=task.pk).update(
+                    output=live.TRUNCATE_NOTE + tail, output_offset=total)
+                task.refresh_from_db()
+
+                out = live.read_live_output(task)
+                self.assertTrue(out['head'].endswith(running_header))
+                self.assertIn('step_one_output', out['head'])
+                self.assertEqual(out['output'], tail)
         finally:
             shutil.rmtree(proj, ignore_errors=True)
 

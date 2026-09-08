@@ -221,13 +221,24 @@ ansible 输出不再等模块跑完才可见：`common.ansible.run_stream` 以
   执行记录再切回来会重连本通道，没有这一步就只剩当前模块。当前模块自身已超出窗口
   时中间那段取不回来，此时快照给 `head`（历史）+ 缺口提示 + `output`（尾段）。
 - **模块表**：`runner.run` 开跑即把整张模块表（含尚未执行的 `pending` 项）写进
-  `TaskExecutionLog.steps_result` 并推送，模块起止各更新一次。面板的任务流树读的
-  就是这份表——执行中也能看到后面还有哪些模块要输出，且先前模块滑出实时窗口后树上
-  的节点不会消失。
+  `TaskExecutionLog.steps_result` 并推送，模块起止各更新一次。面板的模块列表读的
+  就是这份表——执行中也能看到后面还有哪些模块要输出，且先前模块滑出实时窗口后
+  列表里的节点不会消失。每项在转 `running` 时同时带上该模块的**模块头**
+  （`header`，即日志里那行 `═══ 模块 i/n：…═══`）。
+- **为什么要发模块头**：面板是按日志里的模块头把输出切给各模块的，而模块自身输出
+  超过实时窗口时，头部（含模块头那行）会被裁掉。执行中途才打开日志页拿到的就是这种
+  「无头尾段」，那段日志会被算到上一个模块名下，正在执行的模块反而显示「暂无输出」。
+  `live.read_live_output` 在这种情况下把 `steps_result` 里正在执行的模块头补在
+  `head` 末尾，归属就对了。
 - **回退**：连接建立时先 `group_add` 探测 channel layer，未配/连不上 Redis
   直接拒握手（4503）；`live.push` 失败只告警并停止后续推送。前端
   `utils/taskLogStream.js` 在握手失败、连接中断、或 60s 收不到任何帧（含
   pong）时回退到 `output?offset=` 轮询，功能等价。
+- **推送静默兜底**：连接活着但 15s 没收到任何日志帧时，前端按绝对偏移补拉一次
+  `output?offset=`（幂等）。看门狗把 pong 也算活动，所以「连接正常、推送链路却
+  不通」（`push` 已 `_ws_broken`、Redis 抽风、执行进程 channel layer 配成
+  `memory`）它察觉不到，页面会一直停在旧日志上而任务其实在跑。补拉同时负责收尾
+  （状态帧可能一起丢）。
 - **部署**：执行进程（WSGI/celery worker）与 WebSocket 进程（daphne）不同
   进程，跨进程推送**依赖 Redis channel layer**（`CHANNEL_LAYERS`）；nginx
   `/ws/` 已反代到 daphne 8001（见 `deploy/nginx/conf/templates/ops_manager.conf.template`）。dev 的 runserver
@@ -379,7 +390,7 @@ Ansible 项目目录内执行剧本：
   每个模块起一个 ansible 进程、再按 `--forks`（默认 10）派生子进程，不封顶时
   5 个模块就是 50 个进程，小机器上足以打满 CPU 并连带拖慢 web。超出上限的模块
   在线程池里排队，语义不变（仍是全组跑完再汇总）。
-- steps_result 每项新增 `parallel` 布尔，前端日志树以 ∥ 标记。
+- steps_result 每项新增 `parallel` 布尔，前端模块列表以 ∥ 标记。
 
 ## 暂停确认（pause 模块）
 

@@ -844,7 +844,6 @@ def _exec_step(step, task, idx, total, sink, parallel, attempt=1):
     started = time.monotonic()
     retry_mark = f' · 重试#{attempt - 1}' if attempt > 1 else ''
     live_key = (step.id, attempt)
-    sink.step_status(idx, status='running', attempts=attempt)
     # 敏感变量明文：注册给 sink 过滤实时输出，并在下面对完整输出兜一遍。
     # 两处都要——实时块与模块完整输出走的是不同的持久化路径。
     secrets = set() if step.task_type == 'pause' else step_secret_values(step)
@@ -854,6 +853,7 @@ def _exec_step(step, task, idx, total, sink, parallel, attempt=1):
         # 暂停确认模块：不涉及目标主机，等待人工继续/中止
         header = f'═══ 模块 {idx}/{total}：{step.name}（暂停确认 · 等待人工处理）═══'
         prompt = f'⏸ 任务流已暂停，等待人工确认…（超过 {step.timeout or 300}s 未确认将自动中止）'
+        sink.step_status(idx, status='running', attempts=attempt, header=header)
         sink.begin(live_key, header, order=idx)
         try:
             sink.feed(live_key, prompt)
@@ -868,6 +868,10 @@ def _exec_step(step, task, idx, total, sink, parallel, attempt=1):
         header = (f'═══ 模块 {idx}/{total}：{step.name}'
                   f'（{step.get_task_type_display()} · {step.scope_label} {len(servers)} 台'
                   f'{step.service_type_label}{mark}{retry_mark}）═══')
+        # 模块头随 running 状态一起发布：实时日志窗口滚过头部之后（模块自身输出
+        # 超出窗口、或页面执行中途才连上来），面板要靠这行把尾部日志归到本模块，
+        # 否则那段输出会被算到上一个模块名下（看起来就是「本模块暂无输出」）
+        sink.step_status(idx, status='running', attempts=attempt, header=header)
         error = _guard(servers)
         if error:
             rc, out = 1, error

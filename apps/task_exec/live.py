@@ -194,12 +194,14 @@ def read_live_output(task):
     if total < len(body):        # 老数据/未回填偏移：只能按「预览即全文」处理
         total = len(body)
     start = total - len(body)
+    log = task.logs.order_by('-created_at', '-id').values('pk', 'steps_result').first()
     if not start:
         return {'head': '', 'output': body, 'start': 0, 'offset': total}
 
-    file_text, complete = _read_running_log_file(task)
+    file_text, complete = _read_running_log_file(task, log)
     if file_text is None:
-        return {'head': '', 'output': body, 'start': start, 'offset': total}
+        return {'head': _running_headers(log), 'output': body,
+                'start': start, 'offset': total}
     file_len = len(file_text)
     if complete and start <= file_len:
         # 预览与落盘部分有重叠：去掉重叠后接上，得到连续的一段（够长则从 0 开始）
@@ -209,10 +211,26 @@ def read_live_output(task):
                 'start': total - len(visible), 'offset': total}
     # 当前模块自身的输出已超出实时窗口（或落盘文件本身已超出重建上限，只取到尾部
     # 因而算不出重叠位置）：前段照给，中间按缺口处理
-    return {'head': _tail(file_text), 'output': body, 'start': start, 'offset': total}
+    head = _tail(file_text)
+    # 尾段是「执行中模块」的日志，但它的模块头已经滚出窗口了。把模块头补在前段
+    # 末尾，尾段才会被面板归到正在执行的那个模块名下（否则算到上一个模块头上，
+    # 当前模块看起来「暂无输出」，而这正是执行中途打开日志页看到的现象）
+    running = _running_headers(log)
+    if running:
+        head = f'{head}{SEP}{running}' if head else running
+    return {'head': head, 'output': body, 'start': start, 'offset': total}
 
 
-def _read_running_log_file(task):
+def _running_headers(log):
+    """正在执行的模块的模块头（由 runner 随 running 状态一起发布，见 step_status）。"""
+    steps = (log or {}).get('steps_result') or []
+    return SEP.join(
+        item['header'] for item in steps
+        if item.get('status') == 'running' and item.get('header')
+    )
+
+
+def _read_running_log_file(task, log):
     """读本次执行已落盘的日志（已完成模块的完整输出），返回 (文本, 是否读全)。
 
     执行中的 TaskExecutionLog.log_file 还没回填（收尾才写），所以按最新一条执行
@@ -224,7 +242,7 @@ def _read_running_log_file(task):
     """
     from django.conf import settings
 
-    log_id = task.logs.order_by('-created_at', '-id').values_list('pk', flat=True).first()
+    log_id = (log or {}).get('pk')
     if not log_id:
         return None, False
     path = Path(settings.TASK_LOG_DIR) / log_rel_path(task.pk, log_id)

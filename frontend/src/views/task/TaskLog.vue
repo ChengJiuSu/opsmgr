@@ -138,7 +138,10 @@ const polling = ref(false)
 const logTableRef = ref()
 let pollTimer = null
 let listTimer = null
+let resyncTimer = null
 let stream = null   // WebSocket 日志流（不可用时为 null，走 pollTimer）
+let lastFrameAt = 0            // 上次收到日志帧的时刻（推送静默兜底用）
+const RESYNC_QUIET_MS = 15000  // 静默这么久就按偏移补拉一次
 let selectSeq = 0   // 选中序号：异步取详情返回时用它丢弃已被覆盖的旧请求
 // 正在看「执行中」那条记录：看历史记录时通道仍开着（状态/模块表照收，暂停操作条
 // 不会因为翻了一眼历史就消失），但日志帧不再往展示缓冲里写
@@ -231,9 +234,10 @@ function startFollow() {
   stopFollow()
   polling.value = true
   resetBuffer(buf)
+  lastFrameAt = Date.now()
   stream = openTaskLogStream(taskId, {
-    onFull: (frame) => { if (liveTail.value) { applyFull(buf, frame); render() } },
-    onDelta: (frame) => { if (liveTail.value) { applyDelta(buf, frame); render() } },
+    onFull: (frame) => { lastFrameAt = Date.now(); if (liveTail.value) { applyFull(buf, frame); render() } },
+    onDelta: (frame) => { lastFrameAt = Date.now(); if (liveTail.value) { applyDelta(buf, frame); render() } },
     onSteps: applySteps,
     onStatus: applyStatus,
     onFallback: () => {
@@ -241,6 +245,26 @@ function startFollow() {
       if (polling.value) startPolling()  // 通道不可用：退回轮询接口
     },
   })
+  startResyncTimer()
+}
+
+// 推送静默兜底：连接活着（pong 正常）但一直收不到日志帧时，按绝对偏移补拉一次。
+// 推送链路（channel layer / Redis）出问题时看门狗察觉不到——它把 pong 也算活动，
+// 于是页面会一直停在旧日志上，而任务其实在跑。补拉是幂等的（偏移对齐）。
+function startResyncTimer() {
+  stopResyncTimer()
+  resyncTimer = setInterval(async () => {
+    if (!stream || Date.now() - lastFrameAt < RESYNC_QUIET_MS) return
+    lastFrameAt = Date.now()
+    try {
+      // 状态帧可能一起丢了，所以补拉也要负责收尾
+      if (await pollOnce()) { stopFollow(); init() }
+    } catch { /* 下一轮再试 */ }
+  }, 5000)
+}
+
+function stopResyncTimer() {
+  if (resyncTimer) { clearInterval(resyncTimer); resyncTimer = null }
 }
 
 function applyStatus(data) {
@@ -260,7 +284,25 @@ function applyStatus(data) {
 function stopFollow() {
   stream?.close()
   stream = null
+  stopResyncTimer()
   stopPolling()
+}
+
+/** 拉一次输出（轮询回退与推送静默兜底共用）。返回是否已到终态。 */
+async function pollOnce() {
+  const res = await getTaskOutput(taskId, buf.offset)
+  const data = res.data || {}
+  // 日志流字段不能并进任务对象（否则增量片段会污染 task.output）
+  const { output: _o, head: _h, start: _s, offset: _f, delta: _d,
+          steps_result: steps, ...taskFields } = data
+  task.value = { ...task.value, ...taskFields }
+  if (liveTail.value) {
+    if (data.delta) applyDelta(buf, data)
+    else applyFull(buf, data)
+    render()
+  }
+  if (steps) applySteps(steps)
+  return data.status === 'success' || data.status === 'failed'
 }
 
 function startPolling() {
@@ -269,19 +311,7 @@ function startPolling() {
   resetBuffer(buf)
   pollTimer = setInterval(async () => {
     try {
-      const res = await getTaskOutput(taskId, buf.offset)
-      const data = res.data || {}
-      // 日志流字段不能并进任务对象（否则增量片段会污染 task.output）
-      const { output: _o, head: _h, start: _s, offset: _f, delta: _d,
-              steps_result: steps, ...taskFields } = data
-      task.value = { ...task.value, ...taskFields }
-      if (liveTail.value) {
-        if (data.delta) applyDelta(buf, data)
-        else applyFull(buf, data)
-        render()
-      }
-      if (steps) applySteps(steps)
-      if (data.status === 'success' || data.status === 'failed') {
+      if (await pollOnce()) {
         stopPolling()
         init() // 执行完成：刷新日志列表并定位最新记录
       }
@@ -385,7 +415,7 @@ async function copyLink() {
 }
 
 onMounted(init)
-onUnmounted(() => { stopFollow(); stopListTimer() })
+onUnmounted(() => { stopFollow(); stopListTimer() })   // stopFollow 连带停补拉定时器
 </script>
 
 <style scoped>

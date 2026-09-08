@@ -58,6 +58,8 @@ const statusLabel = (mod) =>
 
 // runner 输出的模块分隔头：═══ 模块 i/n：名称（类型 · 范围）═══
 const HEADER_RE = /^═══ 模块 (\d+)\/(\d+)：(.+?)═══\s*$/
+// steps_result 里发布的模块头是整行（带 ═══），标题区只要中间那段
+const stripHeader = (line) => (line ? (stripAnsi(line).match(HEADER_RE)?.[3] || '').trim() : '')
 
 const paneRef = ref()
 // null = 未手动点选，由 current 自动落在正在执行的模块（无则第一个）；
@@ -95,7 +97,9 @@ const modules = computed(() => {
     return props.stepsResult.map((r, i) => ({
       index: i + 1,
       title: r.name || `模块 ${i + 1}`,
-      fullTitle: secs.get(i + 1)?.header || r.name || `模块 ${i + 1}`,
+      // 模块头优先取日志里解析出的那行，其次取 steps_result 里发布的（模块刚开跑、
+      // 日志还没到时也能显示类型与范围），最后退回模块名
+      fullTitle: secs.get(i + 1)?.header || stripHeader(r.header) || r.name || `模块 ${i + 1}`,
       status: r.status,
       duration: r.duration,
       return_code: r.return_code,
@@ -128,17 +132,30 @@ const currentMeta = computed(() =>
   modules.value.find((m) => m.index === current.value) || null,
 )
 
+// 第一个模块头之前那段无主日志（实时窗口裁掉了头部、或缺口提示）该算在谁名下：
+// 它是「第一个带头的模块」的前一个模块产出的；没有解析出任何模块头时（整段都是
+// 某个模块的中段）算给正在执行的模块。不挂到任何模块上就等于看不见。
+const leadOwner = computed(() => {
+  if (!parsed.value.preamble) return null
+  const list = modules.value
+  const secs = parsed.value.sections
+  if (!secs.length) {
+    return (list.find((m) => m.status === 'running') || list[list.length - 1])?.index ?? null
+  }
+  const first = secs[0].index
+  return list.some((m) => m.index === first - 1) ? first - 1 : first
+})
+
 const currentBody = computed(() => {
   const mod = currentMeta.value
   // 没有模块（旧记录、任务未配置模块、执行前的占位文案）：原样显示整段输出
   if (!mod) return props.output || '（暂无输出）'
-  // 模块头之前的内容（如日志缺口提示）挂在第一个模块上，否则无处可看
-  const lead = mod.index === modules.value[0]?.index && parsed.value.preamble
-    ? `${parsed.value.preamble}\n\n`
-    : ''
-  if (mod.section) return lead + (mod.section.body || '（暂无输出）')
-  if (mod.status === 'skipped') return lead + '（该模块因前序失败被跳过，未执行）'
-  return lead + '（等待执行…）'
+  const lead = mod.index === leadOwner.value ? parsed.value.preamble : ''
+  const body = mod.section?.body
+    || (mod.status === 'skipped' ? '（该模块因前序失败被跳过，未执行）' : '')
+  if (lead && body) return `${lead}\n\n${body}`
+  // 还没有日志时的占位：执行中的模块说「等输出」，没轮到的说「等执行」
+  return lead || body || (mod.status === 'running' ? '（执行中，等待输出…）' : '（等待执行…）')
 })
 
 const currentHtml = computed(() => ansiToHtml(currentBody.value))
