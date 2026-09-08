@@ -3,6 +3,15 @@
   <el-card shadow="never">
     <div class="toolbar">
       <div class="toolbar-left">
+        <el-select v-model="filter.project_group" placeholder="项目组" clearable filterable style="width:140px" @change="handleSearch">
+          <el-option v-for="d in dictOptions.projects" :key="d.id" :label="d.name" :value="d.id" />
+        </el-select>
+        <el-select v-model="filter.channel" placeholder="渠道" clearable filterable style="width:120px" @change="handleSearch">
+          <el-option v-for="d in dictOptions.channels" :key="d.id" :label="d.name" :value="d.id" />
+        </el-select>
+        <el-select v-model="filter.environment" placeholder="环境" clearable filterable style="width:120px" @change="handleSearch">
+          <el-option v-for="d in dictOptions.envs" :key="d.id" :label="d.name" :value="d.id" />
+        </el-select>
         <el-input v-model="filter.keyword" placeholder="任务名称" clearable style="width:160px" @input="searchDebounced" @keyup.enter="handleSearch" @clear="handleSearch" />
         <el-select v-model="filter.task_type" placeholder="包含模块类型" clearable style="width:140px" @change="handleSearch">
           <el-option label="命令" value="command" />
@@ -728,7 +737,8 @@ const tableData = ref([])
 const total = ref(0)
 const page = ref(1)
 const pageSize = ref(20)
-const filter = reactive({ keyword: '', task_type: '', status: '' })
+// 已填条件之间「与」，未填=不限（后端 ExecutionTaskViewSet.get_queryset 同口径）
+const filter = reactive({ project_group: null, channel: null, environment: null, keyword: '', task_type: '', status: '' })
 
 const credentialOptions = ref([])
 const methodOptions = ref([])
@@ -763,6 +773,9 @@ async function fetchData() {
   loading.value = true
   try {
     const params = { page: page.value, page_size: pageSize.value }
+    if (filter.project_group) params.project_group = filter.project_group
+    if (filter.channel) params.channel = filter.channel
+    if (filter.environment) params.environment = filter.environment
     if (filter.keyword) params.keyword = filter.keyword
     if (filter.task_type) params.task_type = filter.task_type
     if (filter.status) params.status = filter.status
@@ -1628,6 +1641,8 @@ function stopPolling() {
 onMounted(() => {
   // 概览页的待办 / 失败告警落地：?status=paused|failed 预置状态筛选
   if (route.query.status) filter.status = String(route.query.status)
+  // 搜索栏的维度下拉在列表页就要用，不能只在打开表单时才加载
+  loadDictOptions()
   fetchData()
   listTimer = setInterval(() => {
     if (tableData.value.some((t) => ['running', 'pending', 'paused'].includes(t.status))) {

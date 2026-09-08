@@ -348,12 +348,32 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
             return ExecutionTaskListSerializer
         return super().get_serializer_class()
 
+    # 维度筛选参数 → 模型字段（任务全局维度；模块自定义维度不参与筛选）
+    DIM_FILTERS = [
+        ('project_group', 'project_group'),
+        ('channel', 'channel'),
+        ('environment', 'environment'),
+    ]
+
     def get_queryset(self):
+        """列表筛选：维度（项目组/渠道/环境）+ 任务名称 + 模块类型 + 状态。
+
+        已填条件之间取「与」逐个收窄，未填的条件不限 —— 只填任务名称就是纯模糊
+        搜索，再加维度就在结果里继续收窄。维度值兼容 id 与字典 code。
+        """
         qs = super().get_queryset()
         params = self.request.query_params
         task_type = params.get('task_type')
         status = params.get('status')
         keyword = params.get('keyword')
+        for param, field in self.DIM_FILTERS:
+            value = params.get(param)
+            if not value:
+                continue
+            if str(value).isdigit():
+                qs = qs.filter(**{f'{field}_id': value})
+            else:
+                qs = qs.filter(**{f'{field}__code': value})
         if task_type:
             # 类型下沉到模块后，筛选语义 = 包含该类型模块的任务
             qs = qs.filter(steps__task_type=task_type).distinct()

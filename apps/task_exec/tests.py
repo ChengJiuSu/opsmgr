@@ -838,6 +838,33 @@ class ExecutionAPITests(TestCase):
         names = [t['name'] for t in c.get('/api/exec/tasks/', {'task_type': 'command'}).json()['data']['results']]
         self.assertEqual(sorted(names), ['cmd-only', 'with-pb'])
 
+    def test_dimension_filters(self):
+        """列表维度筛选：项目组/渠道/环境按任务全局维度收窄，与其余条件取「与」。"""
+        from apps.asset_mgr.models import Channel, Environment, ProjectGroup
+
+        c = self._client()
+        pg2 = ProjectGroup.objects.create(name='副项目', code='ut-proj2')
+        ch2 = Channel.objects.create(name='海外渠道', code='ut-oversea')
+        env2 = Environment.objects.create(name='生产环境', code='ut-prod')
+        self._create_task(c, name='任务甲')
+        self._create_task(c, name='任务乙', project_group=pg2.id, channel=ch2.id, environment=env2.id)
+
+        def names(**params):
+            return sorted(t['name'] for t in c.get('/api/exec/tasks/', params).json()['data']['results'])
+
+        # 不选维度：仅名称模糊
+        self.assertEqual(names(keyword='任务'), ['任务乙', '任务甲'])  # sorted 按码位，乙 在前
+        self.assertEqual(names(keyword='乙'), ['任务乙'])
+        # 维度逐项收窄，id 与 code 都认
+        self.assertEqual(names(project_group=pg2.id), ['任务乙'])
+        self.assertEqual(names(channel='ut-official'), ['任务甲'])
+        self.assertEqual(names(environment=env2.id), ['任务乙'])
+        # 多条件取「与」：维度 + 名称 + 模块类型 + 状态
+        self.assertEqual(names(project_group=self.pg.id, keyword='任务', task_type='command', status='pending'),
+                         ['任务甲'])
+        # 条件互斥则为空
+        self.assertEqual(names(project_group=self.pg.id, environment=env2.id), [])
+
     def test_clean_task_logs_command(self):
         """清理命令删除过期日志记录及落盘文件，保留期内的不动。"""
         task = ExecutionTask.objects.create(name='old')

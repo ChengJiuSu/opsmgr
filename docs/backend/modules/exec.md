@@ -467,7 +467,10 @@ GET                 /api/exec/log-files/download/ 日志原文件下载（exec r
 发起执行另看能力位 `can_execute` / `can_exec_prod`。方法库（`method`）与执行变量
 （`variable`）是**另外两个模块**：能改任务流不等于能改方法模板（模板里能写任意
 命令）或读写敏感变量。
-列表 `task_type` 筛选语义 = 包含该类型模块的任务（`steps__task_type`）。
+列表筛选参数：`project_group` / `channel` / `environment`（任务**全局维度**，兼容 id 与
+字典 code；模块自定义维度不参与）、`keyword`（任务名称模糊）、`task_type`、`status`。
+已填条件之间取「与」逐个收窄，未填=不限——只带 `keyword` 就是纯名称搜索。
+`task_type` 筛选语义 = 包含该类型模块的任务（`steps__task_type`）。
 
 ### 保存校验规则（仅内容字段）
 
