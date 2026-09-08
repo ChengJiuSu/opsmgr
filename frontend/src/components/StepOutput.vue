@@ -121,11 +121,16 @@ const modules = computed(() => {
   }))
 })
 
-// 实际展示的模块序号：手动点选优先，否则正在执行的模块，再否则第一个
+// 实际展示的模块序号：手动点选优先，其次正在执行的模块，再其次**最后一个跑过的**
+// 模块。最后一个跑过的（而不是第一个）：执行结束时页面会重新加载这条记录的完整
+// 日志，落回第一个模块等于把用户正在看的那一屏冲掉——刚跑完的那个模块才是他在看的
 const current = computed(() => {
   const list = modules.value
   if (selected.value != null && list.some((m) => m.index === selected.value)) return selected.value
-  return (list.find((m) => m.status === 'running') || list[0])?.index ?? null
+  const auto = list.find((m) => m.status === 'running')
+    || [...list].reverse().find((m) => m.status && m.status !== 'pending')
+    || list[0]
+  return auto?.index ?? null
 })
 
 const currentMeta = computed(() =>
