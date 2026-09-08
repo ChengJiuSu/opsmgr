@@ -2337,6 +2337,9 @@ class LiveSinkBroadcastTests(TestCase):
         self.sink.bind([])
         self.pushes = []
 
+    def tearDown(self):
+        self.sink.close()   # 停掉尾随刷新线程，避免它跨用例继续敲
+
     def _patch_push(self):
         return mock.patch('apps.task_exec.live.push',
                           side_effect=lambda _tid, payload: self.pushes.append(payload) or True)
@@ -2388,6 +2391,24 @@ class LiveSinkBroadcastTests(TestCase):
         self.assertEqual(row['output_offset'], frame['offset'])
         # 库内那份是推送那份的后缀：同一尾部，只是窗口更窄
         self.assertTrue(frame['output'].endswith(row['output'][note:]))
+
+    def test_trailing_flush_pushes_after_quiet(self):
+        """输出停下来之后，被节流挡掉的那一段仍会被补推。
+
+        ansible 是「每个 task 结束吐一段」，一段落在节流窗口内、下一个 task 又跑上
+        几分钟（拉包解压）时，没有尾随刷新这段就一直躺在内存里——页面看着卡住，
+        直到模块收尾才一次性全出来。
+        """
+        with self._patch_push():
+            self.sink.begin(('s', 1), 'H1', order=1)
+            self.pushes.clear()
+            self.sink.feed(('s', 1), 'quiet_marker')   # 紧接 begin，必被节流挡掉
+            self.assertEqual(self.pushes, [], '这一段本应被节流挡下')
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not self.pushes:
+                time.sleep(0.1)
+        self.assertTrue(self.pushes, '输出停下来后没有补推（页面会一直停在旧日志上）')
+        self.assertIn('quiet_marker', ''.join(p.get('output') or '' for p in self.pushes))
 
     def test_broken_channel_stops_pushing(self):
         with mock.patch('apps.task_exec.live.push', return_value=False) as m:

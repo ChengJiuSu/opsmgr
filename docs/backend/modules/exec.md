@@ -169,6 +169,13 @@ ansible 输出不再等模块跑完才可见：`common.ansible.run_stream` 以
   两个窗口是同一份尾部的宽窄之分（库内那份是推送那份的后缀），不是各自截各自的。
   `TaskExecutionLog.output` 只在 `force`（模块起止、阶段收尾）时跟着写一份
   —— 执行中没人读它，详情接口在执行结束回填 `log_file` 后直接读落盘全量。
+  **尾随刷新**：`flush` 全靠 `feed`/`begin`/`end` 驱动，被节流挡掉的那一段没有别的
+  触发点会来补。ansible 的输出是「每个 task 结束吐一段」，一段落在节流窗口内、
+  紧接着下一个 task 跑上几分钟（拉包、解压）时，这段就一直躺在内存里不推——页面
+  看着卡住，直到模块收尾的 force flush 才一次性全出来。所以 sink 起一个
+  `PUSH_INTERVAL` 敲一次的 daemon 线程（`LiveSink._ensure_ticker`，`close()` 时
+  退出）补 flush；写库同时加了「内容没变就不写」的判断，长任务静默期不会每
+  `DB_INTERVAL` 重写同一份预览。
   **为什么拆**：原来两者共用 60000，等于每秒往 MySQL 写一次 60KB TEXT
   （binlog 跟着 60KB/s），而页面根本不读库里那份——全量在落盘文件里，实时靠
   WebSocket 推送。拆开后写库量降到约 2.7KB/s（8000 字符 / 3s）；

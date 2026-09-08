@@ -321,6 +321,11 @@ class LiveSink:
         self._ws_reset = False  # 下次推送整段（模块切换后文本可能被重排）
         self._ws_broken = False
         self._steps = None      # runner 的逐模块结果列表（同一对象，含未执行的 pending）
+        self._extra = None      # 当前的临时提示（尾随刷新沿用）
+        self._db_len = -1       # 上次写库时的输出总长度（内容没变就不重复写）
+        self._io_lock = threading.Lock()   # 串行化写库/推送，避免交叉出乱序
+        self._stop = threading.Event()     # close() 置位，通知尾随刷新线程退出
+        self._ticker = None
 
     # ── 生命周期 ────────────────────────────────────────────
     def bind(self, outputs):
@@ -379,10 +384,33 @@ class LiveSink:
                and entry['size'] - entry['dropped'] - len(entry['buf'][0]) >= PREVIEW_LIMIT):
             entry['dropped'] += len(entry['buf'].pop(0))
 
+    def _ensure_ticker(self):
+        """启动尾随刷新线程：每 PUSH_INTERVAL 补一次 flush。
+
+        存在的理由见 flush 的注释：节流挡掉的那一段没有别的触发点会来补，而
+        ansible 的输出天生是「一阵一阵」的，两阵之间可能隔上几分钟。线程是
+        daemon，close() 置 _stop 后退出；一次执行只有一个（并行组共用一个 sink）。
+        """
+        with self._lock:
+            if self._ticker is not None or self._stop.is_set():
+                return
+            self._ticker = threading.Thread(
+                target=self._tick_loop, name=f'live-flush-{self.task_id}', daemon=True)
+            ticker = self._ticker
+        ticker.start()
+
+    def _tick_loop(self):
+        while not self._stop.wait(PUSH_INTERVAL):
+            try:
+                self.flush(extra=self._extra)
+            except Exception:  # noqa: BLE001 - 补推失败不影响执行本体
+                logger.exception('任务 %s 实时输出补推失败', self.task_id)
+
     def begin(self, key, header, order=0):
         """登记一个正在执行的模块（实时块，模块结束后由 outputs 接管）。"""
         with self._lock:
             self._live[key] = self._new_block(order, header)
+        self._ensure_ticker()
         self.flush(force=True)
 
     def writer(self, key):
@@ -400,6 +428,7 @@ class LiveSink:
         """喂入一段输出分片（节流写库），敏感明文先打码。"""
         if not text:
             return
+        self._ensure_ticker()   # 未经 begin 直接 feed 的兜底路径也要有尾随刷新
         text = mask_secrets(text, self._secrets)
         with self._lock:
             entry = self._live.get(key)
@@ -421,6 +450,10 @@ class LiveSink:
 
     def close(self, final_output=None, note=''):
         """收尾：把 outputs 剩余部分与附加说明（如执行异常）落盘并关闭文件。"""
+        self._stop.set()          # 先停尾随刷新，避免它和收尾写库/落盘打架
+        ticker = self._ticker
+        if ticker is not None and ticker is not threading.current_thread():
+            ticker.join(timeout=PUSH_INTERVAL * 2)
         with self._lock:
             self._live.clear()
             if final_output is not None and len(final_output) > self._file_len:
@@ -481,9 +514,16 @@ class LiveSink:
 
         extra 为仅供实时查看的临时提示（如失败等待人工处理），不落盘。
         推送与写库各自节流（见 PUSH_INTERVAL / DB_INTERVAL），force 时两者都做。
+
+        只在这里节流是不够的：flush 全靠 feed/begin/end 驱动，被节流挡掉的那一段
+        没有人再来补。ansible 是「每个 task 结束吐一段」，于是一段输出落在节流窗口
+        内、紧接着下一个 task 跑上几分钟（拉包、解压），这段就一直躺在内存里不推
+        ——页面看着像卡住，等模块收尾的 force flush 才一次性全出来。补推交给
+        _ticker 线程（见 _ensure_ticker）。
         """
         now = time.monotonic()
         with self._lock:
+            self._extra = extra    # 尾随刷新要沿用当前提示，否则补推会把它抹掉
             push_due = (force or self._pending >= PUSH_BYTES
                         or now - self._last_push >= PUSH_INTERVAL)
             db_due = force or now - self._last_db >= DB_INTERVAL
@@ -501,15 +541,20 @@ class LiveSink:
             tail = join_tail(parts, PREVIEW_LIMIT)
             if push_due:
                 self._last_push, self._pending = now, 0
+            # 内容没变就不写库：尾随刷新每 PUSH_INTERVAL 敲一次，不加这道判断会
+            # 在无输出的长任务期间每 DB_INTERVAL 重写一遍同样的预览
+            db_due = db_due and (force or total != self._db_len)
             if db_due:
-                self._last_db = now
-        # 写库与推送都可能阻塞（DB / channel layer），放锁外
-        if db_due:
-            # 执行日志表只在 force（模块起止、阶段收尾）时跟着写一份：任务表
-            # 才是前端轮询读的对象，两张表都按推送频率写整份预览纯属浪费。
-            self._save_preview(_preview(total, tail), total, write_log=force)
-        if push_due:
-            self._broadcast(total, tail, extra_used=bool(extra))
+                self._last_db, self._db_len = now, total
+        # 写库与推送都可能阻塞（DB / channel layer），放锁外；串行化避免并行组多线程
+        # 与尾随刷新交叉写出乱序的预览/推送
+        with self._io_lock:
+            if db_due:
+                # 执行日志表只在 force（模块起止、阶段收尾）时跟着写一份：任务表
+                # 才是前端轮询读的对象，两张表都按推送频率写整份预览纯属浪费。
+                self._save_preview(_preview(total, tail), total, write_log=force)
+            if push_due:
+                self._broadcast(total, tail, extra_used=bool(extra))
 
     def _broadcast(self, total, tail, extra_used):
         """把新增片段推给 WebSocket 客户端（前缀被破坏时重发实时窗口）。
