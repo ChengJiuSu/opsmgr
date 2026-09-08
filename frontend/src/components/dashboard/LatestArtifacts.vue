@@ -9,6 +9,12 @@
     <el-table-column prop="environment" label="环境" width="80" />
     <el-table-column prop="project_group" label="项目组" min-width="90" show-overflow-tooltip />
     <el-table-column prop="channel" label="渠道" width="80" show-overflow-tooltip />
+    <el-table-column label="服务类型" width="92" show-overflow-tooltip>
+      <template #default="{ row }">
+        <span v-if="row.service_type">{{ row.service_type }}</span>
+        <span v-else class="unset">未指定</span>
+      </template>
+    </el-table-column>
     <el-table-column label="当前版本" min-width="110">
       <template #default="{ row }">
         <span class="version">{{ row.version }}</span>
@@ -37,4 +43,5 @@ const time = (t) => (t ? t.slice(5, 16).replace('T', ' ') : '')
 <style scoped>
 .version { font-family: monospace; color: #303133; }
 .build { margin-left: 6px; color: #c0c4cc; font-size: 12px; }
+.unset { color: #c0c4cc; }
 </style>

@@ -263,7 +263,7 @@ class AssetSummaryTests(OverviewTestBase):
 
 
 class LatestArtifactTests(OverviewTestBase):
-    """各维度当前最新制品版本：每组只留 id 最大的一条，与 CD 注入同口径。"""
+    """各维度 + 服务类型当前最新制品版本：每组只留 id 最大的一条，与 CD 注入同口径。"""
 
     def setUp(self):
         self.group = ProjectGroup.objects.create(name='游戏A', code='ga')
@@ -274,9 +274,10 @@ class LatestArtifactTests(OverviewTestBase):
         self.test, _ = Environment.objects.get_or_create(
             code='test', defaults={'name': '测试'})
 
-    def _artifact(self, env, version):
+    def _artifact(self, env, version, service_type=None):
         return Artifact.objects.create(
             project_group=self.group, channel=self.channel, environment=env,
+            service_type=service_type,
             version=version, file_path=f'{version}.zip', original_name=f'{version}.zip',
             md5='0' * 32, size=1)
 
@@ -290,6 +291,19 @@ class LatestArtifactTests(OverviewTestBase):
         versions = {i['environment']: i['version'] for i in items}
         self.assertEqual(versions['生产'], '1.0.1')
         self.assertEqual(versions['测试'], '2.0.0')
+
+    def test_latest_per_service_type(self):
+        """同环境两个服务各显示一行：不按服务类型分组的话只看得见后上报的那个。"""
+        from apps.asset_mgr.models import ServiceType
+
+        gateway = ServiceType.objects.create(name='网关', code='db-gateway')
+        logic = ServiceType.objects.create(name='逻辑服', code='db-logic')
+        self._artifact(self.prod, '1.0.0', service_type=gateway)
+        self._artifact(self.prod, '3.0.0', service_type=logic)   # 更晚上报
+        client = self._login('ops2', {'artifact': 'read'})
+        items = self._keys(client)['body']['artifacts']['items']
+        self.assertEqual({(i['service_type'], i['version']) for i in items},
+                         {('网关', '1.0.0'), ('逻辑服', '3.0.0')})
 
     def test_hidden_without_artifact_permission(self):
         self._artifact(self.prod, '1.0.0')

@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from apps.asset_mgr.models import Channel, Environment, ProjectGroup
+from apps.asset_mgr.models import Channel, Environment, ProjectGroup, ServiceType
 
 from .models import FILENAME_RE, VERSION_RE, Artifact
 
@@ -11,13 +11,15 @@ class ArtifactSerializer(serializers.ModelSerializer):
     project_group_name = serializers.CharField(source='project_group.name', read_only=True)
     channel_name = serializers.CharField(source='channel.name', read_only=True)
     environment_name = serializers.CharField(source='environment.name', read_only=True)
+    service_type_name = serializers.CharField(source='service_type.name', read_only=True, default='')
     download_url = serializers.SerializerMethodField()
 
     class Meta:
         model = Artifact
         fields = [
             'id', 'project_group', 'project_group_name', 'channel', 'channel_name',
-            'environment', 'environment_name', 'version', 'original_name',
+            'environment', 'environment_name', 'service_type', 'service_type_name',
+            'version', 'original_name',
             'md5', 'size', 'jenkins_job', 'build_number', 'source', 'remark', 'reported_at',
             'download_url',
         ]
@@ -41,12 +43,15 @@ def _resolve_dict(model, raw, label):
 
 
 class ArtifactReportSerializer(serializers.Serializer):
-    """CI 上报入参：multipart（file + 维度 code/id + 版本 + 可选 md5 等）。"""
+    """CI 上报入参：multipart（file + 维度/服务类型 code/id + 版本 + 可选 md5 等）。"""
 
     file = serializers.FileField()
     project_group = serializers.CharField()
     channel = serializers.CharField()
     environment = serializers.CharField()
+    # 服务类型必填：同一 项目组/渠道/环境 下并存多个服务，缺了它 CD 取包只能按
+    # 「最新」猜，会把别的服务的包发出去
+    service_type = serializers.CharField()
     version = serializers.CharField(max_length=100)
     md5 = serializers.RegexField(r'^[0-9a-fA-F]{32}$', required=False, allow_blank=True,
                                  error_messages={'invalid': 'md5 必须为 32 位十六进制字符串'})
@@ -69,4 +74,5 @@ class ArtifactReportSerializer(serializers.Serializer):
         attrs['project_group'] = _resolve_dict(ProjectGroup, attrs['project_group'], '项目组')
         attrs['channel'] = _resolve_dict(Channel, attrs['channel'], '渠道')
         attrs['environment'] = _resolve_dict(Environment, attrs['environment'], '环境')
+        attrs['service_type'] = _resolve_dict(ServiceType, attrs['service_type'], '服务类型')
         return attrs

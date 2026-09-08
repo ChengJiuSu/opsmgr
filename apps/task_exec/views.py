@@ -231,9 +231,16 @@ class ExecVariableViewSet(viewsets.ModelViewSet):
                                           include_secrets=include_secrets)
         excluded = [] if include_secrets else _secret_keys(dims)
         if request.query_params.get('include_artifact') == 'true':
+            # 制品按维度 + 服务类型取：同一三维度下多个服务各有流水线，不带
+            # service_type 就是「取最新一条」，可能是别的服务刚上报的包。
+            # 这里保持可选（存量调用方不带就是老口径），带了则严格收窄
+            service_type, err = self._resolve_service_type(request.query_params)
+            if err:
+                return fail(err)
             try:
                 variables.update(collect_artifact_vars(
                     dims['project_group'].id, dims['channel'].id, dims['environment'].id,
+                    service_type_id=service_type.id if service_type else None,
                     locked=request.query_params.get('artifact_version', ''),
                 ))
             except ArtifactLookupError as exc:
@@ -272,6 +279,20 @@ class ExecVariableViewSet(viewsets.ModelViewSet):
                 return None, f'{label}不存在：{param}={value}'
             dims[field] = obj
         return dims, None
+
+    @staticmethod
+    def _resolve_service_type(params):
+        """解析可选的 service_type 参数（id 或 code），返回 (对象或 None, 错误信息)。"""
+        from apps.asset_mgr.models import ServiceType
+
+        value = (params.get('service_type') or '').strip()
+        if not value:
+            return None, None
+        lookup = {'id': value} if value.isdigit() else {'code': value}
+        obj = ServiceType.objects.filter(**lookup).first()
+        if obj is None:
+            return None, f'服务类型不存在：service_type={value}'
+        return obj, None
 
     @extend_schema(request=None, responses=OpenApiTypes.OBJECT)
     @action(detail=True, methods=['post'], permission_classes=[module_perm('variable', min_level='write'), SudoRequired])

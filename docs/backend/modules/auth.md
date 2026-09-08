@@ -629,7 +629,8 @@ permission_classes = [user_or_scope(IsAdminOrReadCreate, 'asset:read')]    # 对
 ```bash
 # 上报制品
 curl -H "X-API-KEY: ak_xxx.yyy" -F file=@app.tar.gz \
-     -F project_group=proj -F channel=official -F environment=prod -F version=1.2.3 \
+     -F project_group=proj -F channel=official -F environment=prod \
+     -F service_type=gateway -F version=1.2.3 \
      https://ops.example.com/api/artifacts/report/
 
 # 触发任务流（生产环境必须显式确认）

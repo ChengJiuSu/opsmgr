@@ -1095,6 +1095,24 @@ class ExecutionAPITests(TestCase):
                   dict(base, include_artifact='true', artifact_version='9.9.9'))
         self.assertEqual(r.status_code, 400)
         self.assertIn('9.9.9', r.json()['msg'])
+        # service_type 可选，带上则严格收窄：该服务类型没有制品就不注入 package_*
+        from apps.asset_mgr.models import ServiceType
+        svc = ServiceType.objects.create(name='网关', code='vr-gateway')
+        r = c.get('/api/exec/variables/resolved/',
+                  dict(base, include_artifact='true', service_type=svc.code))
+        self.assertNotIn('package_version', r.json()['data']['vars'])
+        Artifact.objects.create(
+            project_group=self.pg, channel=self.ch, environment=self.env, service_type=svc,
+            version='2.0.0', md5='e' * 32,
+            file_path='app-2.0.0.tar.gz', original_name='app-2.0.0.tar.gz', size=1024,
+        )
+        r = c.get('/api/exec/variables/resolved/',
+                  dict(base, include_artifact='true', service_type=svc.code))
+        self.assertEqual(r.json()['data']['vars']['package_version'], '2.0.0')
+        r = c.get('/api/exec/variables/resolved/',
+                  dict(base, include_artifact='true', service_type='no-such-service'))
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('服务类型不存在', r.json()['msg'])
 
     def test_method_step_params_json_roundtrip(self):
         """方法模块参数：JSON 对象保存回显；非对象类型 400。"""
@@ -1154,7 +1172,8 @@ class ExecutionAPITests(TestCase):
 
 @override_settings(TASK_EXEC_BACKEND='sync', TASK_FAILURE_WAIT_TIMEOUT=0)
 class ArtifactInjectTests(TestCase):
-    """CD 制品变量注入：按模块有效维度取最新制品，params.artifact_version 可锁定版本。"""
+    """CD 制品变量注入：按模块有效维度 + 模块服务类型取最新制品，
+    params.artifact_version 可锁定版本。"""
 
     # 复用任务流 API 测试的环境准备与辅助方法（不继承，避免父类用例重复执行）
     setUp = ExecutionAPITests.setUp
@@ -1166,7 +1185,8 @@ class ArtifactInjectTests(TestCase):
         from apps.artifact_mgr.models import Artifact
 
         fields = dict(
-            project_group=self.pg, channel=self.ch, environment=self.env, version=version,
+            project_group=self.pg, channel=self.ch, environment=self.env,
+            service_type=self.base_service, version=version,
             file_path=f'p/c/e/{version}/app.tar.gz', original_name='app.tar.gz',
             md5='a' * 32, size=10,
         )
@@ -1217,6 +1237,33 @@ class ArtifactInjectTests(TestCase):
         self.assertIn('未找到锁定版本的构建制品', task.output)
         log = TaskExecutionLog.objects.get(task=task)
         self.assertEqual(log.steps_result[0]['status'], 'failed')
+
+    def test_artifact_matched_by_step_service_type(self):
+        """同维度多服务：模块只拿自己服务类型的包，不会拿到别的服务后上报的包。"""
+        from apps.asset_mgr.models import ServerService, ServiceType
+
+        logic = ServiceType.objects.create(name='逻辑服', code='ut-logic')
+        ServerService.objects.create(server=self.server, service_type=logic, status='planned')
+        mine = self._make_artifact('1.0.0', service_type=logic)
+        self._make_artifact('9.9.9', service_type=self.base_service)  # 更晚上报的别家包
+        c = self._client()
+        task_id = self._create_task(c, steps=[self._step(service_type=logic.id)])
+        _, variables = _run_and_capture(c, task_id)
+        self.assertEqual(variables['package_version'], '1.0.0')
+        self.assertIn(f'/api/artifacts/{mine.id}/download/', variables['package_url'])
+
+    def test_other_service_type_artifact_not_injected(self):
+        """该服务类型没有制品时不注入，也不回退到别的服务类型或无服务类型的存量制品。"""
+        from apps.asset_mgr.models import ServerService, ServiceType
+
+        logic = ServiceType.objects.create(name='逻辑服', code='ut-logic2')
+        ServerService.objects.create(server=self.server, service_type=logic, status='planned')
+        self._make_artifact('1.0.0', service_type=self.base_service)
+        self._make_artifact('0.9.0', service_type=None)  # 存量制品（无服务类型）
+        c = self._client()
+        task_id = self._create_task(c, steps=[self._step(service_type=logic.id)])
+        cmd, _ = _run_and_capture(c, task_id)
+        self.assertNotIn('--extra-vars', cmd)
 
     def test_artifact_vars_follow_custom_scope_dims(self):
         """自定义范围模块按模块自身维度取制品，而非任务全局维度。"""

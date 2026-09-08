@@ -400,22 +400,24 @@ def asset_summary():
 
 
 def latest_artifacts():
-    """各「项目组 × 渠道 × 环境」的当前最新制品版本。
+    """各「项目组 × 渠道 × 环境 × 服务类型」的当前最新制品版本。
 
     「生产现在跑的是哪个版本」是运维被问最多的一句话，答案就在这张表里，但原先
-    只能去制品页按三个维度筛。取数与 CD 注入 package_* 变量同口径（每组取 id
-    最大的一条），不重算「最新」的定义。
+    只能去制品页按维度筛。取数与 CD 注入 package_* 变量同口径（每组取 id
+    最大的一条），不重算「最新」的定义——服务类型进分组正是因为注入也按它匹配：
+    不分组的话同一环境里两个服务只会显示后上报的那一个版本，另一个服务在跑什么
+    看不见。
     """
     latest_ids = list(
-        Artifact.objects.values('project_group', 'channel', 'environment')
+        Artifact.objects.values('project_group', 'channel', 'environment', 'service_type')
         .annotate(latest=Max('id')).values_list('latest', flat=True)
     )
     if not latest_ids:
         return {'visible': True, 'items': [], 'link': {'path': '/task/artifacts'}}
     rows = (
         Artifact.objects.filter(id__in=latest_ids)
-        .select_related('project_group', 'channel', 'environment')
-        .order_by('environment__id', 'project_group__id', 'channel__id')
+        .select_related('project_group', 'channel', 'environment', 'service_type')
+        .order_by('environment__id', 'project_group__id', 'channel__id', 'service_type__id')
     )
     return {
         'visible': True,
@@ -424,6 +426,8 @@ def latest_artifacts():
             'project_group': a.project_group.name,
             'channel': a.channel.name,
             'environment': a.environment.name,
+            # 存量制品（服务类型上线前上报）给空串，前端显示「未指定」
+            'service_type': a.service_type.name if a.service_type_id else '',
             'version': a.version,
             'build_number': a.build_number,
             'reported_at': a.reported_at,

@@ -80,7 +80,8 @@ ansible 优先级最高**——剧本内 `vars:` 不会反过来覆盖平台变�
 `''`）。三维度必填（缺任一个 400，避免精确匹配语义含糊），取值纯数字按 id、
 否则按 code；`include_artifact=true` 追加该维度制品变量 `package_url` /
 `package_version` / `package_md5`（`artifact_version` 可锁定版本，不存在则
-400）；`output=yaml` 返回**不带 `{code,msg,data}` 包装**的纯 YAML，可直接：
+400；`service_type` 可选，带上则按服务类型**严格**取包——同维度多服务时不带它
+就是「取最新一条」，可能是别的服务刚上报的包）；`output=yaml` 返回**不带 `{code,msg,data}` 包装**的纯 YAML，可直接：
 
 ```bash
 curl -sH "Authorization: Bearer $TOKEN" \
@@ -437,7 +438,7 @@ GET/POST/DELETE     /api/exec/credentials/        凭据 CRUD（仅管理员；�
 GET/POST/PUT/PATCH/DELETE /api/exec/variables/    执行变量 CRUD（普通用户只读；支持 project_group/channel/env 筛选）
 GET                 /api/exec/variables/resolved/ 按维度取已解析变量字典（外部系统喂 ansible）
                                                   必填 project_group/channel/env（id 或 code）；
-                                                  可选 include_artifact=true[&artifact_version=x]、output=yaml
+                                                  可选 include_artifact=true[&artifact_version=x][&service_type=code]、output=yaml
 GET                 /api/exec/variables/{id}/versions/  历史版本列表（默认保留 10 版）
 POST                /api/exec/variables/{id}/rollback/  回滚到指定版本 body {version}（仅管理员，回滚亦落新版本）
 GET                 /api/exec/playbooks/          剧本列表（仅管理员；ANSIBLE_PROJECT_DIR 内相对路径）

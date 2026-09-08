@@ -12,6 +12,9 @@
         <el-select v-model="filter.env" placeholder="环境" clearable filterable style="width:120px" @change="handleSearch">
           <el-option v-for="d in dictOptions.envs" :key="d.id" :label="d.name" :value="d.id" />
         </el-select>
+        <el-select v-model="filter.service_type" placeholder="服务类型" clearable filterable style="width:130px" @change="handleSearch">
+          <el-option v-for="d in dictOptions.serviceTypes" :key="d.id" :label="d.name" :value="d.id" />
+        </el-select>
         <el-button :icon="Search" @click="handleSearch">查询</el-button>
         <el-button :icon="Refresh" @click="fetchData">刷新</el-button>
       </div>
@@ -19,14 +22,25 @@
 
     <el-alert type="info" :closable="false" style="margin-bottom: 12px">
       构建制品由 Jenkins CI 完成后<b>脚本上报</b>（<code>POST /api/artifacts/report/</code>，X-API-KEY 鉴权），
-      按<b>项目组/渠道/环境/版本</b>唯一登记。CD 任务执行时自动注入该维度<b>最新制品</b>的
-      <code>package_url / package_version / package_md5</code>，模块参数 <code>artifact_version</code> 可锁定版本。
+      按<b>项目组/渠道/环境/服务类型/版本</b>唯一登记。CD 任务执行时按<b>模块的服务类型</b>取该维度
+      <b>最新制品</b>并注入 <code>package_url / package_version / package_md5</code>，模块参数
+      <code>artifact_version</code> 可锁定版本。服务类型严格匹配、不回退，所以上报时必须带
+      <code>service_type</code>，否则按服务类型部署的模块取不到包。
     </el-alert>
 
     <el-table v-loading="loading" :data="tableData" stripe>
       <el-table-column label="项目组 / 渠道 / 环境" min-width="190" show-overflow-tooltip>
         <template #default="{ row }">
           {{ row.project_group_name }} / {{ row.channel_name }} / {{ row.environment_name }}
+        </template>
+      </el-table-column>
+      <el-table-column label="服务类型" min-width="120" show-overflow-tooltip>
+        <template #default="{ row }">
+          <span v-if="row.service_type_name">{{ row.service_type_name }}</span>
+          <!-- 存量制品（字段上线前上报）：按服务类型取包的模块不会命中它 -->
+          <el-tooltip v-else content="上报时未带服务类型，按服务类型取包的模块不会取到它" placement="top">
+            <span class="muted">未指定</span>
+          </el-tooltip>
         </template>
       </el-table-column>
       <el-table-column prop="version" label="版本" min-width="180" show-overflow-tooltip>
@@ -79,7 +93,7 @@ import { debounce } from '../../utils/debounce'
 import { Delete, Download, Refresh, Search } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../../stores/auth'
-import { fetchDictOptions, projectGroupApi, channelApi, environmentApi } from '../../api/assets'
+import { fetchDictOptions, projectGroupApi, channelApi, environmentApi, serviceTypeApi } from '../../api/assets'
 import { deleteArtifact, getArtifacts } from '../../api/artifacts'
 
 const authStore = useAuthStore()
@@ -90,8 +104,8 @@ const tableData = ref([])
 const total = ref(0)
 const page = ref(1)
 const pageSize = ref(20)
-const filter = reactive({ keyword: '', project_group: '', channel: '', env: '' })
-const dictOptions = reactive({ projects: [], channels: [], envs: [] })
+const filter = reactive({ keyword: '', project_group: '', channel: '', env: '', service_type: '' })
+const dictOptions = reactive({ projects: [], channels: [], envs: [], serviceTypes: [] })
 
 const formatTime = (t) => (t ? t.slice(0, 19).replace('T', ' ') : '')
 
@@ -109,19 +123,21 @@ function humanSize(bytes) {
 
 async function loadDictOptions() {
   if (dictOptions.projects.length) return
-  const [proj, chan, env] = await Promise.allSettled([
+  const [proj, chan, env, svc] = await Promise.allSettled([
     fetchDictOptions(projectGroupApi), fetchDictOptions(channelApi), fetchDictOptions(environmentApi),
+    fetchDictOptions(serviceTypeApi),
   ])
   if (proj.status === 'fulfilled') dictOptions.projects = proj.value.data?.results || []
   if (chan.status === 'fulfilled') dictOptions.channels = chan.value.data?.results || []
   if (env.status === 'fulfilled') dictOptions.envs = env.value.data?.results || []
+  if (svc.status === 'fulfilled') dictOptions.serviceTypes = svc.value.data?.results || []
 }
 
 async function fetchData() {
   loading.value = true
   try {
     const params = { page: page.value, page_size: pageSize.value }
-    for (const k of ['keyword', 'project_group', 'channel', 'env']) {
+    for (const k of ['keyword', 'project_group', 'channel', 'env', 'service_type']) {
       if (filter[k]) params[k] = filter[k]
     }
     const res = await getArtifacts(params)
@@ -174,7 +190,7 @@ onMounted(() => {
 
 <style scoped>
 .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
-.toolbar-left { display: flex; gap: 8px; }
+.toolbar-left { display: flex; gap: 8px; flex-wrap: wrap; }
 .muted { color: #c0c4cc; }
 code { background: #f5f7fa; padding: 1px 6px; border-radius: 3px; font-size: 12px; }
 .mono { font-family: Menlo, Consolas, "Courier New", monospace; letter-spacing: 0; white-space: nowrap; }

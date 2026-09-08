@@ -1,9 +1,14 @@
 """构建制品：Jenkins CI 完成后上报的代码压缩包。
 
-制品按 项目组/渠道/环境/版本 唯一定位，文件落盘 ARTIFACT_ROOT
-（{项目组code}/{渠道code}/{环境code}/{版本}/{原始文件名}），DB 记录版本与 md5。
-CD 执行时 task_exec.runner 按模块有效维度取最新（或锁定版本）制品，
-把 package_url/package_version/package_md5 注入 --extra-vars。
+制品按 项目组/渠道/环境/服务类型/版本 唯一定位，文件落盘 ARTIFACT_ROOT
+（{项目组code}/{渠道code}/{环境code}/{服务类型code}/{版本}/{原始文件名}），
+DB 记录版本与 md5。CD 执行时 task_exec.runner 按模块有效维度 + 模块服务类型
+取最新（或锁定版本）制品，把 package_url/package_version/package_md5 注入
+--extra-vars。
+
+服务类型进唯一键与取包口径的原因：同一 项目组/渠道/环境 下会并存多个服务
+（如 gateway 与 logic），各自一条 CI 流水线。只按三维度取「最新」，谁后上报
+谁的包就会被另一个服务的部署模块拿去用 —— 装错代码包比装不上更难发现。
 """
 import hashlib
 import hmac
@@ -14,6 +19,7 @@ from urllib.parse import quote
 
 from django.conf import settings
 from django.db import models
+from django.db.models import Q
 
 # 版本号与文件名白名单：仅字母数字 . _ -，从源头排除路径穿越
 VERSION_RE = re.compile(r'^[A-Za-z0-9._-]{1,100}$')
@@ -44,6 +50,11 @@ class Artifact(models.Model):
         'asset_mgr.Channel', verbose_name='渠道', on_delete=models.PROTECT, related_name='artifacts')
     environment = models.ForeignKey(
         'asset_mgr.Environment', verbose_name='环境', on_delete=models.PROTECT, related_name='artifacts')
+    # 服务类型：上报必填（序列化器校验）。字段可空仅为兼容 0002 之前的存量制品，
+    # 存量记录取包时不会被按服务类型匹配的模块命中（严格匹配，不回退）
+    service_type = models.ForeignKey(
+        'asset_mgr.ServiceType', verbose_name='服务类型', on_delete=models.PROTECT,
+        null=True, blank=True, related_name='artifacts')
     version = models.CharField('版本号', max_length=100)
     # 相对 ARTIFACT_ROOT 的落盘路径；不用 FileField，便于流式写盘同时计算 md5
     file_path = models.CharField('文件路径', max_length=500)
@@ -63,25 +74,44 @@ class Artifact(models.Model):
         ordering = ['-id']
         constraints = [
             models.UniqueConstraint(
-                fields=['project_group', 'channel', 'environment', 'version'],
+                fields=['project_group', 'channel', 'environment', 'service_type', 'version'],
                 name='uniq_artifact_dims_version',
+            ),
+            # 上面那条对存量（service_type 为空）的记录不生效：SQL 里 NULL != NULL，
+            # 唯一索引把每个 NULL 当成不同值。存量记录仍需保证「同三维度同版本只有
+            # 一条」，故另加一条 NULL 专用的条件唯一约束。
+            # 注意：MySQL 不支持条件唯一约束，Django 在该后端直接跳过不建——生产
+            # （MySQL）上这条只是声明。可接受：上报必填服务类型，不会再产生新的
+            # NULL 行，而已有的 NULL 行在旧约束下本就是唯一的
+            models.UniqueConstraint(
+                fields=['project_group', 'channel', 'environment', 'version'],
+                condition=Q(service_type__isnull=True),
+                name='uniq_artifact_dims_version_legacy',
             ),
         ]
 
     def __str__(self):
-        return f'{self.project_group_id}/{self.channel_id}/{self.environment_id} {self.version}'
+        return (f'{self.project_group_id}/{self.channel_id}/{self.environment_id}'
+                f'/{self.service_type_id or "-"} {self.version}')
 
     @classmethod
-    def latest_for(cls, project_group_id, channel_id, environment_id, version=None):
-        """按三维度精确匹配取制品：version 为空取最新一条，指定则精确取该版本。
+    def latest_for(cls, project_group_id, channel_id, environment_id,
+                   service_type_id=None, version=None):
+        """按三维度（+服务类型）精确匹配取制品：version 为空取最新一条。
 
         供 CD 执行时注入制品变量（task_exec.runner._artifact_vars）调用。
+
+        service_type_id 非空时**严格**收窄到该服务类型，取不到不回退到无服务类型
+        的存量制品：回退等于把别的服务的包发出去，正是本字段要消灭的故障。
+        留空（存量模块）时不加服务类型条件，保持字段上线前的口径。
         """
         qs = cls.objects.filter(
             project_group_id=project_group_id,
             channel_id=channel_id,
             environment_id=environment_id,
         )
+        if service_type_id:
+            qs = qs.filter(service_type_id=service_type_id)
         if version:
             return qs.filter(version=version).first()
         return qs.order_by('-id').first()

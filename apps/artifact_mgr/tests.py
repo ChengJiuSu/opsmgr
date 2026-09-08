@@ -15,7 +15,7 @@ from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from apps.asset_mgr.models import Channel, Environment, ProjectGroup
+from apps.asset_mgr.models import Channel, Environment, ProjectGroup, ServiceType
 from apps.auth_mgr.apikey import ensure_service_user
 from apps.auth_mgr.models import ApiCredential
 from apps.system_cfg.models import SystemConfig
@@ -51,6 +51,7 @@ class ArtifactTestBase(TestCase):
         self.pg = ProjectGroup.objects.create(name='主项目', code='at-proj')
         self.ch = Channel.objects.create(name='官服', code='at-official')
         self.env = Environment.objects.create(name='测试环境', code='at-test')
+        self.svc = ServiceType.objects.create(name='网关', code='at-gateway')
 
     def _client(self, is_staff=True, username=None):
         username = username or ('admin_a' if is_staff else 'user_a')
@@ -66,7 +67,7 @@ class ArtifactTestBase(TestCase):
         data = {
             'file': SimpleUploadedFile(extra.pop('filename', 'app.tar.gz'), content),
             'project_group': self.pg.code, 'channel': self.ch.code, 'environment': self.env.code,
-            'version': version,
+            'service_type': self.svc.code, 'version': version,
         }
         data.update(extra)
         if api_key is _DEFAULT:
@@ -87,7 +88,9 @@ class ArtifactReportTests(ArtifactTestBase):
         self.assertEqual(art.size, len(content))
         self.assertEqual(art.jenkins_job, 'build-app')
         self.assertEqual(art.build_number, 42)
-        self.assertEqual(art.file_path, os.path.join('at-proj', 'at-official', 'at-test', '1.0.0', 'app.tar.gz'))
+        self.assertEqual(art.service_type_id, self.svc.id)
+        self.assertEqual(art.file_path, os.path.join(
+            'at-proj', 'at-official', 'at-test', 'at-gateway', '1.0.0', 'app.tar.gz'))
         with open(art.abs_path(), 'rb') as f:
             self.assertEqual(f.read(), content)
         # 文件名进路径末段：命令行 curl -O / wget 直接落原名，无需额外参数
@@ -99,14 +102,36 @@ class ArtifactReportTests(ArtifactTestBase):
         self.assertEqual(r.status_code, 400)
         self.assertIn('md5 校验不一致', r.json()['msg'])
         self.assertFalse(Artifact.objects.exists())
-        self.assertFalse(os.path.exists(
-            os.path.join(ARTIFACT_TMP, 'at-proj', 'at-official', 'at-test', '1.0.0', 'app.tar.gz')))
+        self.assertFalse(os.path.exists(os.path.join(
+            ARTIFACT_TMP, 'at-proj', 'at-official', 'at-test', 'at-gateway', '1.0.0', 'app.tar.gz')))
 
     def test_report_duplicate_version_conflict(self):
         self._report()
         r = self._report(content=b'other')
         self.assertEqual(r.status_code, 409)
         self.assertEqual(Artifact.objects.count(), 1)
+
+    def test_report_same_version_different_service_type_allowed(self):
+        """同版本号在不同服务类型下各存一条：两条流水线的包互不覆盖。"""
+        other = ServiceType.objects.create(name='逻辑服', code='at-logic')
+        self.assertEqual(self._report().status_code, 200)
+        r = self._report(content=b'logic-bytes', service_type=other.code)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(Artifact.objects.count(), 2)
+        self.assertEqual(
+            Artifact.objects.get(service_type=other).file_path,
+            os.path.join('at-proj', 'at-official', 'at-test', 'at-logic', '1.0.0', 'app.tar.gz'))
+
+    def test_report_requires_service_type(self):
+        """服务类型必填：缺了它 CD 只能按「最新」取包，会发出别的服务的包。"""
+        r = self._report(service_type='')
+        self.assertEqual(r.status_code, 400)
+        self.assertFalse(Artifact.objects.exists())
+
+    def test_report_unknown_service_type(self):
+        r = self._report(service_type='no-such-service')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('服务类型不存在', r.json()['msg'])
 
     def test_report_requires_api_key(self):
         # 401 而不是 403：接口挂了 ApiKeyAuthentication（带 authenticate_header），
@@ -270,9 +295,10 @@ class ArtifactViewSetTests(ArtifactTestBase):
 
 
 class ArtifactModelTests(ArtifactTestBase):
-    def _create(self, version):
+    def _create(self, version, service_type=None):
         return Artifact.objects.create(
-            project_group=self.pg, channel=self.ch, environment=self.env, version=version,
+            project_group=self.pg, channel=self.ch, environment=self.env,
+            service_type=service_type, version=version,
             file_path=f'x/{version}/a.tar.gz', original_name='a.tar.gz', md5='a' * 32, size=1,
         )
 
@@ -292,6 +318,23 @@ class ArtifactModelTests(ArtifactTestBase):
         self._create('1.0.0')
         other_env = Environment.objects.create(name='生产', code='at-prod')
         self.assertIsNone(Artifact.latest_for(self.pg.id, self.ch.id, other_env.id))
+
+    def test_latest_for_service_type_strict(self):
+        """服务类型严格匹配：不取别的服务类型的包，也不回退到无服务类型的存量制品。"""
+        logic = ServiceType.objects.create(name='逻辑服', code='at-logic2')
+        gateway_pkg = self._create('1.0.0', service_type=self.svc)
+        logic_pkg = self._create('1.0.1', service_type=logic)   # 更晚上报
+        dims = (self.pg.id, self.ch.id, self.env.id)
+        # 网关模块不会拿到后上报的逻辑服包（这正是加服务类型要消灭的故障）
+        self.assertEqual(Artifact.latest_for(*dims, service_type_id=self.svc.id).id, gateway_pkg.id)
+        self.assertEqual(Artifact.latest_for(*dims, service_type_id=logic.id).id, logic_pkg.id)
+        # 没有该服务类型的制品：返回 None 而不是回退到存量/别的服务
+        empty = ServiceType.objects.create(name='空服务', code='at-empty')
+        self.assertIsNone(Artifact.latest_for(*dims, service_type_id=empty.id))
+        legacy = self._create('0.9.0')  # 存量记录（无服务类型）
+        self.assertIsNone(Artifact.latest_for(*dims, service_type_id=empty.id))
+        # 存量模块（未传 service_type）保持旧口径：取该维度最新一条
+        self.assertEqual(Artifact.latest_for(*dims).id, legacy.id)
 
 
 @override_settings(ARTIFACT_ROOT=ARTIFACT_TMP, TRUSTED_PROXIES=['127.0.0.1'])
@@ -320,7 +363,7 @@ class ArtifactApiCredentialTests(ArtifactTestBase):
         data = {
             'file': SimpleUploadedFile('app.tar.gz', b'package-bytes'),
             'project_group': self.pg.code, 'channel': self.ch.code,
-            'environment': self.env.code, 'version': version,
+            'environment': self.env.code, 'service_type': self.svc.code, 'version': version,
         }
         return APIClient().post('/api/artifacts/report/', data, format='multipart',
                                 HTTP_X_API_KEY=key, REMOTE_ADDR=ip or self.ALLOWED_IP)
@@ -371,15 +414,23 @@ class ArtifactApiCredentialTests(ArtifactTestBase):
 class CleanArtifactsCommandTests(ArtifactTestBase):
     """制品保留期清理：过期删除、保底版本与锁定版本必须留下、孤儿文件扫盘。"""
 
-    def _artifact(self, version, days_ago=0, content=b'pkg'):
-        """建一条制品记录并落一个真实文件（清理要验文件也删掉了）。"""
-        rel = os.path.join(self.pg.code, self.ch.code, self.env.code, version, 'app.tar.gz')
+    def _artifact(self, version, days_ago=0, content=b'pkg', service_type=_DEFAULT):
+        """建一条制品记录并落一个真实文件（清理要验文件也删掉了）。
+
+        service_type 默认用基类的网关服务；显式传 None 造存量记录（无服务类型）。
+        """
+        if service_type is _DEFAULT:
+            service_type = self.svc
+        svc_seg = service_type.code if service_type else 'legacy'
+        rel = os.path.join(self.pg.code, self.ch.code, self.env.code, svc_seg,
+                           version, 'app.tar.gz')
         dest = os.path.join(ARTIFACT_TMP, rel)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         with open(dest, 'wb') as f:
             f.write(content)
         art = Artifact.objects.create(
-            project_group=self.pg, channel=self.ch, environment=self.env, version=version,
+            project_group=self.pg, channel=self.ch, environment=self.env,
+            service_type=service_type, version=version,
             file_path=rel, original_name='app.tar.gz', md5='0' * 32, size=len(content),
         )
         if days_ago:
@@ -412,23 +463,74 @@ class CleanArtifactsCommandTests(ArtifactTestBase):
         self.assertFalse(Artifact.objects.filter(pk=older.pk).exists())
         self.assertTrue(Artifact.objects.filter(pk=newer.pk).exists())
 
+    def test_keep_latest_counted_per_service_type(self):
+        """保底名额按服务类型各算一份：否则发版频繁的服务会挤掉另一个服务仅有的包。"""
+        from apps.asset_mgr.models import ServiceType
+
+        logic = ServiceType.objects.create(name='逻辑服', code='ca-logic')
+        self._artifact('1.0.0', days_ago=300)
+        gateway_newer = self._artifact('1.1.0', days_ago=250)
+        logic_only = self._artifact('0.9.0', days_ago=300, service_type=logic)
+        self._run(keep_latest=1)
+        self.assertTrue(Artifact.objects.filter(pk=gateway_newer.pk).exists())
+        self.assertTrue(Artifact.objects.filter(pk=logic_only.pk).exists())
+        self.assertFalse(Artifact.objects.filter(version='1.0.0').exists())
+
     def test_locked_version_survives(self):
         """被任务模块锁定的版本清掉后，下次执行会直接失败。"""
-        from apps.asset_mgr.models import ServiceType
         from apps.task_exec.models import ExecutionTask, TaskStep
 
         locked = self._artifact('1.0.0', days_ago=300)
         self._artifact('1.1.0', days_ago=300)
-        service = ServiceType.objects.create(name='基础', code='ca-base')
         task = ExecutionTask.objects.create(
             name='CD', project_group=self.pg, channel=self.ch, environment=self.env)
         TaskStep.objects.create(
             task=task, order=1, name='部署', task_type='command', command='echo hi',
-            service_type=service, params={'artifact_version': '1.0.0'})
+            service_type=self.svc, params={'artifact_version': '1.0.0'})
 
         self._run(keep_latest=0)
         self.assertTrue(Artifact.objects.filter(pk=locked.pk).exists())
         self.assertFalse(Artifact.objects.filter(version='1.1.0').exists())
+
+    def test_locked_version_other_service_type_not_protected(self):
+        """锁定按服务类型算：锁 gateway 的 1.0.0 不该顺带保住 logic 的 1.0.0。
+
+        执行时按服务类型严格取包，logic 的那条永远不会被这个模块用到，
+        保住它只是白占磁盘。
+        """
+        from apps.asset_mgr.models import ServiceType
+        from apps.task_exec.models import ExecutionTask, TaskStep
+
+        logic = ServiceType.objects.create(name='逻辑服', code='ca-logic2')
+        mine = self._artifact('1.0.0', days_ago=300)
+        others = self._artifact('1.0.0', days_ago=300, service_type=logic)
+        task = ExecutionTask.objects.create(
+            name='CD', project_group=self.pg, channel=self.ch, environment=self.env)
+        TaskStep.objects.create(
+            task=task, order=1, name='部署', task_type='command', command='echo hi',
+            service_type=self.svc, params={'artifact_version': '1.0.0'})
+
+        self._run(keep_latest=0)
+        self.assertTrue(Artifact.objects.filter(pk=mine.pk).exists())
+        self.assertFalse(Artifact.objects.filter(pk=others.pk).exists())
+
+    def test_locked_by_legacy_step_protects_all_service_types(self):
+        """存量模块（未设服务类型）取包不按服务类型收窄，锁定也要保住全部。"""
+        from apps.asset_mgr.models import ServiceType
+        from apps.task_exec.models import ExecutionTask, TaskStep
+
+        logic = ServiceType.objects.create(name='逻辑服', code='ca-logic3')
+        gateway_pkg = self._artifact('1.0.0', days_ago=300)
+        logic_pkg = self._artifact('1.0.0', days_ago=300, service_type=logic)
+        task = ExecutionTask.objects.create(
+            name='CD', project_group=self.pg, channel=self.ch, environment=self.env)
+        TaskStep.objects.create(
+            task=task, order=1, name='部署', task_type='command', command='echo hi',
+            service_type=None, params={'artifact_version': '1.0.0'})
+
+        self._run(keep_latest=0)
+        self.assertTrue(Artifact.objects.filter(pk=gateway_pkg.pk).exists())
+        self.assertTrue(Artifact.objects.filter(pk=logic_pkg.pk).exists())
 
     def test_dry_run_deletes_nothing(self):
         old = self._artifact('1.0.0', days_ago=200)

@@ -80,7 +80,8 @@ class ArtifactViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin,
                       mixins.DestroyModelMixin, viewsets.GenericViewSet):
     """制品列表/详情/删除：登录用户可查，管理员可删；新增只能由 CI 上报。"""
 
-    queryset = Artifact.objects.select_related('project_group', 'channel', 'environment')
+    queryset = Artifact.objects.select_related(
+        'project_group', 'channel', 'environment', 'service_type')
     serializer_class = ArtifactSerializer
     permission_classes = [module_perm('artifact')]
 
@@ -88,6 +89,7 @@ class ArtifactViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin,
         ('project_group', 'project_group'),
         ('channel', 'channel'),
         ('env', 'environment'),
+        ('service_type', 'service_type'),
     )
 
     def get_queryset(self):
@@ -119,7 +121,9 @@ class ArtifactReportView(APIView):
     """CI 上报制品：multipart 上传文件与元数据，X-API-KEY 鉴权（免登录）。
 
     流式写盘同时计算 md5；上报 md5 不一致时删除文件并报错；
-    同 项目组/渠道/环境/版本 已存在则拒绝（409），避免制品被静默覆盖。
+    同 项目组/渠道/环境/服务类型/版本 已存在则拒绝（409），避免制品被静默覆盖。
+    服务类型必填：同一三维度下并存多个服务，缺了它 CD 只能按「最新」取包，
+    会把别的服务的包发出去。
 
     鉴权：API 凭证（key + IP 白名单 + `artifact:report` 作用域 + 数据范围）。
     旧的全局 `artifact.api_key` 兜底已于废弃期结束后删除——那把 key 全脚本共用、
@@ -138,6 +142,7 @@ class ArtifactReportView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         pg, ch, env = data['project_group'], data['channel'], data['environment']
+        svc = data['service_type']
         upload = data['file']
 
         # 凭证数据范围：一把限定了项目组的 CI key 不该能往别的项目组塞包
@@ -147,11 +152,13 @@ class ArtifactReportView(APIView):
                         f'（当前范围：{credential.scope_label}）', status=403)
 
         if Artifact.objects.filter(
-            project_group=pg, channel=ch, environment=env, version=data['version'],
+            project_group=pg, channel=ch, environment=env, service_type=svc,
+            version=data['version'],
         ).exists():
-            return fail(f'制品版本已存在：{data["version"]}（如需重传请先删除旧记录）', status=409)
+            return fail(f'制品版本已存在：{svc.code}/{data["version"]}（如需重传请先删除旧记录）',
+                        status=409)
 
-        rel_path = os.path.join(pg.code, ch.code, env.code, data['version'], upload.name)
+        rel_path = os.path.join(pg.code, ch.code, env.code, svc.code, data['version'], upload.name)
         try:
             dest = resolve_within(settings.ARTIFACT_ROOT, rel_path)
         except ValueError:
@@ -171,13 +178,14 @@ class ArtifactReportView(APIView):
             return fail(f'md5 校验不一致：上报 {reported_md5}，实际 {md5}，文件已丢弃')
 
         artifact = Artifact.objects.create(
-            project_group=pg, channel=ch, environment=env, version=data['version'],
+            project_group=pg, channel=ch, environment=env, service_type=svc,
+            version=data['version'],
             file_path=rel_path, original_name=upload.name, md5=md5, size=upload.size,
             jenkins_job=data.get('jenkins_job') or '', build_number=data.get('build_number'),
             remark=data.get('remark') or '',
         )
-        logger.info('制品上报成功：%s/%s/%s %s (%s, %s bytes)',
-                    pg.code, ch.code, env.code, artifact.version, md5, upload.size)
+        logger.info('制品上报成功：%s/%s/%s/%s %s (%s, %s bytes)',
+                    pg.code, ch.code, env.code, svc.code, artifact.version, md5, upload.size)
         return ok(ArtifactSerializer(artifact).data, msg='上报成功')
 
 

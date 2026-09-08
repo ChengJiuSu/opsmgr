@@ -279,20 +279,27 @@ def collect_dim_secret_values(project_group_id, channel_id, environment_id):
     return values
 
 
-def collect_artifact_vars(project_group_id, channel_id, environment_id, locked=''):
-    """按维度查询构建制品，返回注入 CD 剧本的变量字典。
+def collect_artifact_vars(project_group_id, channel_id, environment_id,
+                          service_type_id=None, locked=''):
+    """按维度（+服务类型）查询构建制品，返回注入 CD 剧本的变量字典。
 
     - locked 非空：锁定该版本，不存在则抛 ArtifactLookupError 供调用方 fail fast；
     - 未锁定：取该维度最新制品；无制品返回空 dict（静默跳过，不影响非 CD 模块）。
+
+    service_type_id 严格收窄，不回退到无服务类型的存量制品：同一三维度下多个
+    服务各有流水线，回退就是把别的服务的代码包发出去。
     """
     from apps.artifact_mgr.models import Artifact
 
     locked = str(locked or '').strip()
     artifact = Artifact.latest_for(
-        project_group_id, channel_id, environment_id, version=locked or None)
+        project_group_id, channel_id, environment_id,
+        service_type_id=service_type_id, version=locked or None)
     if locked and artifact is None:
+        scope = f'、服务类型 id={service_type_id}' if service_type_id else ''
         raise ArtifactLookupError(
-            f'未找到锁定版本的构建制品：version={locked}（请确认该维度下 CI 已上报此版本）。')
+            f'未找到锁定版本的构建制品：version={locked}'
+            f'（请确认该维度{scope}下 CI 已上报此版本）。')
     if artifact is None:
         return {}
     return {
@@ -303,10 +310,16 @@ def collect_artifact_vars(project_group_id, channel_id, environment_id, locked='
 
 
 def _artifact_vars(step):
-    """按模块有效维度取制品变量（step.params.artifact_version 可锁定版本）。"""
+    """按模块有效维度 + 模块服务类型取制品变量（step.params.artifact_version 可锁定版本）。
+
+    服务类型取模块自己的 service_type（与主机收窄同一个字段）：同一三维度下
+    「更新 gateway」与「更新 logic」两个模块，各自只该拿到自己服务的包。
+    存量模块没设服务类型时不加该条件，保持字段上线前的口径。
+    """
     pg, ch, env = _effective_dims(step)
     locked = (getattr(step, 'params', None) or {}).get('artifact_version')
-    return collect_artifact_vars(pg, ch, env, locked=locked)
+    return collect_artifact_vars(
+        pg, ch, env, service_type_id=getattr(step, 'service_type_id', None), locked=locked)
 
 
 def _effective_dims(step):
@@ -318,7 +331,7 @@ def _effective_dims(step):
 
 
 def step_vars(step):
-    """模块生效变量：变量管理（按模块有效维度精确匹配）+ CD 制品变量。
+    """模块生效变量：变量管理（按模块有效维度精确匹配）+ CD 制品变量（按维度 + 服务类型）。
 
     制品变量后合并，同名覆盖变量管理（与原先两段 -e 的先后语义一致）；
     模块自身的额外变量不在此列，由调用方作为最后一个 -e 传入。

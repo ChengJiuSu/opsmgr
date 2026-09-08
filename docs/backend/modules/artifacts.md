@@ -14,11 +14,17 @@
    平台执行日志（`TaskExecutionLog`），构建结果映射为模块返回码。
 2. **制品上报**：Jenkins CI 完成后由脚本主动上报构建压缩包
    （`POST /api/artifacts/report/`，`X-API-KEY` 鉴权免登录），按
-   **项目组/渠道/环境/版本** 唯一登记，DB 记录 md5/大小/Jenkins 构建信息。
-3. **CD 取包**：任务流执行时按**模块有效维度**自动查询最新制品，把
+   **项目组/渠道/环境/服务类型/版本** 唯一登记，DB 记录 md5/大小/Jenkins 构建信息。
+3. **CD 取包**：任务流执行时按**模块有效维度 + 模块服务类型**自动查询最新制品，把
    `package_url` / `package_version` / `package_md5` 注入 `--extra-vars`
    （三类模块通用），CD 剧本用 `get_url` 直接拉包并校验 md5；模块
    `params.artifact_version` 可锁定版本（锁定版本不存在则模块失败）。
+
+> **服务类型为什么进唯一键与取包口径**：同一 项目组/渠道/环境 下会并存多个服务
+> （如 gateway 与 logic），各有一条 CI 流水线。只按三维度取「最新」，谁后上报谁的
+> 包就会被另一个服务的部署模块拿去用——装错代码包比装不上更难发现。因此上报
+> **必须带 `service_type`**，取包按模块自身的 `service_type` **严格匹配、不回退**
+> 到无服务类型的存量制品。
 
 ---
 
@@ -40,7 +46,8 @@ settings：`ARTIFACT_ROOT`（制品落盘根目录，默认 `media/artifacts`）
 
 ```
 apps/artifact_mgr/
-├── models.py        # Artifact：三维度+version 唯一；latest_for 取最新/锁定版本；
+├── models.py        # Artifact：三维度+服务类型+version 唯一（存量 NULL 另有条件唯一约束）；
+│                    #   latest_for 取最新/锁定版本（服务类型严格匹配）；
 │                    #   download_sig/download_url：HMAC 签名下载地址
 ├── serializers.py   # 展示 + 上报入参校验（维度按 code/id 解析、版本/文件名白名单防穿越）
 ├── views.py         # ArtifactViewSet（查/删）+ ArtifactReportView（上报）+ ArtifactDownloadView（下载）
@@ -50,8 +57,10 @@ apps/system_cfg/services.py            # get_config(key)：系统配置读取
 apps/task_exec/runner.py               # _artifact_vars：CD 制品变量注入（extra_vars_args 收口）
 ```
 
-存储路径：`{ARTIFACT_ROOT}/{项目组code}/{渠道code}/{环境code}/{版本}/{原始文件名}`
+存储路径：`{ARTIFACT_ROOT}/{项目组code}/{渠道code}/{环境code}/{服务类型code}/{版本}/{原始文件名}`
 （版本与文件名仅允许 `[A-Za-z0-9._-]`，最终路径再经 `resolve_within` 防穿越）。
+服务类型段是 0002 迁移后新增的，存量制品的 `file_path` 保持旧的四段布局不动
+（路径存在记录里，不靠拼接推导）。
 
 ---
 
@@ -117,7 +126,7 @@ manager（需要 Jenkins 所在内网能出公网；不能出网时得另做 age
 
 | 方法 | 路径 | 权限 | 说明 |
 |------|------|------|------|
-| GET | `/api/artifacts/` | 登录用户 | 列表；`?project_group/channel/env`（id 或 code）、`keyword`（版本/文件名/job） |
+| GET | `/api/artifacts/` | 登录用户 | 列表；`?project_group/channel/env/service_type`（id 或 code）、`keyword`（版本/文件名/job） |
 | GET | `/api/artifacts/{id}/` | 登录用户 | 详情（含 `download_url`） |
 | DELETE | `/api/artifacts/{id}/` | 管理员 | 删除记录并清理磁盘文件 |
 | POST | `/api/artifacts/report/` | API 凭证 `artifact:report`（旧全局 key 兜底） | CI 上报（multipart，见下） |
@@ -131,9 +140,13 @@ manager（需要 Jenkins 所在内网能出公网；不能出网时得另做 age
 
 ### 上报（multipart 字段）
 
-`file`(必填)、`project_group`/`channel`/`environment`(必填，code 或 id)、
+`file`(必填)、`project_group`/`channel`/`environment`/`service_type`(必填，code 或 id)、
 `version`(必填)、`md5`(可选，服务端流式计算后比对，不一致丢弃文件返 400)、
-`jenkins_job`/`build_number`/`remark`(可选)。同维度同版本已存在返 **409**。
+`jenkins_job`/`build_number`/`remark`(可选)。同维度同服务类型同版本已存在返 **409**
+（同版本号在**不同服务类型**下各存一条，互不覆盖）。
+
+> `service_type` 是 2026-09 新增的**必填**字段：老上报脚本不加会得到 400
+> 「该字段是必填项」，Jenkins 侧需同步补 `-F "service_type=..."`。
 
 Jenkins 侧上报脚本示例（Pipeline post 阶段）：
 
@@ -142,6 +155,7 @@ MD5=$(md5sum app.tar.gz | awk '{print $1}')
 curl -sf -H "X-API-KEY: ${OPS_API_KEY}" \
   -F "file=@app.tar.gz" \
   -F "project_group=main-game" -F "channel=official" -F "environment=test" \
+  -F "service_type=gateway" \
   -F "version=${BUILD_NUMBER}" -F "md5=${MD5}" \
   -F "jenkins_job=${JOB_NAME}" -F "build_number=${BUILD_NUMBER}" \
   "${OPS_BASE_URL}/api/artifacts/report/"
@@ -158,7 +172,9 @@ curl -sf -H "X-API-KEY: ${OPS_API_KEY}" \
 ```
 
 注入顺序：变量管理 → 制品变量 → 模块额外变量（ansible 同名后者覆盖，
-模块手填 `package_url=...` 可强制覆盖）。该维度无制品且未锁版本时静默不注入。
+模块手填 `package_url=...` 可强制覆盖）。该维度 + 服务类型无制品且未锁版本时静默
+不注入（**不回退**到别的服务类型或无服务类型的存量制品）。存量模块（未设服务
+类型）保持旧口径：按三维度取最新。
 
 ---
 
@@ -185,8 +201,8 @@ python manage.py clean_artifacts             # 实际清理
 | 规则 | 配置 | 为什么 |
 |------|------|--------|
 | 未超保留期 | `ARTIFACT_RETENTION_DAYS`（`--days`）| — |
-| 每个 项目组/渠道/环境 组合的最新 N 版 | `ARTIFACT_KEEP_LATEST`（`--keep-latest`）| 长期不发版的环境里所有制品都会超期，全清掉之后连「回滚到上一个版本」都做不到 |
-| 被任务模块锁定的版本 | — | `TaskStep.params.artifact_version` 是有人显式指定要用的版本，清掉它下次执行会直接失败。生效维度按模块自定义范围或任务全局维度解析，与执行时同一口径 |
+| 每个 项目组/渠道/环境**/服务类型** 组合的最新 N 版 | `ARTIFACT_KEEP_LATEST`（`--keep-latest`）| 长期不发版的环境里所有制品都会超期，全清掉之后连「回滚到上一个版本」都做不到。保底名额按含服务类型的组合算：只按三维度算的话，发版频繁的服务会占满名额，另一个服务仅有的那个包会被清掉 |
+| 被任务模块锁定的版本 | — | `TaskStep.params.artifact_version` 是有人显式指定要用的版本，清掉它下次执行会直接失败。生效维度按模块自定义范围或任务全局维度解析、服务类型取模块自身的 `service_type`，与执行时同一口径；模块未设服务类型（存量）时该锁定保护同版本的全部服务类型 |
 
 **孤儿文件**（记录已删、文件还在）按 mtime 单独扫盘清理，兜住历史上删除失败的
 残留；保留期沿用同一阈值，避免把刚上报的文件当孤儿删掉。`--skip-orphans` 可跳过。

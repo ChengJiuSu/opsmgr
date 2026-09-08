@@ -6,9 +6,11 @@
 三条保护规则，任一命中即保留：
 
 1. **未超保留期**（settings.ARTIFACT_RETENTION_DAYS，`--days` 覆盖）；
-2. **每个 项目组/渠道/环境 组合的最新 N 个版本**
+2. **每个 项目组/渠道/环境/服务类型 组合的最新 N 个版本**
    （settings.ARTIFACT_KEEP_LATEST，`--keep-latest` 覆盖）——长期不发版的环境
-   里所有制品都会超期，全清掉之后连「回滚到上一个版本」都做不到；
+   里所有制品都会超期，全清掉之后连「回滚到上一个版本」都做不到。保底按**含
+   服务类型**的组合算：只按三维度算的话，发版频繁的服务会把保底名额占满，另一个
+   服务仅有的那个包会被清掉；
 3. **被任务模块锁定的版本**（TaskStep.params.artifact_version）——那是有人显式
    指定要用的版本，清掉它下次执行会直接失败。
 
@@ -35,13 +37,13 @@ logger = logging.getLogger('apps.artifact_mgr')
 
 
 class Command(BaseCommand):
-    help = '清理超过保留期的构建制品记录与文件（每个维度组合保底保留最新若干版本）'
+    help = '清理超过保留期的构建制品记录与文件（每个维度+服务类型组合保底保留最新若干版本）'
 
     def add_arguments(self, parser):
         parser.add_argument('--days', type=int, default=None,
                             help='制品保留天数，默认取 ARTIFACT_RETENTION_DAYS')
         parser.add_argument('--keep-latest', type=int, default=None,
-                            help='每个维度组合保底保留的最新版本数，默认取 ARTIFACT_KEEP_LATEST')
+                            help='每个维度+服务类型组合保底保留的最新版本数，默认取 ARTIFACT_KEEP_LATEST')
         parser.add_argument('--dry-run', action='store_true',
                             help='仅列出将删除的制品，不实际删除')
         parser.add_argument('--skip-orphans', action='store_true',
@@ -58,7 +60,9 @@ class Command(BaseCommand):
         freed = sum(item.size for item in expired)
         for artifact in expired:
             label = (f'{artifact.project_group.code}/{artifact.channel.code}/'
-                     f'{artifact.environment.code} {artifact.version}')
+                     f'{artifact.environment.code}/'
+                     f'{artifact.service_type.code if artifact.service_type_id else "-"} '
+                     f'{artifact.version}')
             if dry_run:
                 self.stdout.write(f'  将删除 {label}（{_mb(artifact.size)}）')
                 continue
@@ -84,22 +88,22 @@ class Command(BaseCommand):
         locked = _locked_versions()
         keep_ids = set()
         dims = Artifact.objects.values_list(
-            'project_group_id', 'channel_id', 'environment_id').distinct()
-        for pg, ch, env in dims:
+            'project_group_id', 'channel_id', 'environment_id', 'service_type_id').distinct()
+        for pg, ch, env, svc in dims:
             if keep <= 0:
                 break
             keep_ids.update(
                 Artifact.objects.filter(
                     project_group_id=pg, channel_id=ch, environment_id=env,
+                    service_type_id=svc,
                 ).order_by('-id').values_list('id', flat=True)[:keep]
             )
         qs = (Artifact.objects
               .filter(reported_at__lt=cutoff)
               .exclude(id__in=keep_ids)
-              .select_related('project_group', 'channel', 'environment')
+              .select_related('project_group', 'channel', 'environment', 'service_type')
               .order_by('id'))
-        return [a for a in qs if (a.project_group_id, a.channel_id, a.environment_id,
-                                  a.version) not in locked]
+        return [a for a in qs if not _is_locked(a, locked)]
 
     def _clean_orphans(self, days, dry_run):
         """扫 ARTIFACT_ROOT 清理「库里没有对应记录」且已过保留期的文件。
@@ -136,18 +140,31 @@ class Command(BaseCommand):
         return count, freed
 
 
+def _is_locked(artifact, locked):
+    """该制品是否被任务模块锁定（含服务类型口径）。
+
+    模块没设服务类型（存量模块）时执行取包也不按服务类型收窄，等于「不限」，
+    所以那条锁定要保护该维度同版本的所有服务类型的制品。
+    """
+    dims = (artifact.project_group_id, artifact.channel_id, artifact.environment_id)
+    return ((*dims, artifact.service_type_id, artifact.version) in locked
+            or (*dims, None, artifact.version) in locked)
+
+
 def _locked_versions():
-    """被任务模块显式锁定的 (项目组, 渠道, 环境, 版本) 集合。
+    """被任务模块显式锁定的 (项目组, 渠道, 环境, 服务类型, 版本) 集合。
 
     锁定写在 TaskStep.params.artifact_version 里（见 runner._artifact_vars），
-    生效维度按模块自定义范围或任务全局维度解析——与执行时同一口径，否则会把
-    「模块自定义范围锁定的版本」误判为可删。
+    生效维度按模块自定义范围或任务全局维度解析、服务类型取模块自身的
+    service_type——与执行时同一口径，否则会把「模块自定义范围锁定的版本」
+    误判为可删。
     """
     from apps.task_exec.models import TaskStep
 
     locked = set()
     steps = TaskStep.objects.select_related('task').only(
-        'params', 'use_custom_scope', 'project_group_id', 'channel_id', 'environment_id',
+        'params', 'use_custom_scope', 'service_type_id',
+        'project_group_id', 'channel_id', 'environment_id',
         'task__project_group_id', 'task__channel_id', 'task__environment_id',
     )
     for step in steps:
@@ -159,7 +176,7 @@ def _locked_versions():
         else:
             task = step.task
             dims = (task.project_group_id, task.channel_id, task.environment_id)
-        locked.add((*dims, version))
+        locked.add((*dims, step.service_type_id, version))
     return locked
 
 
