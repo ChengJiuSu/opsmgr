@@ -769,10 +769,11 @@ async function fetchData() {
     const res = await getTasks(params)
     tableData.value = res.data?.results || []
     total.value = res.data?.total || 0
-    // 日志面板打开时同步任务最新状态
+    // 日志面板打开时同步任务最新状态（合并而不是替换：面板整块由
+    // v-if="logPanel.task" 控制，保持对象身份可免掉一次整块重渲染/重挂）
     if (logPanel.task) {
       const fresh = tableData.value.find((t) => t.id === logPanel.task.id)
-      if (fresh) logPanel.task = fresh
+      if (fresh) Object.assign(logPanel.task, fresh)
     }
   } finally {
     loading.value = false
@@ -1481,7 +1482,10 @@ async function selectLog(log) {
 // 面板这边的关键节点也会打到控制台（与 StepOutput 的输出对照看）
 const dbg = (...args) => {
   try {
-    if (localStorage.getItem('taskLogDebug') === '1') console.log('[logPanel]', ...args)
+    if (new URLSearchParams(location.search).get('logdebug') === '1'
+        || localStorage.getItem('taskLogDebug') === '1') {
+      console.log('[logPanel]', ...args)
+    }
   } catch { /* 隐私模式读不到 localStorage，忽略 */ }
 }
 
@@ -1586,7 +1590,9 @@ async function finish() {
   const byId = new Map((list.data || []).map((r) => [r.id, r]))
   logPanel.logs.forEach((row) => Object.assign(row, byId.get(row.id) || {}))
   if (detail?.data) {
-    logPanel.current = detail.data
+    // 合并而不是整份替换：保持 current 的对象身份，收尾这一拍就不会有 prop 身份
+    // 变化传到日志组件（它按 logId 判断「换了执行记录」，一变就重置选中的模块）
+    Object.assign(logPanel.current, detail.data)
     logPanel.output = detail.data.output || '（暂无输出）'
   }
   dbg('finish:done', {

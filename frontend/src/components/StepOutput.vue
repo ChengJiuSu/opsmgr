@@ -211,16 +211,18 @@ watch([selected, () => props.logId], ([index, logId]) => {
   }
 })
 
-// 排查用开关：浏览器控制台执行 localStorage.taskLogDebug = '1' 后刷新页面，
-// 选中态的每次变化都会打到控制台（定位「执行结束跳回第一个模块」）
+// 排查用开关：URL 带 ?logdebug=1，或控制台执行 localStorage.taskLogDebug = '1'
+// 再刷新。选中态的每次变化都会打到控制台（定位「执行结束跳回第一个模块」）
 const debugOn = (() => {
   try {
-    return localStorage.getItem('taskLogDebug') === '1'
+    return new URLSearchParams(location.search).get('logdebug') === '1'
+      || localStorage.getItem('taskLogDebug') === '1'
   } catch {
     return false
   }
 })()
 if (debugOn) {
+  console.log('[StepOutput] mounted, logId =', props.logId, 'restored =', selected.value)
   watch(
     () => [current.value, selected.value, autoIndex.value, props.logId, props.follow,
            modules.value.map((m) => `${m.index}:${m.status}`).join(','),
@@ -228,7 +230,12 @@ if (debugOn) {
     (line) => console.log('[StepOutput] current|selected|auto|logId|follow|modules|outLen =', line),
     { immediate: true },
   )
-  console.log('[StepOutput] mounted, logId =', props.logId)
+  // 选中往前退或被清空 = 反常，把调用栈打出来，一眼看到是谁改的
+  watch(selected, (now, before) => {
+    if (before != null && (now == null || now < before)) {
+      console.trace(`[StepOutput] selected 回退 ${before} -> ${now}`)
+    }
+  })
 }
 
 // 跟随模式：新输出到达自动选中正在执行的模块并滚到底（用户点选过则只滚动不抢选中）

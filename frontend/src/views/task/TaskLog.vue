@@ -293,7 +293,9 @@ async function finish() {
   const byId = new Map((list.data || []).map((r) => [r.id, r]))
   logs.value.forEach((row) => Object.assign(row, byId.get(row.id) || {}))
   if (detail?.data) {
-    current.value = detail.data
+    // 合并而不是整份替换：保持 current 的对象身份，收尾这一拍就不会有 prop 身份
+    // 变化传到日志组件（它按 logId 判断「换了执行记录」，一变就重置选中的模块）
+    Object.assign(current.value, detail.data)
     output.value = detail.data.output || '（暂无输出）'
   }
 }
