@@ -258,7 +258,7 @@ function startResyncTimer() {
     lastFrameAt = Date.now()
     try {
       // 状态帧可能一起丢了，所以补拉也要负责收尾
-      if (await pollOnce()) { stopFollow(); init() }
+      if (await pollOnce()) finish()
     } catch { /* 下一轮再试 */ }
   }, 5000)
 }
@@ -275,9 +275,26 @@ function applyStatus(data) {
     return_code: data.return_code,
     duration: data.duration,
   }
-  if (data.status === 'success' || data.status === 'failed') {
-    stopFollow()
-    init() // 执行完成：刷新日志列表并定位最新记录
+  if (data.status === 'success' || data.status === 'failed') finish()
+}
+
+// 执行结束的收尾：只把当前记录换成落盘的完整日志，并就地刷新列表各行的状态/耗时。
+// **不能走 init()**：那会重置表格数据、重新 setCurrentRow、重新选中记录，页面看着
+// 像刷新了一次，日志区还会退回第一个模块——而用户正在看的是刚跑完的那个模块。
+async function finish() {
+  stopFollow()
+  stopListTimer()
+  const logId = current.value?.id
+  const [list, detail] = await Promise.all([
+    getTaskLogs(taskId),
+    logId ? getTaskLogDetail(taskId, logId) : Promise.resolve(null),
+  ])
+  // 就地更新行对象（保持身份）：表格的当前行不变，也就不会触发重新选中
+  const byId = new Map((list.data || []).map((r) => [r.id, r]))
+  logs.value.forEach((row) => Object.assign(row, byId.get(row.id) || {}))
+  if (detail?.data) {
+    current.value = detail.data
+    output.value = detail.data.output || '（暂无输出）'
   }
 }
 
@@ -313,7 +330,7 @@ function startPolling() {
     try {
       if (await pollOnce()) {
         stopPolling()
-        init() // 执行完成：刷新日志列表并定位最新记录
+        finish() // 执行完成：换成完整日志（不重置选中，见 finish）
       }
     } catch {
       stopPolling()

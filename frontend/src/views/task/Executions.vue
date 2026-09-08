@@ -1521,11 +1521,7 @@ function startFollow() {
         return_code: data.return_code,
         duration: data.duration,
       }
-      if (data.status === 'success' || data.status === 'failed') {
-        stopFollow()
-        fetchData()
-        refreshLogs() // 执行完成：刷新日志列表并选中最新记录
-      }
+      if (data.status === 'success' || data.status === 'failed') finish()
     },
     onFallback: () => {
       stream = null
@@ -1545,7 +1541,7 @@ function startResyncTimer() {
     lastFrameAt = Date.now()
     try {
       // 状态帧可能一起丢了，所以补拉也要负责收尾
-      if (await pollOnce()) { stopFollow(); fetchData(); refreshLogs() }
+      if (await pollOnce()) finish()
     } catch { /* 下一轮再试 */ }
   }, 5000)
 }
@@ -1559,6 +1555,29 @@ function stopFollow() {
   stream = null
   stopResyncTimer()
   stopPolling()
+}
+
+// 执行结束的收尾：只把当前记录换成落盘的完整日志，并就地刷新列表各行的状态/耗时。
+// **不能走 refreshLogs()**：那会替换表格数据、重新 setCurrentRow、重新选中记录，
+// 面板看着像刷新了一次，日志区还会退回第一个模块——而用户看的是刚跑完的那个模块。
+async function finish() {
+  stopFollow()
+  fetchData()   // 外层任务列表（与面板选中无关）
+  const taskId = logPanel.task?.id
+  const logId = logPanel.current?.id
+  if (!taskId) return
+  const [list, detail] = await Promise.all([
+    getTaskLogs(taskId),
+    logId ? getTaskLogDetail(taskId, logId) : Promise.resolve(null),
+  ])
+  if (logPanel.task?.id !== taskId) return   // 期间换了任务：丢弃
+  // 就地更新行对象（保持身份）：表格的当前行不变，也就不会触发重新选中
+  const byId = new Map((list.data || []).map((r) => [r.id, r]))
+  logPanel.logs.forEach((row) => Object.assign(row, byId.get(row.id) || {}))
+  if (detail?.data) {
+    logPanel.current = detail.data
+    logPanel.output = detail.data.output || '（暂无输出）'
+  }
 }
 
 /** 拉一次输出（轮询回退与推送静默兜底共用）。返回是否已到终态。 */
@@ -1590,8 +1609,7 @@ function startPolling() {
     try {
       if (await pollOnce()) {
         stopPolling()
-        fetchData()
-        refreshLogs() // 执行完成：刷新日志列表并选中最新记录
+        finish() // 执行完成：换成完整日志（不重置选中，见 finish）
       }
     } catch {
       stopPolling()
