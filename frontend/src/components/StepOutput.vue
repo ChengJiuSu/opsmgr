@@ -122,27 +122,33 @@ const modules = computed(() => {
   }))
 })
 
-const runningIndex = computed(() => modules.value.find((m) => m.status === 'running')?.index ?? null)
+// 自动选中的目标：从后往前找第一个「跑过或正在跑」的模块。执行中它就是当前模块
+// （后面的都还 pending），执行完就是最后跑完的那个。
+// 故意不去找 running：模块表来自多条通道（WebSocket 快照/推送、轮询、记录详情、
+// 列表行），其中任何一处都可能送来一份「前面的模块还在 running」的旧快照，而任务流
+// 只进不退，跟着那个 running 走就会把视图拽回前面的模块。
+const AUTO_SKIP = ['pending', 'skipped']   // 没跑过的模块没有日志，不作为自动目标
+const autoIndex = computed(() => {
+  const last = [...modules.value].reverse().find((m) => m.status && !AUTO_SKIP.includes(m.status))
+  return last?.index ?? null
+})
 
-// 实际展示的模块序号：选中的那个（只要还在列表里），否则正在执行的，否则最后一个
-// 跑过的（status 非 pending），最后退回**列表末尾**那个模块。
-// 一律往后落而不是往前落：执行结束时这条记录会被重新拉一次完整日志，落回第一个
-// 模块等于把用户正在看的那一屏冲掉——刚跑完的那个才是他在看的。即使选中态中途被
-// 重置（切记录、模块表被整份替换掉），往后落也仍然停在最后跑过的模块上
+// 实际展示的模块序号：选中的那个（只要还在列表里），否则自动目标，最后退回列表末尾。
+// 兜底一律往后落：执行结束时这条记录会被重新拉一次完整日志，落回第一个模块等于把
+// 用户正在看的那一屏冲掉——刚跑完的那个模块才是他在看的
 const current = computed(() => {
   const list = modules.value
   if (selected.value != null && list.some((m) => m.index === selected.value)) return selected.value
-  const auto = list.find((m) => m.status === 'running')
-    || [...list].reverse().find((m) => m.status && m.status !== 'pending')
-    || list[list.length - 1]
-  return auto?.index ?? null
+  return autoIndex.value ?? list[list.length - 1]?.index ?? null
 })
 
-// 执行中跟随正在执行的模块，并把结果**写进 selected**（不只是算出来）：执行结束
-// 时这条记录会被重新拉一次完整日志，届时模块表里已经没有 running 项，只靠当场
-// 计算就会飘走（回到第一个模块）。写进 selected 后停在原处，与手动点选同一套逻辑
-watch(runningIndex, (idx) => {
-  if (idx != null && !userPinned.value) selected.value = idx
+// 把自动目标**写进 selected**（不只是算出来）：执行结束时模块表里已经没有 running
+// 项，纯计算的选中会随之飘走。写进去之后与手动点选同一套逻辑，停在原处。
+// 只许往后、不许往前：往前一定是过期快照造成的（任务流只进不退）。
+watch(autoIndex, (idx) => {
+  if (idx == null || userPinned.value) return
+  if (selected.value != null && idx <= selected.value) return
+  selected.value = idx
 }, { immediate: true })
 
 const currentMeta = computed(() =>
