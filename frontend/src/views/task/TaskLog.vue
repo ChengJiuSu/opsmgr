@@ -318,7 +318,7 @@ async function pollOnce() {
     else applyFull(buf, data)
     render()
   }
-  if (steps) applySteps(steps)
+  if (steps?.length) applySteps(steps)   // 空数组不覆盖（[] 是真值，会抹掉模块表）
   return data.status === 'success' || data.status === 'failed'
 }
 

@@ -77,13 +77,14 @@ export function openTaskLogStream(taskId, handlers = {}) {
     armWatchdog()  // 任何下行帧（含 pong）都算连接活着
     if (msg.kind === 'full') {
       onFull?.(msg)
-      // 快照同时带模块表与状态，首帧即可画出任务流树、切出暂停操作条
-      if (msg.steps) onSteps?.(msg.steps)
+      // 快照同时带模块表与状态，首帧即可画出模块列表、切出暂停操作条
+      // （空数组不算：[] 是真值，照发会把已有模块表抹掉）
+      if (msg.steps?.length) onSteps?.(msg.steps)
       if (msg.status) onStatus?.(msg)
     } else if (msg.kind === 'delta') {
       onDelta?.(msg)
     } else if (msg.kind === 'steps') {
-      onSteps?.(msg.steps || [])
+      if (msg.steps?.length) onSteps?.(msg.steps)
     } else if (msg.kind === 'status') {
       onStatus?.(msg)
     }

@@ -125,15 +125,16 @@ const modules = computed(() => {
 const runningIndex = computed(() => modules.value.find((m) => m.status === 'running')?.index ?? null)
 
 // 实际展示的模块序号：选中的那个（只要还在列表里），否则正在执行的，否则最后一个
-// 跑过的（status 非 pending），否则第一个。「最后一个跑过的」而不是「第一个」：
-// 执行结束时页面会重新加载这条记录的完整日志，落回第一个模块等于把用户正在看的
-// 那一屏冲掉——刚跑完的那个模块才是他在看的
+// 跑过的（status 非 pending），最后退回**列表末尾**那个模块。
+// 一律往后落而不是往前落：执行结束时这条记录会被重新拉一次完整日志，落回第一个
+// 模块等于把用户正在看的那一屏冲掉——刚跑完的那个才是他在看的。即使选中态中途被
+// 重置（切记录、模块表被整份替换掉），往后落也仍然停在最后跑过的模块上
 const current = computed(() => {
   const list = modules.value
   if (selected.value != null && list.some((m) => m.index === selected.value)) return selected.value
   const auto = list.find((m) => m.status === 'running')
     || [...list].reverse().find((m) => m.status && m.status !== 'pending')
-    || list[0]
+    || list[list.length - 1]
   return auto?.index ?? null
 })
 
