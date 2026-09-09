@@ -1,0 +1,54 @@
+# =============================================================================
+# 兜底 server：拦截所有未显式配置的 Host
+# -----------------------------------------------------------------------------
+# 加这个之前，conf.d 里第一个 listen 80 的 server 会被 nginx 隐式当成
+# default_server —— 也就是 ops_manager.conf 的 HTTP 块。后果：
+#   * 任意域名（含别人解析过来的野域名）+ 直接用 IP 访问，都会被当作本站处理，
+#     HTTP 侧还会 301 到 https://$host，等于替陌生域名做跳转；
+#   * HTTPS 侧则用本站证书完成握手后再返回内容，SNI 与证书名不匹配的扫描器
+#     也能拿到站点指纹。
+#
+# 文件名以 00- 开头有两个作用：
+#   1. include conf.d/*.conf 按文件名排序，本块最先解析，语义上是「兜底在最前」；
+#   2. 提醒不要在这里用 ops_timing —— 那个 log_format 定义在 ops_manager.conf，
+#      解析顺序在后，此处引用会报 unknown log format。故只用内置 combined。
+# default_server 是显式标记，实际生效与文件顺序无关。
+#
+# ⚠ 部署前确认：容器 healthcheck 用的 Host（compose 里写死的
+#   ops-manager.linuxlab.space）必须包含在 OPS_SERVER_NAME 里，
+#   否则健康检查会落到这里被 444 掉，容器一直 unhealthy。
+# =============================================================================
+
+server {
+    # 未匹配任何 server_name 的 HTTP 请求（含裸 IP 访问）落到这里
+    listen ${OPS_HTTP_PORT} default_server;
+    # IPv6：宿主机确实有 v6 地址时再打开，否则 nginx 启动即失败
+    # listen [::]:${OPS_HTTP_PORT} default_server;
+
+    server_name _;
+    server_tokens off;
+
+    # 444 = nginx 私有状态码：不回响应体直接断连，比 403 更省，也不给扫描器信息。
+    # 需要对外表现得「像没这个站」时这是最合适的。
+    # 留一份日志：野域名解析到本机、或有人拿 IP 扫端口，都只能从这里看出来。
+    access_log /var/log/nginx/ops-manager.reject.log combined;
+    error_log  /var/log/nginx/ops-manager.error.log warn;
+
+    return 444;
+}
+
+server {
+    # HTTPS 侧同理。ssl_reject_handshake（nginx 1.19.4+）在 TLS 握手阶段就用
+    # unrecognized_name alert 拒掉，不需要给这个块配任何证书 ——
+    # 也就不存在「用本站证书替野域名握手」的问题。
+    # 因为连不上 TLS，这里不会产生 access_log 记录（HTTP 请求根本没被解析到）。
+    listen ${OPS_HTTPS_PORT} ssl default_server;
+    # listen [::]:${OPS_HTTPS_PORT} ssl default_server;
+
+    server_name _;
+    server_tokens off;
+
+    ssl_reject_handshake on;
+
+    error_log /var/log/nginx/ops-manager.error.log warn;
+}

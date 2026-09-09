@@ -28,6 +28,9 @@ services:
       OPS_TLS_CERT: ${OPS_TLS_CERT}
       OPS_TLS_KEY: ${OPS_TLS_KEY}
       OPS_TLS_CHAIN: ${OPS_TLS_CHAIN}
+      # ICP 备案占位站（ops_manager_beian.conf.template）
+      OPS_BEIAN_SERVER_NAME: ${OPS_BEIAN_SERVER_NAME}
+      OPS_BEIAN_INDEX: ${OPS_BEIAN_INDEX}
       TZ: ${TZ:-Asia/Shanghai}
 
     volumes:
@@ -36,6 +39,10 @@ services:
 
       # 可复用配置片段（安全响应头等），不参与 envsubst 渲染
       - ./conf/snippets:/etc/nginx/snippets:ro
+
+      # 本机托管的纯静态页（ICP 备案占位页等）。一个目录放多域名的页面，
+      # 按文件名区分；页面由 conf.d 里各站点的 root 指到这里。
+      - ./html:/etc/nginx/html-sites:ro
 
       # TLS 证书目录（只读）。续期由宿主机 acme.sh / certbot 负责，
       # 写入宿主机 ./certs 后 reload 容器即可生效。

@@ -21,6 +21,9 @@
 | `docker/` | 后端容器化：Dockerfile + entrypoint（compose 文件在仓库根） |
 | `docker/Dockerfile.builder` | CI 依赖构建镜像（预编 wheelhouse / 生成 lock），不进生产 |
 | `nginx/` | 前置 nginx（容器化）：docker compose + envsubst 模板 + 安全头片段 + logrotate |
+| `nginx/conf/templates/00-default-server.conf.template` | 兜底 server：未显式配置的 Host（含裸 IP）HTTP 返回 444、HTTPS 直接拒握手 |
+| `nginx/conf/templates/ops_manager_beian.conf.template` | ICP 备案占位站：另一个域名的静态首页，**不跳转 HTTPS**（审核要求首页直接可访问） |
+| `nginx/html/` | 纯静态页目录（备案占位页），挂到容器 `/etc/nginx/html-sites` |
 
 ## 依赖交付：CI 预编 wheelhouse，目标机离线装
 
@@ -148,7 +151,9 @@ sudo supervisorctl reread && sudo supervisorctl update
 
 # 前置 nginx（容器化，见 deploy/nginx/）
 cp deploy/nginx/.env.example deploy/nginx/.env
-vim deploy/nginx/.env          # 域名、证书路径、OPS_APP_ROOT、上游地址
+vim deploy/nginx/.env          # 域名、证书路径、OPS_APP_ROOT、上游地址、备案域名
+# ⚠ OPS_SERVER_NAME 必须包含 compose healthcheck 里写死的那个 Host，
+#   否则健康检查会被兜底 server 444 掉，容器一直 unhealthy
 (cd deploy/nginx && docker compose up -d)
 sudo cp deploy/nginx/logrotate/ops_manager_nginx /etc/logrotate.d/   # 改日志目录路径
 ```

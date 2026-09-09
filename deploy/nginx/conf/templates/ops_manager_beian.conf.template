@@ -1,0 +1,83 @@
+# =============================================================================
+# ICP 备案占位站（与 OpsManager 主站同机、不同域名）
+# -----------------------------------------------------------------------------
+# 用途：工信部 / 接入商审核期间，备案域名的首页必须能直接打开。
+#
+# 审核方的硬性要求，决定了本文件为什么长这样：
+#   1. 不做跳转。审核抓的是 http://<备案域名>/ 的直接响应，301/302 到别的域名
+#      （包括跳到主站 HTTPS）会被判「首页无法访问」。所以这里【不】走
+#      ops_manager.conf 里那套「HTTP 全量跳 HTTPS」。
+#   2. 内容简单、无前置审批类内容、无外链依赖。页面是纯静态单文件。
+#
+# 页面文件在宿主机 ./html/，由 compose 挂到容器内 /etc/nginx/html-sites（只读）。
+# 文件名由 OPS_BEIAN_INDEX 指定（当前为 chengjiu.space.beian.html）——
+# 一个目录放多域名的占位页，各自用文件名区分，不按域名建子目录。
+#
+# 文件名排在 ops_manager.conf 之后（'.' < '_'），因此可以安全引用那里定义的
+# ops_timing 日志格式。新增站点文件时注意保持这个顺序，否则 unknown log format。
+# =============================================================================
+
+server {
+    listen ${OPS_HTTP_PORT};
+    server_name ${OPS_BEIAN_SERVER_NAME};
+    server_tokens off;
+
+    access_log /var/log/nginx/ops-manager.beian.access.log ops_timing;
+    error_log  /var/log/nginx/ops-manager.error.log warn;
+
+    root /etc/nginx/html-sites;
+
+    include /etc/nginx/snippets/security_headers.conf;
+
+    # ACME http-01 校验：给这个域名单独签证书时要用（DNS-01 则该目录为空）
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/acme;
+        access_log off;
+    }
+
+    # 首页：把占位页当作 / 的内容直出。用 try_files 而不是 index，
+    # 是因为 index 只在请求以 / 结尾时生效，且会把文件名暴露成一次内部跳转。
+    location = / {
+        try_files /${OPS_BEIAN_INDEX} =404;
+    }
+
+    # 占位站只有首页。其余路径一律 404，不暴露 /etc/nginx/html-sites 下
+    # 其他域名的页面文件（含直接请求 /xxx.beian.html）。
+    location / {
+        return 404;
+    }
+}
+
+# -----------------------------------------------------------------------------
+# HTTPS：等这个域名的证书签好再启用
+# -----------------------------------------------------------------------------
+# 现在不开的原因：00-default-server.conf 的 HTTPS 兜底带 ssl_reject_handshake，
+# https://<备案域名> 会在握手阶段被拒 —— 备案审核只看 HTTP，不影响过审；
+# 但域名要正式对外用之前，把下面整块取消注释，并在 .env 里填
+# OPS_BEIAN_TLS_CERT / OPS_BEIAN_TLS_KEY（同时在 compose 的 environment 里透传）。
+#
+# ⚠ 证书路径填错 / 文件不存在会导致 nginx 整体启动失败，主站一起挂。
+#   改完先 `docker compose exec nginx nginx -t` 再 reload。
+#
+# server {
+#     listen ${OPS_HTTPS_PORT} ssl;
+#     http2 on;
+#     server_name ${OPS_BEIAN_SERVER_NAME};
+#     server_tokens off;
+#
+#     ssl_certificate     ${OPS_BEIAN_TLS_CERT};
+#     ssl_certificate_key ${OPS_BEIAN_TLS_KEY};
+#
+#     access_log /var/log/nginx/ops-manager.beian.access.log ops_timing;
+#     error_log  /var/log/nginx/ops-manager.error.log warn;
+#
+#     root /etc/nginx/html-sites;
+#     include /etc/nginx/snippets/security_headers.conf;
+#
+#     location = / {
+#         try_files /${OPS_BEIAN_INDEX} =404;
+#     }
+#     location / {
+#         return 404;
+#     }
+# }
