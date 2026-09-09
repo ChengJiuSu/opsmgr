@@ -244,9 +244,12 @@
             :key="s.id"
             :label="`${s.name}（${s.public_ip || s.private_ip}）`"
             :value="s.id"
-          />
+          >
+            <span>{{ s.name }}（{{ s.public_ip || s.private_ip }}）</span>
+            <el-tag v-if="s.environment_is_prod" type="danger" size="small" style="margin-left:6px">生产</el-tag>
+          </el-option>
         </el-select>
-        <div class="tip">记录值自动取主机 IP（公网优先）</div>
+        <div class="tip">记录值自动取主机 IP（公网优先）；指向生产主机属高危变更，需填原因走审批</div>
       </el-form-item>
       <el-form-item v-else label="记录值" prop="value">
         <el-input v-model="recordForm.value" :placeholder="recordForm.type === 'CNAME' ? '目标域名' : 'IP 或记录内容'" />
@@ -265,18 +268,19 @@
       <el-form-item label="备注">
         <el-input v-model="recordForm.remark" type="textarea" :rows="2" />
       </el-form-item>
-      <el-form-item v-if="editRecord" label="变更原因" :required="editRiskReasons.length > 0">
+      <el-form-item label="变更原因" prop="reason" :required="formRiskReasons.length > 0">
         <el-input v-model="recordForm.reason" placeholder="如「切流量到新机」，会记入变更留痕" />
         <el-alert
-          v-if="editRiskReasons.length" type="warning" :closable="false" show-icon
+          v-if="formRiskReasons.length" type="warning" :closable="false" show-icon
           style="margin-top:8px"
         >
-          本次变更属<b>高危</b>（{{ editRiskReasons.join('；') }}），
+          本次变更属<b>高危</b>（{{ formRiskReasons.join('；') }}），
           提交后进入<b>审批</b>，需另一位管理员批准才会生效。变更原因必填。
         </el-alert>
-        <div v-else class="tip">
+        <div v-else-if="editRecord" class="tip">
           修改会即时推送厂商、立即生效；变更前的云端真实值已留痕，可在「变更留痕」中一键回滚
         </div>
+        <div v-else class="tip">新增会即时推送厂商、立即生效；原因可留空，建议填写，会记入变更留痕</div>
       </el-form-item>
     </el-form>
     <template #footer>
@@ -622,12 +626,43 @@ const emptyRecordForm = () => ({
   reason: '',  // 变更原因，随改/删请求记入变更留痕
 })
 const recordForm = reactive(emptyRecordForm())
-const recordRules = {
+// 规则用 computed：高危变更的「变更原因」必填，低危时不拦
+const recordRules = computed(() => ({
   rr: [{ required: true, message: '请输入主机记录' }],
   type: [{ required: true, message: '请选择类型' }],
   server: [{ required: true, message: '请选择服务器' }],
   value: [{ required: true, message: '请输入记录值' }],
-}
+  reason: formRiskReasons.value.length
+    ? [{ required: true, message: '高危变更必须填写变更原因，审批人据此判断' }]
+    : [],
+}))
+
+//: 与后端 dns_risk.HIGH_RISK_TYPES 对齐
+const HIGH_RISK_TYPES = ['NS', 'MX', 'CAA', 'TXT']
+
+const selectedServer = computed(
+  () => serverOptions.value.find((s) => s.id === recordForm.server) || null,
+)
+
+/**
+ * 按表单当前值预判高危理由（规则镜像后端 dns_risk.risk_reasons，判定仍以后端为准）。
+ *
+ * 之前只在编辑弹窗里读后端算好的 record.risk_reasons，于是有两个坑：新增记录命中
+ * 高危（比如指向生产主机）时前端根本没有填原因的地方，只能提交后吃一句报错走不下去；
+ * 编辑时改了目标（普通机换成生产机）也还是按旧值提示。
+ */
+const formRiskReasons = computed(() => {
+  const reasons = []
+  if (editRecord.value?.remote_record_id) reasons.push('修改/删除已生效的线上解析')
+  if (recordForm.rr.trim() === '@') reasons.push('根域 @ 记录')
+  if (HIGH_RISK_TYPES.includes(recordForm.type)) reasons.push(`${recordForm.type} 记录`)
+  if (editRecord.value?.protected) reasons.push('记录被标记为受保护')
+  if (recordDomain.value?.protected) reasons.push(`域名 ${recordDomain.value.name} 被标记为受保护`)
+  if (recordForm.target_type === 'server' && selectedServer.value?.environment_is_prod) {
+    reasons.push('指向生产环境主机')
+  }
+  return reasons
+})
 
 function openRecordDialog(domainRow, rec = null) {
   recordDomain.value = domainRow
@@ -677,8 +712,12 @@ async function handleRecordDelete(domainRow, rec) {
       type: 'warning',
       confirmButtonText: '删除',
       confirmButtonClass: 'el-button--danger',
-      inputPlaceholder: '变更原因（可留空，建议填写）',
+      inputPlaceholder: rec.remote_record_id ? '变更原因（必填）' : '变更原因（可留空，建议填写）',
       inputValue: '',
+      // 删已生效的线上解析是高危，后端强制要原因；在这里就拦住，别让人白点一次
+      inputValidator: (v) => (rec.remote_record_id && !(v || '').trim()
+        ? '删除已生效的线上解析属高危变更，请填写变更原因'
+        : true),
     },
   )
   const res = await deleteDnsRecord(rec.id, reason || '')
@@ -696,9 +735,6 @@ const pendingCount = ref(0)
 const reviewingId = ref(null)
 // 与后端 DNS_APPROVAL_TTL_HOURS 对齐的提示文案（只是提示，判定在后端）
 const approvalTtlHint = '24 小时'
-
-// 编辑弹窗里当前记录命中的高危理由（后端在记录序列化里算好）
-const editRiskReasons = computed(() => editRecord.value?.risk_reasons || [])
 
 const requestStatusType = (row) => {
   if (row.expired) return 'info'
