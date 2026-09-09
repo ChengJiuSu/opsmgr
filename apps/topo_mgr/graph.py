@@ -20,6 +20,7 @@ from django.utils import timezone
 
 from apps.asset_mgr.models import Server
 from apps.cloud_mgr.models import CertDeployment, Certificate, DnsRecord, Domain
+from common.timeutil import local_dt
 
 from .models import ALL_KINDS, EXTERNAL_KINDS, HANDLES, REF_KINDS, TopoEdge, TopoNode
 
@@ -213,7 +214,7 @@ def _certificate_info(obj):
         'health': _worst(issues),
         'issues': issues,
         'link': {'path': '/cloud/certificates', 'query': {'keyword': obj.name}},
-        'extra': {'domains': obj.domains, 'expires_at': obj.expires_at,
+        'extra': {'domains': obj.domains, 'expires_at': local_dt(obj.expires_at),
                   'auto_renew': obj.auto_renew},
     }
 

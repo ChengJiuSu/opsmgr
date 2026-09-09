@@ -36,6 +36,7 @@ from apps.task_exec.models import ExecutionTask, TaskExecutionLog
 from apps.topo_mgr import health as topo_health
 from apps.topo_mgr import impact as topo_impact
 from apps.topo_mgr.models import TopoCanvas
+from common.timeutil import local_dt
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +89,7 @@ def cert_alerts():
         items = [{
             'id': c.id,
             'name': c.name,
-            'expires_at': c.expires_at,
+            'expires_at': local_dt(c.expires_at),
             # 已过期时为负数，前端按正负分别显示「已过期 N 天 / 剩 N 天」
             'days_left': (c.expires_at - now).days,
             'auto_renew': c.auto_renew,
@@ -129,7 +130,7 @@ def cert_stuck_alerts():
     if stuck_certs:
         blocks.append(_alert(
             'cert_issue_stuck', 'danger', f'{len(stuck_certs)} 张证书签发卡住（可重新申请）',
-            [{'id': c.id, 'name': c.name, 'updated_at': c.updated_at,
+            [{'id': c.id, 'name': c.name, 'updated_at': local_dt(c.updated_at),
               'link': {'path': '/cloud/certificates', 'query': {'keyword': c.name}}}
              for c in stuck_certs[:ITEM_LIMIT]],
             {'path': '/cloud/certificates', 'query': {'status': 'issuing'}},
@@ -139,7 +140,7 @@ def cert_stuck_alerts():
         blocks.append(_alert(
             'cert_deploy_stuck', 'danger', f'{len(stuck_deploys)} 个证书分发卡住（可重新分发）',
             # certificate_id / server_id 供拓扑深链反查用（明细本身按分发展示）
-            [{'id': d.id, 'name': str(d), 'updated_at': d.updated_at,
+            [{'id': d.id, 'name': str(d), 'updated_at': local_dt(d.updated_at),
               'certificate_id': d.certificate_id, 'server_id': d.server_id,
               'link': {'path': '/cloud/certificates',
                        'query': {'keyword': d.certificate.name}}}
@@ -199,7 +200,7 @@ def task_failed_alerts():
             'log_id': log.id,
             'name': log.task.name if log.task_id else '(任务已删除)',
             'triggered_by': getattr(log.triggered_by, 'username', ''),
-            'finished_at': log.finished_at or log.created_at,
+            'finished_at': local_dt(log.finished_at or log.created_at),
             # 直接指向那一次执行的日志页，不是任务列表：列表按任务的「最近一次
             # 执行」状态过滤，昨天失败今天成功的任务在那里根本筛不出来
             'link': {'path': f'/task/executions/{log.task_id}/logs/{log.id}'} if log.task_id else None,
@@ -216,7 +217,7 @@ def agent_alerts():
     return [_alert(
         'agent_offline', 'danger', f'{len(offline)} 个 Agent 离线',
         [{
-            'id': n.id, 'name': n.name, 'last_heartbeat': n.last_heartbeat,
+            'id': n.id, 'name': n.name, 'last_heartbeat': local_dt(n.last_heartbeat),
             'link': {'path': '/system/agents'},
         } for n in offline[:ITEM_LIMIT]],
         {'path': '/system/agents'}, total=len(offline),
@@ -284,7 +285,7 @@ def dns_approval_todos(user):
             'name': f'{r.get_action_display()} {r.target_rr}.{r.domain.name}',
             'requested_by': getattr(r.requested_by, 'username', ''),
             'self_submitted': r.requested_by_id == user.id,
-            'expires_at': r.expires_at,
+            'expires_at': local_dt(r.expires_at),
             'expires_in': int((r.expires_at - now).total_seconds()),
             'link': {'path': '/cloud/domains', 'query': {'requests': 'pending'}},
         } for r in reqs],
@@ -322,7 +323,7 @@ def running_tasks():
         'log_id': log.id,
         'name': log.task.name if log.task_id else '(任务已删除)',
         'triggered_by': getattr(log.triggered_by, 'username', ''),
-        'started_at': log.started_at,
+        'started_at': local_dt(log.started_at),
         'elapsed': int((now - log.started_at).total_seconds()) if log.started_at else None,
         # steps_result 是「已跑完的模块」，当前正在跑的是它 +1 个
         'step_done': len(log.steps_result or []),
@@ -344,7 +345,7 @@ def agent_panel():
             'name': n.name,
             'enabled': n.enabled,
             'status': 'online' if not n.is_offline else 'offline',
-            'last_heartbeat': n.last_heartbeat,
+            'last_heartbeat': local_dt(n.last_heartbeat),
             'version': n.version,
             'load1': (n.meta or {}).get('load1'),
             'disk_free_pct': (n.meta or {}).get('disk_free_pct'),
@@ -430,7 +431,7 @@ def latest_artifacts():
             'service_type': a.service_type.name if a.service_type_id else '',
             'version': a.version,
             'build_number': a.build_number,
-            'reported_at': a.reported_at,
+            'reported_at': local_dt(a.reported_at),
         } for a in rows],
         'link': {'path': '/task/artifacts'},
     }

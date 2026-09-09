@@ -26,6 +26,7 @@ from django.utils import timezone
 
 from apps.asset_mgr.models import Channel, Environment, ProjectGroup, Server
 from apps.cloud_mgr.models import Certificate, DnsRecord, Domain
+from common.timeutil import local_dt
 
 from . import graph
 from .graph import GraphError, dims_ok
@@ -144,7 +145,7 @@ def export_graph(canvas):
     node_keys = {n.id: f'n{n.id}' for n in nodes}
     return {
         'version': EXPORT_VERSION,
-        'exported_at': timezone.now().isoformat(),
+        'exported_at': local_dt(timezone.now()).isoformat(),
         'canvas': {
             'name': canvas.name,
             'slug': canvas.slug,

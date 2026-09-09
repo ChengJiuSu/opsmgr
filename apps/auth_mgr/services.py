@@ -17,6 +17,7 @@ from django.utils import timezone
 
 from common import totp
 from common.crypto import DecryptError
+from common.timeutil import local_dt
 
 from .models import MFARecoveryCode, UserMFA
 
@@ -84,8 +85,8 @@ def status(user):
     return {
         'enabled': bool(binding and binding.enabled),
         'pending': bool(binding and not binding.enabled),
-        'activated_at': binding.activated_at if binding else None,
-        'last_used_at': binding.last_used_at if binding else None,
+        'activated_at': local_dt(binding.activated_at) if binding else None,
+        'last_used_at': local_dt(binding.last_used_at) if binding else None,
         'recovery_codes_left': MFARecoveryCode.objects.filter(
             user=user, used_at__isnull=True).count(),
         'enforced': required_for(user),

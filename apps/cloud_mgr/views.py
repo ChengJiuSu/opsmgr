@@ -29,6 +29,7 @@ from common.pagination import StandardPagination
 from apps.auth_mgr.permissions import module_perm
 from common.response import fail, ok
 from common.sudo import SudoRequired, required_for
+from common.timeutil import local_dt
 
 from . import dns_approval, dns_history, dns_risk
 from .acme import supported_provider_codes
@@ -502,8 +503,8 @@ class CertificateViewSet(viewsets.ModelViewSet):
         readme = (
             f'证书名称：{cert.name}\n'
             f'域名：{", ".join(cert.domains)}\n'
-            f'签发时间：{cert.issued_at.strftime("%Y-%m-%d %H:%M:%S") if cert.issued_at else "-"}\n'
-            f'过期时间：{cert.expires_at.strftime("%Y-%m-%d %H:%M:%S") if cert.expires_at else "-"}\n'
+            f'签发时间：{local_dt(cert.issued_at).strftime("%Y-%m-%d %H:%M:%S") if cert.issued_at else "-"}\n'
+            f'过期时间：{local_dt(cert.expires_at).strftime("%Y-%m-%d %H:%M:%S") if cert.expires_at else "-"}\n'
             f'\n文件说明：\n'
             f'  {safe_name}.crt            证书（server_certificate）\n'
             f'  {safe_name}.key            私钥（请妥善保管，勿外传）\n'

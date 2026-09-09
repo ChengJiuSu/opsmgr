@@ -312,6 +312,18 @@ class LatestArtifactTests(OverviewTestBase):
         self.assertFalse(artifacts['visible'])
         self.assertEqual(artifacts['items'], [])
 
+    def test_reported_at_is_local_time(self):
+        """上报时间按 TIME_ZONE 输出。
+
+        概览是手拼 dict，DRF 的 JSONEncoder 不做时区转换，漏掉 local_dt 就会
+        输出 UTC 的 ...Z——前端截字符串显示，页面上直接少 8 小时。
+        """
+        artifact = self._artifact(self.prod, '1.0.0')
+        client = self._login('ops', {'artifact': 'read'})
+        reported_at = self._keys(client)['body']['artifacts']['items'][0]['reported_at']
+        self.assertNotIn('Z', reported_at)
+        self.assertEqual(reported_at, timezone.localtime(artifact.reported_at).isoformat())
+
 
 class ExecTrendTests(OverviewTestBase):
     """近 7 天执行趋势：按成败分色，未结束的单独一列。"""
