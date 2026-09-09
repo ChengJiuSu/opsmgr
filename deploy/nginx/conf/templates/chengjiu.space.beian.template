@@ -22,8 +22,8 @@ server {
     server_name ${OPS_BEIAN_SERVER_NAME};
     server_tokens off;
 
-    access_log /var/log/nginx/ops-manager.beian.access.log ops_timing;
-    error_log  /var/log/nginx/ops-manager.error.log warn;
+    access_log /var/log/nginx/chengjiu.space.beian.access.log ops_timing;
+    error_log  /var/log/nginx/chengjiu.space.error.log warn;
 
     root /etc/nginx/html-sites;
 
@@ -68,8 +68,8 @@ server {
 #     ssl_certificate     ${OPS_BEIAN_TLS_CERT};
 #     ssl_certificate_key ${OPS_BEIAN_TLS_KEY};
 #
-#     access_log /var/log/nginx/ops-manager.beian.access.log ops_timing;
-#     error_log  /var/log/nginx/ops-manager.error.log warn;
+#     access_log /var/log/nginx/chengjiu.space.beian.access.log ops_timing;
+#     error_log  /var/log/nginx/chengjiu.space.error.log warn;
 #
 #     root /etc/nginx/html-sites;
 #     include /etc/nginx/snippets/security_headers.conf;
