@@ -200,8 +200,9 @@ ansible 输出不再等模块跑完才可见：`common.ansible.run_stream` 以
   （`TASK_LOG_COLOR=false` 可关，此时 ansible 输出纯文本）；
 - **agent 通道**：`agent_mgr.dispatch.run_via_agent` 轮询 `AgentJob.output`
   时把新增分片喂给同一 sink，NAT 主机执行同样实时可见；
-- 方法执行器（`ansible_playbook` provider）透传 `on_data`；Jenkins/JumpServer
-  等非 ansible provider 忽略该参数，仍为整段输出。
+- 方法执行器（`ansible_playbook` provider）透传 `on_data`；Jenkins 经 agent 时
+  按分片实时回传，直连时整段返回；JumpServer 注册只先推一行标头，逐台结果
+  等整批跑完一次性给出（两条通道都是阻塞调用，没有中间态可推）。
 
 ### 实时通道：WebSocket 推送（轮询为回退）
 

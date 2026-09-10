@@ -21,7 +21,9 @@ from apps.auth_mgr.apikey import (
     user_or_scope,
 )
 from apps.auth_mgr.authentication import MfaJWTAuthentication
-from common.jumpserver import register_servers
+from common.jumpserver import (
+    channel_summary_lines, register_servers_routed, resolve_registration_agent,
+)
 from apps.auth_mgr.permissions import module_perm
 from common.sudo import SudoRequired
 from common.sudo import required_for as sudo_required_for
@@ -600,13 +602,18 @@ class ServerRegisterJumpServerView(APIView):
 
         {"server_ids": [1, 2, 3]}
 
-    连接信息读系统配置 jumpserver.url / jumpserver.token（详见 common.jumpserver）。
+    执行通道：系统配置 jumpserver.agent 填了则统一经该 Agent 注册（JumpServer
+    在内网的场景），留空则按每台主机自身的执行通道分组——内网主机走它自己的
+    Agent，其余直连。直连连接信息读系统配置 jumpserver.url / jumpserver.token
+    （详见 common.jumpserver）。
     """
 
     permission_classes = [module_perm('cmdb', min_level='write')]
 
     @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
     def post(self, request):
+        from apps.agent_mgr.channel import ChannelError
+
         server_ids = request.data.get('server_ids')
         if not isinstance(server_ids, list) or not server_ids:
             return fail('server_ids 必须为非空数组')
@@ -614,8 +621,12 @@ class ServerRegisterJumpServerView(APIView):
         if len(servers) != len(set(server_ids)):
             return fail('存在无效的服务器 id')
         try:
-            results = register_servers(servers)
-        except ValueError as exc:
+            # 资产页没有任务维度，通道候选只有系统配置；命中不了就按主机分组
+            agent, source = resolve_registration_agent()
+            results, channels = register_servers_routed(servers, agent=agent, source=source)
+        except ChannelError as exc:
+            return fail(str(exc))
+        except ValueError as exc:  # 直连连接信息不完整 / 资产重名中止整批
             return fail(str(exc))
         succeeded = sum(1 for r in results if r['ok'])
         return ok({
@@ -623,4 +634,7 @@ class ServerRegisterJumpServerView(APIView):
             'succeeded': succeeded,
             'failed': len(results) - succeeded,
             'results': results,
+            'channels': channels,
+            'channel_text': '；'.join(
+                line.removeprefix('[通道] ') for line in channel_summary_lines(channels)),
         })

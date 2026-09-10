@@ -191,7 +191,7 @@ region         = CharField(max_length=50, blank=True)
 - token 用 JumpServer 私有令牌；v4 无页面入口，需在 jms_core 容器
   `python manage.py shell` 里 `User.objects.get(username=...).create_private_token()` 生成。
 
-连接信息读系统配置：
+连接信息读系统配置（仅直连路径使用）：
 
 | key | 说明 |
 |-----|------|
@@ -200,6 +200,31 @@ region         = CharField(max_length=50, blank=True)
 | `jumpserver.org_id` | 组织 id（可选，多组织时写入 X-JMS-ORG） |
 | `jumpserver.platform_id` | 平台 id（可选，默认 1=Linux） |
 | `jumpserver.node_id` | 挂载节点 id（可选） |
+| `jumpserver.agent` | Agent 名（可选，填了则注册统一经该 Agent 执行） |
+
+### 执行通道：直连 / 经 Agent
+
+JumpServer 在内网、manager 在公网时，注册改经 ops-agent 执行
+（`step_type='jumpserver'` 单元，agent 侧实现见 ops-agent 仓库 `jumpserver.py`）：
+
+- **通道解析**（`resolve_registration_agent` + `register_servers_routed`）：
+  模块参数 `params.agent` → 方法配置 `config.agent` → 系统配置 `jumpserver.agent`
+  → `AgentRoute`（方法模块才有任务维度）→ **按每台主机自身的执行通道分组**
+  （`channel.resolve_channels`，与命令/剧本模块同一口径）。资产页没有任务维度，
+  只有「系统配置 → 按主机分组」两级。
+- **混合通道**：agent 组下发、直连组本地发 REST，逐台结果按入参顺序合并；
+  接口额外返回 `channels`（`[{agent, source, count}]`）与 `channel_text`，
+  方法模块把它渲染成 `[通道] …` 标头行。
+- **凭据不出通道**：payload 只带主机清单（`key`/`name`/`address`/`ssh_port`/
+  `comment`），JumpServer 地址与 token 在 agent 本机 `config.yaml` 的
+  `jumpserver:` 段维护（与 Jenkins、SSH 私钥同口径）。
+- **判定口径两路一致**：查重跳过、重名硬拒绝中止整批、地址公网优先。差别只在
+  失败面：直连组连接信息缺失时，**整批都是直连**才原样抛 400（「配置没填好」
+  要报得明确），混合通道时只把该组逐台标失败，不连累已注册成功的 agent 组。
+- agent 没回传某台的结果（重名中止、通道失败、超时）→ 该台按失败计，原因取
+  通道输出末行；老 agent 不支持 `jumpserver` 能力位时下发前 fail fast 提示升级。
+- 接口超时：agent 单元 timeout 为 `15 + 3×台数`（封顶 300s），前端
+  `registerJumpServer` 超时放宽到 300s。单次下发上限 500 台（agent 侧校验）。
 
 ## 扩展建议
 

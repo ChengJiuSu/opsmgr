@@ -8,9 +8,9 @@ export const deleteServer = (id) => request.delete(`/api/assets/servers/${id}/`)
 // 服务器批量操作（仅管理员）
 export const batchUpdateServers = (data) => request.post('/api/assets/servers/batch/update/', data)
 export const batchDeleteServers = (data) => request.post('/api/assets/servers/batch/delete/', data)
-// 注册到 JumpServer：逐台调用外部 API，放宽超时
+// 注册到 JumpServer：逐台调用外部 API（经 Agent 通道时还要等 agent 回传），放宽超时
 export const registerJumpServer = (data) =>
-  request.post('/api/assets/servers/register-jumpserver/', data, { timeout: 120000 })
+  request.post('/api/assets/servers/register-jumpserver/', data, { timeout: 300000 })
 
 // CSV 导入导出（blob 响应由调用方触发下载）
 export const exportServers = (params) =>

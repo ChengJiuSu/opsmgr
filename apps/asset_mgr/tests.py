@@ -660,6 +660,133 @@ class ServerJumpServerTests(BaseApiTest):
         self.assertEqual(session.post.call_args.kwargs['json']['address'], '42.1.2.3')
         self.assertEqual(r.json()['data']['results'][0]['ip'], '42.1.2.3')
 
+    # ── Agent 通道 ────────────────────────────────────────
+
+    def _agent(self, name='nat-gw-01', **overrides):
+        from apps.agent_mgr.models import AgentNode
+
+        defaults = dict(token_hash='x', status='online', channel_name='ch',
+                        meta={'capabilities': ['command', 'jumpserver']})
+        defaults.update(overrides)
+        return AgentNode.objects.create(name=name, **defaults)
+
+    def _register(self, server_ids):
+        return self.admin.post('/api/assets/servers/register-jumpserver/', {
+            'server_ids': server_ids,
+        }, format='json')
+
+    def test_system_config_agent_dispatches_all(self):
+        """配了 jumpserver.agent：全部主机经该 agent 注册，不发直连请求。"""
+        from unittest import mock
+        from apps.system_cfg.models import SystemConfig
+
+        self._agent()
+        SystemConfig.objects.create(key='jumpserver.agent', value='nat-gw-01')
+        SystemConfig.objects.create(key='jumpserver.url', value='http://js.local')
+        SystemConfig.objects.create(key='jumpserver.token', value='tkn')
+        host_results = {str(self.s1.id): {'ok': True, 'msg': '注册成功'}}
+        with mock.patch('apps.agent_mgr.dispatch.run_via_agent_detail',
+                        return_value=(0, '', {'host_results': host_results})) as dispatched, \
+                mock.patch('common.jumpserver.requests.Session') as session_cls:
+            r = self._register([self.s1.id])
+        self.assertEqual(r.status_code, 200, r.content)
+        data = r.json()['data']
+        self.assertEqual((data['total'], data['succeeded'], data['failed']), (1, 1, 0))
+        self.assertEqual(data['channels'],
+                         [{'agent': 'nat-gw-01', 'source': 'config', 'count': 1}])
+        self.assertEqual(data['channel_text'], '经 Agent nat-gw-01（系统配置）：1 台')
+        session_cls.assert_not_called()
+        payload = dispatched.call_args[0][1]
+        self.assertEqual(payload['step_type'], 'jumpserver')
+        self.assertEqual(payload['hosts'][0]['address'], self.s1.private_ip)
+        # 凭据不下发
+        self.assertNotIn('tkn', str(payload))
+
+    def test_per_host_channel_grouping(self):
+        """未配 jumpserver.agent：按每台主机执行通道分组（agent 组 + 直连组）。"""
+        from unittest import mock
+        from apps.system_cfg.models import SystemConfig
+
+        SystemConfig.objects.create(key='jumpserver.url', value='http://js.local')
+        SystemConfig.objects.create(key='jumpserver.token', value='tkn')
+        agent = self._agent()
+        nat = Server.objects.create(name='js-nat', private_ip='10.7.0.9',
+                                    channel_mode='agent', agent=agent)
+
+        def fake_response(status=200, payload=None):
+            resp = mock.Mock()
+            resp.status_code = status
+            resp.ok = 200 <= status < 300
+            resp.json.return_value = payload if payload is not None else {}
+            resp.text = ''
+            return resp
+
+        host_results = {str(nat.id): {'ok': True, 'msg': '注册成功'}}
+        with mock.patch('apps.agent_mgr.dispatch.run_via_agent_detail',
+                        return_value=(0, '', {'host_results': host_results})) as dispatched, \
+                mock.patch('common.jumpserver.requests.Session') as session_cls:
+            session = session_cls.return_value
+            session.headers = {}
+            session.get.return_value = fake_response(200, {'results': []})
+            session.post.return_value = fake_response(201, {'id': 'x'})
+            r = self._register([self.s1.id, nat.id])
+        self.assertEqual(r.status_code, 200, r.content)
+        data = r.json()['data']
+        self.assertEqual((data['total'], data['succeeded'], data['failed']), (2, 2, 0))
+        self.assertCountEqual(
+            data['channels'],
+            [{'agent': '', 'source': 'direct', 'count': 1},
+             {'agent': 'nat-gw-01', 'source': 'host', 'count': 1}])
+        # 结果顺序与入参一致，各组只处理自己的主机
+        self.assertEqual([row['name'] for row in data['results']], ['js-01', 'js-nat'])
+        self.assertEqual([h['name'] for h in dispatched.call_args[0][1]['hosts']], ['js-nat'])
+        self.assertEqual(session.post.call_args.kwargs['json']['name'], 'js-01')
+
+    def test_missing_host_result_counted_as_failure(self):
+        """agent 没回传某台：按失败计（原因取通道输出末行），不冒充成功。"""
+        from unittest import mock
+        from apps.system_cfg.models import SystemConfig
+
+        self._agent()
+        SystemConfig.objects.create(key='jumpserver.agent', value='nat-gw-01')
+        with mock.patch('apps.agent_mgr.dispatch.run_via_agent_detail',
+                        return_value=(1, '✖ 主机「js-01」与 JumpServer 已有资产重名',
+                                      {'host_results': {}})):
+            r = self._register([self.s1.id])
+        self.assertEqual(r.status_code, 200, r.content)
+        data = r.json()['data']
+        self.assertEqual((data['succeeded'], data['failed']), (0, 1))
+        self.assertIn('重名', data['results'][0]['msg'])
+
+    def test_unknown_agent_name_rejected(self):
+        from unittest import mock
+        from apps.system_cfg.models import SystemConfig
+
+        SystemConfig.objects.create(key='jumpserver.agent', value='ghost-gw')
+        with mock.patch('apps.agent_mgr.dispatch.run_via_agent_detail') as dispatched:
+            r = self._register([self.s1.id])
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('ghost-gw', r.json()['msg'])
+        dispatched.assert_not_called()
+
+    def test_agent_group_survives_direct_group_config_error(self):
+        """混合通道下直连组配置缺失：只让直连那几台失败，不连累 agent 组。"""
+        from unittest import mock
+
+        agent = self._agent()
+        nat = Server.objects.create(name='js-nat', private_ip='10.7.0.9',
+                                    channel_mode='agent', agent=agent)
+        host_results = {str(nat.id): {'ok': True, 'msg': '注册成功'}}
+        with mock.patch('apps.agent_mgr.dispatch.run_via_agent_detail',
+                        return_value=(0, '', {'host_results': host_results})):
+            r = self._register([self.s1.id, nat.id])
+        self.assertEqual(r.status_code, 200, r.content)
+        data = r.json()['data']
+        self.assertEqual((data['succeeded'], data['failed']), (1, 1))
+        failed = next(row for row in data['results'] if not row['ok'])
+        self.assertEqual(failed['name'], 'js-01')
+        self.assertIn('jumpserver.url', failed['msg'])
+
     def test_name_conflict_on_jumpserver_rejected(self):
         from unittest import mock
         from apps.system_cfg.models import SystemConfig

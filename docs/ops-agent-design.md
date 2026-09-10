@@ -102,7 +102,7 @@ JSON 文本帧，统一信封：
 
 | 类型 | 方向 | data 字段 | 说明 |
 |------|------|-----------|------|
-| `register` | agent → mgr | `agent_name, version, hostname, capabilities` | 连接后首条消息，manager 校验后回 `register.ack`；`capabilities` 为支持的 step_type 清单（`command`/`playbook`/`cert_deploy`/`jenkins`），落 `AgentNode.meta`，下发时对老 agent fail fast（未上报则不校验） |
+| `register` | agent → mgr | `agent_name, version, hostname, capabilities` | 连接后首条消息，manager 校验后回 `register.ack`；`capabilities` 为支持的 step_type 清单（`command`/`playbook`/`cert_deploy`/`jenkins`/`jumpserver`），落 `AgentNode.meta`，下发时对老 agent fail fast（未上报则不校验） |
 | `heartbeat` | agent → mgr | `running_tasks, load1, disk_free_pct, version` | 30s 周期 |
 | `task.dispatch` | mgr → agent | 见 3.4 | 下发一个「模块执行单元」 |
 | `task.ack` | agent → mgr | `job_id, accepted, reason` | 收单确认；队列满/磁盘不足时 `accepted=false` |
@@ -140,7 +140,7 @@ manager 侧完成全部业务解析（主机匹配、变量注入、凭据选择
 }
 ```
 
-- `step_type='jenkins'` 的单元不涉及主机，payload 形状另一套（见下）；
+- `step_type='jenkins'` / `'jumpserver'` 的单元不走 ansible，payload 形状另一套（见下）；
 - `inventory` 直接下发文本，agent 落临时文件后传给 ansible，**复用 manager
   现有动态 inventory 口径**（主机名别名、`service_types` 变量、服务分组）；
 - NAT 内主机 `conn_ip` 回退私网 IP 的现有逻辑正好适配：agent 在内网，
@@ -230,6 +230,39 @@ build_url 重连续跟。
   一次。Redis 须只监听本机/内网并设密码——与 manager 库里的加密私钥相比，这是
   本方案唯一新增的暴露点，接受该取舍（另一路「agent 用一次性签名令牌回拉」
   需要 manager 开一个吐私钥的对外端点，暴露面更差）。
+
+### 3.4.3 JumpServer 注册执行单元（`step_type='jumpserver'`）
+
+manager 在公网、JumpServer 在内网时，资产注册改由 agent 代发（2026-09-10 落地）：
+
+```json
+{
+  "job_id": "uuid",
+  "step_type": "jumpserver",
+  "hosts": [
+    {"key": "12", "name": "web-01", "address": "10.0.0.1", "ssh_port": 22, "comment": ""}
+  ],
+  "timeout": 60
+}
+```
+
+- **凭据不下发**：JumpServer url/token/org_id/platform_id/node_id 在 agent 本地
+  `config.yaml` 的 `jumpserver:` 段维护（同 3.4.1 口径）。agent 未配置 → rc=126；
+- agent 侧流程：逐台 `GET /api/v1/assets/hosts/?name=` 查重（命中即跳过）→
+  `POST /api/v1/assets/hosts/` 创建；判定与 manager 直连路径逐条对齐
+  （按主机名查重、地址公网优先由 manager 决定、创建报重名 → 硬拒绝并**中止
+  整批**，不自动改名）；
+- **结构化回传**：逐台结果放 `task.result` 的 `host_results`
+  （`{key: {ok, msg, name, address}}`，key = 平台服务器 id），manager 侧据此
+  还原「每台成功/跳过/失败」的结果表——注册接口要的是表格不是文本。为此
+  `connection._execute` 把执行句柄可选的 `host_results` 一并回传，
+  manager 侧新增 `dispatch.run_via_agent_detail` 多返回 `AgentJob.result`；
+- 缺哪台结果就算哪台失败（原因取通道输出末行），不冒充成功；
+- rc：0 = 全部成功（含已存在跳过），1 = 有主机失败或重名中止，124 超时，
+  143 取消，126 payload/配置错误（含主机清单非法、单次 > 500 台）；
+- 与 ansible/Jenkins **分开计并发**（`max_concurrent_jumpserver_jobs`，默认 2）；
+- HTTP 走 agent 侧 `httpclient.py`（3.4.1 的 urllib 客户端抽出来共用）：
+  忽略环境代理、不跟随重定向、自签 TLS 可配。
 
 ### 3.5 Ansible 项目目录同步（playbook 模块）
 
@@ -354,7 +387,26 @@ Jenkins 构建不 SSH 任何主机，主机三态解析用不上，改由
 - 解析不出 agent 时走原直连路径（`method_mgr/executors/jenkins.py` 自己发
   REST，连接信息读系统配置 `jenkins.*`），存量部署行为不变。
 
-### 4.7 管理与可视化
+### 4.7 JumpServer 注册的通道解析（对象就是主机）
+
+注册的对象是主机本身，故解析比 4.6 多一级兜底
+（`common/jumpserver.py:resolve_registration_agent` + `register_servers_routed`）：
+
+```
+模块参数 params.agent  →  方法配置 config.agent  →  系统配置 jumpserver.agent
+  →  AgentRoute(任务/模块的项目组 + 环境)  →  按每台主机自身的执行通道分组
+```
+
+- 最后一级用 `channel.resolve_channels`（与命令/剧本模块同一口径）：内网主机
+  走它自己的 agent，其余直连——多区域各有一套 JumpServer 时这是唯一对的分法；
+  只有一台中心 JumpServer 就配 `jumpserver.agent` 让全量走它；
+- 资产页批量注册没有任务维度，只有「系统配置 → 按主机分组」两级；
+- 混合通道：agent 组下发、直连组本地发 REST，结果按入参顺序合并，接口另返回
+  `channels`/`channel_text`，方法模块渲染成 `[通道] …` 标头行；
+- 直连组配置缺失时：**整批都是直连**才抛 400（配置问题要报得明确），混合时
+  只标该组逐台失败，不连累已成功的 agent 组。
+
+### 4.8 管理与可视化
 
 - 「Agent 管理」页：列表（名称/状态/版本/最近心跳/运行任务数）、创建
   （生成 token，一次性展示）、禁用/删除；
@@ -485,7 +537,7 @@ WantedBy=multi-user.target
 - wss 强制 TLS，校验 manager 证书（配置可指定 CA）；
 - token 泄露处置：manager 侧禁用/重置该 AgentNode 即断连；
 - 只执行 `task.dispatch` 定义的单元类型（command / playbook / cert_deploy /
-  jenkins），无任意代码加载路径；剧本路径限制在 `ansible_project_dir` 内
+  jenkins / jumpserver），无任意代码加载路径；剧本路径限制在 `ansible_project_dir` 内
   （复用 `resolve_within` 同款校验），cert_deploy 的剧本由 agent 本地按固定
   模板生成（见 3.4.2）；
 - SSH 私钥与 Jenkins 凭据仅驻留 agent 主机，通道与 manager 均不经手；
@@ -519,6 +571,7 @@ steps_result / 失败处理（retry/skip/abort）流程。
 | v1.1 | task.cancel 取消、崩溃恢复补传、磁盘水位清理 | 可靠性补齐 |
 | P1（2026-08-24） | 主机通道三态 + 项目组/环境路由规则 + 有效通道展示 | 新增主机自动继承通道，管理服可钉死直连 |
 | P4（2026-08-28） | 证书分发经 agent：`step_type='cert_deploy'` 单元 + payload 敏感字段脱敏（manager `AgentJob.payload` 与 agent spool 都不落证书） | 内网主机的证书可自动续签自动分发，不必再改「强制直连」 |
+| P5（2026-09-10） | JumpServer 代注册：`step_type='jumpserver'` 单元 + `host_results` 结构化回传 + `run_via_agent_detail` + 五级通道解析（末级按主机分组）+ 系统配置 `jumpserver.agent` | 公网 manager 可把内网主机注册进内网 JumpServer，资产页与方法模块共用 |
 | P2（2026-08-25） | Jenkins 代触发：`step_type='jenkins'` 单元 + agent 侧 REST 客户端 + register capabilities + 四级通道解析 + 系统配置 `jenkins.agent` | 公网 manager 可触发内网 Jenkins，构建日志实时回传 |
 | v2 | 剧本 commit 校验、ansible_playbook method 经 agent、多 Jenkins 实例（payload 带实例名）、agent 重启后按 build_url 续跟构建、多 agent 冷备切换、心跳指标进 dashboard | 能力扩展 |
 
@@ -534,9 +587,11 @@ steps_result / 失败处理（retry/skip/abort）流程。
 | `apps/task_exec/runner.py` | 模块主机按通道分组；agent 组走 dispatch 等待，输出拼接 |
 | `apps/method_mgr/executors/jenkins.py` | 直连/经 agent 双路：解析出 agent 则打 `step_type='jenkins'` payload 下发（P2） |
 | `apps/cloud_mgr/deploy.py` | 直连/经 agent 双路：解析出 agent 则打 `step_type='cert_deploy'` payload 下发（P4） |
+| `common/jumpserver.py` | 直连/经 agent 双路 + 按通道分组注册（`register_servers_routed`），asset_mgr 接口与 `jumpserver` 方法模块共用（P5） |
 | `apps/agent_mgr/dispatch.py` | `secret_fields` 参数：敏感 payload 字段只下发不落库（P4） |
 | `ops-agent/ops_agent/executor.py` | cert_deploy 剧本本地生成 + 私有临时目录 + spool 脱敏（P4） |
 | `ops-agent/ops_agent/jenkins.py` | agent 侧 Jenkins REST 客户端与执行句柄（P2） |
+| `ops-agent/ops_agent/jumpserver.py` + `httpclient.py` | agent 侧 JumpServer 注册执行句柄；urllib 客户端抽出共用（P5） |
 | `frontend` | Agent 管理页；服务器表单「执行通道」项 |
 | `ops-agent/`（新仓库或本仓库子目录） | agent 全部代码 |
 

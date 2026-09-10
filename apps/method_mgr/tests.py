@@ -1,4 +1,5 @@
 """平台方法执行器测试（Jenkins 直连 requests 全程 mock，经 Agent 路径 mock 下发）。"""
+import json
 from types import SimpleNamespace
 from unittest import mock
 
@@ -313,41 +314,219 @@ class JenkinsViaAgentTests(TestCase):
 
 
 class JumpServerExecutorTests(TestCase):
-    """jumpserver 执行器：注册发现、目标为空、逐台结果与返回码。"""
+    """jumpserver 执行器：直连路径、通道解析优先级、经 agent 下发与结果还原。"""
 
     def setUp(self):
-        self.method = Method.objects.create(name='注册跳板机', code='js-reg', provider='jumpserver')
-        self.step = SimpleNamespace(params={}, timeout=60)
+        from apps.agent_mgr.models import AgentNode
+        from apps.asset_mgr.models import Server
+
+        self.method = Method.objects.create(name='注册跳板机', code='js-reg',
+                                            provider='jumpserver')
+        self.executor = get_executor('jumpserver')
+        self.step = _step(params={})
+        self.s1 = Server.objects.create(name='js-1', private_ip='10.6.0.2')
+        self.s2 = Server.objects.create(name='js-2', private_ip='10.6.0.3')
+        self.agent = AgentNode.objects.create(
+            name='nat-gw-01', token_hash='x', status='online', channel_name='ch',
+            meta={'capabilities': ['command', 'jenkins', 'jumpserver']})
+        self.agent2 = AgentNode.objects.create(
+            name='nat-gw-02', token_hash='y', status='online', channel_name='ch2',
+            meta={'capabilities': ['jumpserver']})
+
+    def _execute(self, servers=None, step=None, rc=0, output='', host_results=None):
+        """mock run_via_agent_detail，返回 (执行结果, 调用 kwargs, payload)。"""
+        result = {'host_results': host_results if host_results is not None else {}}
+        with mock.patch('apps.agent_mgr.dispatch.run_via_agent_detail',
+                        return_value=(rc, output, result)) as dispatched:
+            outcome = self.executor.execute(
+                step or self.step, self.method,
+                servers=servers if servers is not None else [self.s1])
+        if not dispatched.call_args:
+            return outcome, None, None
+        args, kwargs = dispatched.call_args
+        return outcome, kwargs, args[1]
+
+    def _ok(self, server, msg='注册成功'):
+        return {str(server.id): {'ok': True, 'msg': msg, 'name': server.name}}
+
+    # ── 基础 ──────────────────────────────────────────────
 
     def test_provider_registered(self):
         from .executors import available_providers
         self.assertIn('jumpserver', available_providers())
 
     def test_no_servers(self):
-        from .executors import get_executor
-        rc, out = get_executor('jumpserver').execute(self.step, self.method, servers=[])
+        rc, out = self.executor.execute(self.step, self.method, servers=[])
         self.assertEqual(rc, 1)
         self.assertIn('没有可注册的目标主机', out)
 
-    def test_missing_config(self):
-        from apps.asset_mgr.models import Server
-        from .executors import get_executor
-        srv = Server.objects.create(name='js-x', private_ip='10.6.0.1')
-        rc, out = get_executor('jumpserver').execute(self.step, self.method, servers=[srv])
+    def test_missing_config_direct(self):
+        rc, out = self.executor.execute(self.step, self.method, servers=[self.s1])
         self.assertEqual(rc, 1)
         self.assertIn('jumpserver.url', out)
 
-    def test_partial_failure_rc(self):
-        from unittest import mock
-        from apps.asset_mgr.models import Server
-        from .executors import get_executor
-        s1 = Server.objects.create(name='js-1', private_ip='10.6.0.2')
-        s2 = Server.objects.create(name='js-2', private_ip='10.6.0.3')
+    def test_partial_failure_rc_direct(self):
         results = [
-            {'id': s1.id, 'name': s1.name, 'ip': s1.private_ip, 'ok': True, 'msg': '注册成功'},
-            {'id': s2.id, 'name': s2.name, 'ip': s2.private_ip, 'ok': False, 'msg': '注册失败：HTTP 400'},
+            {'id': self.s1.id, 'name': self.s1.name, 'ip': self.s1.private_ip,
+             'ok': True, 'msg': '注册成功'},
+            {'id': self.s2.id, 'name': self.s2.name, 'ip': self.s2.private_ip,
+             'ok': False, 'msg': '注册失败：HTTP 400'},
         ]
-        with mock.patch('apps.method_mgr.executors.jumpserver.register_servers', return_value=results):
-            rc, out = get_executor('jumpserver').execute(self.step, self.method, servers=[s1, s2])
+        with mock.patch('common.jumpserver.register_servers', return_value=results):
+            rc, out = self.executor.execute(
+                self.step, self.method, servers=[self.s1, self.s2])
         self.assertEqual(rc, 1)
+        self.assertIn('[通道] 直连：2 台', out)
         self.assertIn('成功 1，失败 1', out)
+
+    # ── 通道解析 ──────────────────────────────────────────
+
+    def test_system_config_routes_to_agent(self):
+        SystemConfig.objects.create(key='jumpserver.agent', value='nat-gw-01')
+        (rc, out), kwargs, payload = self._execute(host_results=self._ok(self.s1))
+        self.assertEqual(rc, 0)
+        self.assertIn('[通道] 经 Agent nat-gw-01（系统配置）：1 台', out)
+        self.assertIn('✔ js-1(10.6.0.2)：注册成功', out)
+        self.assertEqual(kwargs['capability'], 'jumpserver')
+        self.assertEqual((kwargs['task_id'], kwargs['step_order']), (1, 1))
+        self.assertEqual(payload['step_type'], 'jumpserver')
+        self.assertEqual(payload['hosts'], [{
+            'key': str(self.s1.id), 'name': 'js-1', 'address': '10.6.0.2',
+            'ssh_port': 22, 'comment': ''}])
+
+    def test_payload_carries_no_credentials(self):
+        SystemConfig.objects.create(key='jumpserver.agent', value='nat-gw-01')
+        SystemConfig.objects.create(key='jumpserver.url', value='http://js.local')
+        SystemConfig.objects.create(key='jumpserver.token', value='secret-token')
+        _, _, payload = self._execute(host_results=self._ok(self.s1))
+        self.assertNotIn('secret-token', json.dumps(payload, ensure_ascii=False))
+        self.assertEqual(set(payload), {'step_type', 'hosts', 'timeout'})
+
+    def test_step_param_beats_method_and_config(self):
+        SystemConfig.objects.create(key='jumpserver.agent', value='nat-gw-02')
+        self.method.config = {'agent': 'nat-gw-02'}
+        step = _step(params={'agent': 'nat-gw-01'})
+        (_rc, out), _kwargs, _payload = self._execute(
+            step=step, host_results=self._ok(self.s1))
+        self.assertIn('经 Agent nat-gw-01（模块参数）', out)
+
+    def test_method_config_beats_system_config(self):
+        SystemConfig.objects.create(key='jumpserver.agent', value='nat-gw-02')
+        self.method.config = {'agent': 'nat-gw-01'}
+        (_rc, out), _kwargs, _payload = self._execute(host_results=self._ok(self.s1))
+        self.assertIn('经 Agent nat-gw-01（方法配置）', out)
+
+    def test_route_rule_fallback_by_task_dimension(self):
+        from apps.agent_mgr.models import AgentRoute
+        from apps.asset_mgr.models import ProjectGroup
+
+        pg = ProjectGroup.objects.create(name='JS 项目', code='js-p1')
+        AgentRoute.objects.create(agent=self.agent, project_group=pg)
+        step = _step(params={}, project_group_id=pg.pk)
+        (_rc, out), _kwargs, _payload = self._execute(
+            step=step, host_results=self._ok(self.s1))
+        self.assertIn('经 Agent nat-gw-01（路由规则）', out)
+
+    def test_unknown_agent_name_fails_without_dispatch(self):
+        SystemConfig.objects.create(key='jumpserver.agent', value='ghost-gw')
+        with mock.patch('apps.agent_mgr.dispatch.run_via_agent_detail') as dispatched, \
+                mock.patch('common.jumpserver.register_servers') as direct:
+            rc, out = self.executor.execute(self.step, self.method, servers=[self.s1])
+        self.assertEqual(rc, 1)
+        self.assertIn('ghost-gw', out)
+        dispatched.assert_not_called()
+        direct.assert_not_called()
+
+    def test_per_host_channel_grouping_when_no_agent_configured(self):
+        """无统一通道：按每台主机自身执行通道分组，agent 组与直连组各走各的。"""
+        self.s1.channel_mode = 'agent'
+        self.s1.agent = self.agent
+        self.s1.save(update_fields=['channel_mode', 'agent'])
+        direct_result = [{'id': self.s2.id, 'name': self.s2.name,
+                          'ip': self.s2.private_ip, 'ok': True, 'msg': '已存在，跳过'}]
+        with mock.patch('apps.agent_mgr.dispatch.run_via_agent_detail',
+                        return_value=(0, '', {'host_results': self._ok(self.s1)})) as dispatched, \
+                mock.patch('common.jumpserver.register_servers',
+                           return_value=direct_result) as direct:
+            rc, out = self.executor.execute(
+                self.step, self.method, servers=[self.s1, self.s2])
+        self.assertEqual(rc, 0)
+        self.assertIn('经 Agent nat-gw-01（主机指定）：1 台', out)
+        self.assertIn('[通道] 直连：1 台', out)
+        # 各组只拿到属于自己的主机
+        self.assertEqual([h['name'] for h in dispatched.call_args[0][1]['hosts']], ['js-1'])
+        self.assertEqual([s.name for s in direct.call_args[0][0]], ['js-2'])
+        # 输出顺序与入参一致
+        self.assertLess(out.index('js-1('), out.index('js-2('))
+
+    # ── 结果还原 ──────────────────────────────────────────
+
+    def test_batches_over_agent_host_limit(self):
+        """超过单元上限（500 台）自动分批下发，不硬失败。"""
+        from apps.asset_mgr.models import Server
+        from common.jumpserver import AGENT_MAX_HOSTS
+
+        SystemConfig.objects.create(key='jumpserver.agent', value='nat-gw-01')
+        servers = [self.s1, self.s2] + [
+            Server.objects.create(name=f'js-b{i}', private_ip=f'10.6.1.{i}')
+            for i in range(AGENT_MAX_HOSTS)
+        ]
+        results = {str(s.id): {'ok': True, 'msg': '注册成功'} for s in servers}
+        with mock.patch('apps.agent_mgr.dispatch.run_via_agent_detail',
+                        return_value=(0, '', {'host_results': results})) as dispatched:
+            rc, out = self.executor.execute(self.step, self.method, servers=servers)
+        self.assertEqual(rc, 0)
+        self.assertEqual(dispatched.call_count, 2)
+        self.assertEqual(
+            [len(call[0][1]['hosts']) for call in dispatched.call_args_list],
+            [AGENT_MAX_HOSTS, 2])
+        self.assertIn(f'成功 {AGENT_MAX_HOSTS + 2}，失败 0', out)
+
+    def test_missing_host_result_counted_as_failure(self):
+        """agent 回传缺某台（如重名中止整批）：该台按失败计，原因取输出末行。"""
+        SystemConfig.objects.create(key='jumpserver.agent', value='nat-gw-01')
+        (rc, out), _kwargs, _payload = self._execute(
+            servers=[self.s1, self.s2], rc=1,
+            output='✔ js-1(10.6.0.2)：注册成功\n✖ 主机「js-2」与 JumpServer 已有资产重名',
+            host_results=self._ok(self.s1))
+        self.assertEqual(rc, 1)
+        self.assertIn('✖ js-2(10.6.0.3)：✖ 主机「js-2」与 JumpServer 已有资产重名', out)
+        self.assertIn('成功 1，失败 1', out)
+
+    def test_channel_failure_marks_all_hosts_failed(self):
+        SystemConfig.objects.create(key='jumpserver.agent', value='nat-gw-01')
+        (rc, out), _kwargs, _payload = self._execute(
+            rc=1, output='Agent「nat-gw-01」离线（最近心跳：从未），无法下发。')
+        self.assertEqual(rc, 1)
+        self.assertIn('离线', out)
+        self.assertIn('成功 0，失败 1', out)
+
+    def test_offline_agent_real_dispatch_fails_fast(self):
+        """不 mock dispatch：离线 agent 下发前失败，不落 AgentJob。"""
+        from apps.agent_mgr.models import AgentJob
+
+        from apps.agent_mgr.models import AgentNode
+
+        offline = AgentNode.objects.create(name='nat-gw-03', token_hash='z')
+        SystemConfig.objects.create(key='jumpserver.agent', value=offline.name)
+        rc, out = self.executor.execute(self.step, self.method, servers=[self.s1])
+        self.assertEqual(rc, 1)
+        self.assertIn('离线', out)
+        self.assertFalse(AgentJob.objects.exists())
+
+    def test_old_agent_without_capability_fails_fast(self):
+        from apps.agent_mgr.models import AgentNode
+
+        old = AgentNode.objects.create(
+            name='nat-gw-old', token_hash='w', status='online', channel_name='ch3',
+            version='1.1.0', meta={'capabilities': ['command', 'playbook']})
+        SystemConfig.objects.create(key='jumpserver.agent', value=old.name)
+        rc, out = self.executor.execute(self.step, self.method, servers=[self.s1])
+        self.assertEqual(rc, 1)
+        self.assertIn('不支持 jumpserver 执行单元', out)
+
+    def test_invalid_agent_config_type(self):
+        self.method.config = {'agent': 123}
+        rc, out = self.executor.execute(self.step, self.method, servers=[self.s1])
+        self.assertEqual(rc, 1)
+        self.assertIn('config.agent', out)

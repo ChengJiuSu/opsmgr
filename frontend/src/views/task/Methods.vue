@@ -15,7 +15,7 @@
     </div>
 
     <el-alert type="info" :closable="false" show-icon style="margin-bottom:12px">
-      平台方法用于集中管理可复用的执行能力。Ansible 剧本方法 = 指定剧本文件 + tags；Jenkins 构建方法 = 指定 Job 触发 CI（直连时连接信息在「系统配置」维护 jenkins.url / jenkins.user / jenkins.api_token；Jenkins 在内网时经 Agent 触发，凭据放 agent 本机 config.yaml）；JumpServer 注册方法 = 把目标主机注册为 JumpServer 资产（jumpserver.url / jumpserver.token）；云主机管理等 provider 为后续扩展预留。
+      平台方法用于集中管理可复用的执行能力。Ansible 剧本方法 = 指定剧本文件 + tags；Jenkins 构建方法 = 指定 Job 触发 CI（直连时连接信息在「系统配置」维护 jenkins.url / jenkins.user / jenkins.api_token；Jenkins 在内网时经 Agent 触发，凭据放 agent 本机 config.yaml）；JumpServer 注册方法 = 把目标主机注册为 JumpServer 资产（直连时连接信息在「系统配置」维护 jumpserver.url / jumpserver.token；JumpServer 在内网时经 Agent 注册，凭据放 agent 本机 config.yaml）；云主机管理等 provider 为后续扩展预留。
     </el-alert>
 
     <el-table v-loading="loading" :data="tableData" stripe>
@@ -122,11 +122,19 @@
         </el-alert>
       </template>
 
-      <!-- jumpserver：无专属配置，把模块目标主机注册为 JumpServer 资产 -->
-      <el-alert v-else-if="form.provider === 'jumpserver'" type="info" :closable="false" style="margin-bottom:18px">
-        执行时把模块匹配到的目标主机注册为 JumpServer 资产（已存在的自动跳过），
-        无需额外配置；连接信息在「系统配置」维护 <code>jumpserver.url</code> / <code>jumpserver.token</code>。
-      </el-alert>
+      <!-- jumpserver：仅执行通道可配，把模块目标主机注册为 JumpServer 资产 -->
+      <template v-else-if="form.provider === 'jumpserver'">
+        <el-form-item label="执行 Agent">
+          <el-input v-model="form.config.agent" placeholder="留空=按系统配置 jumpserver.agent 与主机执行通道解析" />
+          <span class="form-tip">填 Agent 名则本方法固定经该 Agent 注册（JumpServer 在内网时用）</span>
+        </el-form-item>
+        <el-alert type="info" :closable="false" style="margin-bottom:18px">
+          执行时把模块匹配到的目标主机注册为 JumpServer 资产（已存在的自动跳过）。
+          直连时连接信息在「系统配置」维护 <code>jumpserver.url</code> / <code>jumpserver.token</code>；
+          JumpServer 在内网时经 Agent 注册，凭据放 agent 本机 config.yaml。
+          留空则按每台主机自身的执行通道分组，模块参数 <code>"agent"</code> 可临时覆盖。
+        </el-alert>
+      </template>
 
       <!-- 其他 provider：通用 JSON 配置 -->
       <el-form-item v-else label="配置 (JSON)">
@@ -260,6 +268,10 @@ async function handleSubmit() {
     // 留空即不写 agent 键：解析回落到系统配置与通道路由
     const agent = (form.config.agent || '').trim()
     if (agent) config.agent = agent
+  } else if (form.provider === 'jumpserver') {
+    // 只有执行通道可配；留空即不写 agent 键，回落系统配置与主机执行通道
+    const agent = (form.config.agent || '').trim()
+    config = agent ? { agent } : {}
   } else if (form.provider !== 'ansible_playbook') {
     try {
       config = JSON.parse(rawConfig.value || '{}')

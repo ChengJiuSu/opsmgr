@@ -34,7 +34,7 @@ flowchart TB
 
     subgraph EXT["外部系统"]
         JENKINS["Jenkins<br/>触发 job + 拉控制台日志"]
-        JMS["JumpServer<br/>资产注册"]
+        JMS["JumpServer<br/>资产注册（直连或经 agent）"]
         DNS["阿里云 / 腾讯云<br/>DNS OpenAPI"]
         ACME["ACME (Let's Encrypt)<br/>DNS-01 签发"]
     end
@@ -77,6 +77,7 @@ flowchart TB
     AGENT -- "wss（方向恒为 agent → manager）" --> NGINX
     WS <-. "指令下发 / 日志回传" .-> AGENT
     AGENT --> INNER
+    AGENT -. "内网 Jenkins / JumpServer 代调用" .-> EXT
 ```
 
 要点：

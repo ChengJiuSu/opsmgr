@@ -76,5 +76,6 @@ class SystemConfigViewSet(viewsets.ModelViewSet):
 | `LOGIN_RETRY_LIMIT` | `5` | 登录失败次数上限 |
 | `jumpserver.url` | `http://192.168.1.10` | JumpServer 地址（服务器注册用） |
 | `jumpserver.token` | `<API Token>` | JumpServer 个人 API Token |
+| `jumpserver.agent` | `nat-gw-01` | 经该 Agent 注册资产（JumpServer 在内网时；留空按主机执行通道分组） |
 | `jenkins.agent` | `nat-gw-01` | Jenkins 在内网时经该 Agent 触发（留空=直连） |
 | `mfa.enforce_scope` | `off` / `staff` / `all` | MFA 强制范围，默认 off（拼错值按 off 处理并告警，不会把全员挡在门外） |

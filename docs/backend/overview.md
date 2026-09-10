@@ -57,7 +57,7 @@ devops-manager/
     ├── permissions.py          # 权限档位判定
     ├── dimscope.py             # 数据范围（项目组/环境）收窄
     ├── ansible.py              # ansible / ansible-playbook 调用
-    ├── jumpserver.py           # JumpServer 资产注册
+    ├── jumpserver.py           # JumpServer 资产注册（直连 / 经 Agent 双通道 + 分组）
     ├── crypto.py / secrets.py  # 敏感字段加解密与脱敏
     ├── totp.py                 # MFA 一次性口令
     └── ratelimit.py            # 登录失败限速

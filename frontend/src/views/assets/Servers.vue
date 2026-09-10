@@ -360,6 +360,7 @@
       :type="jsResult.failed ? 'warning' : 'success'" :closable="false" show-icon style="margin-bottom:12px"
     >
       共 {{ jsResult.total }} 台：成功 {{ jsResult.succeeded }}，失败 {{ jsResult.failed }}
+      <template v-if="jsResult.channel_text">（执行通道：{{ jsResult.channel_text }}）</template>
     </el-alert>
     <el-table :data="jsResult.results" size="small" max-height="320">
       <el-table-column prop="name" label="主机名" min-width="120" />
@@ -625,7 +626,7 @@ async function handleBatchDelete() {
 
 // ── JumpServer 注册 ─────────────────────────────────────
 const jsResultVisible = ref(false)
-const jsResult = ref({ total: 0, succeeded: 0, failed: 0, results: [] })
+const jsResult = ref({ total: 0, succeeded: 0, failed: 0, results: [], channel_text: '' })
 
 async function handleRegisterJumpServer() {
   await ElMessageBox.confirm(
@@ -636,7 +637,7 @@ async function handleRegisterJumpServer() {
   submitting.value = true
   try {
     const res = await registerJumpServer({ server_ids: selection.value.map((r) => r.id) })
-    jsResult.value = res.data || { total: 0, succeeded: 0, failed: 0, results: [] }
+    jsResult.value = res.data || { total: 0, succeeded: 0, failed: 0, results: [], channel_text: '' }
     jsResultVisible.value = true
   } finally {
     submitting.value = false

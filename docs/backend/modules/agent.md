@@ -13,10 +13,12 @@ NAT 出口执行代理（ops-agent）的服务端：agent 主动外连 WebSocket
 路由到 agent 通道的主机组打包为**自包含执行单元**（AgentJob）下发，agent
 本地调用 ansible 执行并流式回传日志。
 
-执行单元有四类 `step_type`：`command` / `playbook`（agent 侧调 ansible）、
+执行单元有五类 `step_type`：`command` / `playbook`（agent 侧调 ansible）、
 `jenkins`（agent 侧调内网 Jenkins REST，用于 manager 在公网而 Jenkins 在内网
-的场景，见 `docs/backend/modules/artifacts.md`）与 `cert_deploy`（云控证书分发
-到内网主机，剧本由 agent 本地生成，见 `docs/backend/modules/cloud.md`）。
+的场景，见 `docs/backend/modules/artifacts.md`）、`cert_deploy`（云控证书分发
+到内网主机，剧本由 agent 本地生成，见 `docs/backend/modules/cloud.md`）与
+`jumpserver`（把主机注册到内网 JumpServer，逐台结果经 `host_results` 结构化
+回传，见 `docs/backend/modules/assets.md`）。
 
 | 概念 | 说明 |
 |------|------|
@@ -33,9 +35,10 @@ NAT 出口执行代理（ops-agent）的服务端：agent 主动外连 WebSocket
 apps/agent_mgr/
 ├── models.py      # AgentNode / AgentJob / AgentRoute / hash_token（sha256 口径）
 ├── channel.py     # 执行通道解析：主机三态 + 路由规则 → (agent, source)；
-│                  #   resolve_service_agent：无主机单元（Jenkins）的四级解析
+│                  #   resolve_service_agent：无主机单元（Jenkins / JumpServer 指定通道）解析
 ├── consumers.py   # AgentConsumer：鉴权、心跳落库、log.chunk 幂等追加、result 终态
-├── dispatch.py    # run_via_agent：创建 job → channel layer 下发 → 轮询终态（同步阻塞）
+├── dispatch.py    # run_via_agent(_detail)：创建 job → channel layer 下发 → 轮询终态（同步阻塞）；
+│                  #   _detail 多返回 AgentJob.result（host_results：JumpServer 逐台结果）
 ├── routing.py     # /ws/agent/ 路由（ops_manager/asgi.py 挂载）
 ├── serializers.py # token 不回显；job 列表不含 output 全文
 ├── views.py       # AgentNodeViewSet（agent 模块：read 可查、write 可改）+ regen_token / jobs 动作
@@ -93,6 +96,9 @@ Server.channel_mode='auto'（默认）：
   老 agent 不上报该字段时不校验，由 agent 侧 `task.ack` 拒收兜底。
   `secret_fields` 列出「只下发、不落 `AgentJob.payload`」的键（证书分发的
   `files`）：落库前换占位串，agent 侧 spool 同样脱敏，见设计文档 3.4.2。
+  需要 agent 上报的结构化终态（JumpServer 注册的逐台结果）时改调
+  `run_via_agent_detail(...)`，多返回一个 `AgentJob.result`（含
+  `host_results`）；`run_via_agent` 即它丢掉第三个返回值的薄壳。
 - 日志分片 `log.chunk` 携带严格递增 `chunk_seq`：Consumer 只追加大于当前
   游标的分片（重复/乱序重 ack 游标，agent 按游标补传），单 job 输出上限
   2MB 超限截断。`task.result` 幂等，重复上报只重 ack。
@@ -120,7 +126,15 @@ Server.channel_mode='auto'（默认）：
   提前失败并提示）；`jenkins` provider **已支持**，按 `resolve_service_agent`
   解析后下发 `step_type='jenkins'` 单元，payload 只含 job 名/构建参数/
   allow_unstable/timeout，**不含任何 Jenkins 凭据**（凭据在 agent 本地
-  config.yaml）。
+  config.yaml）。`jumpserver` provider 同样已支持，见下条。
+- **JumpServer 注册**（`common/jumpserver.py`，资产页接口与 `jumpserver` 方法
+  模块共用）：通道解析为「模块参数 → 方法配置 → 系统配置 `jumpserver.agent`
+  → `AgentRoute`（任务维度）→ **按每台主机自身的执行通道分组**」。最后一级是
+  与 Jenkins 的差别——注册的对象就是主机，主机自己的通道天然是对的通道，混合
+  时 agent 组下发、直连组本地发 REST，结果按入参顺序合并。payload 只含主机
+  清单（`key`/`name`/`address`/`ssh_port`/`comment`），**不含任何 JumpServer
+  凭据**；agent 没回传某台的 `host_results` 即按失败计（原因取通道输出末行），
+  不冒充成功。
 
 ## 接口
 
