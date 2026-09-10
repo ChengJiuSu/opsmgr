@@ -284,6 +284,7 @@ A：跨组件共享的全局变量。Token 和用户名存在 store 里，任何
 ## 相关文档
 
 - [项目总览 README](../README.md)
+- [全局架构图](architecture.md)
 - [后端架构总览](backend/overview.md)
 - [前端架构总览](frontend/overview.md)
 - [API 接口文档](backend/api-reference.md)

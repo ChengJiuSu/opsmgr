@@ -102,35 +102,51 @@ npm run dev
 
 ## 项目结构
 
+> 全局架构图（进程拓扑、请求链路、模块依赖、执行/云控时序）见 **[docs/architecture.md](docs/architecture.md)**。
+
 ```
 devops-manager/
 ├── manage.py
-├── requirements.txt
+├── requirements.txt / requirements.lock   # 直接依赖 / 钉死版本锁文件
 ├── ops_manager/              # Django 项目配置
 │   ├── settings/
 │   │   ├── base.py           # 通用配置
 │   │   ├── dev.py            # 开发环境（SQLite）
 │   │   └── prod.py           # 生产环境（MySQL）
-│   └── urls.py               # 根路由
+│   ├── celery.py             # Celery 应用（broker/result = Redis）
+│   ├── urls.py               # 根路由
+│   ├── wsgi.py               # WSGI 入口（gunicorn，全部 HTTP API）
+│   └── asgi.py               # ASGI 入口（daphne，/ws/ 走 Channels）
 ├── apps/                     # 业务模块
-│   ├── auth_mgr/             # 用户认证与管理
-│   ├── asset_mgr/            # 资产管理（CMDB：服务器 + 项目组/渠道/环境/云厂商字典）
+│   ├── auth_mgr/             # 用户认证与管理、角色矩阵、MFA、API 凭证
+│   ├── asset_mgr/            # 资产管理（CMDB：服务器/服务规划 + 五类字典）
 │   ├── config_mgr/           # 配置管理（服务器归属批量分配，无模型，数据源为 asset_mgr）
-│   ├── audit/                # 操作审计
+│   ├── audit/                # 操作审计（中间件自动记录写操作）
 │   ├── system_cfg/           # 系统配置
-│   ├── dashboard/            # 概览统计
+│   ├── dashboard/            # 概览/值班视角聚合（无模型）
 │   ├── method_mgr/           # 平台方法（provider 执行器可扩展）
-│   │   └── executors/        # ansible_playbook / cloud_host(预留)...
-│   └── task_exec/            # 任务执行（命令 / 方法调度）
-├── common/                   # 公共工具（分页、响应、权限、ansible 调用）
+│   │   └── executors/        # ansible_playbook / jenkins / jumpserver / cloud_host(预留)
+│   ├── task_exec/            # 任务执行（任务流、变量、凭据、日志推送、webhook 触发）
+│   ├── agent_mgr/            # 执行通道（ops-agent 接入、路由规则、指令下发）
+│   ├── artifact_mgr/         # 构建制品（上报、签名下载、CD 变量注入）
+│   ├── cloud_mgr/            # 云控（域名、解析审批、证书签发与分发）
+│   │   └── providers/        # 阿里云 / 腾讯云 DNS（零 SDK，直连 OpenAPI）
+│   ├── topo_mgr/             # 拓扑画布（画布/节点/边）
+│   └── portal_mgr/           # 内部导航页配置
+├── common/                   # 公共工具（分页、响应、权限、数据范围、ansible、
+│                             #   jumpserver、加解密、TOTP、限速）
 ├── frontend/                 # Vue 3 前端
 │   └── src/
 │       ├── api/              # 接口调用层
 │       ├── stores/           # Pinia 状态管理
 │       ├── router/           # 路由配置
-│       ├── utils/            # Axios 封装
+│       ├── utils/            # Axios 封装、任务日志 WebSocket 流
 │       └── views/            # 页面组件
+├── ansible/                  # 内置剧本示例与 inventory
+├── deploy/                   # 部署产物：supervisor 配置、nginx 模板、安装/更新脚本
 └── docs/                     # 项目文档
+    ├── architecture.md       # 全局架构图
+    ├── ops-agent-design.md   # ops-agent 通道设计
     ├── backend/              # 后端文档
     └── frontend/             # 前端文档
 ```
@@ -250,6 +266,7 @@ celery -A ops_manager worker -l info
 
 ## 文档
 
+- [全局架构图](docs/architecture.md)
 - [后端文档](docs/backend/README.md)
 - [前端文档](docs/frontend/README.md)
 

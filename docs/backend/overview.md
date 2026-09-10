@@ -11,33 +11,56 @@
 | drf-spectacular | 0.29 | OpenAPI/Swagger 文档 |
 | django-cors-headers | 4.9 | 跨域支持 |
 | SQLite / MySQL | — | 数据库（开发/生产） |
-| Redis + Celery | — | 异步任务（P2 阶段启用） |
+| Redis | — | Celery broker/result、Channels channel layer、限速计数缓存 |
+| Celery | — | 异步任务（任务执行 `task_exec` 队列 / 证书默认队列 / beat 定时） |
+| Channels + daphne | — | WebSocket：ops-agent 接入、任务日志实时推送 |
 
 ---
 
 ## 目录结构
 
+> 进程拓扑与跨模块链路见 [全局架构图](../architecture.md)。
+
 ```
 devops-manager/
 ├── manage.py                   # Django 入口
-├── requirements.txt            # 依赖清单
+├── requirements.txt            # 直接依赖（requirements.lock 为钉死版本锁文件）
 ├── db.sqlite3                  # 开发数据库
 ├── ops_manager/                # 项目配置包
 │   ├── settings/
 │   │   ├── base.py             # 所有环境共用配置
 │   │   ├── dev.py              # 开发环境配置（SQLite + DEBUG）
 │   │   └── prod.py             # 生产环境配置（MySQL）
+│   ├── celery.py               # Celery 应用
 │   ├── urls.py                 # 根路由
-│   ├── wsgi.py                 # WSGI 入口
-│   └── asgi.py                 # ASGI 入口
+│   ├── wsgi.py                 # WSGI 入口（gunicorn）
+│   └── asgi.py                 # ASGI 入口（daphne，/ws/ 走 Channels）
 ├── apps/                       # 业务模块
-│   ├── auth_mgr/               # 用户认证
-│   ├── asset_mgr/              # 资产管理
+│   ├── auth_mgr/               # 用户认证、角色矩阵、MFA、API 凭证
+│   ├── asset_mgr/              # 资产管理（服务器 + 五类 CMDB 字典 + 服务规划）
+│   ├── config_mgr/             # 归属批量分配（无模型）
 │   ├── audit/                  # 操作审计
-│   └── system_cfg/             # 系统配置
+│   ├── system_cfg/             # 系统配置
+│   ├── dashboard/              # 概览/值班视角聚合（无模型）
+│   ├── method_mgr/             # 平台方法注册表
+│   │   └── executors/          # ansible_playbook / jenkins / jumpserver / cloud_host
+│   ├── task_exec/              # 任务流执行、变量、凭据、日志推送、webhook 触发
+│   ├── agent_mgr/              # 执行通道（agent 接入 / 路由规则 / 指令下发）
+│   ├── artifact_mgr/           # 构建制品
+│   ├── cloud_mgr/              # 域名 / 解析 / 证书 / 分发
+│   │   └── providers/          # 阿里云 / 腾讯云 DNS
+│   ├── topo_mgr/               # 拓扑画布
+│   └── portal_mgr/             # 内部导航页配置
 └── common/                     # 公共工具
     ├── pagination.py           # 标准分页
-    └── response.py             # 统一响应 & 异常处理
+    ├── response.py             # 统一响应 & 异常处理
+    ├── permissions.py          # 权限档位判定
+    ├── dimscope.py             # 数据范围（项目组/环境）收窄
+    ├── ansible.py              # ansible / ansible-playbook 调用
+    ├── jumpserver.py           # JumpServer 资产注册
+    ├── crypto.py / secrets.py  # 敏感字段加解密与脱敏
+    ├── totp.py                 # MFA 一次性口令
+    └── ratelimit.py            # 登录失败限速
 ```
 
 ---
@@ -59,11 +82,22 @@ XFrameOptionsMiddleware     → 点击劫持防护
 AuditLogMiddleware          → 写操作自动审计记录
     │
     ▼
+认证层  MfaJWTAuthentication  → JWT 校验 + MFA 强制（读 token 的 amr）
+        ApiKeyAuthentication  → X-API-KEY：密钥比对 / 过期 / IP 白名单 / 验签 / 作用域
+    │
+    ▼
+权限层  IsAuthenticated · IsAdmin · IsAdminOrReadOnly · IsAdminOrReadCreate
+        + 角色权限矩阵 + 数据范围（common.dimscope）
+    │
+    ▼
 Router → ViewSet → Serializer → ORM → Database
     │
     ▼
 统一分页响应 / 统一异常响应
 ```
+
+- **MFA 强制放认证类而非权限类**：大量 ViewSet 自带 `permission_classes`，全局默认权限对它们不生效。
+- 自带 `ApiKeyAuthentication` 的机读接口（制品上报等）因此绕过 MFA —— 脚本无法过第二因子，这是期望行为。
 
 ---
 
@@ -71,11 +105,20 @@ Router → ViewSet → Serializer → ORM → Database
 
 | 模块 | App Label | 说明 |
 |------|-----------|------|
-| `apps.auth_mgr` | `auth_mgr` | 自定义用户模型、JWT 登录、Token 刷新 |
-| `apps.asset_mgr` | `asset_mgr` | 服务器资产 CRUD、状态与环境过滤 |
-| `apps.audit` | `audit` | 操作审计日志（中间件自动记录） |
+| `apps.auth_mgr` | `auth_mgr` | 自定义用户模型、JWT 登录/刷新、角色权限矩阵、MFA、机读接口 API 凭证 |
+| `apps.asset_mgr` | `asset_mgr` | 服务器资产 CRUD、五类 CMDB 字典、服务规划（进程名/进程数） |
+| `apps.config_mgr` | `config_mgr` | 服务器归属批量分配与分配概览（无模型，数据源为 asset_mgr） |
+| `apps.audit` | `audit` | 操作审计日志（中间件自动记录写操作） |
 | `apps.system_cfg` | `system_cfg` | 系统配置键值对管理 |
-| `common` | — | 标准分页、统一响应格式、全局异常处理 |
+| `apps.dashboard` | `dashboard` | 概览与值班视角聚合（无模型，只读其它模块） |
+| `apps.method_mgr` | `method_mgr` | 平台方法注册表 + 可插拔 provider 执行器 |
+| `apps.task_exec` | `task_exec` | 任务流编排与执行、执行变量、连接凭据、日志推送、外部触发 |
+| `apps.agent_mgr` | `agent_mgr` | ops-agent 接入与执行通道解析（主机三态 + 路由规则） |
+| `apps.artifact_mgr` | `artifact_mgr` | 构建制品上报、签名下载、CD 制品变量注入 |
+| `apps.cloud_mgr` | `cloud_mgr` | 域名、DNS 解析（风险判定/审批）、证书签发续签与分发 |
+| `apps.topo_mgr` | `topo_mgr` | 拓扑画布：引用型/外部型节点、边、按维度编排 |
+| `apps.portal_mgr` | `portal_mgr` | 内部导航页（/nav.html）配置 |
+| `common` | — | 分页、统一响应、权限、数据范围、ansible/JumpServer 调用、加解密、TOTP、限速 |
 
 ---
 
