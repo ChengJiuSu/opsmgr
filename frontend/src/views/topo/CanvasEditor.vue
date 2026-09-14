@@ -38,6 +38,22 @@
             @change="onShowServicesChange"
           />
         </el-tooltip>
+        <el-tooltip
+          :content="flowDowngraded
+            ? `连线超过 ${FLOW_MAX_EDGES} 条，已自动只让选中/悬停的链路流动`
+            : '让全图连线都跑起来。默认只有鼠标指到的那条链路流动'"
+          placement="bottom"
+        >
+          <!-- 降级时把开关一并禁掉：开着却不动比关着更让人困惑，tooltip 里说清为什么 -->
+          <el-switch
+            v-model="showFlow"
+            active-text="流动"
+            inline-prompt
+            :disabled="flowDowngraded"
+            style="margin-right:4px"
+            @change="onShowFlowChange"
+          />
+        </el-tooltip>
         <el-tooltip content="只读并每 30 秒自动刷新，异常节点高亮" placement="bottom">
           <el-switch
             v-model="watchMode"
@@ -127,6 +143,26 @@
 
       <!-- 中：画布 -->
       <main v-loading="loading" class="canvas-wrap">
+        <!-- 中段箭头的 marker 定义。放在画布外面单独一个零尺寸 <svg> 里：SVG 的 url(#id)
+             是全文档解析的，不必塞进 vue-flow 自己那个 <svg>——塞进去反而会被它每次
+             重渲染连坐。每种关系一个颜色，连线用 CSS 的 marker-mid 引用（见 TopoEdge） -->
+        <svg class="marker-defs" aria-hidden="true" focusable="false">
+          <defs>
+            <marker
+              v-for="m in ARROW_DEFS"
+              :id="m.id"
+              :key="m.id"
+              :markerWidth="MID_ARROW_SIZE"
+              :markerHeight="MID_ARROW_SIZE"
+              :refX="MID_ARROW_SIZE / 2"
+              :refY="MID_ARROW_SIZE / 2"
+              orient="auto"
+              markerUnits="userSpaceOnUse"
+            >
+              <path :d="arrowShape" :fill="m.color" />
+            </marker>
+          </defs>
+        </svg>
         <VueFlow
           v-model:nodes="nodes"
           v-model:edges="edges"
@@ -149,6 +185,9 @@
           @edge-context-menu="onEdgeContextMenu"
           @pane-click="clearSelection"
           @pane-context-menu="onPaneContextMenu"
+          @node-mouse-enter="onNodeMouseEnter"
+          @node-mouse-leave="onNodeMouseLeave"
+          @pane-mouse-enter="clearHover"
         >
           <Background :gap="16" pattern-color="#dfe4ec" />
           <Controls />
@@ -161,7 +200,15 @@
               class="topo-node"
               :class="[
                 `health-${data.health || 'none'}`,
-                { selected: selectedNodeId === id, pulse: watchMode && data.health === 'danger' },
+                {
+                  selected: selectedNodeId === id,
+                  pulse: watchMode && data.health === 'danger',
+                  // 链路之外的节点一并压暗，否则线暗了卡片还亮着，
+                  // 视线仍旧被一片亮卡片拽走。悬停（transient）压得更狠并禁点击，
+                  // 点击锁定时只压一半且保持可点——见 focus 的注释
+                  dimmed: nodeDimmed(id),
+                  transient: nodeDimmed(id) && !highlight.sticky,
+                },
               ]"
             >
               <div class="node-head">
@@ -241,6 +288,15 @@
             </div>
           </template>
         </VueFlow>
+        <!-- 图例：颜色 + 线型是这张图的主要信息通道，不给对照表就等于让人猜。
+             只列图上真实用到的关系，七种全摆出来反而要人先找哪几个跟自己有关 -->
+        <div v-if="legendItems.length" class="edge-legend">
+          <span v-for="item in legendItems" :key="item.value" class="legend-item">
+            <i class="legend-line" :style="{ background: legendDash(item) }" />
+            <i class="legend-arrow" :style="{ borderLeftColor: item.color }" />
+            {{ item.label }}
+          </span>
+        </div>
         <div v-if="!loading && !nodes.length" class="empty-hint">
           画布还是空的。点「自动编排」按维度拉出平台已有的主机 / 解析 / 证书，
           再手动补上 GA、负载均衡这类外部节点。
@@ -503,7 +559,7 @@ import {
   ref, reactive, computed, watch, provide, onMounted, onUnmounted, nextTick,
 } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { VueFlow, Handle, Position, MarkerType, useVueFlow } from '@vue-flow/core'
+import { VueFlow, Handle, Position, useVueFlow } from '@vue-flow/core'
 import { Background } from '@vue-flow/background'
 import { Controls } from '@vue-flow/controls'
 import {
@@ -515,6 +571,9 @@ import { debounce } from '../../utils/debounce'
 import { useAuthStore } from '../../stores/auth'
 import ContextMenu from '../../components/ContextMenu.vue'
 import TopoEdge from './TopoEdge.vue'
+import {
+  relationStyle, computeFanOffsets, FLOW_MAX_EDGES, ARROW_DEFS, MID_ARROW_SIZE,
+} from './edgeStyles'
 import TopoImpactDialog from '../../components/TopoImpactDialog.vue'
 import {
   projectGroupApi, channelApi, environmentApi, fetchDictOptions,
@@ -558,6 +617,18 @@ const SERVICE_TAG_LIMIT = 3
 //: 「显示服务」是按人记的看图偏好，存 localStorage——与概览页区块显隐同口径，
 //: 不进后端：它不影响任何人看到的数据，只影响这台浏览器上卡片有多高
 const SHOW_SERVICES_KEY = 'topo.showServices'
+//: 中段箭头的三角。留 1 的内边距，免得 marker 视窗边缘把斜边切出锯齿
+const arrowShape = `M1,1 L${MID_ARROW_SIZE - 1},${MID_ARROW_SIZE / 2} L1,${MID_ARROW_SIZE - 1} Z`
+
+/*
+  流动动画的显隐按人记在本地：它不改变任何数据，只影响这台机器上图动不动。
+
+  **默认关**。一开始是默认开的，理由是「进图第一眼就该看见流量往哪儿走」——实际用下来
+  满图几十上百条线同时有东西在跑，是持续的动态噪声，看图的人反而定不下来看某一处。
+  方向这件事交给箭头（端点一个 + 曲线正中一个）静态地说清楚就够了，动画留给「我正在
+  追这一条链路」的时刻：鼠标指到哪个节点，那整条链路才亮起来并流动。
+*/
+const SHOW_FLOW_KEY = 'topo.showFlow'
 
 //: 值班模式的刷新间隔。30 秒是「大屏挂着看」的量级：再快只是给库加压，
 //: 主机状态与证书天数都不是秒级变化的东西
@@ -576,6 +647,7 @@ const selectedEdgeId = ref('')
 // 值班模式：只读 + 定时刷新。初值取自 URL，所以「大屏那份链接」可以直接分享
 const watchMode = ref(route.query.watch === '1')
 const showServices = ref(readShowServices())
+const showFlow = ref(readLocalFlag(SHOW_FLOW_KEY, false))
 const refreshedAt = ref(null)
 // 右键菜单与就地改名
 const menuRef = ref(null)
@@ -635,22 +707,34 @@ function serviceSummary(services) {
 
 const selectedNodeServices = computed(() => nodeServices(selectedNode.value?.data))
 
-function readShowServices() {
+/** 本地看图偏好。没存过（或隐私模式下读不到）时用 fallback。读写都包 try：会直接抛。 */
+function readLocalFlag(key, fallback = true) {
   try {
-    const saved = localStorage.getItem(SHOW_SERVICES_KEY)
-    return saved === null ? true : saved === '1'
+    const saved = localStorage.getItem(key)
+    return saved === null ? fallback : saved === '1'
   } catch {
-    // 隐私模式 / 禁用站点数据时读不到，默认开着
-    return true
+    return fallback
   }
 }
 
-function onShowServicesChange(value) {
+function writeLocalFlag(key, value) {
   try {
-    localStorage.setItem(SHOW_SERVICES_KEY, value ? '1' : '0')
+    localStorage.setItem(key, value ? '1' : '0')
   } catch {
     // 存不下就只在本次会话生效，不值得为此报错
   }
+}
+
+function readShowServices() {
+  return readLocalFlag(SHOW_SERVICES_KEY)
+}
+
+function onShowServicesChange(value) {
+  writeLocalFlag(SHOW_SERVICES_KEY, value)
+}
+
+function onShowFlowChange(value) {
+  writeLocalFlag(SHOW_FLOW_KEY, value)
 }
 
 const canUndo = computed(() => editable.value && undoStack.value.length > 0)
@@ -914,7 +998,8 @@ function buildEdge(id, source, target, relation, handles = {}) {
     sourceHandle: handles.source || DEFAULT_SOURCE_HANDLE,
     targetHandle: handles.target || DEFAULT_TARGET_HANDLE,
     label: RELATION_LABELS.value[relation] || relation,
-    markerEnd: MarkerType.ArrowClosed,
+    // 箭头不在这里定：颜色要跟关系走，而关系可以在图上随时改（右键菜单/右侧下拉）。
+    // 写死在边对象上就得在每个改关系的地方记着同步一次，漏一处就是「线紫箭头蓝」
     data: { relation },
   }
 }
@@ -1247,6 +1332,164 @@ function selectEdge(edgeId) {
 
 provide('topoOpenEdgeMenu', openEdgeMenu)
 provide('topoSelectEdge', selectEdge)
+
+// ── 链路高亮 ──────────────────────────────────────────
+
+/*
+  点中或悬停一个节点 = 「这台机/这个域名，上下游是谁」。这是看拓扑图最高频的一问，
+  原来只能靠眼睛顺着线爬，线一交叉就爬丢。
+
+  实现上有两条路，这里刻意选了第二条：
+
+  1. 改 edges 里每条边的 style/class —— 会触碰 v-model 绑定的数组，vue-flow 要走一遍
+     边的 diff，而且很容易顺手把 dirty 标脏（看图不是改动，标脏了人会以为自己动了图）；
+  2. 算一份集合 provide 下去，连线与节点自己读 —— 高亮只让若干个 computed 重算，
+     边数组一个字节都不动。
+
+  集合在这里算一次（O(V+E)），连线那边只做 has（O(1)）。反过来让每条边自己去
+  遍历全图判断「我在不在链路上」，100 条边就是 100×100。
+*/
+const hoverNodeId = ref('')
+
+//: 空集合复用同一个实例：没在悬停时不该每次重算都造两个新 Set
+const EMPTY_SET = new Set()
+
+/*
+  高亮跟着谁走。两种来源，区别不只是「谁触发的」，还决定后面压暗压多狠：
+
+  - 悬停（transient）：鼠标一挪就没，是「顺手瞥一眼」。压得狠一些没关系，
+    而且期间可以把无关卡片的点击一并关掉——反正一秒后就恢复。
+  - 点击（sticky）：选中一个节点后一直亮着，是「我要沿着这条链路看一会儿」。
+    这种时候绝不能把其余卡片压到点不动：人接着要做的事十有八九就是点链路上的
+    下一个节点，或者换一个节点看——把它们变成死图等于把人锁在当前选择里。
+
+  悬停优先于选中：选中 A 之后把鼠标移到 B 上，人想看的是 B。松开手回到 A。
+*/
+const focus = computed(() => {
+  if (hoverNodeId.value) return { id: hoverNodeId.value, sticky: false }
+  if (selectedNodeId.value) return { id: selectedNodeId.value, sticky: true }
+  return { id: '', sticky: false }
+})
+
+/*
+  邻接索引。多跳遍历每跳都要问「从这个节点出去的边有哪些」，不建索引就是每跳扫一遍
+  全部边，链路长一点当场退化成 O(V×E)。建一次是 O(E)，只依赖 edges——拖节点不重算。
+
+  出边入边分开存：链路是有向的，顺流和逆流要分别走（见 highlight）。
+*/
+const adjacency = computed(() => {
+  const outgoing = new Map()
+  const incoming = new Map()
+  for (const e of edges.value) {
+    if (!outgoing.has(e.source)) outgoing.set(e.source, [])
+    outgoing.get(e.source).push(e)
+    if (!incoming.has(e.target)) incoming.set(e.target, [])
+    incoming.get(e.target).push(e)
+  }
+  return { outgoing, incoming }
+})
+
+/**
+ * 沿一个方向把链路走到底（BFS）。`index` 决定方向（出边 = 顺流 / 入边 = 逆流），
+ * `nextOf` 从边上取该方向的另一端。命中的边与节点直接写进传进来的两个集合。
+ *
+ * 队列用游标而不是 shift()：shift 每次要挪整个数组，链路长的图上白白多一个 O(n²)。
+ * seen 防环——拓扑图上「A 回源 B、B 又落地回 A」这种环是真实存在的，不防就死循环。
+ */
+function walkChain(startId, index, nextOf, nodeIds, edgeIds) {
+  const queue = [startId]
+  const seen = new Set([startId])
+  for (let i = 0; i < queue.length; i += 1) {
+    for (const e of index.get(queue[i]) || []) {
+      edgeIds.add(e.id)
+      const next = nextOf(e)
+      nodeIds.add(next)
+      if (seen.has(next)) continue
+      seen.add(next)
+      queue.push(next)
+    }
+  }
+}
+
+/*
+  高亮整条链路，不是只有一跳。
+
+  「这台机的上下游是谁」问的其实是一整条路径：域名 → 加速 → 负载均衡 → 后端机，
+  只亮一跳等于让人点一下走一格，点到终点还得自己在脑子里把几段拼起来。
+
+  方向上刻意分两次走，而不是把边当无向图 BFS：无向遍历会顺着任意一条边往回再往外爬，
+  一路漫到整个连通分量——这张图上绝大多数节点是连通的，结果就是「全亮 = 没亮」。
+  分开走则只亮「经过这个节点的那条链路」：所有能流到它的上游 + 它能流到的下游。
+  共用同一个上游的旁支（兄弟节点）不亮——流量不经过它，它不在这条链路上。
+*/
+const highlight = computed(() => {
+  const { id, sticky } = focus.value
+  if (!id) return { active: false, sticky: false, nodes: EMPTY_SET, edges: EMPTY_SET }
+  const { outgoing, incoming } = adjacency.value
+  const nodeIds = new Set([id])
+  const edgeIds = new Set()
+  // 顺流：它能流到哪儿
+  walkChain(id, outgoing, (e) => e.target, nodeIds, edgeIds)
+  // 逆流：谁能流到它
+  walkChain(id, incoming, (e) => e.source, nodeIds, edgeIds)
+  return { active: true, sticky, nodes: nodeIds, edges: edgeIds }
+})
+
+//: 汇聚到同一连接点的多条线，末端各让开一点，否则箭头精确重合（见 edgeStyles.js）。
+//: 只依赖 edges，拖节点不会重算
+const fanOffsets = computed(() => computeFanOffsets(edges.value))
+
+/*
+  全图流动动画开不开。
+
+  默认**关着**：满图都在动是噪声，方向由箭头静态交代（见 SHOW_FLOW_KEY 的注释）。
+  这个开关是给「我就想看全图在流」的人留的口子。
+  stroke-dashoffset 动不了合成器，每帧要重 paint 一遍路径——边一多就是整屏持续重绘，
+  所以超过 FLOW_MAX_EDGES 自动降级为「只有选中/高亮的线在动」，不等人自己发现卡了再去
+  翻开关。悬停时其余边被压暗，压暗的边一律停动画（见 TopoEdge.vue 的 flowing），
+  所以真正在动的线数量只会比这个上限更少。
+*/
+const flowDowngraded = computed(() => edges.value.length > FLOW_MAX_EDGES)
+const flowAll = computed(() => showFlow.value && !flowDowngraded.value)
+
+provide('topoHighlight', highlight)
+provide('topoFanOffsets', fanOffsets)
+provide('topoFlowAll', flowAll)
+
+function onNodeMouseEnter({ node }) {
+  // 拖拽中不高亮：鼠标正压着一个节点走，沿途每个节点都会闪一下，图在抖
+  if (dragSnapshot) return
+  hoverNodeId.value = node.id
+}
+
+function onNodeMouseLeave() {
+  hoverNodeId.value = ''
+}
+
+//: 鼠标从节点直接滑到画布空白（快速划过时 node-mouse-leave 偶尔会漏），
+//: 在画布上兜一次底，免得整张图卡在压暗状态
+function clearHover() {
+  hoverNodeId.value = ''
+}
+
+/** 节点是否该压暗：有人在悬停、而它不在那条链路上。 */
+function nodeDimmed(nodeId) {
+  const state = highlight.value
+  return state.active && !state.nodes.has(nodeId)
+}
+
+//: 图例：只列图上真实出现过的关系。七种全列出来，人得在一排色块里找哪个是自己图上有的
+const legendItems = computed(() => {
+  const used = new Set(edges.value.map((e) => e.data?.relation || 'custom'))
+  return meta.relations
+    .filter((r) => used.has(r.value))
+    .map((r) => ({ ...r, ...relationStyle(r.value) }))
+})
+
+//: 图例里的线型要和画布上的完全一致，所以同样从配置读，不在 CSS 里另写一份
+function legendDash(item) {
+  return item.dash ? `repeating-linear-gradient(to right, ${item.color} 0 ${item.dash[0]}px, transparent ${item.dash[0]}px ${item.dash[0] + item.dash[1]}px)` : item.color
+}
 
 function onPaneContextMenu(event) {
   // 落点用画布坐标而不是屏幕坐标：缩放/平移过之后两者差得很远
@@ -1717,6 +1960,62 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+/* ── 悬停联动与图例 ────────────────────────────────────── */
+
+/* 链路之外的节点压暗。压的是整张卡片（含健康度色条与服务标签）——只压文字的话
+   色条还亮着，远看仍是一片花的 */
+/* 点击锁定时的压暗：压到「退到背景里」但仍然读得出、点得动。链路之外的节点
+   下一秒很可能就是人要点的下一个目标 */
+.topo-node.dimmed { opacity: 0.45; }
+/* 悬停预览时的压暗：更狠，并且暂时不接受点击——鼠标此刻正贴着某个节点，
+   误点旁边一张暗卡片会把选中态和右侧面板整个换掉。鼠标一挪就恢复 */
+.topo-node.dimmed.transient {
+  opacity: 0.15;
+  pointer-events: none;
+}
+/* 只给透明度加过渡，不给 transform：节点同时还在被拖动，给 transform 加过渡会让
+   拖拽出现橡皮筋一样的滞后 */
+.topo-node { transition: opacity 0.15s ease; }
+
+/* 只是放 <defs> 的容器，本身不该占位也不该吃事件 */
+.marker-defs {
+  position: absolute;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+}
+
+.edge-legend {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  z-index: 5;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  max-width: 60%;
+  padding: 6px 10px;
+  font-size: 11px;
+  color: #606266;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid #e4e7ed;
+  border-radius: 6px;
+  /* 图例是参照物不是操作对象，不能挡住底下的画布交互 */
+  pointer-events: none;
+  user-select: none;
+}
+.legend-item { display: inline-flex; align-items: center; gap: 2px; }
+.legend-line { width: 20px; height: 2px; }
+/* 纯 CSS 三角当箭头：为一排图例去内联七个 svg marker 不值当 */
+.legend-arrow {
+  width: 0;
+  height: 0;
+  margin-right: 4px;
+  border-top: 3px solid transparent;
+  border-bottom: 3px solid transparent;
+  border-left: 5px solid currentColor;
+}
+
 .topo-editor { display: flex; flex-direction: column; height: calc(100vh - 110px); }
 .topbar {
   display: flex; justify-content: space-between; align-items: center;
