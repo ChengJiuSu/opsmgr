@@ -95,6 +95,11 @@
             </el-menu-item>
           </el-menu>
           <div class="scene-content">
+            <div v-if="sceneContent" class="scene-bar">
+              <span class="muted scene-path">{{ sceneActive }}</span>
+              <el-button size="small" :icon="CopyDocument" :disabled="sceneContent === EMPTY_SCENE"
+                         @click="copyScene">复制</el-button>
+            </div>
             <pre v-if="sceneContent">{{ sceneContent }}</pre>
             <el-empty v-else description="选择左侧文件查看内容" :image-size="60" />
             <el-alert v-if="sceneTruncated" type="warning" :closable="false" show-icon
@@ -395,6 +400,7 @@ const sceneVisible = ref(false)
 const sceneLoading = ref(false)
 const sceneFiles = ref([])
 const sceneActive = ref('')
+const EMPTY_SCENE = '（空文件）'   // 空文件的占位文案，占位时不给复制
 const sceneContent = ref('')
 const sceneTruncated = ref(false)
 
@@ -418,8 +424,31 @@ async function openScene() {
 async function loadSceneFile(path) {
   sceneActive.value = path
   const res = await getTaskLogScene(taskId, current.value.id, path)
-  sceneContent.value = res.data?.content || '（空文件）'
+  sceneContent.value = res.data?.content || EMPTY_SCENE
   sceneTruncated.value = !!res.data?.truncated
+}
+
+// 复制当前现场文件内容；截断时如实提示复制的只是截断后的部分
+async function copyScene() {
+  const text = sceneContent.value
+  try {
+    await navigator.clipboard.writeText(text)
+  } catch {
+    // 非 https/localhost 环境 clipboard API 不可用，退回 execCommand
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    const ok = document.execCommand('copy')
+    document.body.removeChild(ta)
+    if (!ok) {
+      ElMessage.error('复制失败，请手动选中内容复制')
+      return
+    }
+  }
+  ElMessage.success(sceneTruncated.value ? '已复制（内容过长已截断）' : `已复制 ${sceneActive.value}`)
 }
 
 async function copyLink() {
@@ -462,5 +491,7 @@ onUnmounted(() => { stopFollow(); stopListTimer() })   // stopFollow 连带停�
 .scene-path { overflow: hidden; text-overflow: ellipsis; }
 .scene-size { margin-left: 8px; flex-shrink: 0; }
 .scene-content { flex: 1; min-width: 0; max-height: 60vh; overflow: auto; }
+.scene-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
+.scene-bar .scene-path { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .scene-content pre { margin: 0; padding: 10px; background: #f5f7fa; border-radius: 4px; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
 </style>
