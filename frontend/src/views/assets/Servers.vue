@@ -17,14 +17,15 @@
           <el-option label="已停止" value="stopped" />
           <el-option label="维护中" value="maintenance" />
         </el-select>
-        <el-select v-model="filter.env" placeholder="环境" clearable style="width:110px" @change="handleSearch">
-          <el-option v-for="o in dicts.environments" :key="o.id" :label="o.name" :value="o.code" />
-        </el-select>
+        <!-- 归属三维度筛选顺序与表格列一致：项目组 → 渠道 → 环境 -->
         <el-select v-model="filter.project_group" placeholder="项目组" clearable style="width:130px" @change="handleSearch">
           <el-option v-for="o in dicts.projectGroups" :key="o.id" :label="o.name" :value="o.code" />
         </el-select>
         <el-select v-model="filter.channel" placeholder="渠道" clearable style="width:120px" @change="handleSearch">
           <el-option v-for="o in dicts.channels" :key="o.id" :label="o.name" :value="o.code" />
+        </el-select>
+        <el-select v-model="filter.env" placeholder="环境" clearable style="width:110px" @change="handleSearch">
+          <el-option v-for="o in dicts.environments" :key="o.id" :label="o.name" :value="o.code" />
         </el-select>
         <el-select v-model="filter.cloud_provider" placeholder="云厂商" clearable style="width:120px" @change="handleSearch">
           <el-option v-for="o in dicts.cloudProviders" :key="o.id" :label="o.name" :value="o.code" />
@@ -57,18 +58,25 @@
       stripe
       @selection-change="(rows) => (selection = rows)"
     >
-      <el-table-column v-if="canWrite" type="selection" width="46" reserve-selection />
-      <el-table-column prop="name" label="名称" min-width="120" />
-      <el-table-column prop="private_ip" label="私网 IP" width="130" />
-      <el-table-column label="公网 IP" width="130">
+      <el-table-column v-if="canWrite" type="selection" width="46" align="center" reserve-selection />
+      <el-table-column prop="name" label="名称" min-width="230" align="center" show-overflow-tooltip />
+      <el-table-column prop="private_ip" label="私网 IP" width="140" align="center" />
+      <el-table-column label="公网 IP" width="140" align="center">
         <template #default="{ row }">{{ row.public_ip || '-' }}</template>
       </el-table-column>
-      <el-table-column label="配置" width="110">
+      <el-table-column label="配置" width="110" align="center">
         <template #default="{ row }">
           {{ row.cpu }}核 / {{ (row.memory / 1024).toFixed(0) }}GB
         </template>
       </el-table-column>
-      <el-table-column label="环境" width="90">
+      <!-- 归属三维度按「项目组 → 渠道 → 环境」的固定口径相邻排列（与制品/变量的维度顺序一致） -->
+      <el-table-column label="项目组" min-width="120" align="center">
+        <template #default="{ row }">{{ row.project_group_name || '-' }}</template>
+      </el-table-column>
+      <el-table-column label="渠道" min-width="100" align="center">
+        <template #default="{ row }">{{ row.channel_name || '-' }}</template>
+      </el-table-column>
+      <el-table-column label="环境" width="100" align="center">
         <template #default="{ row }">
           <el-tag v-if="row.environment_name" size="small" :type="row.environment_is_prod ? 'danger' : 'info'">
             {{ row.environment_name }}
@@ -76,24 +84,18 @@
           <span v-else>-</span>
         </template>
       </el-table-column>
-      <el-table-column label="项目组" min-width="110">
-        <template #default="{ row }">{{ row.project_group_name || '-' }}</template>
-      </el-table-column>
-      <el-table-column label="渠道" min-width="90">
-        <template #default="{ row }">{{ row.channel_name || '-' }}</template>
-      </el-table-column>
-      <el-table-column label="云厂商/地域" min-width="130">
+      <el-table-column label="云厂商/地域" min-width="160" align="center">
         <template #default="{ row }">
           {{ row.cloud_provider_name || '-' }}<template v-if="row.region"> / {{ row.region }}</template>
         </template>
       </el-table-column>
-      <el-table-column label="状态" width="90">
+      <el-table-column label="状态" width="100" align="center">
         <template #default="{ row }">
           <el-tag size="small" :type="statusType(row.status)">{{ statusLabel(row.status) }}</el-tag>
         </template>
       </el-table-column>
       <!-- 展示解析后的实际通道：来源可能是主机指定，也可能是项目组/环境路由规则 -->
-      <el-table-column label="执行通道" width="150">
+      <el-table-column label="执行通道" width="160" align="center">
         <template #default="{ row }">
           <template v-if="row.effective_agent_name">
             <el-tag size="small" type="warning">{{ row.effective_agent_name }}</el-tag>
@@ -105,7 +107,7 @@
           </template>
         </template>
       </el-table-column>
-      <el-table-column v-if="canWrite || canTopo" label="操作" width="210" fixed="right">
+      <el-table-column v-if="canWrite || canTopo" label="操作" width="260" align="center" fixed="right">
         <template #default="{ row }">
           <!-- 拓扑：反查这台主机被画进了哪些接入链路，下线前先看上游还有没有流量 -->
           <el-button v-if="canTopo" size="small" @click="openImpact(row)">拓扑</el-button>
@@ -176,16 +178,16 @@
           </el-form-item>
         </el-col>
         <el-col :span="12">
-          <el-form-item label="环境" prop="environment">
-            <el-select v-model="form.environment" style="width:100%" placeholder="必选">
-              <el-option v-for="o in dicts.environments" :key="o.id" :label="o.name" :value="o.id" />
+          <el-form-item label="渠道" prop="channel">
+            <el-select v-model="form.channel" style="width:100%" placeholder="必选">
+              <el-option v-for="o in dicts.channels" :key="o.id" :label="o.name" :value="o.id" />
             </el-select>
           </el-form-item>
         </el-col>
         <el-col :span="12">
-          <el-form-item label="渠道" prop="channel">
-            <el-select v-model="form.channel" style="width:100%" placeholder="必选">
-              <el-option v-for="o in dicts.channels" :key="o.id" :label="o.name" :value="o.id" />
+          <el-form-item label="环境" prop="environment">
+            <el-select v-model="form.environment" style="width:100%" placeholder="必选">
+              <el-option v-for="o in dicts.environments" :key="o.id" :label="o.name" :value="o.id" />
             </el-select>
           </el-form-item>
         </el-col>
@@ -731,4 +733,9 @@ onMounted(() => {
 .channel-source { color: #909399; font-size: 12px; margin-left: 4px; }
 .batch-line > :last-child { flex: 1; }
 .import-toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+/* 表格：列内容居中 + 单元格左右留白，长主机名不至于贴着相邻列 */
+:deep(.el-table .el-table__cell) { padding: 10px 6px; }
+:deep(.el-table .cell) { padding: 0 10px; }
+/* 操作列三个按钮排一行，不换行挤高行距 */
+:deep(.el-table .el-button + .el-button) { margin-left: 8px; }
 </style>
