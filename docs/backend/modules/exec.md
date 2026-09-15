@@ -60,6 +60,29 @@ skipped）；模块内主机按任务级 exec_mode 并发/串行（串行 = `--f
 `{{ var.子键 }}` 引用），模块自身的额外变量作为后一个 `-e` 传入
 （ansible 同名覆盖）。
 
+**平台注入变量 `service_type`**：取**模块编辑时选择的服务类型 code**，
+在变量管理与制品变量之后合并进同一份 `vars.yml`（`runner.step_vars()`），
+命令/剧本/方法三类模块与 agent 通道一并生效。用途是让剧本直接
+`{{ service_type }}` 拿到「这次要动哪个服务」，不必再去解析 inventory 里的
+`service_types`：
+
+| 变量 | 载体 | 语义 |
+|---|---|---|
+| `service_type` | extra-vars（`vars.yml`） | **本模块**这次要操作的服务类型，一个 code |
+| `service_types` | inventory 主机变量 | **该主机**已规划/已部署的全部服务类型，逗号分隔 |
+
+- 任务流内每个模块各有各的值：inventory 与 `vars.yml` 本就是**每模块一份**
+  临时工作目录（`tempfile.mkdtemp`，执行完即删），不存在多模块互相覆盖；
+- 与变量管理里的同名 key 冲突时**以模块实际选择为准**——同名属配置错误，
+  静默沿用旧值比覆盖难查得多；
+- `service_type` 因此是平台保留变量名，变量管理里不要再定义；
+- 暂停模块与 0015 之前未选服务类型的存量模块不注入该 key，剧本侧自行
+  `{{ service_type | default('') }}`；
+- 模块日志首行打印 `▸ 注入变量 service_type=<code>`（同时进实时视图与留存
+  日志）：现场文件执行完即删，日志得能自证这次按哪个服务跑的。
+- 对外 `resolved` 接口不含该变量（它是模块级上下文，非维度变量），外部系统
+  自行拼 `-e service_type=...`。
+
 走文件而非命令行 JSON 的原因：变量值不进 argv（同机 `ps` 可见）、不进
 `common.ansible` 的命令行日志，且事后可原样复制复现。**仍是 extra vars，
 ansible 优先级最高**——剧本内 `vars:` 不会反过来覆盖平台变量，与改造前语义
@@ -324,6 +347,8 @@ TASK_LOG_DIR/<task_id>/<log_id>.d/step<order>[-retry<n>]/
   planned/deployed 记录，offline 不算）：
   - 主机变量 `service_types="<code1>,<code2>"`，剧本/命令中可引用
   - 按服务类型 code 生成分组 `[<code>]`，`pattern` 字段可直接圈选（如 `game-server`）
+  - 注意与 extra-vars 里的 `service_type`（单数）区分：那个是**本模块**选定的
+    服务类型，见上文「平台注入变量 `service_type`」
 
 示例：
 

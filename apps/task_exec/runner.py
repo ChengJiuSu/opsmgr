@@ -330,15 +330,31 @@ def _effective_dims(step):
     return task.project_group_id, task.channel_id, task.environment_id
 
 
+def step_service_type_code(step):
+    """模块选定的服务类型 code，未选（暂停模块 / 存量数据）返回空串。"""
+    return step.service_type.code if getattr(step, 'service_type_id', None) else ''
+
+
 def step_vars(step):
-    """模块生效变量：变量管理（按模块有效维度精确匹配）+ CD 制品变量（按维度 + 服务类型）。
+    """模块生效变量：变量管理（按模块有效维度精确匹配）+ CD 制品变量（按维度 + 服务类型）
+    + 平台注入的模块上下文变量 service_type。
 
     制品变量后合并，同名覆盖变量管理（与原先两段 -e 的先后语义一致）；
     模块自身的额外变量不在此列，由调用方作为最后一个 -e 传入。
+
+    service_type = 本模块选定的服务类型 code（编辑任务时选的那个），最后注入：
+    与「变量管理」里同名 key 冲突时以模块实际选择为准——同名是配置错误，
+    静默沿用旧值比覆盖难查得多。注意它与 inventory 里的 service_types 主机
+    变量语义不同：后者是这台主机**已规划的全部服务**，前者是本模块**这次要
+    动的那个服务**，剧本可直接 `{{ service_type }}` 用，不必再解析逗号串。
+    未选服务类型时不注入该 key，剧本侧自行 `| default(...)`。
     """
     pg, ch, env = _effective_dims(step)
     variables = collect_dim_variables(pg, ch, env)
     variables.update(_artifact_vars(step))
+    code = step_service_type_code(step)
+    if code:
+        variables['service_type'] = code
     return variables
 
 
@@ -848,6 +864,14 @@ def _exec_stage(pairs, task, total, sink, parallel, attempt=1):
     return _exec_parallel_stage(pairs, task, total, sink, attempt)
 
 
+def _service_type_notice(step):
+    """模块日志首行：说明本次注入的 service_type 变量（未选服务类型时给出提示）。"""
+    code = step_service_type_code(step)
+    if code:
+        return f'▸ 注入变量 service_type={code}\n'
+    return '▸ 本模块未选择服务类型，不注入 service_type 变量\n'
+
+
 def _exec_step(step, task, idx, total, sink, parallel, attempt=1):
     """执行单个模块，返回 (step, header, rc, out, duration, server_count)。
 
@@ -889,8 +913,15 @@ def _exec_step(step, task, idx, total, sink, parallel, attempt=1):
         if error:
             rc, out = 1, error
         else:
+            # 模块日志首行给出本次注入的服务类型变量：inventory/vars 是每模块
+            # 一份临时文件、执行完即删，事后只能翻执行现场归档，这行让「这次
+            # 到底按哪个服务跑的」在日志里直接可见。
+            # 两处都要写：feed 进实时块（执行中可见），并前置到 out（实时块在
+            # end 时丢弃，留存日志走的是 handler 返回的完整输出）
+            notice = _service_type_notice(step)
             sink.begin(live_key, header, order=idx)
             try:
+                sink.feed(live_key, notice)
                 rc, out = _STEP_HANDLERS[step.task_type](
                     step, task, servers, sink.writer(live_key),
                     archive_dir=step_archive_dir(sink, step, attempt))
@@ -898,6 +929,7 @@ def _exec_step(step, task, idx, total, sink, parallel, attempt=1):
                 rc, out = 1, str(exc)
             finally:
                 sink.end(live_key)
+            out = notice + out
         server_count = len(servers)
     duration = round(time.monotonic() - started, 2)
     return step, header, rc, mask_secrets(out, secrets), duration, server_count

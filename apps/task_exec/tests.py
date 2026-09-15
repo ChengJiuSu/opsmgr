@@ -1161,7 +1161,8 @@ class ExecutionAPITests(TestCase):
         idxs = [i for i, a in enumerate(cmd) if a == '--extra-vars']
         self.assertEqual(len(idxs), 2)
         self.assertTrue(cmd[idxs[0] + 1].startswith('@'))
-        self.assertEqual(variables, {'app_conf': {'mode': 'prod', 'ports': [80, 443]}})
+        # service_type 为平台注入（见 ServiceTypeVarTests），此处只校验变量管理部分
+        self.assertEqual(variables['app_conf'], {'mode': 'prod', 'ports': [80, 443]})
         self.assertNotIn('other_dim_var', variables)
         self.assertNotIn('disabled_var', variables)
         self.assertEqual(cmd[idxs[1] + 1], 'override=1')  # 模块变量在后，ansible 同名覆盖
@@ -1193,11 +1194,6 @@ class ArtifactInjectTests(TestCase):
         fields.update(overrides)
         return Artifact.objects.create(**fields)
 
-    def _run_step_cmd(self, c, task_id):
-        """mock 子进程执行一次任务，返回捕获到的 ansible 命令行。"""
-        cmd, _ = _run_and_capture(c, task_id)
-        return cmd
-
     def test_latest_artifact_injected_as_extra_vars(self):
         self._make_artifact('1.0.0')
         latest = self._make_artifact('1.1.0', md5='b' * 32)
@@ -1213,9 +1209,11 @@ class ArtifactInjectTests(TestCase):
                       variables['package_url'])
 
     def test_no_artifact_no_injection(self):
+        """无制品时不注入 package_*（变量文件仍在：平台注入的 service_type 恒有）。"""
         c = self._client()
-        cmd = self._run_step_cmd(c, self._create_task(c))
-        self.assertNotIn('--extra-vars', cmd)
+        _, variables = _run_and_capture(c, self._create_task(c))
+        self.assertNotIn('package_version', variables)
+        self.assertNotIn('package_url', variables)
 
     def test_locked_version_injected(self):
         target = self._make_artifact('1.0.0')
@@ -1262,8 +1260,9 @@ class ArtifactInjectTests(TestCase):
         self._make_artifact('0.9.0', service_type=None)  # 存量制品（无服务类型）
         c = self._client()
         task_id = self._create_task(c, steps=[self._step(service_type=logic.id)])
-        cmd, _ = _run_and_capture(c, task_id)
-        self.assertNotIn('--extra-vars', cmd)
+        _, variables = _run_and_capture(c, task_id)
+        self.assertNotIn('package_version', variables)
+        self.assertNotIn('package_url', variables)
 
     def test_artifact_vars_follow_custom_scope_dims(self):
         """自定义范围模块按模块自身维度取制品，而非任务全局维度。"""
@@ -1285,6 +1284,84 @@ class ArtifactInjectTests(TestCase):
         _, variables = _run_and_capture(c, task_id)
         self.assertEqual(variables['package_version'], '2.0.0')
         self.assertIn(f'/api/artifacts/{scoped.id}/download/', variables['package_url'])
+
+
+@override_settings(TASK_EXEC_BACKEND='sync', TASK_FAILURE_WAIT_TIMEOUT=0)
+class ServiceTypeVarTests(TestCase):
+    """平台注入的 service_type 变量：取模块编辑时选的服务类型 code，逐模块变化。
+
+    与 inventory 里的 service_types 主机变量（该主机已规划的全部服务）区分开：
+    剧本直接用 {{ service_type }} 即可，不必再解析逗号串。
+    """
+
+    setUp = ExecutionAPITests.setUp
+    _client = ExecutionAPITests._client
+    _step = ExecutionAPITests._step
+    _create_task = ExecutionAPITests._create_task
+
+    def _run_all_steps(self, c, task_id):
+        """执行任务，返回每个模块实际传入的变量字典（按执行顺序）。"""
+        captured = []
+
+        def fake_run(cmd, *args, **kwargs):
+            for arg in cmd:
+                if arg.startswith('@'):
+                    with open(arg[1:], encoding='utf-8') as f:
+                        captured.append(yaml.safe_load(f.read()))
+            return 0, 'ok'
+
+        with mock.patch('apps.task_exec.runner.run_stream', side_effect=fake_run):
+            c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
+        return captured
+
+    def test_step_service_type_injected(self):
+        c = self._client()
+        _, variables = _run_and_capture(c, self._create_task(c))
+        self.assertEqual(variables['service_type'], self.base_service.code)
+
+    def test_each_step_gets_its_own_service_type(self):
+        """任务流内多模块各选不同服务类型时，逐模块传各自的值（inventory/变量每模块一份）。"""
+        from apps.asset_mgr.models import ServerService, ServiceType
+
+        logic = ServiceType.objects.create(name='逻辑服', code='ut-logic-var')
+        ServerService.objects.create(server=self.server, service_type=logic, status='planned')
+        c = self._client()
+        task_id = self._create_task(c, steps=[
+            self._step(name='模块A'),
+            self._step(order=2, name='模块B', service_type=logic.id),
+        ])
+        got = [v['service_type'] for v in self._run_all_steps(c, task_id)]
+        self.assertEqual(got, [self.base_service.code, logic.code])
+
+    def test_platform_value_overrides_same_named_managed_variable(self):
+        """「变量管理」里同名 key 是配置错误，以模块实际选择为准（静默沿用旧值更难查）。"""
+        from .models import ExecVariable
+
+        ExecVariable.objects.create(
+            key='service_type', value='stale', enabled=True,
+            project_group=self.pg, channel=self.ch, environment=self.env,
+        )
+        c = self._client()
+        _, variables = _run_and_capture(c, self._create_task(c))
+        self.assertEqual(variables['service_type'], self.base_service.code)
+
+    def test_step_without_service_type_not_injected(self):
+        """存量模块（0015 之前，无服务类型）不注入该 key，剧本侧自行 default。"""
+        from . import runner
+
+        task = ExecutionTask.objects.create(
+            name='legacy', project_group=self.pg, channel=self.ch, environment=self.env)
+        step = TaskStep.objects.create(
+            task=task, order=1, name='存量模块', task_type='command', command='echo hi')
+        self.assertNotIn('service_type', runner.step_vars(step))
+
+    def test_notice_line_persisted_in_log(self):
+        """模块日志首行写明注入值：现场文件执行完即删，日志得能自证按哪个服务跑的。"""
+        c = self._client()
+        task_id = self._create_task(c)
+        _run_and_capture(c, task_id)
+        log = TaskExecutionLog.objects.get(task_id=task_id)
+        self.assertIn(f'▸ 注入变量 service_type={self.base_service.code}', log.output)
 
 
 class PauseStepTests(TestCase):
@@ -2045,7 +2122,9 @@ class ExecSceneArchiveTests(TestCase):
                 _run_and_capture(c, task_id)
                 scene = self._scene_dir(log_dir, task_id)
                 with open(os.path.join(scene, 'vars.yml'), encoding='utf-8') as f:
-                    self.assertEqual(yaml.safe_load(f.read()), {'app_conf': {'mode': 'prod'}})
+                    self.assertEqual(
+                        yaml.safe_load(f.read()),
+                        {'app_conf': {'mode': 'prod'}, 'service_type': self.base_service.code})
                 with open(os.path.join(scene, 'inventory.ini'), encoding='utf-8') as f:
                     inventory = f.read()
                 with open(os.path.join(scene, 'command.txt'), encoding='utf-8') as f:
@@ -2086,7 +2165,8 @@ class ExecSceneArchiveTests(TestCase):
 
                 r = c.get(base, {'file': os.path.join('step1', 'direct', 'vars.yml')})
                 self.assertEqual(
-                    yaml.safe_load(r.json()['data']['content']), {'app_conf': {'mode': 'prod'}})
+                    yaml.safe_load(r.json()['data']['content']),
+                    {'app_conf': {'mode': 'prod'}, 'service_type': self.base_service.code})
                 # 路径穿越拒绝
                 r = c.get(base, {'file': '../../../../etc/passwd'})
                 self.assertEqual(r.status_code, 400)

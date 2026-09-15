@@ -26,6 +26,9 @@
       变量按<b>项目组/渠道/环境</b>生效：任务执行时仅加载与模块有效维度精确匹配的启用变量，
       YAML 解析后以 <code>--extra-vars</code> 注入（命令内可用 <code v-pre>{{ 变量名 }}</code> 引用），
       模块自身的额外变量覆盖同名项。每次保存自动留存版本（保留最近 10 版，可回滚）。
+      <br>
+      <code>service_type</code> 为平台保留变量名：执行时自动注入为该模块所选的服务类型 code，
+      此处定义同名变量不会生效。
     </el-alert>
 
     <el-table v-loading="loading" :data="tableData" stripe>
