@@ -19,3 +19,33 @@
       tags: [echo]
       ansible.builtin.debug:
         msg: "extra-vars 传入 message={{ message | default('（未传 message）') }}"
+
+    # ── 服务类型：单数 service_type 与复数 service_types 是两回事 ──
+    # service_type （extra-vars）：本次任务模块选定的服务类型，一个 code，
+    #                             由平台按「编辑任务时选的服务类型」注入；
+    # service_types（主机变量）  ：该主机已规划/已部署的全部服务类型，逗号分隔，
+    #                             来自平台动态 inventory（本目录的静态 hosts.ini 没有）。
+    # 要「这次动哪个服务」用单数，不必再去切分复数那个串。
+    - name: 打印平台注入的服务类型变量
+      tags: [service]
+      ansible.builtin.debug:
+        msg: >-
+          service_type={{ service_type | default('（未注入：暂停模块或模块未选服务类型）') }} /
+          service_types={{ service_types | default('（非平台动态 inventory）') }}
+
+    # 按服务类型分支的写法：同一个剧本被多个模块复用时，各模块只做自己那份
+    - name: 按服务类型分支（示例：仅 redis 模块执行）
+      tags: [service]
+      when: service_type | default('') == 'redis'
+      ansible.builtin.debug:
+        msg: "这一步只在 service_type=redis 的模块里执行"
+
+    # 部署类剧本建议加这道前置校验：宁可明确报错，也别拿空值去拼服务名/路径
+    - name: 校验 service_type 已注入
+      tags: [service]
+      ansible.builtin.assert:
+        that:
+          - service_type is defined
+          - service_type | length > 0
+        fail_msg: 未注入 service_type，请在任务模块里选择服务类型后再执行
+        success_msg: "service_type={{ service_type | default('') }}"
