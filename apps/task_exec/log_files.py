@@ -9,6 +9,10 @@
         ├── vars.yml        变量文件
         └── command.txt     实际执行命令（可复制重跑）
 
+每层目录名都是「机器口径」的 id 与序号，业务名称（任务名、执行状态、**模块
+名称**、执行通道）由 _annotate 补进条目的 label 字段，前端列在「说明」列 ——
+浏览时一眼能对上，落盘结构不受业务命名影响。
+
 与 ExecutionTaskViewSet.log_scene 的区别：那个接口按「某任务的某次执行」定向取
 归档，本模块是不依赖数据库记录的目录浏览器——记录已被清理、或任务已删除但文件
 仍在时，仍能翻到文件。两者共用同一片目录，权限也一致（`exec` read）。
@@ -22,6 +26,7 @@
 软链接指向外部同样拒绝），只读，不提供任何写/删接口。
 """
 import os
+import re
 from datetime import datetime, timezone as dt_timezone
 from pathlib import Path
 
@@ -42,6 +47,12 @@ MAX_ENTRIES = 2000
 CONTENT_LIMIT = 512 * 1024
 # 归档目录后缀（<log_id>.d），列表里标注为「执行现场」
 SCENE_DIR_SUFFIX = '.d'
+# 模块归档目录名：step<序号>[-retry<轮次>]（见 runner.step_archive_dir）
+STEP_DIR_RE = re.compile(r'^step(\d+)(?:-retry(\d+))?$')
+# steps_result.status code → 中文（模块类型文案直接取 TaskStep.TYPE_CHOICES，不另抄一份）
+STEP_STATUS_LABELS = {
+    'success': '成功', 'failed': '失败', 'skipped': '被中止跳过', 'pending': '未执行',
+}
 
 
 def log_root():
@@ -102,7 +113,16 @@ def list_dir(path, rel):
 
 
 def _annotate(rel, entries):
-    """给条目补业务标注：根层目录=任务名，任务目录内=该次执行的状态与时间。
+    """给条目补业务标注，逐层递进：
+
+        根层                      目录 = 任务名
+        <task_id>/                目录/文件 = 该次执行的状态与时间
+        <task_id>/<log_id>.d/     step<n> = 该模块名称与执行结果
+        <task_id>/<log_id>.d/step<n>/  direct / agent-<id> = 执行通道
+
+    目录名仍是 step<n>（序号是排序与定位的锚点，模块名可重名、可改名、可含
+    路径分隔符，不适合直接做目录名），模块名走「说明」列——查的时候一眼能对上，
+    落盘结构不受业务命名影响。
 
     标注纯属可读性增强，数据库记录已删（过保留期清理）时留空，不影响浏览。
     """
@@ -111,6 +131,12 @@ def _annotate(rel, entries):
         _annotate_tasks(entries)
     elif len(parts) == 1 and parts[0].isdigit():
         _annotate_logs(int(parts[0]), entries)
+    elif len(parts) == 2 and parts[1].endswith(SCENE_DIR_SUFFIX):
+        stem = parts[1][:-len(SCENE_DIR_SUFFIX)]
+        if stem.isdigit():
+            _annotate_steps(int(stem), entries)
+    elif len(parts) == 3 and parts[1].endswith(SCENE_DIR_SUFFIX):
+        _annotate_channels(entries)
     return entries
 
 
@@ -143,6 +169,67 @@ def _annotate_logs(task_id, entries):
         started = timezone.localtime(log.started_at).strftime('%Y-%m-%d %H:%M:%S') \
             if log.started_at else '-'
         entry['label'] = f'{kind} · {log.get_status_display()} · {started}'
+
+
+def _step_order(name):
+    """归档目录名 step<n> / step<n>-retry<m> → (序号, 重试轮次)，不匹配返回 None。"""
+    match = STEP_DIR_RE.match(name)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2) or 0)
+
+
+def _annotate_steps(log_id, entries):
+    """标注某次执行的模块归档目录：模块名 + 类型 + 结果（取 steps_result 快照）。
+
+    用执行时的 steps_result 而不是现在的 TaskStep：归档是历史现场，模块
+    可能早被改名甚至删掉，回头看应当是当时那个名字。
+    """
+    from .models import TaskExecutionLog, TaskStep
+
+    type_labels = dict(TaskStep.TYPE_CHOICES)
+    log = TaskExecutionLog.objects.filter(pk=log_id).only('steps_result').first()
+    steps = {}
+    for item in (log.steps_result if log else None) or []:
+        if isinstance(item, dict) and item.get('order') is not None:
+            steps[item['order']] = item
+    for entry in entries:
+        parsed = _step_order(entry['name'])
+        if parsed is None:
+            continue
+        order, retry = parsed
+        step = steps.get(order)
+        retry_mark = f' · 重试#{retry}' if retry else ''
+        if step is None:
+            entry['label'] = f'模块 {order}（记录已删除）{retry_mark}'
+            continue
+        kind = type_labels.get(step.get('task_type'), step.get('task_type') or '')
+        status = STEP_STATUS_LABELS.get(step.get('status'), step.get('status') or '')
+        if step.get('skipped_over'):
+            # skipped_over 是 status 之外的独立标记（失败后人工选择跳过，任务仍记失败）
+            status = f'{status} · 人工跳过继续'
+        parts = [f"模块 {order}：{step.get('name') or '未命名'}"]
+        if kind:
+            parts.append(kind)
+        if status:
+            parts.append(status)
+        entry['label'] = ' · '.join(parts) + retry_mark
+
+
+def _annotate_channels(entries):
+    """标注模块归档下的执行通道目录：direct = 直连，agent-<id> = 经该 Agent。"""
+    from apps.agent_mgr.models import AgentNode
+
+    agent_ids = [int(e['name'][6:]) for e in entries
+                 if e['name'].startswith('agent-') and e['name'][6:].isdigit()]
+    names = dict(AgentNode.objects.filter(id__in=agent_ids).values_list('id', 'name')) \
+        if agent_ids else {}
+    for entry in entries:
+        if entry['name'] == 'direct':
+            entry['label'] = '执行通道 · 直连'
+        elif entry['name'].startswith('agent-') and entry['name'][6:].isdigit():
+            agent_id = int(entry['name'][6:])
+            entry['label'] = f"执行通道 · 经 Agent {names.get(agent_id, f'（id={agent_id} 已删除）')}"
 
 
 class TaskLogFileListView(APIView):

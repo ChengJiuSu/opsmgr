@@ -2669,6 +2669,46 @@ class LogFileBrowserTests(TestCase):
         self.assertEqual(names, {'inventory.ini', 'vars.yml', 'command.txt'})
         self.assertTrue(all(e['size'] > 0 for e in data['entries']))
 
+    def test_scene_dir_annotates_step_module_name(self):
+        """执行现场目录内：step<n> 目录标出当时的模块名称/类型/结果（目录名不变）。"""
+        os.makedirs(os.path.join(self.dir, str(self.task.id),
+                                 f'{self.log.id}.d', 'step2-retry1'))
+        os.makedirs(os.path.join(self.dir, str(self.task.id), f'{self.log.id}.d', 'step9'))
+        self.log.steps_result = [
+            {'order': 1, 'name': '停服', 'task_type': 'command', 'status': 'success'},
+            {'order': 2, 'name': '更新网关', 'task_type': 'playbook',
+             'status': 'failed', 'skipped_over': True},
+        ]
+        self.log.save(update_fields=['steps_result'])
+
+        rel = f'{self.task.id}/{self.log.id}.d'
+        with override_settings(TASK_LOG_DIR=self.dir):
+            r = self._client().get('/api/exec/log-files/', {'path': rel})
+        labels = {e['name']: e['label'] for e in r.json()['data']['entries']}
+        self.assertEqual(labels['step1'], '模块 1：停服 · 命令 · 成功')
+        # 重试轮次与「失败后人工跳过」都要体现
+        self.assertEqual(labels['step2-retry1'],
+                         '模块 2：更新网关 · Playbook · 失败 · 人工跳过继续 · 重试#1')
+        # 目录还在但 steps_result 里没有该序号（记录被改写/清理）
+        self.assertEqual(labels['step9'], '模块 9（记录已删除）')
+
+    def test_step_dir_annotates_channel(self):
+        """模块目录内：direct / agent-<id> 标出执行通道。"""
+        from apps.agent_mgr.models import AgentNode
+
+        agent = AgentNode.objects.create(name='sh-nat-01', token_hash='x' * 64)
+        step_dir = os.path.join(self.dir, str(self.task.id), f'{self.log.id}.d', 'step1')
+        os.makedirs(os.path.join(step_dir, f'agent-{agent.pk}'))
+        os.makedirs(os.path.join(step_dir, 'agent-99999'))
+
+        rel = f'{self.task.id}/{self.log.id}.d/step1'
+        with override_settings(TASK_LOG_DIR=self.dir):
+            r = self._client().get('/api/exec/log-files/', {'path': rel})
+        labels = {e['name']: e['label'] for e in r.json()['data']['entries']}
+        self.assertEqual(labels['direct'], '执行通道 · 直连')
+        self.assertEqual(labels[f'agent-{agent.pk}'], '执行通道 · 经 Agent sh-nat-01')
+        self.assertIn('已删除', labels['agent-99999'])
+
     def test_read_file_content(self):
         rel = f'{self.task.id}/{self.log.id}.d/step1/direct/vars.yml'
         with override_settings(TASK_LOG_DIR=self.dir):

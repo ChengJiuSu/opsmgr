@@ -22,7 +22,8 @@
       任务执行的落盘日志与执行现场归档（主机文件 <code>inventory.ini</code>、变量文件
       <code>vars.yml</code>、执行命令 <code>command.txt</code>）按
       <code>&lt;任务 id&gt;/&lt;执行记录 id&gt;.log</code> 与
-      <code>&lt;执行记录 id&gt;.d/step&lt;序号&gt;/&lt;通道&gt;/</code> 存放。
+      <code>&lt;执行记录 id&gt;.d/step&lt;序号&gt;/&lt;通道&gt;/</code> 存放，
+      对应的模块名称与执行通道见「说明」列。
       文件含变量值，仅管理员可见；过保留期由清理任务删除。
       <span class="muted">根目录：{{ root || '—' }}</span>
     </el-alert>
