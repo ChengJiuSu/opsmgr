@@ -80,8 +80,8 @@ skipped）；模块内主机按任务级 exec_mode 并发/串行（串行 = `--f
   `{{ service_type | default('') }}`；
 - 模块日志首行打印 `▸ 注入变量 service_type=<code>`（同时进实时视图与留存
   日志）：现场文件执行完即删，日志得能自证这次按哪个服务跑的。
-- 对外 `resolved` 接口不含该变量（它是模块级上下文，非维度变量），外部系统
-  自行拼 `-e service_type=...`。
+- 对外 `resolved` 接口传 `service_type` 参数时一并下发该变量（同一口径：压过
+  同名变量记录），不传则不注入，存量调用方口径不变。
 
 走文件而非命令行 JSON 的原因：变量值不进 argv（同机 `ps` 可见）、不进
 `common.ansible` 的命令行日志，且事后可原样复制复现。**仍是 extra vars，
@@ -104,7 +104,9 @@ ansible 优先级最高**——剧本内 `vars:` 不会反过来覆盖平台变�
 否则按 code；`include_artifact=true` 追加该维度制品变量 `package_url` /
 `package_version` / `package_md5`（`artifact_version` 可锁定版本，不存在则
 400；`service_type` 可选，带上则按服务类型**严格**取包——同维度多服务时不带它
-就是「取最新一条」，可能是别的服务刚上报的包）；`output=yaml` 返回**不带 `{code,msg,data}` 包装**的纯 YAML，可直接：
+就是「取最新一条」，可能是别的服务刚上报的包）；`service_type` 参数与
+`include_artifact` 相互独立，只要带上就额外下发 `service_type` 变量（值为 code，
+与执行器注入的同名变量同义，见上文）；`output=yaml` 返回**不带 `{code,msg,data}` 包装**的纯 YAML，可直接：
 
 ```bash
 curl -sH "Authorization: Bearer $TOKEN" \

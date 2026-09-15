@@ -185,6 +185,9 @@ class ExecVariableViewSet(viewsets.ModelViewSet):
         含糊；output=yaml 时返回不带 {code,msg,data} 包装的纯 YAML，可直接
         `curl -o vars.yml` 后 `ansible-playbook -e @vars.yml`（用 output 而非
         format，后者被 DRF 内容协商占用）。
+
+        带 service_type 参数时额外下发 `service_type` 变量（值为 code），与
+        执行器注入的同名变量同义，外部系统拼装的调用与平台内部执行口径一致。
         """
         from .runner import ArtifactLookupError, collect_artifact_vars, collect_dim_variables
 
@@ -226,6 +229,12 @@ class ExecVariableViewSet(viewsets.ModelViewSet):
                 # 该维度下**全部**密码类变量，暴露面只会更大。SudoRequired 权限类
                 # 放行所有 GET，管不到这个查询参数，所以在这里显式判一次
                 raise sudo.SudoRequiredError()
+        # service_type 全程可选，两处用途：取制品时严格收窄，以及作为 service_type
+        # 变量下发（与执行器 runner.step_vars 同名同义——外部系统自行拼 ansible
+        # 调用时，剧本里的 {{ service_type }} 不该因为换个入口就取不到值）
+        service_type, err = self._resolve_service_type(request.query_params)
+        if err:
+            return fail(err)
         variables = collect_dim_variables(dims['project_group'].id, dims['channel'].id,
                                           dims['environment'].id,
                                           include_secrets=include_secrets)
@@ -234,9 +243,6 @@ class ExecVariableViewSet(viewsets.ModelViewSet):
             # 制品按维度 + 服务类型取：同一三维度下多个服务各有流水线，不带
             # service_type 就是「取最新一条」，可能是别的服务刚上报的包。
             # 这里保持可选（存量调用方不带就是老口径），带了则严格收窄
-            service_type, err = self._resolve_service_type(request.query_params)
-            if err:
-                return fail(err)
             try:
                 variables.update(collect_artifact_vars(
                     dims['project_group'].id, dims['channel'].id, dims['environment'].id,
@@ -245,6 +251,11 @@ class ExecVariableViewSet(viewsets.ModelViewSet):
                 ))
             except ArtifactLookupError as exc:
                 return fail(str(exc))
+        if service_type is not None:
+            # 与 runner 同一口径：平台注入值压过同名的「变量管理」记录，
+            # 同名属配置错误，静默沿用旧值比覆盖难查得多。
+            # 不带 service_type 参数时不注入该 key，保持存量调用方的口径不变
+            variables['service_type'] = service_type.code
         if request.query_params.get('output') == 'yaml':
             text = yaml.safe_dump(variables, allow_unicode=True, default_flow_style=False)
             return HttpResponse(text, content_type='application/x-yaml; charset=utf-8')

@@ -1114,6 +1114,35 @@ class ExecutionAPITests(TestCase):
         self.assertEqual(r.status_code, 400)
         self.assertIn('服务类型不存在', r.json()['msg'])
 
+    def test_variables_resolved_service_type_var(self):
+        """resolved 接口：带 service_type 时下发同名变量（与执行器注入口径一致）。"""
+        from apps.asset_mgr.models import ServiceType
+
+        from .models import ExecVariable
+
+        svc = ServiceType.objects.create(name='逻辑服', code='vr-logic')
+        ExecVariable.objects.create(
+            key='service_type', value='stale',
+            project_group=self.pg, channel=self.ch, environment=self.env,
+        )
+        c = self._client()
+        base = {'project_group': self.pg.code, 'channel': self.ch.code, 'env': self.env.code}
+
+        # 不带参数：保持存量口径，不注入（此处回的是变量管理里那条同名记录）
+        self.assertEqual(c.get('/api/exec/variables/resolved/', base)
+                         .json()['data']['vars']['service_type'], 'stale')
+
+        # 带参数：压过同名变量记录，且不依赖 include_artifact
+        r = c.get('/api/exec/variables/resolved/', dict(base, service_type=svc.code))
+        self.assertEqual(r.json()['data']['vars']['service_type'], svc.code)
+        # 按 id 传同样生效
+        r = c.get('/api/exec/variables/resolved/', dict(base, service_type=str(svc.id)))
+        self.assertEqual(r.json()['data']['vars']['service_type'], svc.code)
+        # output=yaml 通道一并带上
+        r = c.get('/api/exec/variables/resolved/',
+                  dict(base, service_type=svc.code, output='yaml'))
+        self.assertEqual(yaml.safe_load(r.content.decode())['service_type'], svc.code)
+
     def test_method_step_params_json_roundtrip(self):
         """方法模块参数：JSON 对象保存回显；非对象类型 400。"""
         method = Method.objects.create(
