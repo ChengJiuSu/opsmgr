@@ -73,6 +73,9 @@
         <el-button size="small" :icon="Download" @click="download({ path: viewer.path, name: viewer.name })">
           下载原文件
         </el-button>
+        <el-button size="small" :icon="CopyDocument" :disabled="!viewer.content" @click="copyContent">
+          复制
+        </el-button>
         <span v-if="!viewer.eof" class="muted">已读到 {{ formatSize(viewer.read) }}，未到末尾</span>
       </div>
       <pre v-loading="viewer.loading" class="viewer-body" v-html="viewerHtml" />
@@ -88,10 +91,10 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted } from 'vue'
-import { Back, Document, Download, Folder, Refresh } from '@element-plus/icons-vue'
+import { Back, CopyDocument, Document, Download, Folder, Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { getLogFiles, getLogFileContent, downloadLogFile } from '../../api/tasks'
-import { ansiToHtml } from '../../utils/ansi'
+import { ansiToHtml, stripAnsi } from '../../utils/ansi'
 
 const loading = ref(false)
 const entries = ref([])
@@ -167,6 +170,29 @@ async function load(params) {
   } finally {
     viewer.loading = false
   }
+}
+
+// 复制当前已加载的内容；日志带 ANSI 转义，复制前先剥离
+async function copyContent() {
+  const text = stripAnsi(viewer.content)
+  try {
+    await navigator.clipboard.writeText(text)
+  } catch {
+    // 非 https/localhost 环境 clipboard API 不可用，退回 execCommand
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    const ok = document.execCommand('copy')
+    document.body.removeChild(ta)
+    if (!ok) {
+      ElMessage.error('复制失败，请手动选中内容复制')
+      return
+    }
+  }
+  ElMessage.success(viewer.eof ? '已复制文件内容' : '已复制当前已加载内容（文件未读完）')
 }
 
 async function download(row) {
