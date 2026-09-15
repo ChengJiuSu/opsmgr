@@ -169,22 +169,22 @@
           </el-form-item>
         </el-col>
         <el-col :span="12">
-          <el-form-item label="项目组">
-            <el-select v-model="form.project_group" clearable style="width:100%">
+          <el-form-item label="项目组" prop="project_group">
+            <el-select v-model="form.project_group" style="width:100%" placeholder="必选">
               <el-option v-for="o in dicts.projectGroups" :key="o.id" :label="o.name" :value="o.id" />
             </el-select>
           </el-form-item>
         </el-col>
         <el-col :span="12">
-          <el-form-item label="环境">
-            <el-select v-model="form.environment" clearable style="width:100%">
+          <el-form-item label="环境" prop="environment">
+            <el-select v-model="form.environment" style="width:100%" placeholder="必选">
               <el-option v-for="o in dicts.environments" :key="o.id" :label="o.name" :value="o.id" />
             </el-select>
           </el-form-item>
         </el-col>
         <el-col :span="12">
-          <el-form-item label="渠道">
-            <el-select v-model="form.channel" clearable style="width:100%">
+          <el-form-item label="渠道" prop="channel">
+            <el-select v-model="form.channel" style="width:100%" placeholder="必选">
               <el-option v-for="o in dicts.channels" :key="o.id" :label="o.name" :value="o.id" />
             </el-select>
           </el-form-item>
@@ -319,7 +319,8 @@
   <!-- CSV 导入弹窗 -->
   <el-dialog v-model="importVisible" title="批量导入服务器" width="560px">
     <el-alert type="info" :closable="false" show-icon style="margin-bottom:12px">
-      按模板填写（字典列填编码，如环境 prod；channel 为渠道字典）；执行通道 channel_mode 填
+      按模板填写（字典列填编码，如环境 prod；channel 为渠道字典）；project_group / channel /
+      environment 为必填列，留空的行会被判为校验失败；执行通道 channel_mode 填
       auto/direct/agent，agent 列填 Agent 名称（仅 channel_mode=agent 时生效）；任一行校验失败则整体不导入并提示逐行错误
     </el-alert>
     <div class="import-toolbar">
@@ -452,6 +453,10 @@ const form = reactive(emptyForm())
 const rules = {
   name: [{ required: true, message: '请输入名称' }],
   private_ip: [{ required: true, message: '请输入私网 IP' }],
+  // 归属三维度为录入硬门槛，后端同样强制（缺维度的主机变量注入/制品匹配都算不准）
+  project_group: [{ required: true, message: '请选择项目组', trigger: 'change' }],
+  channel: [{ required: true, message: '请选择渠道', trigger: 'change' }],
+  environment: [{ required: true, message: '请选择环境', trigger: 'change' }],
 }
 
 const statusType = (s) => ({ running: 'success', stopped: 'danger', maintenance: 'warning' }[s] || 'info')

@@ -6,6 +6,13 @@ from apps.agent_mgr.channel import SOURCE_DIRECT, SOURCE_LABELS, resolve_channel
 
 from .models import Channel, CloudProvider, Environment, ProjectGroup, Server, ServerService, ServiceType
 
+# 服务器录入必填的归属维度：字段 → 展示名（云厂商/地域仍可留空）
+REQUIRED_DIMS = (
+    ('project_group', '项目组'),
+    ('channel', '渠道'),
+    ('environment', '环境'),
+)
+
 
 class ProjectGroupSerializer(serializers.ModelSerializer):
     class Meta:
@@ -88,6 +95,19 @@ class ServerSerializer(serializers.ModelSerializer):
         return value
 
     def validate(self, attrs):
+        # 归属三维度（项目组/渠道/环境）是录入硬门槛：变量注入、制品匹配、数据范围
+        # 都按这三维度定位，缺维度的主机进台账就是一台谁都算不准的「野机器」。
+        # 新增必须选齐；编辑允许不传（兼容存量主机），但禁止把已有值清空。
+        dim_errors = {}
+        for field, label in REQUIRED_DIMS:
+            if self.instance is None:
+                if attrs.get(field) is None:
+                    dim_errors[field] = f'新增服务器必须选择{label}'
+            elif field in attrs and attrs[field] is None:
+                dim_errors[field] = f'{label}不允许清空'
+        if dim_errors:
+            raise serializers.ValidationError(dim_errors)
+
         # 执行通道一致性：仅「指定 Agent」模式保留 agent，其余模式清空，
         # 避免库里留下不生效却看着像生效的残留配置。
         mode = attrs.get('channel_mode', getattr(self.instance, 'channel_mode', 'auto'))

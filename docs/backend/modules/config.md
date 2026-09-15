@@ -53,7 +53,7 @@ POST /api/config/allocation/assign/    （仅管理员）
   "server_ids": [1, 2, 3],
   "assign": {
     "project_group": 2,        // 提供且非 null → 设置
-    "environment": null,       // 提供且为 null → 清空
+    "cloud_provider": null,    // 提供且为 null → 清空
     "region": "cn-hangzhou"    // 文本字段，"" 表示清空
   }                            // 未提供的字段保持不动
 }
@@ -64,6 +64,7 @@ POST /api/config/allocation/assign/    （仅管理员）
 | 规则 | 说明 |
 |------|------|
 | 部分更新 | `assign` 中未出现的字段不改动，出现且为 `null` 则清空 |
+| 归属必填 | `project_group` / `channel` / `environment` 传 `null` 返回 400（只能改成另一个字典项）：主机录入时已强制选齐，清空等于绕过新增校验造出无归属主机。弹窗里这三项也不再提供「清空」选项 |
 | 字典校验 | 分配的字典项必须存在且 `enabled=true`，否则 400 |
 | 服务器校验 | `server_ids` 必须全部存在，否则 400 |
 | 原子性 | 事务内单条 UPDATE 批量完成，并手动刷新 `updated_at` |

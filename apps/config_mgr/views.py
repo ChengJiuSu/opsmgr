@@ -20,6 +20,9 @@ from apps.asset_mgr.models import (
 from apps.auth_mgr.permissions import module_perm
 from common.response import fail, ok
 
+# 归属三维度为主机录入硬门槛（见 asset_mgr.serializers.REQUIRED_DIMS），
+# 批量分配可以改归属，但不允许清空——否则等于绕过新增校验造出无归属主机。
+NON_CLEARABLE_DIMS = ('project_group', 'channel', 'environment')
 # 可批量分配的字典外键：请求键 → (模型, 展示名)
 ASSIGN_DICT_FIELDS = {
     'project_group': (ProjectGroup, '项目组'),
@@ -40,10 +43,12 @@ class BatchAssignView(APIView):
           "server_ids": [1, 2, 3],
           "assign": {
             "project_group": 2,        # 提供且非 null → 设置
-            "environment": null,       # 提供且为 null → 清空
+            "cloud_provider": null,    # 提供且为 null → 清空
             "region": "cn-hangzhou"    # 文本字段，"" 表示清空
           }                            # 未提供的字段保持不动
         }
+
+    项目组 / 渠道 / 环境不允许清空（传 null 返回 400），只能改成另一个字典项。
     """
 
     permission_classes = [module_perm('cmdb', min_level='write')]
@@ -73,6 +78,8 @@ class BatchAssignView(APIView):
                 continue
             value = assign[key]
             if value is None:
+                if key in NON_CLEARABLE_DIMS:
+                    return fail(f'{label}不允许清空（主机必须归属项目组 / 渠道 / 环境）')
                 update_fields[f'{key}_id'] = None
                 continue
             # 字典项必须存在且处于启用状态

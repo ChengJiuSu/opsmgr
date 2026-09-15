@@ -51,16 +51,35 @@ class BatchAssignTests(BaseApiTest):
         self.assertEqual(self.s2.region, 'cn-shanghai')
 
     def test_null_clears_and_region_text(self):
-        self.s1.environment = self.envProd
+        from apps.asset_mgr.models import CloudProvider
+
+        self.s1.cloud_provider = CloudProvider.objects.get(code='aliyun')
         self.s1.save()
         r = self.admin.post(ASSIGN_URL, {
             'server_ids': [self.s1.id],
-            'assign': {'environment': None, 'region': 'cn-hangzhou'},
+            'assign': {'cloud_provider': None, 'region': 'cn-hangzhou'},
         }, format='json')
         self.assertEqual(r.status_code, 200)
         self.s1.refresh_from_db()
-        self.assertIsNone(self.s1.environment_id)
+        self.assertIsNone(self.s1.cloud_provider_id)
         self.assertEqual(self.s1.region, 'cn-hangzhou')
+
+    def test_required_dims_cannot_be_cleared(self):
+        """项目组/渠道/环境是录入硬门槛：批量分配只能改，不能清空。"""
+        self.s1.project_group = self.group
+        self.s1.channel = self.channel
+        self.s1.environment = self.envProd
+        self.s1.save()
+        for key, label in (('project_group', '项目组'), ('channel', '渠道'), ('environment', '环境')):
+            r = self.admin.post(ASSIGN_URL, {
+                'server_ids': [self.s1.id], 'assign': {key: None},
+            }, format='json')
+            self.assertEqual(r.status_code, 400)
+            self.assertIn(f'{label}不允许清空', r.json()['msg'])
+        self.s1.refresh_from_db()
+        self.assertEqual(
+            (self.s1.project_group_id, self.s1.channel_id, self.s1.environment_id),
+            (self.group.id, self.channel.id, self.envProd.id))
 
     def test_validations(self):
         # 空参数

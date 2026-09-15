@@ -164,7 +164,8 @@
           <!-- 「多个值」「未分配」为当前值回显项，保持选中即不修改 -->
           <el-option v-if="baseline[dim.key] === MIXED" label="多个值（保持不变）" :value="MIXED" />
           <el-option v-if="baseline[dim.key] === NONE" label="未分配（当前）" :value="NONE" />
-          <el-option v-else label="清空" :value="CLEAR" />
+          <!-- 项目组/渠道/环境为录入硬门槛，只能改不能清空（后端同样拒绝） -->
+          <el-option v-else-if="dim.clearable" label="清空" :value="CLEAR" />
           <el-option
             v-for="o in [...extraOptions[dim.key], ...dim.options()]"
             :key="o.id"
@@ -388,7 +389,7 @@ const assignDims = [
   { key: 'project_group', label: '项目组', options: () => dicts.projectGroups },
   { key: 'environment', label: '环境', options: () => dicts.environments },
   { key: 'channel', label: '渠道', options: () => dicts.channels },
-  { key: 'cloud_provider', label: '云厂商', options: () => dicts.cloudProviders },
+  { key: 'cloud_provider', label: '云厂商', options: () => dicts.cloudProviders, clearable: true },
 ]
 const assignForm = reactive({
   project_group: NONE, environment: NONE, channel: NONE, cloud_provider: NONE,

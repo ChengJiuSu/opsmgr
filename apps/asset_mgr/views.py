@@ -31,6 +31,7 @@ from common.response import fail, ok
 
 from .models import Channel, CloudProvider, Environment, ProjectGroup, Server, ServerService, ServiceType
 from .serializers import (
+    REQUIRED_DIMS,
     ChannelSerializer,
     CloudProviderSerializer,
     EnvironmentSerializer,
@@ -54,6 +55,9 @@ CSV_DICT_FIELDS = {
     'environment': (Environment, '环境'),
     'cloud_provider': (CloudProvider, '云厂商'),
 }
+# 归属三维度（与新增表单同一口径，见 serializers.REQUIRED_DIMS）：新建行必须填齐，
+# 已有主机的更新行可以整列不写（保持原值），但写了空值算清空 → 拒绝。
+REQUIRED_DIM_LABELS = dict(REQUIRED_DIMS)
 # 批量编辑允许的普通字段（字典外键分配走「配置管理 → 服务器分配」的批量分配）
 BATCH_UPDATE_FIELDS = ('status', 'os', 'region', 'ssh_user', 'ssh_port', 'remark',
                        'channel_mode', 'agent')
@@ -286,7 +290,10 @@ class ServerViewSet(viewsets.ModelViewSet):
 
 
 class ServerImportTemplateView(APIView):
-    """下载服务器导入 CSV 模板：表头 + 一行示例，字典列填编码（code）。"""
+    """下载服务器导入 CSV 模板：表头 + 一行示例，字典列填编码（code）。
+
+    project_group / channel / environment 为必填列（与新增表单同一口径）。
+    """
 
     permission_classes = [module_perm('cmdb')]
 
@@ -301,7 +308,8 @@ class ServerImportTemplateView(APIView):
             'web-server-01', '192.168.1.100', '', 'Ubuntu 22.04', '4', '8192', 'running',
             'legend', 'official', 'prod', 'aliyun',
             'cn-hangzhou', 'auto', '', '22', 'root',
-            '示例行，导入前请删除；channel_mode 填 auto/direct/agent，填 agent 时 agent 列写 Agent 名称',
+            '示例行，导入前请删除；project_group/channel/environment 为必填列；'
+            'channel_mode 填 auto/direct/agent，填 agent 时 agent 列写 Agent 名称',
         ])
         return response
 
@@ -496,6 +504,12 @@ class ServerImportView(APIView):
                 else:
                     skipped += 1
             else:
+                # 新建行必须填齐归属三维度（缺列同样算缺，与新增表单一致）
+                lacking = [label for key, label in REQUIRED_DIM_LABELS.items() if parsed.get(key) is None]
+                if lacking:
+                    errors.append({'line': lineno, 'name': name or '', 'errors': [
+                        f'新增主机必须指定{label}' for label in lacking]})
+                    continue
                 to_create.append(Server(**parsed))
         if errors:
             return fail('导入校验未通过，已中止（未写入任何数据）', data={'errors': errors})
@@ -557,6 +571,11 @@ class ServerImportView(APIView):
         for key, (_, label) in CSV_DICT_FIELDS.items():
             raw = get(key)
             if not raw:
+                # 归属三维度：整列缺失 = 不改（跳过），列在但留空 = 清空 → 拒绝
+                if key in REQUIRED_DIM_LABELS:
+                    if key in row:
+                        errors.append(f'{label}不能为空（填字典编码，可在对应字典页查看）')
+                    continue
                 parsed[key] = None
                 continue
             obj = dict_cache[key].get(raw)

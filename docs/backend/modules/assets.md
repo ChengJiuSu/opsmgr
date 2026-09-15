@@ -162,6 +162,10 @@ region         = CharField(max_length=50, blank=True)
 
 - **主机名全局唯一**（DB unique）：是导入更新、JumpServer 注册查重的匹配键。
 - **私网 IP（`private_ip`）必填**：ansible / JumpServer 的连接地址；跨网段可重复（NAT 场景），靠主机名区分。
+- **项目组 / 渠道 / 环境必填**：新增服务器必须选齐这三个维度，否则拒绝录入（`POST /api/assets/servers/` 返回 400）。
+  变量注入、制品匹配、数据范围都按这三维度定位，缺维度的主机进了台账就算不准。编辑时允许不传（兼容存量主机），
+  但显式传 `null` 清空会被拒绝；「服务器分配」页的批量分配同样只能改不能清空（见 config 模块文档）。
+  云厂商、地域仍可留空。
 - **公网 IP（`public_ip`）可空**：NAT 出局主机留空（存 null，前端空串自动转换）；有值时全局唯一（部分唯一约束
   `uniq_server_public_ip`，DRF 不校验部分约束，序列化器手动查重转友好报错）。
 
@@ -169,6 +173,8 @@ region         = CharField(max_length=50, blank=True)
 
 - 列：`name,private_ip,public_ip,os,cpu,memory,status,project_group,channel,environment,cloud_provider,region,channel_mode,agent,ssh_port,ssh_user,remark`，
   字典外键列填字典**编码**（兼容名称），`name`/`private_ip` 必填。
+- 归属三列（`project_group`/`channel`/`environment`）：**新建行必须填齐**，缺列或留空都会被逐行拦截；
+  更新行（`mode=update`）整列缺省时保持原归属不动，列在却留空视为清空 → 拒绝。
 - 执行通道两列（注意 `channel` 是 CMDB「渠道」字典，与执行通道无关）：
   - `channel_mode`：`auto`（默认，按路由规则）/ `direct`（强制直连）/ `agent`（指定 Agent），兼容填中文标签；
   - `agent`：Agent **名称**（`AgentNode.name` 唯一），仅 `channel_mode=agent` 生效，其余模式导入时清空钉死目标

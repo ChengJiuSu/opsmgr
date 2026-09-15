@@ -89,9 +89,9 @@ system_cfg.SystemConfig 独立
 | `cpu` | PositiveSmallIntegerField | 0 | CPU 核数 |
 | `memory` | PositiveIntegerField | 0 | 内存（MB）|
 | `status` | CharField(20) | 'running' | 状态（枚举）|
-| `project_group` | FK → ProjectGroup | null | 项目组（PROTECT）|
-| `channel` | FK → Channel | null | 渠道（PROTECT）|
-| `environment` | FK → Environment | null | 环境（PROTECT）|
+| `project_group` | FK → ProjectGroup | null | 项目组（PROTECT），接口层必填 |
+| `channel` | FK → Channel | null | 渠道（PROTECT），接口层必填 |
+| `environment` | FK → Environment | null | 环境（PROTECT），接口层必填 |
 | `cloud_provider` | FK → CloudProvider | null | 云厂商（PROTECT）|
 | `region` | CharField(50) | '' | 地域/机房（如 cn-hangzhou）|
 | `channel_mode` | CharField(10) | 'auto' | 执行通道模式：auto（按路由规则）/ direct（强制直连）/ agent（钉死）|
@@ -109,6 +109,9 @@ system_cfg.SystemConfig 独立
 | `running` | 运行中 |
 | `stopped` | 已停止 |
 | `maintenance` | 维护中 |
+
+> 项目组 / 渠道 / 环境三列 DB 层保留 `null=True`（存量主机可能为空），必填在接口层强制：
+> 新增必须选齐、编辑与批量分配禁止清空（见 `docs/backend/modules/assets.md`）。
 
 > 原 `env` / `department` 文本字段已由 `environment` / `project_group` 外键替代，
 > 存量数据由迁移 `0004` 自动转换回填。

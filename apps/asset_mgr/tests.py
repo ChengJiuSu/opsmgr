@@ -108,13 +108,18 @@ class ServerApiTests(BaseApiTest):
         self.channel = Channel.objects.get(code='qixia')
         self.provider = CloudProvider.objects.get(code='aliyun')
 
+    def _payload(self, **extra):
+        """新增主机的最小合法请求体：归属三维度（项目组/渠道/环境）为必填。"""
+        return {
+            'project_group': self.group.id, 'channel': self.channel.id,
+            'environment': self.envProd.id, **extra,
+        }
+
     def test_create_with_fk_and_display_fields(self):
-        r = self.admin.post('/api/assets/servers/', {
-            'name': 'game-01', 'private_ip': '10.1.0.1',
-            'environment': self.envProd.id, 'project_group': self.group.id,
-            'channel': self.channel.id, 'cloud_provider': self.provider.id,
-            'region': 'cn-hangzhou',
-        }, format='json')
+        r = self.admin.post('/api/assets/servers/', self._payload(
+            name='game-01', private_ip='10.1.0.1',
+            cloud_provider=self.provider.id, region='cn-hangzhou',
+        ), format='json')
         self.assertEqual(r.status_code, 201)
         data = r.json()['data'] if 'data' in r.json() else r.json()
         self.assertEqual(data['environment_name'], '生产')
@@ -122,45 +127,80 @@ class ServerApiTests(BaseApiTest):
         self.assertEqual(data['project_group_name'], '仙侠项目组')
         self.assertEqual(data['cloud_provider_name'], '阿里云')
 
-        # 外键全部留空也允许创建
-        r = self.admin.post('/api/assets/servers/', {'name': 'tmp-01', 'private_ip': '10.1.0.9'}, format='json')
+        # 云厂商/地域可留空
+        r = self.admin.post('/api/assets/servers/', self._payload(
+            name='tmp-01', private_ip='10.1.0.9'), format='json')
         self.assertEqual(r.status_code, 201)
+
+    def test_create_requires_project_group_channel_environment(self):
+        """归属三维度缺任一项一律拒绝录入（新增表单硬门槛）。"""
+        r = self.admin.post('/api/assets/servers/',
+                            {'name': 'bare-01', 'private_ip': '10.1.9.1'}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('新增服务器必须选择', r.content.decode('utf-8'))
+        self.assertFalse(Server.objects.filter(name='bare-01').exists())
+
+        # 逐个缺失同样拒绝（云厂商/地域留空不影响）
+        for key, label in (('project_group', '项目组'), ('channel', '渠道'), ('environment', '环境')):
+            payload = self._payload(name=f'miss-{key}', private_ip='10.1.9.2')
+            payload[key] = None
+            r = self.admin.post('/api/assets/servers/', payload, format='json')
+            self.assertEqual(r.status_code, 400)
+            self.assertIn(f'新增服务器必须选择{label}', r.content.decode('utf-8'))
+            self.assertFalse(Server.objects.filter(name=f'miss-{key}').exists())
+
+    def test_update_cannot_clear_required_dims(self):
+        """编辑允许不传（兼容存量主机），但禁止把已有归属清空。"""
+        srv = Server.objects.create(
+            name='keep-01', private_ip='10.1.9.5', project_group=self.group,
+            channel=self.channel, environment=self.envProd)
+        r = self.admin.patch(f'/api/assets/servers/{srv.id}/',
+                             {'environment': None}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('环境不允许清空', r.content.decode('utf-8'))
+        # 不传该字段的普通编辑照常通过
+        r = self.admin.patch(f'/api/assets/servers/{srv.id}/',
+                             {'region': 'cn-hangzhou'}, format='json')
+        self.assertEqual(r.status_code, 200)
+        srv.refresh_from_db()
+        self.assertEqual((srv.region, srv.environment_id), ('cn-hangzhou', self.envProd.id))
 
     def test_name_unique_and_public_ip_rules(self):
         # 主机名全局唯一
-        self.admin.post('/api/assets/servers/', {'name': 'uniq-01', 'private_ip': '10.3.0.1'}, format='json')
-        r = self.admin.post('/api/assets/servers/', {'name': 'uniq-01', 'private_ip': '10.3.0.2'}, format='json')
+        self.admin.post('/api/assets/servers/',
+                        self._payload(name='uniq-01', private_ip='10.3.0.1'), format='json')
+        r = self.admin.post('/api/assets/servers/',
+                            self._payload(name='uniq-01', private_ip='10.3.0.2'), format='json')
         self.assertEqual(r.status_code, 400)
         self.assertIn('主机名', str(r.content.decode('utf-8')))
         # 私网 IP 允许重复（NAT 场景跨网段复用），靠主机名区分
-        r = self.admin.post('/api/assets/servers/', {'name': 'uniq-02', 'private_ip': '10.3.0.1'}, format='json')
+        r = self.admin.post('/api/assets/servers/',
+                            self._payload(name='uniq-02', private_ip='10.3.0.1'), format='json')
         self.assertEqual(r.status_code, 201)
         # 公网 IP 留空（空串转 null）可多台并存
-        r = self.admin.post('/api/assets/servers/', {
-            'name': 'nat-01', 'private_ip': '10.3.1.1', 'public_ip': '',
-        }, format='json')
+        r = self.admin.post('/api/assets/servers/', self._payload(
+            name='nat-01', private_ip='10.3.1.1', public_ip=''), format='json')
         self.assertEqual(r.status_code, 201)
-        r = self.admin.post('/api/assets/servers/', {
-            'name': 'nat-02', 'private_ip': '10.3.1.2', 'public_ip': '',
-        }, format='json')
+        r = self.admin.post('/api/assets/servers/', self._payload(
+            name='nat-02', private_ip='10.3.1.2', public_ip=''), format='json')
         self.assertEqual(r.status_code, 201)
         # 公网 IP 有值时唯一
-        self.admin.post('/api/assets/servers/', {
-            'name': 'pub-01', 'private_ip': '10.3.2.1', 'public_ip': '1.2.3.4',
-        }, format='json')
-        r = self.admin.post('/api/assets/servers/', {
-            'name': 'pub-02', 'private_ip': '10.3.2.2', 'public_ip': '1.2.3.4',
-        }, format='json')
+        self.admin.post('/api/assets/servers/', self._payload(
+            name='pub-01', private_ip='10.3.2.1', public_ip='1.2.3.4'), format='json')
+        r = self.admin.post('/api/assets/servers/', self._payload(
+            name='pub-02', private_ip='10.3.2.2', public_ip='1.2.3.4'), format='json')
         self.assertEqual(r.status_code, 400)
         self.assertIn('公网 IP', r.content.decode('utf-8'))
 
     def test_normal_user_can_create_but_not_modify(self):
         normal = self._client(is_staff=False)
-        r = normal.post('/api/assets/servers/', {'name': 'user-01', 'private_ip': '10.2.0.1'}, format='json')
+        r = normal.post('/api/assets/servers/',
+                        self._payload(name='user-01', private_ip='10.2.0.1'), format='json')
         self.assertEqual(r.status_code, 201)
         sid = r.json()['data']['id'] if 'data' in r.json() else r.json()['id']
 
-        r = normal.put(f'/api/assets/servers/{sid}/', {'name': 'user-01x', 'private_ip': '10.2.0.1'}, format='json')
+        r = normal.put(f'/api/assets/servers/{sid}/',
+                       self._payload(name='user-01x', private_ip='10.2.0.1'), format='json')
         self.assertEqual(r.status_code, 403)
         r = normal.delete(f'/api/assets/servers/{sid}/')
         self.assertEqual(r.status_code, 403)
@@ -400,6 +440,13 @@ class ServerChannelFieldTests(BaseApiTest):
         self.agent = AgentNode.objects.create(name='ch-gw', token_hash='x')
         self.pg = ProjectGroup.objects.create(name='通道展示项目', code='view-p1')
         self.env = Environment.objects.create(name='通道展示正式', code='view-prod')
+        self.ch = Channel.objects.get(code='qixia')
+
+    def _payload(self, **extra):
+        return {
+            'project_group': self.pg.id, 'channel': self.ch.id,
+            'environment': self.env.id, **extra,
+        }
 
     def test_effective_channel_from_rule(self):
         from apps.agent_mgr.models import AgentRoute
@@ -434,18 +481,17 @@ class ServerChannelFieldTests(BaseApiTest):
         self.assertTrue(all(row['effective_agent_name'] == 'ch-gw' for row in rows))
 
     def test_create_with_agent_only_implies_agent_mode(self):
-        r = self.admin.post('/api/assets/servers/', {
-            'name': 'v-05', 'private_ip': '10.8.0.5', 'agent': self.agent.id,
-        }, format='json')
+        r = self.admin.post('/api/assets/servers/', self._payload(
+            name='v-05', private_ip='10.8.0.5', agent=self.agent.id), format='json')
         self.assertEqual(r.status_code, 201)
         srv = Server.objects.get(name='v-05')
         self.assertEqual((srv.channel_mode, srv.agent_id), ('agent', self.agent.id))
 
     def test_create_with_agent_mode_requires_agent(self):
-        r = self.admin.post('/api/assets/servers/', {
-            'name': 'v-03', 'private_ip': '10.8.0.3', 'channel_mode': 'agent',
-        }, format='json')
+        r = self.admin.post('/api/assets/servers/', self._payload(
+            name='v-03', private_ip='10.8.0.3', channel_mode='agent'), format='json')
         self.assertEqual(r.status_code, 400)
+        self.assertIn('必须选择 Agent', r.content.decode('utf-8'))
 
     def test_switching_to_auto_clears_pinned_agent(self):
         srv = Server.objects.create(
@@ -479,8 +525,8 @@ class ServerImportExportTests(BaseApiTest):
     def test_import_create_and_skip_update(self):
         csv_text = (
             'name,private_ip,public_ip,os,cpu,memory,status,project_group,channel,environment,cloud_provider,region,ssh_port,ssh_user,remark\n'
-            'imp-01,10.8.0.1,8.8.8.1,Ubuntu,4,8192,running,legend,,prod,aliyun,cn-hz,22,root,首次导入\n'
-            'imp-02,10.8.0.2,,,,,,,,,,,,,\n'
+            'imp-01,10.8.0.1,8.8.8.1,Ubuntu,4,8192,running,legend,qixia,prod,aliyun,cn-hz,22,root,首次导入\n'
+            'imp-02,10.8.0.2,,,,,,legend,qixia,prod,,,,,\n'
         )
         r = self._import(csv_text)
         self.assertEqual(r.status_code, 200, r.content)
@@ -506,9 +552,9 @@ class ServerImportExportTests(BaseApiTest):
 
     def test_import_validation_errors_abort_all(self):
         csv_text = (
-            'name,private_ip,status,project_group\n'
-            'ok-01,10.8.1.1,running,legend\n'
-            ',bad-ip,flying,nope\n'
+            'name,private_ip,status,project_group,channel,environment\n'
+            'ok-01,10.8.1.1,running,legend,qixia,prod\n'
+            ',bad-ip,flying,nope,qixia,prod\n'
         )
         r = self._import(csv_text)
         self.assertEqual(r.status_code, 400)
@@ -523,10 +569,10 @@ class ServerImportExportTests(BaseApiTest):
     def test_import_rejects_duplicate_names_and_taken_public_ip(self):
         Server.objects.create(name='occupied', private_ip='10.8.3.1', public_ip='9.9.9.9')
         csv_text = (
-            'name,private_ip,public_ip\n'
-            'dup-01,10.8.3.2,\n'
-            'dup-01,10.8.3.3,\n'
-            'new-01,10.8.3.4,9.9.9.9\n'
+            'name,private_ip,public_ip,project_group,channel,environment\n'
+            'dup-01,10.8.3.2,,legend,qixia,prod\n'
+            'dup-01,10.8.3.3,,legend,qixia,prod\n'
+            'new-01,10.8.3.4,9.9.9.9,legend,qixia,prod\n'
         )
         r = self._import(csv_text)
         self.assertEqual(r.status_code, 400)
@@ -538,10 +584,10 @@ class ServerImportExportTests(BaseApiTest):
         from apps.agent_mgr.models import AgentNode
         agent = AgentNode.objects.create(name='nat-hz', token_hash='x')
         csv_text = (
-            'name,private_ip,channel_mode,agent\n'
-            'ch-01,10.8.5.1,agent,nat-hz\n'
-            'ch-02,10.8.5.2,direct,\n'
-            'ch-03,10.8.5.3,,\n'
+            'name,private_ip,project_group,channel,environment,channel_mode,agent\n'
+            'ch-01,10.8.5.1,legend,qixia,prod,agent,nat-hz\n'
+            'ch-02,10.8.5.2,legend,qixia,prod,direct,\n'
+            'ch-03,10.8.5.3,legend,qixia,prod,,\n'
         )
         r = self._import(csv_text)
         self.assertEqual(r.status_code, 200, r.content)
@@ -565,10 +611,10 @@ class ServerImportExportTests(BaseApiTest):
 
     def test_import_channel_validation_errors(self):
         csv_text = (
-            'name,private_ip,channel_mode,agent\n'
-            'bad-01,10.8.6.1,flying,\n'
-            'bad-02,10.8.6.2,agent,\n'
-            'bad-03,10.8.6.3,agent,ghost\n'
+            'name,private_ip,project_group,channel,environment,channel_mode,agent\n'
+            'bad-01,10.8.6.1,legend,qixia,prod,flying,\n'
+            'bad-02,10.8.6.2,legend,qixia,prod,agent,\n'
+            'bad-03,10.8.6.3,legend,qixia,prod,agent,ghost\n'
         )
         r = self._import(csv_text)
         self.assertEqual(r.status_code, 400)
@@ -577,6 +623,48 @@ class ServerImportExportTests(BaseApiTest):
         self.assertIn('channel_mode=agent 时必须在 agent 列填写 Agent 名称', joined)
         self.assertIn('Agent 不存在：ghost', joined)
         self.assertFalse(Server.objects.filter(name__startswith='bad-').exists())
+
+    def test_import_required_dims(self):
+        """新建行必须填齐归属三维度；更新行缺列不动、列在留空则拒绝。"""
+        # 缺列的新建行：拒绝
+        r = self._import('name,private_ip\nno-dim-01,10.8.7.1\n')
+        self.assertEqual(r.status_code, 400)
+        joined = ' '.join(e for row in r.json()['data']['errors'] for e in row['errors'])
+        for label in ('项目组', '渠道', '环境'):
+            self.assertIn(f'新增主机必须指定{label}', joined)
+        self.assertFalse(Server.objects.filter(name='no-dim-01').exists())
+
+        # 列在但留空：拒绝（无论新建还是更新）
+        r = self._import(
+            'name,private_ip,project_group,channel,environment\n'
+            'no-dim-02,10.8.7.2,legend,,prod\n')
+        self.assertEqual(r.status_code, 400)
+        joined = ' '.join(e for row in r.json()['data']['errors'] for e in row['errors'])
+        self.assertIn('渠道不能为空', joined)
+
+        # 填齐即可创建
+        r = self._import(
+            'name,private_ip,project_group,channel,environment\n'
+            'dim-ok,10.8.7.3,legend,qixia,prod\n')
+        self.assertEqual(r.status_code, 200, r.content)
+        srv = Server.objects.get(name='dim-ok')
+        self.assertEqual(
+            (srv.project_group.code, srv.channel.code, srv.environment.code),
+            ('legend', 'qixia', 'prod'))
+
+        # 更新行不带归属列：保持原归属
+        r = self._import('name,private_ip,status\ndim-ok,10.8.7.3,stopped\n', mode='update')
+        self.assertEqual(r.status_code, 200, r.content)
+        srv.refresh_from_db()
+        self.assertEqual((srv.status, srv.channel.code), ('stopped', 'qixia'))
+
+        # 更新行带空归属列：拒绝清空
+        r = self._import(
+            'name,private_ip,project_group,channel,environment\n'
+            'dim-ok,10.8.7.3,legend,,prod\n', mode='update')
+        self.assertEqual(r.status_code, 400)
+        srv.refresh_from_db()
+        self.assertEqual(srv.channel.code, 'qixia')
 
     def test_export_roundtrip(self):
         Server.objects.create(name='exp-01', private_ip='10.8.2.1', project_group=self.group, ssh_port=2222)

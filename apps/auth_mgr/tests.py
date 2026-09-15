@@ -22,6 +22,18 @@ from common.response import ok
 from common.testing import grant_sudo
 
 from .apikey import ApiKeyAuthentication, ApiKeyThrottle, ensure_service_user, scope_required
+
+
+def _server_dims():
+    """新增服务器必填的归属三维度（项目组/渠道/环境），见 asset_mgr.serializers.REQUIRED_DIMS。"""
+    from apps.asset_mgr.models import Channel, Environment, ProjectGroup
+
+    group, _ = ProjectGroup.objects.get_or_create(code='auth-test-pg', defaults={'name': '权限测试组'})
+    return {
+        'project_group': group.id,
+        'channel': Channel.objects.first().id,
+        'environment': Environment.objects.get(code='prod').id,
+    }
 from .models import ApiCredential, MFARecoveryCode, Role, UserMFA
 
 User = get_user_model()
@@ -684,7 +696,8 @@ class SudoTests(TestCase):
             self.client.delete(f'/api/assets/servers/{srv.pk}/').status_code, 403)
         # 新增不拦：新加的主机不会改变已有主机的执行通道
         created = self.client.post('/api/assets/servers/',
-                                   {'name': 's-new', 'private_ip': '10.9.9.10'},
+                                   {'name': 's-new', 'private_ip': '10.9.9.10',
+                                    **_server_dims()},
                                    format='json')
         self.assertEqual(created.status_code, 201)
 
@@ -1402,7 +1415,8 @@ class RoleMatrixTests(TestCase):
         client = self._client(member)
         self.assertEqual(client.get('/api/assets/servers/').status_code, 200)
         r = client.post('/api/assets/servers/',
-                        {'name': 'rm-host', 'private_ip': '10.7.7.7'}, format='json')
+                        {'name': 'rm-host', 'private_ip': '10.7.7.7', **_server_dims()},
+                        format='json')
         self.assertEqual(r.status_code, 201, r.content)
         server_id = r.json()['id']
         self.assertEqual(client.patch(f'/api/assets/servers/{server_id}/',
