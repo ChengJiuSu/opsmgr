@@ -298,6 +298,12 @@ docker compose --profile mysql up -d --build
 
 4. **先跑自检**，通过了再回飞书保存地址：
 
+   > ⚠ 生产机上跑任何 `manage.py` 命令都要带 `--settings=ops_manager.settings.prod`
+   > （或 `export DJANGO_SETTINGS_MODULE=ops_manager.settings.prod`）。manage.py
+   > 默认是 `settings.dev`，而 dev 用本地 SQLite——不带就是在操作一个空库，
+   > `feishu_check` 会报「四项凭据全缺」，指向完全错误的方向。命令会先打出
+   > 当前连的是哪个库，看到 `sqlite3` 就是带错了。
+
    ```bash
    venv/bin/python manage.py feishu_check                      # 配置 + 出站 + 地址
    venv/bin/python manage.py feishu_check --chats              # 列出机器人所在的群与 chat_id

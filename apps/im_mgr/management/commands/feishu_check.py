@@ -39,6 +39,7 @@ class Command(BaseCommand):
                             help='测试卡改发「多选组件探针」，用来确认飞书回传的结构')
 
     def handle(self, *args, **options):
+        self._warn_settings_module()
         app = FeishuApp.load()
         failed = self._check_config(app)
         if failed:
@@ -61,6 +62,30 @@ class Command(BaseCommand):
         else:
             self.stdout.write(self.style.SUCCESS(
                 '全部通过。可以去飞书开放平台保存回调地址了（顺序见 deploy/README.md）。'))
+
+    # ── 环境 ─────────────────────────────────────────────
+    @staticmethod
+    def _warn_settings_module():
+        """连的是哪个库，先说清楚。
+
+        manage.py 默认 DJANGO_SETTINGS_MODULE=…settings.dev，而 dev 用 SQLite。
+        在生产机上不带 --settings 直接跑，读到的是一个空的 db.sqlite3，报出来是
+        「四项凭据全缺」——指向完全错误的方向（配置明明在页面上好好的）。
+        """
+        import os
+
+        from django.db import connection
+
+        module = os.environ.get('DJANGO_SETTINGS_MODULE', '(未设置)')
+        engine = connection.settings_dict.get('ENGINE', '').rsplit('.', 1)[-1]
+        name = connection.settings_dict.get('NAME', '')
+        line = f'settings={module}　数据库={engine}:{name}'
+        if engine == 'sqlite3':
+            print(f'  [!!] {line}')
+            print('       生产上要带 --settings=ops_manager.settings.prod，'
+                  '否则读的是空的本地 SQLite')
+        else:
+            print(f'       {line}')
 
     # ── 配置 ─────────────────────────────────────────────
     def _check_config(self, app):
