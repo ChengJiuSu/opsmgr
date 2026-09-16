@@ -7,7 +7,8 @@
     ./venv/bin/python manage.py feishu_check                    # 配置 + 出站连通性
     ./venv/bin/python manage.py feishu_check --chats            # 列出机器人所在的群与 chat_id
     ./venv/bin/python manage.py feishu_check --email a@b.com    # 顺带验通讯录反查
-    ./venv/bin/python manage.py feishu_check --chat-id oc_xxx   # 真发一张测试卡片
+    ./venv/bin/python manage.py feishu_check --to <用户名>      # 真发一张测试卡片（私聊）
+    ./venv/bin/python manage.py feishu_check --to oc_xxx        # 发到群里
 
 除 `--chat-id` 外全部只读，不会发任何消息、不改任何数据。
 """
@@ -30,7 +31,10 @@ class Command(BaseCommand):
         parser.add_argument('--mobile', help='用该手机号验证通讯录反查')
         parser.add_argument('--chats', action='store_true',
                             help='列出机器人已加入的群与 chat_id（登记会话白名单用）')
-        parser.add_argument('--chat-id', help='向该会话真发一张测试卡片（会打扰到人）')
+        parser.add_argument('--chat-id', dest='to',
+                            help='测试卡片的收件人：群 chat_id（oc_…）/ 飞书 open_id（ou_…）'
+                                 '/ 平台用户名（自动查其飞书绑定）')
+        parser.add_argument('--to', dest='to', help='同 --chat-id')
         parser.add_argument('--probe-select', action='store_true',
                             help='测试卡改发「多选组件探针」，用来确认飞书回传的结构')
 
@@ -48,8 +52,8 @@ class Command(BaseCommand):
             failed |= self._list_chats()
         if options.get('email') or options.get('mobile'):
             failed |= self._check_lookup(options.get('email'), options.get('mobile'))
-        if options.get('chat_id'):
-            failed |= self._check_send(options['chat_id'], options.get('probe_select'))
+        if options.get('to'):
+            failed |= self._check_send(options['to'], options.get('probe_select'))
 
         self.stdout.write('')
         if failed:
@@ -194,10 +198,36 @@ class Command(BaseCommand):
         return False
 
     # ── 发卡 ─────────────────────────────────────────────
-    def _check_send(self, chat_id, probe_select=False):
+    @staticmethod
+    def _resolve_target(target):
+        """收件人 → (receive_id, receive_id_type)。
+
+        单聊场景下让人去翻自己的 open_id 不现实（飞书界面上不显示），所以既收
+        ID 也收平台用户名——用户名走飞书绑定表反查。`oc_`/`ou_` 前缀是飞书的
+        固定约定，可以直接判；注意**单聊的 chat_id 同样是 oc_ 开头**，但那也确实
+        该按 chat_id 发，不冲突。
+        """
+        from apps.im_mgr.models import FeishuBinding
+
+        target = str(target or '').strip()
+        if target.startswith('oc_'):
+            return target, 'chat_id'
+        if target.startswith('ou_'):
+            return target, 'open_id'
+        binding = FeishuBinding.objects.filter(user__username=target).first()
+        if binding is None or not binding.open_id:
+            return None, f'平台用户「{target}」没有飞书绑定，取不到收件人'
+        return binding.open_id, 'open_id'
+
+    def _check_send(self, target, probe_select=False):
         from apps.im_mgr import cards
 
         self.stdout.write(self.style.MIGRATE_HEADING('\n[6] 发送测试卡片'))
+        receive_id, receive_id_type = self._resolve_target(target)
+        if receive_id is None:
+            self.stdout.write(BAD + receive_id_type)   # 这一支里第二个返回值是原因
+            return True
+        self.stdout.write(INFO + f'收件人：{receive_id}（{receive_id_type}）')
         if probe_select:
             card = cards.probe_multi_select([
                 {'label': 'web1 · 10.0.0.1', 'value': '1'},
@@ -208,10 +238,12 @@ class Command(BaseCommand):
             card = cards.notice('飞书接入自检', '这是一张来自运维平台的测试卡片，收到即表示出站正常。',
                                 tip='由 manage.py feishu_check 发出')
         try:
-            message_id = client.send_card(chat_id, card)
+            message_id = client.send_card(receive_id, card,
+                                          receive_id_type=receive_id_type)
         except client.FeishuError as exc:
             self.stdout.write(BAD + f'发送失败：{exc}')
-            self.stdout.write(INFO + '常见原因：机器人不在该群、或缺 im:message:send_as_bot 权限')
+            self.stdout.write(INFO + '常见原因：机器人不在该群 / 对方没跟机器人建立过会话、'
+                                     '或缺 im:message:send_as_bot 权限')
             return True
         self.stdout.write(OK + f'已发出，message_id={message_id}')
         if probe_select:

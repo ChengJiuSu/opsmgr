@@ -302,8 +302,13 @@ docker compose --profile mysql up -d --build
    venv/bin/python manage.py feishu_check                      # 配置 + 出站 + 地址
    venv/bin/python manage.py feishu_check --chats              # 列出机器人所在的群与 chat_id
    venv/bin/python manage.py feishu_check --email a@corp.com   # 顺带验通讯录反查
-   venv/bin/python manage.py feishu_check --chat-id oc_xxx     # 真发一张测试卡片
+   venv/bin/python manage.py feishu_check --to <平台用户名>    # 私聊发一张测试卡片
+   venv/bin/python manage.py feishu_check --to oc_xxx          # 发到群里
    ```
+
+   `--to` 收群 `chat_id`（`oc_…`）、飞书 `open_id`（`ou_…`），也收**平台用户名**
+   （自动查其飞书绑定取 open_id）——单聊场景下让人去翻自己的 open_id 不现实，
+   飞书界面上根本不显示。
 
    它会把要粘到飞书后台的三个地址打出来，并当场验证两种 token、授权页路径与通讯录
    权限。除 `--chat-id` 外全部只读。
