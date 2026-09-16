@@ -14,7 +14,7 @@ from rest_framework.test import APIClient
 
 from common.testing import grant_sudo
 
-from apps.im_mgr import access, client, crypto, sso
+from apps.im_mgr import access, cards, client, crypto, sso
 from apps.im_mgr.models import FeishuApp, FeishuBinding, FeishuChannel
 
 PASSWORD = 'Pass!2345xyz'
@@ -1040,3 +1040,230 @@ class FeishuAccessTests(TestCase):
         other = ProjectGroup.objects.create(name='别的项目', code='im-other')
         self.member.allowed_project_groups.add(other)
         self.assertEqual(access.available_tasks(self.member, 'oc_ops').count(), 0)
+
+
+# ══════════════════════════════════════════════════════════
+# T7：卡片模板（纯函数）
+# ══════════════════════════════════════════════════════════
+
+def _texts(payload):
+    """递归收集卡片里的所有文本，便于断言「这句话出现了」。"""
+    found = []
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if key == 'content' and isinstance(value, str):
+                found.append(value)
+            else:
+                found.extend(_texts(value))
+    elif isinstance(payload, list):
+        for item in payload:
+            found.extend(_texts(item))
+    return found
+
+
+def _buttons(payload):
+    """收集卡片里的所有按钮。"""
+    found = []
+    if isinstance(payload, dict):
+        if payload.get('tag') == 'button':
+            found.append(payload)
+        for value in payload.values():
+            found.extend(_buttons(value))
+    elif isinstance(payload, list):
+        for item in payload:
+            found.extend(_buttons(item))
+    return found
+
+
+class FeishuCardHelperTests(TestCase):
+    def test_esc_neutralizes_markdown(self):
+        """任务名里一个 * 或 ` 就能把整张卡片的结构带歪。"""
+        raw = '重启*网关*_test_ `cmd` [x](y)'
+        escaped = cards.esc(raw)
+        for ch in ('*', '_', '`', '[', ']'):
+            self.assertNotIn(ch, escaped)
+        self.assertIn('重启', escaped)
+
+    def test_esc_handles_none(self):
+        self.assertEqual(cards.esc(None), '')
+
+    def test_log_block_strips_backticks(self):
+        """日志里自带 ``` 会让代码块围栏提前闭合，后面的内容当 markdown 渲染。"""
+        block = cards.log_block('前面\n```\nrm -rf /\n```\n后面')
+        content = block['text']['content']
+        self.assertEqual(content.count('```'), 2)   # 只有外层围栏
+        self.assertIn("'''", content)               # 内层被替换成单引号
+
+    def test_log_block_truncates(self):
+        block = cards.log_block('\n'.join(f'line{i}' for i in range(100)))
+        body = block['text']['content']
+        self.assertEqual(body.count('line'), cards.LOG_TAIL_LINES)
+        self.assertIn('line99', body)               # 留的是尾段
+        self.assertNotIn('line0\n', body)
+
+    def test_log_block_truncates_long_line(self):
+        block = cards.log_block('x' * 5000)
+        self.assertLess(len(block['text']['content']), cards.LOG_LINE_LIMIT + 50)
+
+    def test_log_block_empty(self):
+        self.assertIsNone(cards.log_block(''))
+        self.assertIsNone(cards.log_block('   \n  '))
+
+    def test_fmt_duration(self):
+        self.assertEqual(cards.fmt_duration(None), '—')
+        self.assertEqual(cards.fmt_duration(45), '45s')
+        self.assertEqual(cards.fmt_duration(125), '2m05s')
+        self.assertEqual(cards.fmt_duration(3725), '1h02m')
+
+
+class FeishuCardTests(TestCase):
+    def setUp(self):
+        from apps.asset_mgr.models import Channel, Environment, ProjectGroup
+        from apps.task_exec.models import ExecutionTask, TaskExecutionLog
+
+        self.pg = ProjectGroup.objects.create(name='主项目', code='card-proj')
+        self.ch = Channel.objects.create(name='官服', code='card-ch')
+        self.env = Environment.objects.create(name='测试环境', code='card-env')
+        self.prod = Environment.objects.create(name='生产环境', code='card-prod', is_prod=True)
+        self.task = ExecutionTask.objects.create(
+            name='重启网关', project_group=self.pg, channel=self.ch, environment=self.env,
+            im_enabled=True)
+        self.log = TaskExecutionLog.objects.create(
+            task=self.task, status='running', trigger_type='feishu',
+            servers_snapshot=[{'id': 1, 'name': 'web1', 'ip': '10.0.0.1'}],
+            steps_result=[
+                {'order': 1, 'name': '拉包', 'status': 'success', 'duration': 12},
+                {'order': 2, 'name': '重启', 'status': 'running'},
+                {'order': 3, 'name': '校验', 'status': 'pending'},
+            ])
+
+    def _to_prod(self):
+        self.task.environment = self.prod
+        self.task.save(update_fields=['environment'])
+        return self.task
+
+    # ── 任务选择 ──────────────────────────────────────────
+    def test_picker_lists_tasks(self):
+        payload = cards.task_picker([self.task])
+        options = payload['elements'][1]['actions'][0]['options']
+        self.assertEqual(options[0]['value'], str(self.task.id))
+        self.assertIn('重启网关', options[0]['text']['content'])
+
+    def test_picker_empty_has_no_select(self):
+        """空下拉比一句说明更让人困惑。"""
+        payload = cards.task_picker([])
+        self.assertNotIn('select_static', json.dumps(payload))
+        self.assertIn('没有可从飞书发起的任务', ''.join(_texts(payload)))
+
+    # ── 确认卡 ────────────────────────────────────────────
+    def test_detail_non_prod(self):
+        payload = cards.task_detail(self.task, server_count=3, step_count=2)
+        self.assertEqual(payload['header']['template'], 'blue')
+        run = _buttons(payload)[0]
+        self.assertEqual(run['value']['act'], cards.ACT_RUN)
+        self.assertEqual(run['type'], 'primary')
+
+    def test_detail_prod_is_red_and_danger(self):
+        payload = cards.task_detail(self._to_prod(), server_count=3, step_count=2)
+        self.assertEqual(payload['header']['template'], 'red')
+        self.assertEqual(_buttons(payload)[0]['type'], 'danger')
+        self.assertIn('生产', ''.join(_texts(payload)))
+
+    def test_detail_without_hosts_offers_no_run(self):
+        """让人点下去再看到「没有主机」的报错，不如现在就说清楚。"""
+        payload = cards.task_detail(self.task, server_count=0, step_count=2)
+        acts = [b['value']['act'] for b in _buttons(payload)]
+        self.assertEqual(acts, [cards.ACT_CANCEL])
+        self.assertIn('未匹配到可执行主机', ''.join(_texts(payload)))
+
+    def test_production_confirm_states_the_target(self):
+        """确认的意义是让人看清在对什么下手，只写「确认吗」等于没确认。"""
+        payload = cards.production_confirm(
+            self._to_prod(), server_count=12, step_count=4, token='tk1', ttl_seconds=60)
+        text = ''.join(_texts(payload))
+        self.assertIn('生产环境', text)
+        self.assertIn('4 个模块 × 12 台主机', text)
+        self.assertIn('60 秒内有效', text)
+        confirm = _buttons(payload)[0]
+        self.assertEqual(confirm['value'],
+                         {'act': cards.ACT_CONFIRM_PROD, 'task': self.task.id, 'token': 'tk1'})
+
+    # ── 状态卡 ────────────────────────────────────────────
+    def test_progress_shows_step_icons(self):
+        text = ''.join(_texts(cards.progress(self.task, self.log)))
+        self.assertIn('✅ 拉包', text)
+        self.assertIn('⏳ 重启', text)
+        self.assertIn('⬜ 校验', text)
+
+    def test_progress_truncates_long_flow(self):
+        self.log.steps_result = [
+            {'order': i, 'name': f'模块{i}', 'status': 'pending'} for i in range(1, 26)
+        ]
+        text = ''.join(_texts(cards.progress(self.task, self.log)))
+        self.assertIn(f'还有 {25 - cards.MAX_STEPS_SHOWN} 个模块', text)
+
+    def test_result_failed_has_tail_and_failed_names(self):
+        self.log.status = 'failed'
+        self.log.steps_result = [
+            {'order': 1, 'name': '拉包', 'status': 'success', 'duration': 3},
+            {'order': 2, 'name': '重启', 'status': 'failed', 'duration': 5},
+        ]
+        payload = cards.result(self.task, self.log, tail='boom\nfailed', url='https://x/y')
+        text = ''.join(_texts(payload))
+        self.assertEqual(payload['header']['template'], 'red')
+        self.assertIn('失败模块', text)
+        self.assertIn('重启', text)
+        self.assertIn('boom', text)
+        self.assertIn('https://x/y', text)
+
+    def test_result_success_is_green_without_tail(self):
+        self.log.status = 'success'
+        payload = cards.result(self.task, self.log, tail='应当忽略')
+        self.assertEqual(payload['header']['template'], 'green')
+        self.assertNotIn('应当忽略', ''.join(_texts(payload)))
+
+    # ── 暂停处理 ──────────────────────────────────────────
+    def test_pause_confirm_buttons(self):
+        payload = cards.pause(self.task, self.log, 'confirm', current_step='重启')
+        dos = [b['value']['do'] for b in _buttons(payload)]
+        self.assertEqual(dos, ['continue', 'abort'])
+
+    def test_pause_failed_buttons_with_log(self):
+        payload = cards.pause(self.task, self.log, 'failed',
+                              current_step='重启', tail='Traceback...')
+        dos = [b['value']['do'] for b in _buttons(payload)]
+        self.assertEqual(dos, ['retry', 'skip', 'abort'])
+        self.assertIn('Traceback...', ''.join(_texts(payload)))
+
+    def test_pause_unknown_type_falls_back_to_confirm(self):
+        payload = cards.pause(self.task, self.log, '', current_step=None)
+        dos = [b['value']['do'] for b in _buttons(payload)]
+        self.assertEqual(dos, ['continue', 'abort'])
+
+    def test_pause_buttons_carry_log_id(self):
+        """处理动作要落到具体这次执行上，不能只带任务 id。"""
+        payload = cards.pause(self.task, self.log, 'failed')
+        for btn in _buttons(payload):
+            self.assertEqual(btn['value']['log'], self.log.id)
+
+    # ── 定格与提示 ────────────────────────────────────────
+    def test_handled_has_no_buttons(self):
+        payload = cards.handled('已继续执行', by='张三')
+        self.assertEqual(_buttons(payload), [])
+        self.assertIn('张三', ''.join(_texts(payload)))
+
+    def test_notice(self):
+        payload = cards.notice('无法执行', '当前角色没有发起任务执行的权限。')
+        self.assertIn('没有发起任务执行的权限', ''.join(_texts(payload)))
+
+    # ── 体积边界 ──────────────────────────────────────────
+    def test_large_flow_card_stays_small(self):
+        """卡片有大小上限：50 个模块 + 长名字也不能撑爆。"""
+        self.task.name = '超长任务名' * 40
+        self.log.steps_result = [
+            {'order': i, 'name': '模块名字很长' * 20, 'status': 'failed', 'duration': 9}
+            for i in range(1, 51)
+        ]
+        self.log.status = 'failed'
+        payload = cards.result(self.task, self.log, tail='x' * 10000)
+        self.assertLess(len(json.dumps(payload, ensure_ascii=False)), 20000)

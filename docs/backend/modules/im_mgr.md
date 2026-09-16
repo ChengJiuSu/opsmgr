@@ -35,6 +35,7 @@ apps/im_mgr/
 ├── crypto.py        # 回调解密与验签（公网入口的第一道门）
 ├── dedupe.py        # 一次性消费：nonce / event_id / 卡片 token 共用，fail-closed
 ├── access.py        # 飞书侧发起执行的准入判定（四道闸，唯一入口）
+├── cards.py         # 消息卡片模板（纯函数，无副作用）
 ├── handlers.py      # 回调的业务路由（事件 / 卡片动作）
 ├── sso.py           # 飞书网页免登：state、换 token、身份落到平台 User
 ├── client.py        # 出站客户端：token 缓存 + 统一请求封装 + 消息接口
@@ -216,6 +217,40 @@ conf/snippets/feishu_callback_ips.conf     # 来源 IP 白名单（⚠ 待填）
 | `FEISHU_BASE_URL` | `https://open.feishu.cn` | Lark（海外）改 `open.larksuite.com` |
 | `FEISHU_TRUST_ENV` | `True` | 是否吃环境代理。与 `common/jumpserver.py` 的 `trust_env=False` 相反——那边目标在内网 |
 | `FEISHU_CONNECT_TIMEOUT` / `FEISHU_READ_TIMEOUT` | 5 / 10 | 卡片回调要 3 秒内回包，真正的发卡走异步任务 |
+
+---
+
+## 卡片模板（cards.py）
+
+**纯函数**：入参是普通对象，出参是可直接 `json.dumps` 的 dict。不碰数据库、
+不发请求——卡片是这套交互里最容易反复改的部分，保持可单测、改起来才不用提心吊胆。
+
+| 函数 | 用途 |
+|------|------|
+| `task_picker(tasks)` | 任务下拉；列表为空时**不渲染下拉**，只给说明 |
+| `task_detail(task, server_count, step_count)` | 确认卡；0 台主机时只给「重新选择」 |
+| `production_confirm(task, …, token, ttl)` | 生产二次确认（红标题，写死环境名与主机数） |
+| `progress(task, log)` | 执行进度，随 `steps_result` 刷新同一条消息 |
+| `result(task, log, tail=…)` | 终态；失败附日志尾段与失败模块名 |
+| `pause(task, log, pause_type, …)` | 暂停处理：continue/abort 或 retry/skip/abort |
+| `handled(text, by=…)` | 动作处理后的定格卡，按钮换成结论 |
+| `notice(title, content)` | 拒绝原因等通用提示 |
+
+按钮回传值约定 `{'act': 动作, ...}`，动作常量在模块顶部，handlers 从这里 import。
+**value 只放标识不放状态**：卡片可能被翻出来重点，状态必须以库里为准。
+
+三条硬约束（都是会出事的地方）：
+
+- **用户内容一律走 `esc()`**：任务名里一个 `*` 或 `` ` `` 就能把卡片的 markdown
+  结构带歪。飞书的 lark_md 不支持反斜杠转义，所以用全角同形字符替换。
+- **日志尾段要剥反引号**：贴进代码块的日志若自带 ```` ``` ````，围栏会提前闭合，
+  后面的内容直接当 markdown 渲染出去。
+- **模块列表要截断**（`MAX_STEPS_SHOWN`）：卡片有大小上限，50 个模块的任务流
+  全渲染会超。测试里用「50 模块 + 超长名字 + 10KB 日志」压着这条线。
+
+生产二次确认的文案**写死环境名与主机数**：确认的意义在于让人看清自己在对什么
+下手，只写「确认执行吗」等于没确认。按钮上那个飞书原生 `confirm` 弹窗不承担
+安全职责——它只是客户端提示，拦不住重放，真正的确认是带一次性 token 的第二张卡。
 
 ---
 
