@@ -14,8 +14,8 @@ from rest_framework.test import APIClient
 
 from common.testing import grant_sudo
 
-from apps.im_mgr import client, crypto
-from apps.im_mgr.models import FeishuApp, FeishuChannel
+from apps.im_mgr import client, crypto, sso
+from apps.im_mgr.models import FeishuApp, FeishuBinding, FeishuChannel
 
 PASSWORD = 'Pass!2345xyz'
 #: 配齐一份可启用的配置（IP 白名单用文档示例段，测试不依赖真实出口 IP）
@@ -704,3 +704,195 @@ class FeishuCallbackViewTests(TestCase):
         self._post(self.event_url, self._event())
         self.assertFalse(AuditLog.objects.filter(path__startswith=
                                                  FeishuApp.CALLBACK_PREFIX).exists())
+
+
+# ══════════════════════════════════════════════════════════
+# T4：飞书登录（SSO）与 MFA 口径
+# ══════════════════════════════════════════════════════════
+
+PROFILE = {
+    'union_id': 'on_union_1',
+    'open_id': 'ou_open_1',
+    'name': '张三',
+    'enterprise_email': 'zhangsan@corp.com',
+}
+
+
+class FeishuSsoTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.app = FeishuApp.load()
+        for key, value in FULL_CONFIG.items():
+            setattr(self.app, key, value)
+        self.app.enabled = True
+        self.app.sso_enabled = True
+        self.app.sso_redirect_uri = 'https://ops.example.com/login/feishu'
+        self.app.save()
+        self.client = APIClient()
+
+    # ── 授权入口 ──────────────────────────────────────────
+    def test_status_reflects_switch(self):
+        self.assertTrue(self.client.get('/api/feishu/sso/status/').json()['data']['enabled'])
+        FeishuApp.objects.filter(pk=FeishuApp.SINGLETON_PK).update(sso_enabled=False)
+        self.assertFalse(self.client.get('/api/feishu/sso/status/').json()['data']['enabled'])
+
+    def test_authorize_returns_url_with_one_time_state(self):
+        data = self.client.get('/api/feishu/sso/authorize/').json()['data']
+        self.assertIn('app_id=cli_test0001', data['authorize_url'])
+        self.assertIn('redirect_uri=https%3A%2F%2Fops.example.com%2Flogin%2Ffeishu',
+                      data['authorize_url'])
+        self.assertIn(f'state={data["state"]}', data['authorize_url'])
+        # state 可用一次，用完即失效
+        sso.consume_state(data['state'])
+        with self.assertRaises(sso.SsoError):
+            sso.consume_state(data['state'])
+
+    def test_authorize_rejected_when_sso_off(self):
+        FeishuApp.objects.filter(pk=FeishuApp.SINGLETON_PK).update(sso_enabled=False)
+        resp = self.client.get('/api/feishu/sso/authorize/')
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('飞书登录未启用', resp.json()['msg'])
+
+    # ── 登录回调 ──────────────────────────────────────────
+    def _login(self, profile=None, state=None):
+        """走完整回调链路，只把飞书两次出站调用换成假数据。"""
+        profile = PROFILE if profile is None else profile
+        state = state or self.client.get('/api/feishu/sso/authorize/').json()['data']['state']
+
+        def fake_call(method, path, **kwargs):
+            if path == sso.OIDC_TOKEN_PATH:
+                return {'access_token': 'u-token'}
+            if path == sso.USER_INFO_PATH:
+                return dict(profile)
+            raise AssertionError(f'未预期的飞书调用：{path}')
+
+        with patch('apps.im_mgr.client.get_app_token', return_value='a-token'), \
+                patch('apps.im_mgr.client.call', side_effect=fake_call):
+            return self.client.post('/api/feishu/sso/callback/',
+                                    {'code': 'c-1', 'state': state}, format='json')
+
+    def test_login_with_existing_binding(self):
+        user = get_user_model().objects.create(username='zhangsan', is_staff=True)
+        FeishuBinding.objects.create(user=user, union_id='on_union_1', open_id='ou_open_1')
+        resp = self._login()
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn('access', resp.json())
+        binding = FeishuBinding.objects.get(union_id='on_union_1')
+        self.assertIsNotNone(binding.last_login_at)
+
+    def test_login_binds_by_email(self):
+        user = get_user_model().objects.create(username='zs', email='ZhangSan@corp.com')
+        resp = self._login()
+        self.assertEqual(resp.status_code, 200)
+        binding = FeishuBinding.objects.get(union_id='on_union_1')
+        self.assertEqual(binding.user_id, user.id)
+        self.assertEqual(binding.source, 'email')
+
+    def test_ambiguous_email_not_auto_bound(self):
+        """同一邮箱匹配到多个账号一律放弃——这条路最容易绑错人。"""
+        get_user_model().objects.create(username='a1', email='zhangsan@corp.com')
+        get_user_model().objects.create(username='a2', email='zhangsan@corp.com')
+        resp = self._login()
+        self.assertEqual(resp.status_code, 401)
+        self.assertIn('未绑定平台用户', resp.json()['msg'])
+        self.assertFalse(FeishuBinding.objects.exists())
+
+    def test_unknown_user_rejected_by_default(self):
+        resp = self._login()
+        self.assertEqual(resp.status_code, 401)
+        self.assertIn('未绑定平台用户', resp.json()['msg'])
+        self.assertFalse(get_user_model().objects.filter(username='zhangsan').exists())
+
+    def test_auto_create_when_enabled(self):
+        FeishuApp.objects.filter(pk=FeishuApp.SINGLETON_PK).update(auto_create_user=True)
+        resp = self._login()
+        self.assertEqual(resp.status_code, 200)
+        user = get_user_model().objects.get(email='zhangsan@corp.com')
+        self.assertFalse(user.is_staff)
+        # 不设可用密码：这类账号只能经飞书登录，也因此做不了要 sudo 的写操作
+        self.assertFalse(user.has_usable_password())
+        self.assertEqual(FeishuBinding.objects.get().source, 'auto_create')
+
+    def test_inactive_user_rejected(self):
+        user = get_user_model().objects.create(username='zs', is_active=False)
+        FeishuBinding.objects.create(user=user, union_id='on_union_1')
+        resp = self._login()
+        self.assertEqual(resp.status_code, 401)
+        self.assertIn('已停用', resp.json()['msg'])
+
+    def test_service_account_rejected(self):
+        user = get_user_model().objects.create(username='svc-ci', is_service=True)
+        FeishuBinding.objects.create(user=user, union_id='on_union_1')
+        resp = self._login()
+        self.assertEqual(resp.status_code, 401)
+        self.assertIn('服务账号', resp.json()['msg'])
+
+    def test_state_cannot_be_reused(self):
+        user = get_user_model().objects.create(username='zs')
+        FeishuBinding.objects.create(user=user, union_id='on_union_1')
+        state = self.client.get('/api/feishu/sso/authorize/').json()['data']['state']
+        self.assertEqual(self._login(state=state).status_code, 200)
+        second = self._login(state=state)
+        self.assertEqual(second.status_code, 401)
+        self.assertIn('登录状态已失效', second.json()['msg'])
+
+    def test_missing_state_rejected(self):
+        resp = self.client.post('/api/feishu/sso/callback/', {'code': 'c-1'}, format='json')
+        self.assertEqual(resp.status_code, 401)
+        self.assertIn('登录状态缺失', resp.json()['msg'])
+
+    def test_missing_union_id_rejected(self):
+        """拿不到 UnionID 通常是少了通讯录权限，报错要指向那里。"""
+        get_user_model().objects.create(username='zs', email='zhangsan@corp.com')
+        resp = self._login(profile={**PROFILE, 'union_id': ''})
+        self.assertEqual(resp.status_code, 401)
+        self.assertIn('UnionID', resp.json()['msg'])
+
+
+class FeishuSsoMfaInteropTests(TestCase):
+    """SSO 登录视为已过第二因子，但 sudo 不吃这一条。"""
+
+    def setUp(self):
+        cache.clear()
+        from apps.system_cfg.models import SystemConfig
+
+        SystemConfig.objects.update_or_create(
+            key='mfa.enforce_scope', defaults={'value': 'all'})
+        self.user = get_user_model().objects.create(username='sso_user', is_staff=True)
+        self.user.set_password(PASSWORD)
+        self.user.save()
+
+    def _client_with(self, tokens):
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION='Bearer ' + tokens['access'])
+        return client
+
+    def test_password_session_blocked_by_mfa_enforcement(self):
+        from apps.auth_mgr.tokens import issue_access
+
+        client = self._client_with(issue_access(self.user))
+        resp = client.get('/api/assets/servers/')
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json().get('error_code'), 'mfa_enrollment_required')
+
+    def test_sso_session_passes_mfa_enforcement(self):
+        from apps.auth_mgr.tokens import issue_after_sso
+
+        tokens = issue_after_sso(self.user)
+        resp = self._client_with(tokens).get('/api/assets/servers/')
+        self.assertEqual(resp.status_code, 200)
+
+    def test_sso_session_still_needs_sudo_credentials(self):
+        """飞书登录不替代 sudo：没给密码/验证码一律拒。"""
+        from apps.auth_mgr.tokens import issue_after_sso
+
+        client = self._client_with(issue_after_sso(self.user))
+        resp = client.post('/api/auth/mfa/sudo/', {}, format='json')
+        self.assertEqual(resp.status_code, 400)
+
+    def test_sso_session_can_sudo_with_password(self):
+        from apps.auth_mgr.tokens import issue_after_sso
+
+        client = self._client_with(issue_after_sso(self.user))
+        resp = client.post('/api/auth/mfa/sudo/', {'password': PASSWORD}, format='json')
+        self.assertEqual(resp.status_code, 200)

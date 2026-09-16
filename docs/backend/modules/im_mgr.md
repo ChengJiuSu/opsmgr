@@ -35,6 +35,7 @@ apps/im_mgr/
 ├── crypto.py        # 回调解密与验签（公网入口的第一道门）
 ├── dedupe.py        # 一次性消费：nonce / event_id / 卡片 token 共用，fail-closed
 ├── handlers.py      # 回调的业务路由（事件 / 卡片动作）
+├── sso.py           # 飞书网页免登：state、换 token、身份落到平台 User
 ├── client.py        # 出站客户端：token 缓存 + 统一请求封装 + 消息接口
 ├── serializers.py   # 秘密 write_only + has_xxx 回显、启用前置校验
 ├── views.py         # 配置单例 APIView + 会话 ViewSet
@@ -77,6 +78,16 @@ apps/im_mgr/
 `created_at` 在新实例上是 None 而 Django 走 UPDATE，会把创建时间抹成 NULL；
 `callback_slug` 有随机默认值，不回填就等于**静默轮换了回调地址**，表现是飞书那边
 突然全部 404 且没有任何操作记录指向它。两者都在 `save()` 里从库中回填。
+
+### FeishuBinding
+
+平台用户 ↔ 飞书身份。**不映射到平台 User 的话，RBAC、`can_exec_prod`、数据范围
+与审计全部失效**——这是整个飞书接入的安全底座。
+
+以 `union_id` 为准（同一开发者账号下稳定），`open_id` 一并存下来供卡片回调反查
+（那里只有 open_id）。`source` 留痕绑定来源，出问题时要能分清「管理员手工绑的」
+与「按邮箱自动匹配上的」——后者依赖通讯录邮箱与平台账号邮箱一致，是最容易绑错
+人的一条路。
 
 ### FeishuChannel
 
@@ -204,6 +215,48 @@ conf/snippets/feishu_callback_ips.conf     # 来源 IP 白名单（⚠ 待填）
 | `FEISHU_BASE_URL` | `https://open.feishu.cn` | Lark（海外）改 `open.larksuite.com` |
 | `FEISHU_TRUST_ENV` | `True` | 是否吃环境代理。与 `common/jumpserver.py` 的 `trust_env=False` 相反——那边目标在内网 |
 | `FEISHU_CONNECT_TIMEOUT` / `FEISHU_READ_TIMEOUT` | 5 / 10 | 卡片回调要 3 秒内回包，真正的发卡走异步任务 |
+
+---
+
+## 飞书登录（sso.py）
+
+```
+GET  /api/feishu/sso/status/      登录页据此决定是否渲染「飞书登录」（公开，只回布尔）
+GET  /api/feishu/sso/authorize/   取授权跳转地址 + 一次性 state
+POST /api/feishu/sso/callback/    {code, state} → {access, refresh}
+```
+
+**不需要为 SSO 额外开放公网**：授权码由用户浏览器带回，飞书服务器不访问回调
+地址；换 token 是平台的**出站**请求。所以 `sso_redirect_uri` 是给浏览器用的前端
+路由（默认 `/login/feishu`），与 `/api/feishu/callback/` 那两条入站入口无关。
+
+身份落地顺序：
+
+1. `union_id` → `open_id` 查 `FeishuBinding`；
+2. 查不到则按**企业邮箱**唯一匹配平台账号（个人邮箱是用户自己填的，拿它匹配等于
+   让用户自选绑定对象），匹配到多个一律放弃；
+3. 仍无：`auto_create_user` 关（默认）→ 明确拒绝并提示找管理员；开 → 建账号，
+   **不设可用密码、不给角色**（落到无角色分支：只读矩阵、无执行能力）。
+
+停用账号与服务账号一律拒登。`state` 后端签发、缓存 5 分钟、用掉即删，防登录 CSRF；
+缓存不可用时**拒绝登录**（fail-closed）——这是登录路径。回调按来源 IP 限速，与
+密码登录同一套 `common.ratelimit` 参数。
+
+`FEISHU_AUTHORIZE_PATH` 单独抽成配置项：飞书文档上这条地址换过名字（旧版是
+`/open-apis/authen/v1/index`），真换了改一行就行。
+
+### MFA 口径
+
+飞书登录签发的令牌 `amr=['sso']`，被 `MfaJWTAuthentication` 视为**已过第二因子**
+（`auth_mgr.services.AMR_STRONG`）。理由：飞书登录本身已经是「受信设备上的飞书
+客户端 + 飞书自身的二次验证」，再叠一层本平台 TOTP 是重复劳动。
+
+**但 sudo 窗口不吃这一条**：改凭据 / 用户 / 系统配置仍要当场证明是本人——绑了
+TOTP 用 TOTP，没绑的回退密码。登录一次能用 60 分钟而 sudo 只有 10 分钟，两者防的
+不是同一件事。由此推出一个刻意的结果：**自动创建的账号没有可用密码，做不了配置面
+的写操作**，那类账号本就不该直接拿到配置权限。
+
+本地密码登录始终保留——飞书挂了要能进平台。管理员账号建议保留密码 + TOTP。
 
 ---
 

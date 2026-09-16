@@ -12,9 +12,11 @@
 import hmac
 import logging
 
+from django.conf import settings
+from django.contrib.auth.models import update_last_login
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema
-from rest_framework import viewsets
+from rest_framework import status, viewsets
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.throttling import SimpleRateThrottle
@@ -22,15 +24,20 @@ from rest_framework.views import APIView
 
 from apps.auth_mgr.permissions import module_perm
 from common.pagination import StandardPagination
-from common.request import auth_client_ip
-from common.response import ok
+from common.ratelimit import blocked_seconds, record_failure, reset
+from common.request import auth_client_ip, client_ip
+from common.response import fail, ok
 from common.sudo import SudoRequired
 
-from . import crypto, dedupe, handlers
+from . import crypto, dedupe, handlers, sso
+from .client import FeishuError
 from .models import FeishuApp, FeishuChannel
 from .serializers import FeishuAppSerializer, FeishuChannelSerializer
 
 logger = logging.getLogger(__name__)
+
+#: 飞书登录的失败限速分桶（按来源 IP；走到这一步还不知道是谁）
+SSO_SCOPE_IP = 'feishu_sso_ip'
 
 CONFIG_PERMISSIONS = [module_perm('system', min_level='write'), SudoRequired]
 
@@ -246,3 +253,78 @@ class FeishuCardView(FeishuCallbackView):
 
     def dispatch_payload(self, app, payload):
         return handlers.handle_card_action(app, payload)
+
+
+# ══════════════════════════════════════════════════════════
+# 飞书登录（SSO，免登录入口）
+# ══════════════════════════════════════════════════════════
+
+class FeishuSsoStatusView(APIView):
+    """GET /api/feishu/sso/status/ —— 登录页据此决定要不要渲染「飞书登录」。
+
+    公开接口，只回一个布尔。暴露「本站是否开了飞书登录」不构成信息泄露，
+    而把按钮渲染出来再报错是更差的体验。
+    """
+
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    @extend_schema(responses=OpenApiTypes.OBJECT)
+    def get(self, request):
+        app = FeishuApp.load()
+        return ok({'enabled': bool(app.is_ready() and app.sso_enabled)})
+
+
+class FeishuSsoAuthorizeView(APIView):
+    """GET /api/feishu/sso/authorize/ —— 取授权跳转地址（含一次性 state）。"""
+
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    @extend_schema(responses=OpenApiTypes.OBJECT)
+    def get(self, request):
+        try:
+            app = sso.get_app()
+            url, state = sso.authorize_url(app, request)
+        except sso.SsoError as exc:
+            return fail(str(exc))
+        return ok({'authorize_url': url, 'state': state})
+
+
+class FeishuSsoCallbackView(APIView):
+    """POST /api/feishu/sso/callback/ —— 授权码换平台令牌。
+
+    与密码登录同样按 IP 限速：这条路能拿到正式令牌，不限速就是给撞库留门。
+    按 IP 而不是按用户：走到这一步还不知道是谁。
+    """
+
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
+    def post(self, request):
+        ip = client_ip(request)
+        remaining = blocked_seconds(SSO_SCOPE_IP, ip) if ip else 0
+        if remaining:
+            minutes = max(1, -(-remaining // 60))
+            return fail(f'登录失败次数过多，请 {minutes} 分钟后再试。',
+                        code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        status=status.HTTP_429_TOO_MANY_REQUESTS)
+
+        try:
+            app = sso.get_app()
+            user, tokens = sso.login(
+                app, request.data.get('code'), request.data.get('state'), request)
+        except (sso.SsoError, FeishuError) as exc:
+            if ip:
+                record_failure(SSO_SCOPE_IP, ip, limit=settings.LOGIN_FAIL_IP_LIMIT,
+                               window=settings.LOGIN_FAIL_WINDOW,
+                               block=settings.LOGIN_FAIL_BLOCK)
+            logger.warning('飞书登录失败（ip=%s）：%s', ip, exc)
+            return fail(str(exc), status=status.HTTP_401_UNAUTHORIZED)
+
+        if ip:
+            reset(SSO_SCOPE_IP, ip)
+        update_last_login(None, user)
+        logger.info('用户 %s 经飞书登录成功（ip=%s）', user.username, ip)
+        return Response(tokens)

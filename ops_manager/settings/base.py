@@ -357,6 +357,10 @@ FEISHU_BASE_URL = config('FEISHU_BASE_URL', default='https://open.feishu.cn')
 # 那边的目标在内网，吃了开发机代理会得到 502
 FEISHU_TRUST_ENV = config('FEISHU_TRUST_ENV', default=True, cast=bool)
 # 出站请求超时（连接秒, 读取秒）：卡片回调必须 3 秒内回包，读超时不能太长
+# 网页免登的授权页路径。飞书文档上这条地址换过名字（旧版是
+# /open-apis/authen/v1/index），单独抽成配置项，真换了改一行就行
+FEISHU_AUTHORIZE_PATH = config(
+    'FEISHU_AUTHORIZE_PATH', default='/open-apis/authen/v1/authorize')
 FEISHU_TIMEOUT = (
     config('FEISHU_CONNECT_TIMEOUT', default=5, cast=int),
     config('FEISHU_READ_TIMEOUT', default=10, cast=int),

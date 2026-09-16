@@ -26,12 +26,16 @@ from .models import FeishuApp
 logger = logging.getLogger(__name__)
 
 TOKEN_CACHE_KEY = 'feishu:tenant_access_token'
+APP_TOKEN_CACHE_KEY = 'feishu:app_access_token'
 #: 提前这么多秒判定过期，避免拿着一张「还有 3 秒到期」的 token 去发请求
 TOKEN_SAFETY_MARGIN = 300
 #: 飞书返回这些错误码 = token 不可用，清缓存重取一次
 INVALID_TOKEN_CODES = (99991661, 99991663, 99991664, 99991668)
 
 TOKEN_PATH = '/open-apis/auth/v3/tenant_access_token/internal'
+# 网页免登换 user_access_token 时，Authorization 里要的是 app_access_token，
+# 不是 tenant_access_token——自建应用里这是两把不同的 token，混用直接报权限错
+APP_TOKEN_PATH = '/open-apis/auth/v3/app_access_token/internal'
 MESSAGE_PATH = '/open-apis/im/v1/messages'
 USER_PATH = '/open-apis/contact/v3/users'
 
@@ -87,58 +91,87 @@ def _request(session, method, path, *, headers=None, payload=None, params=None):
     return body
 
 
-def get_tenant_token(app=None, force_refresh=False):
-    """取 tenant_access_token，默认读缓存。
-
-    缓存不可用时退化为每次现取（fail-open）：这里失败的后果只是多打几次接口，
-    与 nonce 去重那种「放行即可被重放」的判定不同，不需要 fail-closed。
-    """
-    if not force_refresh:
-        try:
-            cached = cache.get(TOKEN_CACHE_KEY)
-        except Exception:  # noqa: BLE001 - 缓存后端异常类型由实现决定
-            logger.warning('飞书 token 缓存不可用，改为现取', exc_info=True)
-            cached = None
-        if cached:
-            return cached
-
-    app = app or _app()
+def _fetch_token(app, path, field, cache_key):
+    """取一把应用级 token 并写缓存。"""
     body = _request(
-        _session(), 'POST', TOKEN_PATH,
+        _session(), 'POST', path,
         payload={'app_id': app.app_id, 'app_secret': app.app_secret},
     )
     if body.get('code'):
         raise FeishuError(
-            f'获取 tenant_access_token 失败：{body.get("msg")}（code={body.get("code")}）',
+            f'获取 {field} 失败：{body.get("msg")}（code={body.get("code")}）',
             code=body.get('code'),
         )
-    token = body.get('tenant_access_token')
+    token = body.get(field)
     if not token:
-        raise FeishuError('飞书未返回 tenant_access_token')
+        raise FeishuError(f'飞书未返回 {field}')
     ttl = int(body.get('expire') or 7200) - TOKEN_SAFETY_MARGIN
     if ttl > 0:
         try:
-            cache.set(TOKEN_CACHE_KEY, token, timeout=ttl)
+            cache.set(cache_key, token, timeout=ttl)
         except Exception:  # noqa: BLE001
             logger.warning('飞书 token 写缓存失败，本次照常使用', exc_info=True)
     return token
 
 
+def _cached_token(cache_key):
+    try:
+        return cache.get(cache_key)
+    except Exception:  # noqa: BLE001 - 缓存后端异常类型由实现决定
+        logger.warning('飞书 token 缓存不可用，改为现取', exc_info=True)
+        return None
+
+
+def get_tenant_token(app=None, force_refresh=False):
+    """取 tenant_access_token（发消息、读通讯录用），默认读缓存。
+
+    缓存不可用时退化为每次现取（fail-open）：这里失败的后果只是多打几次接口，
+    与 nonce 去重那种「放行即可被重放」的判定不同，不需要 fail-closed。
+    """
+    if not force_refresh:
+        cached = _cached_token(TOKEN_CACHE_KEY)
+        if cached:
+            return cached
+    return _fetch_token(app or _app(), TOKEN_PATH,
+                        'tenant_access_token', TOKEN_CACHE_KEY)
+
+
+def get_app_token(app=None, force_refresh=False):
+    """取 app_access_token（网页免登换 user_access_token 用）。"""
+    if not force_refresh:
+        cached = _cached_token(APP_TOKEN_CACHE_KEY)
+        if cached:
+            return cached
+    return _fetch_token(app or _app(), APP_TOKEN_PATH,
+                        'app_access_token', APP_TOKEN_CACHE_KEY)
+
+
 def drop_token_cache():
     try:
-        cache.delete(TOKEN_CACHE_KEY)
+        cache.delete_many([TOKEN_CACHE_KEY, APP_TOKEN_CACHE_KEY])
     except Exception:  # noqa: BLE001
         logger.warning('飞书 token 缓存清理失败', exc_info=True)
 
 
-def call(method, path, *, payload=None, params=None, app=None):
+def call(method, path, *, payload=None, params=None, app=None, token=None):
     """调一次飞书业务接口，返回 data 部分；业务错误码抛 FeishuError。
 
     token 失效（INVALID_TOKEN_CODES）时自动清缓存、重取、重试一次。只重试
     一次：真的是 App Secret 被改了的话，重试多少次都一样，快点报错更有用。
+
+    `token` 显式传入时（网页免登拿到的 user_access_token、或 app_access_token）
+    不做重取重试——那把 token 不是本模块发的，重取也拿不到同一把。
     """
     app = app or _app()
     session = _session()
+    if token:
+        body = _request(session, method, path, payload=payload, params=params,
+                        headers={'Authorization': f'Bearer {token}'})
+        if body.get('code'):
+            raise FeishuError(
+                f'飞书接口 {path} 调用失败：{body.get("msg")}（code={body.get("code")}）',
+                code=body.get('code'))
+        return body.get('data') or {}
     for attempt in (1, 2):
         token = get_tenant_token(app, force_refresh=attempt == 2)
         body = _request(

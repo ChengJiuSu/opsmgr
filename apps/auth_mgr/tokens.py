@@ -17,7 +17,7 @@ from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken, Token
 
 from . import roles
-from .services import AMR_OTP, AMR_PASSWORD
+from .services import AMR_OTP, AMR_PASSWORD, AMR_SSO
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +93,15 @@ def issue_access(user, amr=None):
 
 def issue_after_mfa(user):
     return issue_access(user, amr=[AMR_PASSWORD, AMR_OTP])
+
+
+def issue_after_sso(user):
+    """外部身份源（飞书）登录后的令牌。
+
+    amr 只写 `sso`，不带 `pwd`——用户压根没输密码，声明成输过是给审计与将来的
+    策略判断埋错误信息。
+    """
+    return issue_access(user, amr=[AMR_SSO])
 
 
 def _incr(key):

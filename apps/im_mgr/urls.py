@@ -7,6 +7,9 @@ from .views import (
     FeishuCardView,
     FeishuChannelViewSet,
     FeishuEventView,
+    FeishuSsoAuthorizeView,
+    FeishuSsoCallbackView,
+    FeishuSsoStatusView,
 )
 
 router = DefaultRouter()
@@ -21,6 +24,12 @@ urlpatterns = [
     # 审计中间件据此整段跳过回调流量（见 apps/audit/middleware.py）
     re_path(rf'^callback/{SLUG}/event/$', FeishuEventView.as_view(), name='feishu-event'),
     re_path(rf'^callback/{SLUG}/card/$', FeishuCardView.as_view(), name='feishu-card'),
+
+    # 飞书登录（免登录入口）。授权码由浏览器带回，飞书服务器不访问这些地址，
+    # 因此不需要像 /callback/ 那样额外开放与加固
+    path('sso/status/', FeishuSsoStatusView.as_view(), name='feishu-sso-status'),
+    path('sso/authorize/', FeishuSsoAuthorizeView.as_view(), name='feishu-sso-authorize'),
+    path('sso/callback/', FeishuSsoCallbackView.as_view(), name='feishu-sso-callback'),
 
     path('app/', FeishuAppView.as_view(), name='feishu-app'),
     path('app/rotate-slug/', FeishuAppCallbackSlugView.as_view(), name='feishu-app-rotate-slug'),

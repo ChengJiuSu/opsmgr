@@ -52,5 +52,7 @@ class MfaJWTAuthentication(JWTAuthentication):
     def _passed_mfa(token):
         # 存量 token 没有 amr 声明：视为只过了密码。开启强制后这些会话会被挡，
         # 重新登录即可——这正是「开启强制」应有的效果。
+        # otp（本平台 TOTP）与 sso（飞书登录）同档，理由见 services.AMR_STRONG。
         payload = getattr(token, 'payload', None) or {}
-        return services.AMR_OTP in (payload.get('amr') or [])
+        claimed = set(payload.get('amr') or [])
+        return bool(claimed & set(services.AMR_STRONG))

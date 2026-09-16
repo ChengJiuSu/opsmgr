@@ -34,9 +34,21 @@ SCOPE_STAFF = 'staff'
 SCOPE_ALL = 'all'
 SCOPES = (SCOPE_OFF, SCOPE_STAFF, SCOPE_ALL)
 
-# token 里的认证方式声明（RFC 8176 amr）：pwd = 只过了密码，otp = 过了第二因子
+# token 里的认证方式声明（RFC 8176 amr）：pwd = 只过了密码，otp = 过了第二因子，
+# sso = 经外部身份源（飞书）登录。
+#
+# **sso 与 otp 同档**：飞书登录本身已经是「受信任设备上的飞书客户端 + 飞书自身的
+# 二次验证」，再叠一层本平台的 TOTP 属于重复劳动，会把 SSO 的价值抵消掉一半。
+# 这是明确拍板过的取舍（见 apps/im_mgr/sso.py）。
+#
+# **但 sudo 窗口不吃这一条**：改凭据/用户/系统配置仍要当场证明是本人（TOTP，
+# 没绑 TOTP 则回退密码）。登录一次就能持续 60 分钟，而 sudo 只有 10 分钟——
+# 两者要防的不是同一件事。
 AMR_PASSWORD = 'pwd'
 AMR_OTP = 'otp'
+AMR_SSO = 'sso'
+#: 视为「已过第二因子」的认证方式
+AMR_STRONG = (AMR_OTP, AMR_SSO)
 
 
 class MfaError(Exception):

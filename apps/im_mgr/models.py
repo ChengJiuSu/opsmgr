@@ -26,6 +26,7 @@
 """
 import secrets
 
+from django.conf import settings
 from django.db import models
 
 from common.fields import EncryptedTextField
@@ -62,6 +63,9 @@ class FeishuApp(models.Model):
 
     enabled = models.BooleanField('启用飞书接入', default=False)
     sso_enabled = models.BooleanField('启用飞书登录', default=False)
+    # 授权回调地址（浏览器跳回的前端页），必须与飞书后台「重定向 URL」白名单
+    # 一致。留空则按请求域名推导出 <scheme>://<host>/login/feishu
+    sso_redirect_uri = models.CharField('飞书登录回调地址', max_length=500, blank=True)
     # 飞书账号在平台里找不到对应用户时是否自动建号。默认关：开了等于全公司飞书
     # 员工都能进后台，而「谁能进平台」不该由通讯录决定
     auto_create_user = models.BooleanField('未绑定用户时自动创建', default=False)
@@ -220,3 +224,62 @@ class FeishuChannel(models.Model):
         """该会话当前是否允许发起执行（未登记 / 停用 / 未授权一律 False）。"""
         return cls.objects.filter(
             chat_id=chat_id, enabled=True, allow_execute=True).exists()
+
+
+class FeishuBinding(models.Model):
+    """平台用户与飞书身份的绑定。
+
+    飞书回调只给 `open_id`，不映射到平台 User 的话，RBAC、can_exec_prod、数据
+    范围与审计**全部失效**——这是整个飞书接入的安全底座，不能省。
+
+    **以 union_id 为准**：`open_id` 是「同一个人在某个应用下」的标识，换一个
+    自建应用就变；`union_id` 在同一开发者账号下稳定。open_id 一并存下来是因为
+    回调里只有它，要靠它反查。
+
+    绑定来源（`source`）留痕：出问题时要能分清「管理员手工绑的」与「按邮箱自动
+    匹配上的」——后者依赖通讯录邮箱与平台账号邮箱一致，是最容易绑错人的一条路。
+    """
+
+    SOURCE_CHOICES = [
+        ('manual', '管理员绑定'),
+        ('email', '邮箱自动匹配'),
+        ('auto_create', '自动创建账号'),
+    ]
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL, verbose_name='平台用户',
+        on_delete=models.CASCADE, related_name='feishu_binding',
+    )
+    # 一个平台账号只绑一个飞书身份（OneToOne），反过来也唯一
+    union_id = models.CharField('飞书 UnionID', max_length=128, unique=True)
+    open_id = models.CharField('飞书 OpenID', max_length=128, blank=True, db_index=True)
+    feishu_name = models.CharField('飞书昵称', max_length=100, blank=True)
+    feishu_email = models.CharField('飞书邮箱', max_length=254, blank=True)
+    source = models.CharField('绑定来源', max_length=20, choices=SOURCE_CHOICES, default='manual')
+    last_login_at = models.DateTimeField('最近飞书登录', null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = '飞书绑定'
+        verbose_name_plural = '飞书绑定'
+        db_table = 'im_feishu_binding'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'{self.user_id}↔{self.union_id}'
+
+    @classmethod
+    def resolve(cls, union_id=None, open_id=None):
+        """按 union_id 优先、open_id 兜底查绑定。
+
+        open_id 兜底是给卡片回调用的：那里拿不到 union_id。
+        """
+        query = cls.objects.select_related('user')
+        if union_id:
+            hit = query.filter(union_id=union_id).first()
+            if hit:
+                return hit
+        if open_id:
+            return query.filter(open_id=open_id).first()
+        return None
