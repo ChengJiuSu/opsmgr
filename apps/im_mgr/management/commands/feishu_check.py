@@ -31,6 +31,8 @@ class Command(BaseCommand):
         parser.add_argument('--chats', action='store_true',
                             help='列出机器人已加入的群与 chat_id（登记会话白名单用）')
         parser.add_argument('--chat-id', help='向该会话真发一张测试卡片（会打扰到人）')
+        parser.add_argument('--probe-select', action='store_true',
+                            help='测试卡改发「多选组件探针」，用来确认飞书回传的结构')
 
     def handle(self, *args, **options):
         app = FeishuApp.load()
@@ -47,7 +49,7 @@ class Command(BaseCommand):
         if options.get('email') or options.get('mobile'):
             failed |= self._check_lookup(options.get('email'), options.get('mobile'))
         if options.get('chat_id'):
-            failed |= self._check_send(options['chat_id'])
+            failed |= self._check_send(options['chat_id'], options.get('probe_select'))
 
         self.stdout.write('')
         if failed:
@@ -192,12 +194,19 @@ class Command(BaseCommand):
         return False
 
     # ── 发卡 ─────────────────────────────────────────────
-    def _check_send(self, chat_id):
+    def _check_send(self, chat_id, probe_select=False):
         from apps.im_mgr import cards
 
         self.stdout.write(self.style.MIGRATE_HEADING('\n[6] 发送测试卡片'))
-        card = cards.notice('飞书接入自检', '这是一张来自运维平台的测试卡片，收到即表示出站正常。',
-                            tip='由 manage.py feishu_check 发出')
+        if probe_select:
+            card = cards.probe_multi_select([
+                {'label': 'web1 · 10.0.0.1', 'value': '1'},
+                {'label': 'web2 · 10.0.0.2', 'value': '2'},
+                {'label': 'web3 · 10.0.0.3', 'value': '3'},
+            ])
+        else:
+            card = cards.notice('飞书接入自检', '这是一张来自运维平台的测试卡片，收到即表示出站正常。',
+                                tip='由 manage.py feishu_check 发出')
         try:
             message_id = client.send_card(chat_id, card)
         except client.FeishuError as exc:
@@ -205,4 +214,7 @@ class Command(BaseCommand):
             self.stdout.write(INFO + '常见原因：机器人不在该群、或缺 im:message:send_as_bot 权限')
             return True
         self.stdout.write(OK + f'已发出，message_id={message_id}')
+        if probe_select:
+            self.stdout.write(INFO + '在飞书里改几项再点「提交」，回传结构会直接显示在卡片上，'
+                                     '也会进日志（grep 组件探针）')
         return False

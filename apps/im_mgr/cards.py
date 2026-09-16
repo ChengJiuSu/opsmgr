@@ -23,6 +23,7 @@ ACT_RUN = 'run'                   # 确认执行（非生产）
 ACT_CONFIRM_PROD = 'confirm_prod'  # 生产二次确认
 ACT_CANCEL = 'cancel'             # 取消
 ACT_PAUSE = 'pause'               # 暂停处理（continue/abort/retry/skip）
+ACT_PROBE = 'probe'               # 组件探针：回显飞书实际回传的 action 结构
 
 #: 模块列表最多渲染这么多条，其余折成一行说明
 MAX_STEPS_SHOWN = 20
@@ -339,3 +340,72 @@ def notice(title, content, *, template='grey', tip=None):
     if tip:
         elements.append(note(tip))
     return card(title, elements, template=template)
+
+
+# ── 组件探针 ──────────────────────────────────────────────
+
+def probe_multi_select(options, *, preselect=None):
+    """探针卡（**卡片 2.0**）：表单容器 + 多选 + 提交按钮。
+
+    1.0 的交互组件各自独立回调，点「提交」时拿不到之前选了什么——要么服务端暂存
+    选择状态，要么升 2.0 用表单容器一次性带回。选了后者，所以先用这张卡确认两件
+    事：2.0 在这个企业的客户端渲染正常，以及提交时 `form_value` 的实际结构
+    （文档对字段名讲得不清楚，照着猜写一版再返工不划算）。
+
+    默认选中两种写法都放进去，哪种生效一眼看得出来。
+    """
+    preselect = list(preselect if preselect is not None else [o['value'] for o in options])
+    choices = [{'text': {'tag': 'plain_text', 'content': o['label']}, 'value': o['value']}
+               for o in options]
+    return {
+        'schema': '2.0',
+        'config': {'width_mode': 'fill', 'update_multi': True},
+        'header': {'title': {'tag': 'plain_text', 'content': '组件探针（多选 · 卡片 2.0）'},
+                   'template': 'grey'},
+        'body': {
+            'direction': 'vertical',
+            'elements': [
+                {'tag': 'markdown', 'content': '先在下拉里改几项，再点「提交」。'},
+                {
+                    'tag': 'form',
+                    'name': 'probe_form',
+                    'elements': [
+                        {
+                            'tag': 'multi_select_static',
+                            'name': 'hosts',
+                            'placeholder': {'tag': 'plain_text',
+                                            'content': '选择主机（默认全选）'},
+                            'options': choices,
+                            'selected_values': preselect,
+                            'initial_options': [c for c in choices
+                                                if c['value'] in preselect],
+                        },
+                        {
+                            'tag': 'button',
+                            'text': {'tag': 'plain_text', 'content': '提交'},
+                            'type': 'primary',
+                            'name': 'submit',
+                            'form_action_type': 'submit',
+                            'behaviors': [{'type': 'callback',
+                                           'value': {'act': ACT_PROBE, 'from': 'form'}}],
+                        },
+                    ],
+                },
+                {'tag': 'note',
+                 'elements': [{'tag': 'plain_text',
+                               'content': '这张卡只用于确认飞书回传的数据结构，'
+                                          '不会执行任何任务。'}]},
+            ],
+        },
+    }
+
+
+def probe_result(action):
+    """把飞书回传的 action 原样展示出来（用 1.0，只是展示，不需要交互）。"""
+    import json as _json
+
+    body = _json.dumps(action, ensure_ascii=False, indent=2)[:1500].replace('`', "'")
+    return card('探针回传', [
+        md('飞书这次回传的 action：'),
+        md(f'```\n{body}\n```'),
+    ], template='grey')

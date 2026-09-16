@@ -110,11 +110,21 @@ def context_ids(payload):
 
 
 def action_payload(payload):
-    """按钮/下拉的回传体，返回 (value dict, 下拉选中值)。"""
+    """按钮/下拉的回传体，返回 (value dict, 下拉选中值)。
+
+    卡片 2.0 的回调把值放在 `behaviors[].value`（`value` 字段在某些组件上不再出现），
+    表单提交时另有 `form_value`。这里只负责取出「这次点的是什么」，表单里勾了什么
+    由调用方读 `form_value`。
+    """
     action = _event(payload).get('action') or payload.get('action') or {}
     if not isinstance(action, dict):
         return {}, ''
     value = action.get('value')
+    if not value:
+        for behavior in (action.get('behaviors') or []):
+            if isinstance(behavior, dict) and behavior.get('value'):
+                value = behavior['value']
+                break
     if isinstance(value, str):
         # 部分客户端会把 value 序列化成字符串回传
         try:
@@ -133,6 +143,13 @@ def is_p2p(payload):
         return True
     message = _event(payload).get('message') or {}
     return str(message.get('chat_type') or '') == 'p2p'
+
+
+def form_value(payload):
+    """卡片 2.0 表单提交时，表单内各组件的值（name → 值）。"""
+    action = _event(payload).get('action') or payload.get('action') or {}
+    values = action.get('form_value') if isinstance(action, dict) else None
+    return values if isinstance(values, dict) else {}
 
 
 def message_text(payload):
@@ -289,6 +306,11 @@ def handle_card_action(app, payload):
         return _on_confirm_prod(user, chat_id, open_id, value, message_id, p2p)
     if act == cards.ACT_PAUSE:
         return _on_pause(user, value)
+    if act == cards.ACT_PROBE:
+        # 组件探针：把飞书回传的 action 原样打回去，用来确认多选组件的数据结构
+        action = _event(payload).get('action') or payload.get('action') or {}
+        logger.warning('飞书组件探针回传：%s', json.dumps(action, ensure_ascii=False))
+        return card_response(cards.probe_result(action))
 
     logger.info('飞书卡片动作未识别：%s', value)
     return None
