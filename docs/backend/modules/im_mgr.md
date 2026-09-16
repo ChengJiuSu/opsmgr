@@ -519,6 +519,27 @@ open_id。查不到就明说「通讯录里没有」，**不返回半个 id**—
 
 ---
 
+## 自检命令
+
+```bash
+./venv/bin/python manage.py feishu_check                    # 配置 + 出站连通性 + 地址
+./venv/bin/python manage.py feishu_check --email a@corp.com # 顺带验通讯录反查
+./venv/bin/python manage.py feishu_check --chat-id oc_xxx   # 真发一张测试卡片
+```
+
+**在去飞书后台保存回调地址之前跑它**。那一步一保存就立刻触发地址验证，而验证失败
+时回包是恒定的（安全要求），从飞书后台完全看不出原因——只能翻服务端日志。先用这条
+命令把「平台侧准备好了没」一次问清楚。
+
+它覆盖三件离线确认不了的事：两种 token 是否取得到（`tenant_access_token` 与
+`app_access_token` 是两把不同的 token）、授权页路径是否还叫这个名字（飞书换过，
+404 就说明要改 `FEISHU_AUTHORIZE_PATH`）、通讯录里的邮箱字段是否有值
+（`enterprise_email` 为空则飞书登录无法按邮箱自动绑定）。
+
+除 `--chat-id` 外全部只读。
+
+---
+
 ## 部署提醒
 
 - 秘密只经配置页录入、加密落库，**不进仓库、不进 .env**。
