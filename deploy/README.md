@@ -262,58 +262,121 @@ docker compose --profile mysql up -d --build
 
 6. 接入飞书（可选）时**顺序不能反**，见下节。
 
-## 飞书接入上线顺序
+## 飞书接入
 
-模块说明见 `docs/backend/modules/im_mgr.md`。顺序有硬依赖：**飞书后台一保存回调
-地址就会立刻发一次地址验证，而那次验证同样要过全部校验**。平台侧没准备好就去
-保存，验证必然失败，且回包是恒定的（安全要求），从飞书后台完全看不出原因——
-只能翻服务端日志。所以：
+模块设计见 `docs/backend/modules/im_mgr.md`，这里只讲怎么配通。
 
-1. 飞书开放平台建自建应用，拿到 App ID / App Secret / Encrypt Key /
-   Verification Token；申请权限：`im:message`、`im:message:send_as_bot`、
-   `im:chat:readonly`、`contact:user.base:readonly`、`contact:user.email:readonly`，
-   以及网页免登（`authen`）。事件订阅先**不填**回调地址。
+### 飞书后台要配的四处
 
-2. nginx 填回调来源 IP 白名单——飞书帮助中心「配置企业内网防火墙域名和 IP 白名单」：
+在[飞书开放平台](https://open.feishu.cn/app)建**自建应用**，下面四处都要配，
+少一处就卡在对应的那一步：
+
+| 位置 | 配什么 | 不配的现象 |
+|------|--------|-----------|
+| 凭证与基础信息 | App ID / App Secret | 平台取不到 token，`feishu_check` 第 2 项失败 |
+| 事件配置 → **加密策略** | Encrypt Key、Verification Token | 地址验证能过，但**正式事件推送全被拒**（飞书不加密就不带签名头） |
+| 事件配置 → 订阅方式 | 请求地址（事件订阅 / 卡片回调） | 群里 @机器人没反应 |
+| 安全设置 → **重定向 URL** | `https://<域名>/login/feishu` | 飞书登录跳转后报 `20029 Invalid redirect URL` |
+
+**权限**（申请后需管理员审批）：`im:message`、`im:message:send_as_bot`、
+`im:chat:readonly`、`contact:user.base:readonly`、`contact:user.email:readonly`，
+以及网页免登（`authen`）。
+
+### 配置顺序（有硬依赖）
+
+**飞书后台一保存请求地址就会立刻发一次地址验证**，平台侧没准备好就去保存必然失败，
+而回包是恒定的（安全要求），从飞书后台完全看不出原因——只能翻服务端日志。所以：
+
+1. 飞书后台先配好**加密策略**，拿到 Encrypt Key 与 Verification Token。
+   请求地址这一步先**空着**。
+
+2. 平台「系统管理 → 飞书接入」录入四项凭据（加密落库，**不进 .env、不进仓库**），
+   勾选**启用飞书接入**。缺项时页面会直接列出还差什么。
+
+3. 回调来源 IP 白名单（两层，见下节「收紧」）。**测试期可以都不填**——签名那道是
+   独立完整的防护，没有 Encrypt Key 伪造不出请求。
+
+4. **先跑自检**，通过了再回飞书保存地址：
 
    ```bash
-   vim deploy/nginx/conf/snippets/feishu_callback_ips.conf   # ⚠ 该文件为空 = 拒绝所有回调
-   docker compose -f deploy/nginx/docker-compose.yaml exec nginx nginx -s reload
+   venv/bin/python manage.py feishu_check                      # 配置 + 出站 + 地址
+   venv/bin/python manage.py feishu_check --email a@corp.com   # 顺带验通讯录反查
+   venv/bin/python manage.py feishu_check --chat-id oc_xxx     # 真发一张测试卡片
    ```
 
-3. 平台「系统管理 → 飞书接入」录入四项凭据（加密落库，**不进 .env、不进仓库**），
-   填同一份 IP 白名单（应用层是主、nginx 是兜底），保存并勾选**启用飞书接入**。
-   缺项时页面会直接列出还差什么。
+   它会把要粘到飞书后台的三个地址打出来，并当场验证两种 token、授权页路径与通讯录
+   权限。除 `--chat-id` 外全部只读。
 
-4. **先跑自检**，再去飞书后台保存地址：
+5. 把页面上的**事件订阅地址**与**卡片回调地址**贴到飞书后台保存——这一步才触发
+   地址验证。
 
-   ```bash
-   venv/bin/python manage.py feishu_check                   # 配置 + 出站 + 地址
-   venv/bin/python manage.py feishu_check --email a@corp.com  # 顺带验通讯录反查
-   venv/bin/python manage.py feishu_check --chat-id oc_xxx    # 真发一张测试卡片
-   ```
+6. 要用飞书登录：平台侧勾**启用飞书登录**，并把**飞书登录回调地址**显式填成
+   `https://<域名>/login/feishu`；同一个值加进飞书后台的**安全设置 → 重定向 URL**。
 
-   它会把要粘到飞书后台的三个地址打出来，并当场验证两种 token、授权页路径与
-   通讯录权限。除 `--chat-id` 外全部只读。
+   > 平台侧留空时是按**当前请求的域名**推导的。有人从 IP、内网域名或带端口访问后台
+   > 就会推出另一个值，跟飞书白名单对不上，现象随访问方式变化、很难复现。填死它。
 
-5. 把页面上的**事件订阅地址**与**卡片回调地址**复制到飞书开放平台保存——
-   这一步才会触发地址验证。失败时看 `logs/`，不要看飞书后台的提示。
-
-6. 要用飞书登录：勾选**启用飞书登录**，并把 `https://<域名>/login/feishu` 加进
-   飞书后台的「重定向 URL」白名单。
-
-7. 「系统管理 → 飞书接入」登记允许交互的群/单聊（`chat_id`），需要从群里发起执行
-   的才勾「允许发起任务执行」。
+7. 「系统管理 → 飞书接入」登记允许交互的群/单聊（`chat_id`），需要从群里发起执行的
+   才勾「允许发起任务执行」。
 
 8. 任务侧逐条开放：任务编辑页勾「允许从飞书发起执行」（默认关，且要求
    「执行时默认全选主机」）。
 
 9. 验证：群里 @机器人 → 出任务下拉 → 选一条非生产任务执行 → 卡片应随执行进度刷新。
 
-上线后 **把对话/工单里出现过的 App Secret 在飞书后台重置一次**，再到配置页重新录入。
+### 排错：日志怎么看
 
-轮换回调地址（配置页上的「轮换回调地址」）会让旧地址**立即失效**，必须同步更新
-飞书后台，否则所有回调被拒。
+回调的回包**恒定**是 `{"code":0}`（回包有差异就是给攻击者的探测反馈），所以飞书后台
+永远只显示「Challenge code 没有返回」这类笼统提示。**排错一律看服务端日志**：
+
+```bash
+grep -i "飞书回调" logs/*.log | tail -20
+```
+
+失败时会把收到了哪些 `X-Lark-*` 头一并打出来，往往直接指出问题在哪：
+
+| 日志 / 现象 | 原因 |
+|------|------|
+| `缺少签名头 X-Lark-Signature`（正式事件） | 飞书侧没配加密策略；地址验证不受影响（飞书那一步本来就不带签名头） |
+| `签名校验失败` | 两边 Encrypt Key 不一致，多半是复制时带了空格 |
+| `Verification Token 不匹配` | Token 填错 |
+| `解密结果填充非法` | Encrypt Key 对不上的另一种表现 |
+| `时间戳偏差 Ns 超过 300s` | 服务器时钟不准，查 `timedatectl status` |
+| `来源 IP 不在白名单内` | 应用层白名单没放行飞书出口段 |
+| 日志里**什么都没有** | 请求没到 Django。查 nginx：`grep feishu deploy/nginx/logs/ops-manager.api.access.log`，403 = IP 白名单挡住（**空的白名单文件 = 拒绝所有回调**） |
+| 浏览器 `20029 Invalid redirect URL` | 飞书后台「安全设置 → 重定向 URL」里没有我们传的那个地址。以**浏览器地址栏里的 `redirect_uri` 参数**为准去对，不要用 `feishu_check` 打印的那行（命令行没有 request，它按 `SITE_BASE_URL` 推导） |
+
+绕过 nginx 直接打后端，判断是哪一层的问题：
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/feishu/callback/<slug>/event/ \
+     -H 'Content-Type: application/json' -d '{}'
+# {"code":0} → 到了 Django，看上面的日志表
+# 404       → 代码没部署，或 slug 对不上
+```
+
+### 上线前收紧
+
+测试期可以先不做限制，**正式启用前这三项必须补上**：
+
+1. **应用层 IP 白名单**：配置页取消勾选「不限制来源 IP」，填飞书出口 IP 段
+   （飞书帮助中心「配置企业内网防火墙域名和 IP 白名单」）；
+2. **nginx IP 白名单 + 限速**：
+
+   ```bash
+   vim deploy/nginx/conf/snippets/feishu_callback_ips.conf   # ⚠ 空文件 = 拒绝所有回调
+   docker compose -f deploy/nginx/docker-compose.yaml up -d --force-recreate
+   ```
+
+   两层不可互相替代：nginx 管「这条路径根本不该从别处被摸到」，扫描流量在网络层就
+   被挡掉；应用层白名单可以改一处配置就生效，不用改 nginx 再 reload。
+   顺序上**先填白名单再让配置生效**，反了会把刚配通的回调全部 403 挡死。
+3. `.env` 的 `SITE_BASE_URL` 配成真实域名——执行卡片里「查看完整日志」的链接用它。
+
+另外：把对话/工单里出现过的 **App Secret 在飞书后台重置一次**，再到配置页重新录入。
+
+配置页上的「轮换回调地址」会让旧地址**立即失效**，必须同步更新飞书后台，否则所有
+回调被拒。
 
 ## 日常更新
 

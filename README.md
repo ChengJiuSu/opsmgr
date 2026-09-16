@@ -219,6 +219,9 @@ Authorization: Bearer <access_token>
 
 完整接口文档见 [docs/backend/api-reference.md](docs/backend/api-reference.md) 或访问 `/api/docs/`。
 
+> 飞书接入的配置步骤与排错见 [deploy/README.md 飞书接入](deploy/README.md#飞书接入)，
+> 模块设计见 [docs/backend/modules/im_mgr.md](docs/backend/modules/im_mgr.md)。
+
 ---
 
 ## 平台方法与任务执行
