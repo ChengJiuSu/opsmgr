@@ -20,3 +20,11 @@ export const getChannels = (params) => request.get('/api/feishu/channels/', { pa
 export const createChannel = (data) => request.post('/api/feishu/channels/', data)
 export const updateChannel = (id, data) => request.put(`/api/feishu/channels/${id}/`, data)
 export const deleteChannel = (id) => request.delete(`/api/feishu/channels/${id}/`)
+
+// ── 绑定关系（account 模块 write 档 + sudo）──
+// 没有更新接口：改绑 = 解绑再绑，两步各自留痕
+export const getBindings = (params) => request.get('/api/feishu/bindings/', { params })
+export const createBinding = (data) => request.post('/api/feishu/bindings/', data)
+export const deleteBinding = (id) => request.delete(`/api/feishu/bindings/${id}/`)
+// 按邮箱/手机号在飞书通讯录里反查 union_id / open_id（手工绑定用）
+export const lookupFeishuUser = (data) => request.post('/api/feishu/bindings/lookup/', data)

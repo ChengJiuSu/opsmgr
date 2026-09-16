@@ -470,6 +470,20 @@ TOTP 用 TOTP，没绑的回退密码。登录一次能用 60 分钟而 sudo 只
 **`min_level='write'` 而不是按方法推导**：读到的是 App ID、回调地址与 IP 白名单，
 等于一份「怎么打这两条公网入口」的说明书，GET 也不能对所有人开。
 
+**绑定关系单独挂 `account`**（不是 `system`）：它决定「哪个飞书号能以哪个平台账号
+登录与发起执行」，和用户、角色、API 凭证是同一个身份面——改这里等于改身份映射。
+读也需要 write 档：绑定列表本身就是一份「谁能从飞书进来」的清单。
+
+**绑定没有更新接口**：改绑 = 解绑再绑，两步各自留痕比一次静默改值清楚得多。
+
+手工绑定时管理员手上通常只有邮箱或手机号，`lookup` 动作按它反查 union_id 与
+open_id。查不到就明说「通讯录里没有」，**不返回半个 id**——拿半个 id 建出来的绑定
+永远匹配不上回调里的身份，而那种错很难从现象倒推。
+
+序列化器里 `user` 与 `union_id` 两个字段**关掉了 DRF 的字段级唯一校验器**：它跑在
+`validate()` 之前，报出来的是「具有 平台用户 的 飞书绑定 已存在」——看不出是谁
+占着，而管理员最需要知道的恰恰是这个。唯一性仍由数据库约束兜底。
+
 ---
 
 ## 接口速览
@@ -481,6 +495,9 @@ TOTP 用 TOTP，没绑的回退密码。登录一次能用 60 分钟而 sudo 只
 | POST | `/api/feishu/app/rotate-slug/` | 轮换回调标识，飞书后台需同步改 |
 | GET/POST | `/api/feishu/channels/` | 会话白名单列表 / 新增 |
 | PUT/PATCH/DELETE | `/api/feishu/channels/<id>/` | 会话白名单维护 |
+| GET/POST | `/api/feishu/bindings/` | 绑定关系列表 / 手工绑定（**account** write + sudo） |
+| DELETE | `/api/feishu/bindings/<id>/` | 解绑 |
+| POST | `/api/feishu/bindings/lookup/` | 按邮箱/手机号在飞书通讯录反查 union_id / open_id |
 
 会话列表筛选：`chat_type`、`enabled`、`allow_execute`（`true`/`false`）、`keyword`。
 

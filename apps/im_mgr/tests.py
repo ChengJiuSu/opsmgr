@@ -1912,3 +1912,139 @@ class FeishuPauseTests(TestCase):
         send.assert_not_called()
         dos = [b['value']['do'] for b in _buttons(update.call_args[0][1])]
         self.assertEqual(dos, ['continue', 'abort'])
+
+
+# ══════════════════════════════════════════════════════════
+# T11：绑定关系管理（account 模块）
+# ══════════════════════════════════════════════════════════
+
+class FeishuBindingAdminTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.app = FeishuApp.load()
+        for key, value in FULL_CONFIG.items():
+            setattr(self.app, key, value)
+        self.app.enabled = True
+        self.app.save()
+        self.target = get_user_model().objects.create(
+            username='zhangsan', email='zhangsan@corp.com')
+
+    def _client(self, is_staff=True, username=None, sudo=True):
+        username = username or ('admin_bind' if is_staff else 'user_bind')
+        user = get_user_model().objects.create(username=username, is_staff=is_staff)
+        user.set_password(PASSWORD)
+        user.save()
+        client_ = APIClient()
+        resp = client_.post('/api/auth/login/',
+                            {'username': username, 'password': PASSWORD}, format='json')
+        client_.credentials(HTTP_AUTHORIZATION='Bearer ' + resp.json()['access'])
+        if is_staff and sudo:
+            grant_sudo(client_)
+        return client_
+
+    def test_create_and_list(self):
+        admin = self._client()
+        resp = admin.post('/api/feishu/bindings/', {
+            'user': self.target.id, 'union_id': 'on_new', 'open_id': 'ou_new',
+            'feishu_name': '张三', 'feishu_email': 'zhangsan@corp.com',
+        }, format='json')
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(FeishuBinding.objects.get().source, 'manual')
+        listed = admin.get('/api/feishu/bindings/?keyword=zhang').json()['data']
+        self.assertEqual(listed['total'], 1)
+        self.assertEqual(listed['results'][0]['username'], 'zhangsan')
+
+    def test_duplicate_union_id_names_the_holder(self):
+        """默认报错看不出是谁占着，而管理员最需要知道的恰恰是这个。"""
+        FeishuBinding.objects.create(user=self.target, union_id='on_taken')
+        other = get_user_model().objects.create(username='lisi')
+        admin = self._client()
+        resp = admin.post('/api/feishu/bindings/', {
+            'user': other.id, 'union_id': 'on_taken',
+        }, format='json')
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('zhangsan', resp.json()['msg'])
+
+    def test_user_already_bound(self):
+        FeishuBinding.objects.create(user=self.target, union_id='on_a')
+        admin = self._client()
+        resp = admin.post('/api/feishu/bindings/', {
+            'user': self.target.id, 'union_id': 'on_b',
+        }, format='json')
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('已绑定飞书账号', resp.json()['msg'])
+
+    def test_service_account_rejected(self):
+        svc = get_user_model().objects.create(username='svc-ci', is_service=True)
+        admin = self._client()
+        resp = admin.post('/api/feishu/bindings/', {
+            'user': svc.id, 'union_id': 'on_svc',
+        }, format='json')
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('服务账号', resp.json()['msg'])
+
+    def test_destroy(self):
+        binding = FeishuBinding.objects.create(user=self.target, union_id='on_x')
+        admin = self._client()
+        resp = admin.delete(f'/api/feishu/bindings/{binding.id}/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(FeishuBinding.objects.exists())
+
+    def test_no_update_endpoint(self):
+        """改绑 = 解绑再绑，两步各自留痕比一次静默改值清楚。"""
+        binding = FeishuBinding.objects.create(user=self.target, union_id='on_x')
+        admin = self._client()
+        resp = admin.put(f'/api/feishu/bindings/{binding.id}/',
+                         {'user': self.target.id, 'union_id': 'on_y'}, format='json')
+        self.assertEqual(resp.status_code, 405)
+
+    def test_requires_account_permission(self):
+        """绑定列表本身就是一份「谁能从飞书进来」的清单，读也要 write 档。"""
+        member = self._client(is_staff=False)
+        self.assertEqual(member.get('/api/feishu/bindings/').status_code, 403)
+
+    def test_write_requires_sudo(self):
+        admin = self._client(username='admin_nosudo_bind', sudo=False)
+        resp = admin.post('/api/feishu/bindings/', {
+            'user': self.target.id, 'union_id': 'on_s',
+        }, format='json')
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json().get('error_code'), 'sudo_required')
+
+    # ── 通讯录反查 ────────────────────────────────────────
+    def test_lookup_returns_ids_and_name(self):
+        admin = self._client()
+        with patch('apps.im_mgr.client.lookup_user_ids',
+                   return_value={'union_id': 'on_1', 'open_id': 'ou_1'}), \
+                patch('apps.im_mgr.client.get_user', return_value={'name': '张三'}):
+            resp = admin.post('/api/feishu/bindings/lookup/',
+                              {'email': 'zhangsan@corp.com'}, format='json')
+        data = resp.json()['data']
+        self.assertEqual(data['union_id'], 'on_1')
+        self.assertEqual(data['name'], '张三')
+
+    def test_lookup_not_found(self):
+        """查不到就明说，不返回半个 id——那样建出的绑定永远匹配不上回调身份。"""
+        admin = self._client()
+        with patch('apps.im_mgr.client.lookup_user_ids', return_value={}):
+            resp = admin.post('/api/feishu/bindings/lookup/',
+                              {'email': 'nobody@corp.com'}, format='json')
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('未找到', resp.json()['msg'])
+
+    def test_lookup_requires_input(self):
+        admin = self._client()
+        resp = admin.post('/api/feishu/bindings/lookup/', {}, format='json')
+        self.assertEqual(resp.status_code, 400)
+
+    def test_lookup_survives_name_query_failure(self):
+        """名字只是给人看的，查不到不该让整次反查失败。"""
+        admin = self._client()
+        with patch('apps.im_mgr.client.lookup_user_ids',
+                   return_value={'union_id': 'on_1', 'open_id': 'ou_1'}), \
+                patch('apps.im_mgr.client.get_user',
+                      side_effect=client.FeishuError('no permission')):
+            resp = admin.post('/api/feishu/bindings/lookup/',
+                              {'email': 'zhangsan@corp.com'}, format='json')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['data']['name'], '')

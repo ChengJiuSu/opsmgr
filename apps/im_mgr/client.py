@@ -38,6 +38,8 @@ TOKEN_PATH = '/open-apis/auth/v3/tenant_access_token/internal'
 APP_TOKEN_PATH = '/open-apis/auth/v3/app_access_token/internal'
 MESSAGE_PATH = '/open-apis/im/v1/messages'
 USER_PATH = '/open-apis/contact/v3/users'
+#: 按邮箱/手机号反查飞书用户 id（管理员手工绑定用）
+USER_ID_LOOKUP_PATH = '/open-apis/contact/v3/users/batch_get_id'
 
 
 class FeishuError(Exception):
@@ -235,6 +237,32 @@ def send_text(receive_id, text, receive_id_type='chat_id', app=None):
 
 
 # ── 通讯录 ────────────────────────────────────────────────
+
+def lookup_user_ids(email=None, mobile=None, app=None):
+    """按邮箱或手机号反查飞书用户标识，返回 {'union_id':…, 'open_id':…}。
+
+    要取两种 id，而 batch_get_id 一次只按一种 `user_id_type` 返回，所以调两次。
+    两次都查不到返回空 dict——上层据此给「通讯录里找不到这个人」的提示，
+    而不是拿着半个 id 去建一条绑不上的绑定。
+    """
+    payload = {}
+    if email:
+        payload['emails'] = [str(email)]
+    if mobile:
+        payload['mobiles'] = [str(mobile)]
+    if not payload:
+        raise FeishuError('请提供邮箱或手机号')
+
+    result = {}
+    for id_type in ('union_id', 'open_id'):
+        data = call('POST', USER_ID_LOOKUP_PATH,
+                    params={'user_id_type': id_type}, payload=payload, app=app)
+        for item in (data.get('user_list') or []):
+            if item.get('user_id'):
+                result[id_type] = item['user_id']
+                break
+    return result if result.get('union_id') else {}
+
 
 def get_user(open_id, app=None):
     """按 open_id 取用户信息（name / email / union_id），供 SSO 绑定用。"""

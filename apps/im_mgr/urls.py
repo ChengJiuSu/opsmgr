@@ -4,6 +4,7 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     FeishuAppCallbackSlugView,
     FeishuAppView,
+    FeishuBindingViewSet,
     FeishuCardView,
     FeishuChannelViewSet,
     FeishuEventView,
@@ -15,6 +16,7 @@ from .views import (
 
 router = DefaultRouter()
 router.register('channels', FeishuChannelViewSet, basename='feishu-channel')
+router.register('bindings', FeishuBindingViewSet, basename='feishu-binding')
 
 # 回调入口的 slug 用严格的 32 位十六进制匹配：不合形状的请求连视图都进不去，
 # 省掉一次配置读取与一次恒定时间比对。真正的标识校验仍在视图里做。

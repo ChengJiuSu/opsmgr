@@ -4,13 +4,14 @@
 配置页要能看出「配没配」，但任何档位都读不到值本身。留空表示不修改——否则
 每次改个 IP 白名单都要把三把密钥重新粘一遍，粘错了还查不出来。
 """
+from django.contrib.auth import get_user_model
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from common.request import parse_ip_rules
 
-from .models import FeishuApp, FeishuChannel
+from .models import FeishuApp, FeishuBinding, FeishuChannel
 
 #: 留空表示「不修改」的秘密字段
 SECRET_FIELDS = ('app_secret', 'encrypt_key', 'verification_token')
@@ -130,4 +131,63 @@ class FeishuChannelSerializer(serializers.ModelSerializer):
         # 停用的会话配「允许执行」只会让人以为这条已经生效，实际一直没生效
         if allow_execute and not enabled:
             raise serializers.ValidationError('已停用的会话不能开启「允许发起任务执行」。')
+        return attrs
+
+
+class FeishuBindingSerializer(serializers.ModelSerializer):
+    """飞书绑定关系（管理员维护）。
+
+    `union_id` / `open_id` 由管理员按邮箱手机号反查后带上来，或由飞书登录时
+    自动写入。**不提供修改**：改绑等于解绑再绑，两步各自留痕比一次静默改值清楚。
+    """
+
+    # 关掉字段级的唯一校验器：它跑在 validate() 之前，报出来的是
+    # 「具有 平台用户 的 飞书绑定 已存在」——看不出是谁占着，而管理员最需要
+    # 知道的恰恰是这个。唯一性仍由数据库约束兜底，只是报错文案换成人话
+    user = serializers.PrimaryKeyRelatedField(
+        queryset=get_user_model().objects.all(), validators=[])
+    union_id = serializers.CharField(max_length=128, validators=[])
+
+    username = serializers.CharField(source='user.username', read_only=True)
+    user_email = serializers.CharField(source='user.email', read_only=True)
+    user_is_active = serializers.BooleanField(source='user.is_active', read_only=True)
+    source_display = serializers.CharField(source='get_source_display', read_only=True)
+
+    class Meta:
+        model = FeishuBinding
+        fields = [
+            'id', 'user', 'username', 'user_email', 'user_is_active',
+            'union_id', 'open_id', 'feishu_name', 'feishu_email',
+            'source', 'source_display', 'last_login_at', 'created_at',
+        ]
+        read_only_fields = ['source', 'last_login_at', 'created_at']
+
+    def validate_union_id(self, value):
+        value = str(value or '').strip()
+        if not value:
+            raise serializers.ValidationError('UnionID 不能为空。')
+        return value
+
+    def validate_user(self, value):
+        # 服务账号是 API 凭证的行权身份，不是人，绑了也登不进来
+        if getattr(value, 'is_service', False):
+            raise serializers.ValidationError('服务账号不能绑定飞书。')
+        return value
+
+    def validate(self, attrs):
+        """把唯一约束翻译成人话。
+
+        默认的报错是「具有 UnionID 的 飞书绑定 已存在」，看不出来是谁占着，
+        而管理员最需要知道的恰恰是这个。
+        """
+        union_id = attrs.get('union_id')
+        if union_id:
+            taken = FeishuBinding.objects.filter(union_id=union_id).first()
+            if taken is not None:
+                raise serializers.ValidationError(
+                    f'该飞书账号已绑定平台用户「{taken.user.username}」，请先解绑。')
+        user = attrs.get('user')
+        if user is not None and FeishuBinding.objects.filter(user=user).exists():
+            raise serializers.ValidationError(
+                f'用户「{user.username}」已绑定飞书账号，请先解绑。')
         return attrs

@@ -16,7 +16,8 @@ from django.conf import settings
 from django.contrib.auth.models import update_last_login
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema
-from rest_framework import status, viewsets
+from rest_framework import mixins, status, viewsets
+from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.throttling import SimpleRateThrottle
@@ -29,10 +30,14 @@ from common.request import auth_client_ip, client_ip
 from common.response import fail, ok
 from common.sudo import SudoRequired
 
-from . import crypto, dedupe, handlers, sso
+from . import client, crypto, dedupe, handlers, sso
 from .client import FeishuError
 from .models import FeishuApp, FeishuBinding, FeishuChannel
-from .serializers import FeishuAppSerializer, FeishuChannelSerializer
+from .serializers import (
+    FeishuAppSerializer,
+    FeishuBindingSerializer,
+    FeishuChannelSerializer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -359,3 +364,80 @@ class FeishuMyBindingView(APIView):
                 'created_at': binding.created_at,
             })
         return ok(data)
+
+
+class FeishuBindingViewSet(mixins.ListModelMixin,
+                           mixins.CreateModelMixin,
+                           mixins.DestroyModelMixin,
+                           viewsets.GenericViewSet):
+    """飞书绑定关系管理（管理员）。
+
+    权限挂 `account` 而不是 `system`：绑定关系决定「哪个飞书号能以哪个平台账号
+    登录与发起执行」，和用户、角色、API 凭证是同一个身份面——改这里等于改身份
+    映射，属 account 的风险面。`account` 只有 none/write 两档，读也需要 write：
+    绑定列表本身就是一份「谁能从飞书进来」的清单。
+
+    **没有更新接口**：改绑 = 解绑再绑，两步各自留痕比一次静默改值清楚得多。
+    """
+
+    queryset = FeishuBinding.objects.select_related('user').all()
+    serializer_class = FeishuBindingSerializer
+    permission_classes = [module_perm('account', min_level='write'), SudoRequired]
+    pagination_class = StandardPagination
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        keyword = self.request.query_params.get('keyword')
+        if keyword:
+            from django.db.models import Q
+
+            qs = qs.filter(Q(user__username__icontains=keyword)
+                           | Q(feishu_name__icontains=keyword)
+                           | Q(feishu_email__icontains=keyword)
+                           | Q(union_id__icontains=keyword))
+        return qs
+
+    def perform_create(self, serializer):
+        binding = serializer.save(source='manual')
+        logger.warning('管理员 %s 手工绑定飞书账号 %s → 平台用户 %s',
+                       self.request.user.username, binding.union_id,
+                       binding.user.username)
+
+    def destroy(self, request, *args, **kwargs):
+        binding = self.get_object()
+        username = binding.user.username
+        binding.delete()
+        logger.warning('管理员 %s 解除了平台用户 %s 的飞书绑定',
+                       request.user.username, username)
+        return ok(msg=f'已解除「{username}」的飞书绑定。')
+
+    @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
+    @action(detail=False, methods=['post'])
+    def lookup(self, request):
+        """按邮箱 / 手机号在飞书通讯录里反查用户标识。
+
+        手工绑定时管理员手上只有邮箱或手机号，让他去别处翻 union_id 不现实。
+        查不到就明确说「通讯录里没有」，不返回半个 id——拿半个 id 建出来的绑定
+        永远匹配不上回调里的身份。
+        """
+        email = str(request.data.get('email') or '').strip()
+        mobile = str(request.data.get('mobile') or '').strip()
+        if not (email or mobile):
+            return fail('请提供邮箱或手机号')
+        try:
+            ids = client.lookup_user_ids(email=email or None, mobile=mobile or None)
+        except FeishuError as exc:
+            return fail(str(exc))
+        if not ids:
+            return fail('飞书通讯录中未找到该邮箱/手机号对应的成员。')
+
+        name = ''
+        if ids.get('open_id'):
+            try:
+                name = str(client.get_user(ids['open_id']).get('name') or '')
+            except FeishuError:
+                # 名字只是给人看的，查不到不影响绑定本身
+                logger.info('飞书用户名查询失败，绑定照常进行')
+        return ok({'union_id': ids.get('union_id', ''),
+                   'open_id': ids.get('open_id', ''),
+                   'name': name, 'email': email, 'mobile': mobile})

@@ -78,6 +78,7 @@
           <el-menu-item v-if="authStore.can('account', 'write')" index="/system/api-credentials">API 凭证</el-menu-item>
           <el-menu-item v-if="authStore.can('system', 'write')" index="/system/configs">系统配置</el-menu-item>
           <el-menu-item v-if="authStore.can('system', 'write')" index="/system/feishu">飞书接入</el-menu-item>
+          <el-menu-item v-if="authStore.can('account', 'write')" index="/system/feishu-bindings">飞书绑定</el-menu-item>
         </el-sub-menu>
         <el-menu-item v-if="authStore.can('audit')" index="/audit/logs">
           <el-icon><Document /></el-icon>

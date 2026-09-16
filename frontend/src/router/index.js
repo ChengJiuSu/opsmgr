@@ -199,6 +199,13 @@ const router = createRouter({
           component: () => import('../views/system/Feishu.vue'),
           meta: { title: '飞书接入', perm: ['system', 'write'] },
         },
+        {
+          // 绑定关系决定「哪个飞书号能以哪个平台账号进来」，属身份面 → account
+          path: 'system/feishu-bindings',
+          name: 'SystemFeishuBindings',
+          component: () => import('../views/system/FeishuBindings.vue'),
+          meta: { title: '飞书绑定', perm: ['account', 'write'] },
+        },
         // 二次认证（所有人可见，入口在右上角头像菜单，不进侧边栏）
         {
           path: 'security/mfa',
