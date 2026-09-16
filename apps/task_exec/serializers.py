@@ -292,7 +292,7 @@ class ExecutionTaskSerializer(serializers.ModelSerializer):
             'id', 'name', 'steps',
             'project_group', 'project_group_name', 'channel', 'channel_name',
             'environment', 'environment_name', 'environment_is_prod',
-            'exec_mode', 'exec_mode_display', 'forks', 'default_select_all', 'servers',
+            'exec_mode', 'exec_mode_display', 'forks', 'default_select_all', 'im_enabled', 'servers',
             'credential', 'credential_name',
             'status', 'status_display', 'pause_type', 'return_code', 'output',
             'created_by_name', 'created_at', 'started_at', 'finished_at', 'duration',
@@ -322,6 +322,27 @@ class ExecutionTaskSerializer(serializers.ModelSerializer):
             value = attrs.get(field, getattr(self.instance, field, None) if self.instance else None)
             if value is None:
                 raise serializers.ValidationError({field: f'必须选择{label}（主机范围三维度必选）'})
+
+        # 飞书里没法像执行弹窗那样逐模块勾主机：关掉默认全选的任务本就是要求
+        # 人工确认，开了飞书执行等于把这条要求绕过去
+        def current(field):
+            """字段的「本次保存后」取值。
+
+            新建时未提交的布尔字段**不在 attrs 里**（模型默认值要到 save 才生效），
+            直接取 None 会把「没传 default_select_all」误判成关闭状态，于是新建
+            带 im_enabled 的任务一律被拒。取模型默认值兜底。
+            """
+            if field in attrs:
+                return attrs[field]
+            if self.instance is not None:
+                return getattr(self.instance, field)
+            return ExecutionTask._meta.get_field(field).default
+
+        if current('im_enabled') and not current('default_select_all'):
+            raise serializers.ValidationError({
+                'im_enabled': '关闭「执行时默认全选主机」的任务不支持飞书执行'
+                              '（飞书里无法逐模块勾选主机）',
+            })
         return attrs
 
     def _save_steps(self, task, steps_data):

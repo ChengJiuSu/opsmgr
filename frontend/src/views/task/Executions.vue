@@ -275,11 +275,25 @@
           模块可单独覆盖范围与服务类型，具体主机在「执行」时确认
         </div>
         <!-- 关闭后执行表单不预勾选，必须人工挑主机（后端同样拒绝缺省 server_ids） -->
-        <el-checkbox v-model="form.default_select_all" size="small">
+        <el-checkbox v-model="form.default_select_all" size="small" @change="onSelectAllChange">
           执行时默认全选范围主机
         </el-checkbox>
         <span class="form-tip" style="margin:0 0 0 8px">
           取消后发起执行时不预勾选，必须人工确认要跑哪些主机
+        </span>
+        <br />
+        <!-- 飞书执行：默认关，且依赖「默认全选」——飞书里没法逐模块勾主机 -->
+        <el-checkbox
+          v-model="form.im_enabled"
+          size="small"
+          :disabled="!form.default_select_all"
+        >
+          允许从飞书发起执行
+        </el-checkbox>
+        <span class="form-tip" style="margin:0 0 0 8px">
+          {{ form.default_select_all
+            ? '开启后该任务会出现在飞书的任务下拉里；生产环境仍需卡片二次确认'
+            : '需先勾选「执行时默认全选范围主机」——飞书里无法逐模块勾选主机' }}
         </span>
       </el-form-item>
 
@@ -841,7 +855,7 @@ const emptyStep = () => ({
 const emptyForm = () => ({
   id: null, name: '',
   project_group: null, channel: null, environment: null,
-  forks: 10, credential: null, default_select_all: true,
+  forks: 10, credential: null, default_select_all: true, im_enabled: false,
   steps: [emptyStep()],
 })
 const form = reactive(emptyForm())
@@ -962,6 +976,7 @@ async function openForm(row) {
       environment: row.environment || null,
       forks: row.exec_mode === 'serial' ? 1 : (row.forks || 10), credential: row.credential || null,
       default_select_all: row.default_select_all !== false,
+      im_enabled: !!row.im_enabled,
       steps: (row.steps || []).map((s) => ({
         name: s.name, task_type: s.task_type, command: s.command || '',
         playbook: s.playbook || '', pbMethod: null, method: s.method || null,
@@ -1029,6 +1044,11 @@ function validateSteps() {
   return null
 }
 
+/** 取消「默认全选」时连带关掉飞书执行：两者的组合后端会直接拒，不能留着让人提交后才知道。 */
+function onSelectAllChange(value) {
+  if (!value) form.im_enabled = false
+}
+
 function buildPayload() {
   return {
     name: form.name,
@@ -1036,6 +1056,7 @@ function buildPayload() {
     exec_mode: (form.forks || 10) === 1 ? 'serial' : 'parallel',
     forks: form.forks || 10, credential: form.credential,
     default_select_all: form.default_select_all,
+    im_enabled: form.default_select_all ? form.im_enabled : false,
     steps: form.steps.map((s, i) => ({
       order: i + 1, name: s.name, task_type: s.task_type,
       command: s.task_type === 'command' ? s.command : '',

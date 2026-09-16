@@ -34,6 +34,7 @@ apps/im_mgr/
 ├── models.py        # FeishuApp（单例）/ FeishuChannel
 ├── crypto.py        # 回调解密与验签（公网入口的第一道门）
 ├── dedupe.py        # 一次性消费：nonce / event_id / 卡片 token 共用，fail-closed
+├── access.py        # 飞书侧发起执行的准入判定（四道闸，唯一入口）
 ├── handlers.py      # 回调的业务路由（事件 / 卡片动作）
 ├── sso.py           # 飞书网页免登：state、换 token、身份落到平台 User
 ├── client.py        # 出站客户端：token 缓存 + 统一请求封装 + 消息接口
@@ -215,6 +216,38 @@ conf/snippets/feishu_callback_ips.conf     # 来源 IP 白名单（⚠ 待填）
 | `FEISHU_BASE_URL` | `https://open.feishu.cn` | Lark（海外）改 `open.larksuite.com` |
 | `FEISHU_TRUST_ENV` | `True` | 是否吃环境代理。与 `common/jumpserver.py` 的 `trust_env=False` 相反——那边目标在内网 |
 | `FEISHU_CONNECT_TIMEOUT` / `FEISHU_READ_TIMEOUT` | 5 / 10 | 卡片回调要 3 秒内回包，真正的发卡走异步任务 |
+
+---
+
+## 执行准入（access.py）
+
+飞书那边所有「能不能跑」的判断都走这里，**不在 handlers/cards 里各写一段**。
+四道闸叠加，任一不过即拒：
+
+| 序 | 闸 | 说明 |
+|----|----|------|
+| 1 | `ExecutionTask.im_enabled` | 默认关。开放哪几条任务是一次有意识的选择，不能全挂群里 |
+| 2 | `default_select_all` | 飞书里没法逐模块勾主机；关掉默认全选的任务本就是要求人工确认（与接口触发同口径） |
+| 3 | 会话白名单 | `FeishuChannel.executable(chat_id)`：未登记 / 停用 / 只收播报的会话都不给执行入口 |
+| 4 | 人的权限 | 直接调 `task_exec.trigger.permission_error`（能力位 → 生产环境 → 数据范围），**不另写一份** |
+
+`im_enabled` 与 `default_select_all` 的依赖关系在 `ExecutionTaskSerializer.validate`
+里也拦一道，页面上勾不出非法组合；`access.check` 仍然兜一次存量数据与直接改库的情况。
+
+**鉴权按点按钮的人判，不是按发卡片的人**：群里的卡片谁都看得见、按钮谁都点得到。
+调用方必须先把 `open_id` 解析成平台 User（`FeishuBinding`），拿不到就传 `None`，
+`check()` 直接拒。
+
+`available_tasks(user, chat_id)` 给卡片的任务下拉用，只做「列得出来」的收窄
+（任务属性 + 数据范围）；真正发起前仍要过一次 `check()`。
+
+`needs_production_confirm(task)` 决定要不要走生产二次确认卡片——机器触发没有
+「弹窗再确认」这一步，把确认动作前移到卡片上（一次性 token、限发起人本人、
+60 秒有效，T8）。
+
+第四道为什么要复用而不是新写：飞书这条路最容易被当成「内部工具」而放松，
+它恰恰是最该跟页面一样严的。`permission_error` 因此从 `task_exec/views.py`
+移到了 `task_exec/trigger.py`——那里本来就是页面执行与接口触发的共用入口。
 
 ---
 

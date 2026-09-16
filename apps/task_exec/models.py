@@ -281,6 +281,10 @@ class ExecutionTask(models.Model):
     # False=默认不选，必须在执行时人工挑主机（execute 也拒绝缺省 server_ids），
     # 用于范围内混着多种服务类型、必须逐台确认的任务
     default_select_all = models.BooleanField('执行时默认全选主机', default=True)
+    # 允许从飞书发起执行。默认关：全部任务都挂在群里迟早出事，开放哪几条该是
+    # 一次有意识的选择。仅 default_select_all=True 的任务可开——飞书里没法像
+    # 执行弹窗那样逐模块勾主机，关掉默认全选的任务本就是要求人工确认
+    im_enabled = models.BooleanField('允许从飞书发起执行', default=False)
 
     # ── 目标主机与连接：servers 为「最近一次执行的全局范围主机」快照 ──
     servers = models.ManyToManyField(
@@ -458,6 +462,7 @@ class TaskExecutionLog(models.Model):
         ('rerun', '重跑'),       # 历史数据：曾经的重跑动作
         ('execute', '手动执行'),
         ('api', '接口触发'),  # API 凭证（内部脚本 / Webhook），见 task_exec/webhook.py
+        ('feishu', '飞书触发'),  # 飞书卡片按钮，见 apps/im_mgr/handlers.py
     ]
 
     task = models.ForeignKey(

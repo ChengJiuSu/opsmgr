@@ -39,6 +39,12 @@ skipped）；模块内主机按任务级 exec_mode 并发/串行（串行 = `--f
 执行表单每个模块都不预勾选，必须逐模块人工确认；`execute` 缺省
 `server_ids` 且模块未出现在 `step_servers` 时直接拒绝（点名未勾选的模块）。
 
+**飞书执行开关**（`ExecutionTask.im_enabled`，默认 **False**）：该任务是否出现在
+飞书的任务下拉里。依赖 `default_select_all=True`（序列化器校验拦住非法组合）——
+飞书里没法像执行弹窗那样逐模块勾主机，与接口触发同一口径。完整的四道准入判定在
+[飞书接入模块](im_mgr.md)的 `access.py`，其中「人的权限」那道直接复用本模块的
+`trigger.permission_error`。
+
 **模块服务类型**（`TaskStep.service_type`，非暂停模块**必选**）：与 `use_custom_scope`
 **正交**，对「跟随全局」与「自定义」两种范围都生效——在该范围解析出的主机上
 再收窄到**已规划/已部署该服务类型**的主机。同一任务流据此对不同服务类型跑
@@ -164,7 +170,8 @@ apps/task_exec/
 │                    #   match_executable_servers：全局/模块维度匹配共用口径
 ├── serializers.py   # 变量 key 校验、凭据脱敏、嵌套模块整体读写与内容校验、方法 service_type 执行校验
 ├── views.py         # 变量/凭据/任务 ViewSet + matched_servers/execute/output/logs 动作 + 剧本列表
-├── trigger.py       # 发起前置校验 + 主机快照固化 + 调度（页面执行与接口触发共用）
+├── trigger.py       # 权限判定 + 发起前置校验 + 主机快照固化 + 调度
+│                    #   （页面执行 / 接口触发 / 飞书卡片共用同一段）
 ├── webhook.py       # TaskTriggerView：API 凭证鉴权的机读触发入口
 ├── log_files.py     # 日志文件浏览：TASK_LOG_DIR 只读目录树 / 文本分段读 / 原文件下载（exec read）
 ├── runner.py        # 任务流执行：逐模块解析主机 + 动态 inventory + 变量注入 + ansible 调用，失败中止
@@ -513,6 +520,7 @@ GET                 /api/exec/log-files/download/ 日志原文件下载（exec r
 | 模块服务类型 | 非 `pause` 模块**必选**（不支持不限），跟随全局/自定义范围均生效；`pause` 模块不允许选；存量空值仅执行时按不限兼容 |
 | 执行方式 | `exec_mode` 默认 parallel |
 | 默认全选主机 | `default_select_all` 默认 True；False 时执行必须显式传 `server_ids` |
+| 飞书执行 | `im_enabled` 默认 False；开启要求 `default_select_all=True`（飞书无法逐模块勾主机） |
 | 变量 | `key` 须为合法 ansible 变量名；`value` 须为合法 YAML；生效条件三维度必选 |
 | 超时 | 模块级 `timeout` 秒，默认 300 |
 

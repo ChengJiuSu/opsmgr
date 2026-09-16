@@ -8,8 +8,32 @@
 （逐模块勾选 / 全局兜底）留在调用方——页面来的选择结构复杂，接口来的只有
 「全部匹配主机」一种。
 """
+from apps.auth_mgr import roles
+
 from .serializers import validate_service_planned
 from .tasks import dispatch
+
+
+def permission_error(user, task):
+    """发起/处理任务执行的权限校验，返回中文错误消息；None 表示放行。
+
+    三道：能力位（可否发起执行）→ 生产环境（可否碰生产）→ 数据范围（能碰哪些项目）。
+
+    生产单独立一个能力位而不是塞进模块矩阵：「能改任务定义」与「能往生产推」是两件
+    事，前者错了可以改回来，后者错了已经推上去了。这也是最高频的真实诉求。
+
+    放在 trigger 而不是 views：页面执行、飞书卡片（apps/im_mgr）都要用同一段判定，
+    各写一份早晚有一边漏掉生产那道。
+    """
+    if not roles.user_capability(user, 'can_execute'):
+        return '当前角色没有发起任务执行的权限。'
+    environment = task.environment
+    if environment is not None and environment.is_prod \
+            and not roles.user_capability(user, 'can_exec_prod'):
+        return f'当前角色不允许对生产环境（{environment.name}）发起执行。'
+    if not user.allows_dims(task.project_group_id, task.environment_id):
+        return f'该任务不在你的数据范围内（当前范围：{user.scope_label}）。'
+    return None
 
 
 def preflight(task):

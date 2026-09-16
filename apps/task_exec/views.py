@@ -44,25 +44,6 @@ from . import trigger
 logger = logging.getLogger('apps.task_exec')
 
 
-def _exec_permission_error(user, task):
-    """发起/处理任务执行的权限校验，返回中文错误消息；None 表示放行。
-
-    三道：能力位（可否发起执行）→ 生产环境（可否碰生产）→ 数据范围（能碰哪些项目）。
-
-    生产单独立一个能力位而不是塞进模块矩阵：「能改任务定义」与「能往生产推」是两件
-    事，前者错了可以改回来，后者错了已经推上去了。这也是最高频的真实诉求。
-    """
-    if not roles.user_capability(user, 'can_execute'):
-        return '当前角色没有发起任务执行的权限。'
-    environment = task.environment
-    if environment is not None and environment.is_prod \
-            and not roles.user_capability(user, 'can_exec_prod'):
-        return f'当前角色不允许对生产环境（{environment.name}）发起执行。'
-    if not user.allows_dims(task.project_group_id, task.environment_id):
-        return f'该任务不在你的数据范围内（当前范围：{user.scope_label}）。'
-    return None
-
-
 def _secret_keys(dims):
     """该维度下被排除的敏感变量名（resolved 接口告知外部系统）。"""
     return list(
@@ -470,7 +451,7 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
         主机，任务关闭 default_select_all 时缺省会被拒绝）；
         自定义范围模块按其维度全量执行。逐模块校验主机非空与方法服务规划。"""
         task = self.get_object()
-        error = _exec_permission_error(request.user, task)
+        error = trigger.permission_error(request.user, task)
         if error:
             return fail(error, status=403)
         error = trigger.preflight(task)
@@ -556,7 +537,7 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
         pause_action 由 runner 轮询消费。
         """
         task = self.get_object()
-        error = _exec_permission_error(request.user, task)
+        error = trigger.permission_error(request.user, task)
         if error:
             return fail(error, status=403)
         action_value = request.data.get('action')

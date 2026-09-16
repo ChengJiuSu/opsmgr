@@ -3178,3 +3178,86 @@ def raw_column(table, column, pk):
     with connection.cursor() as cursor:
         cursor.execute(f'SELECT {column} FROM {table} WHERE id = %s', [pk])
         return cursor.fetchone()[0]
+
+
+@override_settings(TASK_EXEC_BACKEND='sync', TASK_FAILURE_WAIT_TIMEOUT=0)
+class FeishuExecFlagTests(TestCase):
+    """飞书执行开关（im_enabled）的保存校验。
+
+    飞书里没法像执行弹窗那样逐模块勾主机，所以它依赖「默认全选主机」；
+    准入判定本身在 apps/im_mgr/access.py。
+    """
+
+    def setUp(self):
+        from apps.asset_mgr.models import Channel, Environment, ProjectGroup, ServerService, ServiceType
+
+        user = User.objects.create(username='admin_im_flag', is_staff=True)
+        user.set_password('Pass!2345xyz')
+        user.save()
+        self.pg = ProjectGroup.objects.create(name='主项目', code='ut-proj')
+        self.ch = Channel.objects.create(name='官服渠道', code='ut-official')
+        self.env = Environment.objects.create(name='单测环境', code='ut-env')
+        server = Server.objects.create(
+            name='local', private_ip='127.0.0.1',
+            project_group=self.pg, channel=self.ch, environment=self.env,
+        )
+        self.base_service = ServiceType.objects.create(name='基础服务', code='base')
+        ServerService.objects.create(server=server, service_type=self.base_service, status='planned')
+
+    def _client(self):
+        c = APIClient()
+        r = c.post('/api/auth/login/',
+                   {'username': 'admin_im_flag', 'password': 'Pass!2345xyz'}, format='json')
+        c.credentials(HTTP_AUTHORIZATION='Bearer ' + r.json()['access'])
+        return c
+
+    def _step(self):
+        return {'order': 1, 'name': '模块1', 'task_type': 'command',
+                'command': 'echo hi', 'service_type': self.base_service.id}
+
+    def _create_task(self, c, **overrides):
+        payload = {
+            'name': 'demo',
+            'project_group': self.pg.id, 'channel': self.ch.id, 'environment': self.env.id,
+            'steps': [self._step()],
+        }
+        payload.update(overrides)
+        r = c.post('/api/exec/tasks/', payload, format='json')
+        self.assertEqual(r.status_code, 201, r.content)
+        return r.json()['id']
+
+    def test_default_off(self):
+        c = self._client()
+        task_id = self._create_task(c)
+        self.assertFalse(ExecutionTask.objects.get(pk=task_id).im_enabled)
+
+    def test_can_enable_with_select_all(self):
+        c = self._client()
+        task_id = self._create_task(c, im_enabled=True)
+        self.assertTrue(ExecutionTask.objects.get(pk=task_id).im_enabled)
+
+    def test_rejected_without_select_all(self):
+        c = self._client()
+        r = c.post('/api/exec/tasks/', {
+            'name': 'feishu-bad',
+            'project_group': self.pg.id, 'channel': self.ch.id, 'environment': self.env.id,
+            'steps': [self._step()],
+            'default_select_all': False, 'im_enabled': True,
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('默认全选主机', r.content.decode())
+
+    def test_rejected_when_turning_off_select_all_later(self):
+        """存量任务改成不全选时，必须连带关掉飞书执行，否则拒绝保存。"""
+        c = self._client()
+        task_id = self._create_task(c, im_enabled=True)
+        r = c.patch(f'/api/exec/tasks/{task_id}/',
+                    {'default_select_all': False}, format='json')
+        self.assertEqual(r.status_code, 400)
+        r = c.patch(f'/api/exec/tasks/{task_id}/',
+                    {'default_select_all': False, 'im_enabled': False}, format='json')
+        self.assertEqual(r.status_code, 200)
+
+    def test_feishu_trigger_type_registered(self):
+        choices = dict(TaskExecutionLog.TRIGGER_CHOICES)
+        self.assertEqual(choices['feishu'], '飞书触发')

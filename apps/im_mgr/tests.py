@@ -14,7 +14,7 @@ from rest_framework.test import APIClient
 
 from common.testing import grant_sudo
 
-from apps.im_mgr import client, crypto, sso
+from apps.im_mgr import access, client, crypto, sso
 from apps.im_mgr.models import FeishuApp, FeishuBinding, FeishuChannel
 
 PASSWORD = 'Pass!2345xyz'
@@ -930,3 +930,113 @@ class FeishuMyBindingTests(TestCase):
 
     def test_requires_login(self):
         self.assertEqual(APIClient().get('/api/feishu/sso/binding/').status_code, 401)
+
+
+# ══════════════════════════════════════════════════════════
+# T6：飞书侧发起执行的准入判定
+# ══════════════════════════════════════════════════════════
+
+class FeishuAccessTests(TestCase):
+    """四道闸：任务开关 → 默认全选 → 会话白名单 → 人的权限。"""
+
+    def setUp(self):
+        from apps.asset_mgr.models import Channel, Environment, ProjectGroup
+        from apps.task_exec.models import ExecutionTask, TaskStep
+
+        cache.clear()
+        self.pg = ProjectGroup.objects.create(name='主项目', code='im-proj')
+        self.ch = Channel.objects.create(name='官服', code='im-ch')
+        self.env = Environment.objects.create(name='测试环境', code='im-env')
+        self.prod = Environment.objects.create(name='生产环境', code='im-prod', is_prod=True)
+        self.task = ExecutionTask.objects.create(
+            name='重启网关', project_group=self.pg, channel=self.ch, environment=self.env,
+            im_enabled=True, default_select_all=True,
+        )
+        TaskStep.objects.create(task=self.task, order=1, name='m1', command='echo hi')
+        self.channel = FeishuChannel.objects.create(
+            chat_id='oc_ops', name='运维群', allow_execute=True)
+        # 无角色的 staff 回退为全权限 + 全能力位（roles.py 的存量兼容分支）
+        self.admin = get_user_model().objects.create(username='im_admin', is_staff=True)
+        self.member = get_user_model().objects.create(username='im_member', is_staff=False)
+
+    def test_allows_admin_in_whitelisted_chat(self):
+        self.assertIsNone(access.check(self.admin, self.task, 'oc_ops'))
+
+    def test_unbound_user_rejected(self):
+        """卡片上的 open_id 解析不到平台用户时，调用方传 None。"""
+        self.assertIn('尚未绑定平台用户', access.check(None, self.task, 'oc_ops'))
+
+    def test_task_switch_off_rejected(self):
+        self.task.im_enabled = False
+        self.task.save(update_fields=['im_enabled'])
+        self.assertIn('未开启飞书执行', access.check(self.admin, self.task, 'oc_ops'))
+
+    def test_manual_host_pick_task_rejected(self):
+        """存量数据/直接改库造出的组合：关掉默认全选却开着飞书执行。"""
+        self.task.default_select_all = False
+        self.task.save(update_fields=['default_select_all'])
+        self.assertIn('默认全选主机', access.check(self.admin, self.task, 'oc_ops'))
+
+    def test_chat_not_whitelisted_rejected(self):
+        self.assertIn('未被授权', access.check(self.admin, self.task, 'oc_other'))
+
+    def test_disabled_chat_rejected(self):
+        FeishuChannel.objects.filter(pk=self.channel.pk).update(enabled=False)
+        self.assertIn('未被授权', access.check(self.admin, self.task, 'oc_ops'))
+
+    def test_notify_only_chat_cannot_execute(self):
+        """只收播报的群不给执行入口。"""
+        FeishuChannel.objects.filter(pk=self.channel.pk).update(allow_execute=False)
+        self.assertIn('未被授权', access.check(self.admin, self.task, 'oc_ops'))
+
+    def test_capability_reused_from_trigger(self):
+        """人的权限直接复用 task_exec.trigger.permission_error，不另写一份。"""
+        reason = access.check(self.member, self.task, 'oc_ops')
+        self.assertIn('没有发起任务执行的权限', reason)
+
+    def test_production_capability_blocked(self):
+        from apps.auth_mgr.models import Role
+
+        role = Role.objects.create(
+            code='im-ops', name='飞书运维',
+            permissions={'exec': 'read'}, can_execute=True, can_exec_prod=False)
+        self.member.role = role
+        self.member.save(update_fields=['role'])
+        self.task.environment = self.prod
+        self.task.save(update_fields=['environment'])
+        self.assertIn('不允许对生产环境', access.check(self.member, self.task, 'oc_ops'))
+
+    def test_data_scope_blocked(self):
+        from apps.asset_mgr.models import ProjectGroup
+
+        other = ProjectGroup.objects.create(name='别的项目', code='im-other')
+        self.admin.allowed_project_groups.add(other)
+        self.assertIn('不在你的数据范围内', access.check(self.admin, self.task, 'oc_ops'))
+
+    def test_needs_production_confirm(self):
+        self.assertFalse(access.needs_production_confirm(self.task))
+        self.task.environment = self.prod
+        self.assertTrue(access.needs_production_confirm(self.task))
+
+    # ── 任务下拉的可见范围 ────────────────────────────────
+    def test_available_tasks_filters(self):
+        from apps.task_exec.models import ExecutionTask
+
+        ExecutionTask.objects.create(
+            name='未开放', project_group=self.pg, channel=self.ch, environment=self.env,
+            im_enabled=False)
+        ExecutionTask.objects.create(
+            name='要手选主机', project_group=self.pg, channel=self.ch, environment=self.env,
+            im_enabled=True, default_select_all=False)
+        names = list(access.available_tasks(self.admin, 'oc_ops').values_list('name', flat=True))
+        self.assertEqual(names, ['重启网关'])
+
+    def test_available_tasks_empty_for_unlisted_chat(self):
+        self.assertEqual(access.available_tasks(self.admin, 'oc_other').count(), 0)
+
+    def test_available_tasks_narrowed_by_data_scope(self):
+        from apps.asset_mgr.models import ProjectGroup
+
+        other = ProjectGroup.objects.create(name='别的项目', code='im-other')
+        self.member.allowed_project_groups.add(other)
+        self.assertEqual(access.available_tasks(self.member, 'oc_ops').count(), 0)
