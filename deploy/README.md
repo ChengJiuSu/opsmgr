@@ -300,6 +300,7 @@ docker compose --profile mysql up -d --build
 
    ```bash
    venv/bin/python manage.py feishu_check                      # 配置 + 出站 + 地址
+   venv/bin/python manage.py feishu_check --chats              # 列出机器人所在的群与 chat_id
    venv/bin/python manage.py feishu_check --email a@corp.com   # 顺带验通讯录反查
    venv/bin/python manage.py feishu_check --chat-id oc_xxx     # 真发一张测试卡片
    ```
@@ -316,8 +317,15 @@ docker compose --profile mysql up -d --build
    > 平台侧留空时是按**当前请求的域名**推导的。有人从 IP、内网域名或带端口访问后台
    > 就会推出另一个值，跟飞书白名单对不上，现象随访问方式变化、很难复现。填死它。
 
-7. 「系统管理 → 飞书接入」登记允许交互的群/单聊（`chat_id`），需要从群里发起执行的
-   才勾「允许发起任务执行」。
+7. 开启机器人并登记会话：
+
+   - 飞书后台 → **应用功能 → 机器人** → 启用（不启用时任何 `im/v1/*` 调用都返回
+     `Bot ability is not activated`，code 232025）；
+   - **版本管理与发布** → 创建版本并发布（自建应用要发布后才能被拉进群）；
+   - 飞书群里：群设置 → **群机器人 → 添加机器人** → 选中本应用；
+   - `manage.py feishu_check --chats` 列出 `chat_id`（飞书界面上看不到它）；
+   - 「系统管理 → 飞书接入 → 会话白名单」登记该 `chat_id`，需要从群里发起执行的
+     才勾「允许发起任务执行」。
 
 8. 任务侧逐条开放：任务编辑页勾「允许从飞书发起执行」（默认关，且要求
    「执行时默认全选主机」）。

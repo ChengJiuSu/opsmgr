@@ -5,6 +5,7 @@
 先用这条命令把「平台侧准备好了没」一次问清楚，比对着日志猜快得多。
 
     ./venv/bin/python manage.py feishu_check                    # 配置 + 出站连通性
+    ./venv/bin/python manage.py feishu_check --chats            # 列出机器人所在的群与 chat_id
     ./venv/bin/python manage.py feishu_check --email a@b.com    # 顺带验通讯录反查
     ./venv/bin/python manage.py feishu_check --chat-id oc_xxx   # 真发一张测试卡片
 
@@ -27,6 +28,8 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument('--email', help='用该邮箱验证通讯录反查（batch_get_id）')
         parser.add_argument('--mobile', help='用该手机号验证通讯录反查')
+        parser.add_argument('--chats', action='store_true',
+                            help='列出机器人已加入的群与 chat_id（登记会话白名单用）')
         parser.add_argument('--chat-id', help='向该会话真发一张测试卡片（会打扰到人）')
 
     def handle(self, *args, **options):
@@ -39,6 +42,8 @@ class Command(BaseCommand):
 
         failed |= self._check_outbound(app)
         failed |= self._print_urls(app)
+        if options.get('chats'):
+            failed |= self._list_chats()
         if options.get('email') or options.get('mobile'):
             failed |= self._check_lookup(options.get('email'), options.get('mobile'))
         if options.get('chat_id'):
@@ -140,9 +145,28 @@ class Command(BaseCommand):
         self.stdout.write(OK + f'授权页路径 {path} 可达（HTTP {resp.status_code}）')
         return False
 
+    # ── 群列表 ───────────────────────────────────────────
+    def _list_chats(self):
+        """列出机器人所在的群——登记会话白名单要 chat_id，飞书界面上看不到。"""
+        self.stdout.write(self.style.MIGRATE_HEADING('\n[4] 机器人已加入的群'))
+        try:
+            chats = client.list_chats()
+        except client.FeishuError as exc:
+            self.stdout.write(BAD + f'查询失败：{exc}')
+            self.stdout.write(INFO + '多半是缺 im:chat:readonly 权限，或机器人能力未启用')
+            return True
+        if not chats:
+            self.stdout.write(BAD + '机器人还没被拉进任何群')
+            self.stdout.write(INFO + '群设置 → 群机器人 → 添加机器人，选中本应用')
+            return True
+        for chat in chats:
+            self.stdout.write(OK + f'{chat.get("name") or "(无名群)"}　{chat.get("chat_id")}')
+        self.stdout.write(INFO + '把要用的 chat_id 登记到「系统管理 → 飞书接入 → 会话白名单」')
+        return False
+
     # ── 通讯录反查 ───────────────────────────────────────
     def _check_lookup(self, email, mobile):
-        self.stdout.write(self.style.MIGRATE_HEADING('\n[4] 通讯录反查'))
+        self.stdout.write(self.style.MIGRATE_HEADING('\n[5] 通讯录反查'))
         try:
             ids = client.lookup_user_ids(email=email, mobile=mobile)
         except client.FeishuError as exc:
@@ -171,7 +195,7 @@ class Command(BaseCommand):
     def _check_send(self, chat_id):
         from apps.im_mgr import cards
 
-        self.stdout.write(self.style.MIGRATE_HEADING('\n[5] 发送测试卡片'))
+        self.stdout.write(self.style.MIGRATE_HEADING('\n[6] 发送测试卡片'))
         card = cards.notice('飞书接入自检', '这是一张来自运维平台的测试卡片，收到即表示出站正常。',
                             tip='由 manage.py feishu_check 发出')
         try:

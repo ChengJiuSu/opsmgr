@@ -37,6 +37,8 @@ TOKEN_PATH = '/open-apis/auth/v3/tenant_access_token/internal'
 # 不是 tenant_access_token——自建应用里这是两把不同的 token，混用直接报权限错
 APP_TOKEN_PATH = '/open-apis/auth/v3/app_access_token/internal'
 MESSAGE_PATH = '/open-apis/im/v1/messages'
+#: 机器人所在的群列表（拿 chat_id 用——飞书界面上不直接显示它）
+CHAT_PATH = '/open-apis/im/v1/chats'
 USER_PATH = '/open-apis/contact/v3/users'
 #: 按邮箱/手机号反查飞书用户 id（管理员手工绑定用）
 USER_ID_LOOKUP_PATH = '/open-apis/contact/v3/users/batch_get_id'
@@ -234,6 +236,16 @@ def send_text(receive_id, text, receive_id_type='chat_id', app=None):
         app=app,
     )
     return data.get('message_id') or ''
+
+
+def list_chats(app=None, page_size=50):
+    """列出机器人已加入的群，返回 [{'chat_id','name',...}]。
+
+    登记会话白名单需要 chat_id，而飞书客户端界面上看不到它。让人去翻开发者工具或
+    抓包不现实，所以给一条只读的命令（manage.py feishu_check --chats）。
+    """
+    data = call('GET', CHAT_PATH, params={'page_size': page_size}, app=app)
+    return data.get('items') or []
 
 
 # ── 通讯录 ────────────────────────────────────────────────
