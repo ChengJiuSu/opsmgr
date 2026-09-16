@@ -137,7 +137,7 @@ apps/im_mgr/
 |----|------|------|
 | 0 | 来源 IP | 在视图层（T3）用 `app.ip_allowed(auth_client_ip(request))`，取 IP 需要 request |
 | 1 | 签名 | `sha256(timestamp + nonce + encrypt_key + 原始请求体)`，恒定时间比对 |
-| 2 | 时间戳 | 偏差 > ±300s 拒，压缩重放窗口 |
+| 2 | 时间戳 | 偏差 > ±300s 拒，压缩重放窗口。**两条路的格式不一样**：事件订阅给 Unix 秒，卡片回调给 Go 的 `time.Time` 字符串（`2026-09-16 17:22:51.15 +0800 CST m=+526362.48`），`parse_timestamp` 两种都吃；签名仍用**原样字符串**参与计算，解析只影响这一道 |
 | 3 | nonce | `cache.add` 原子判重，窗口内只接受一次，重放窗口压到 0 |
 | 4 | 解密 | AES-256-CBC，key = `sha256(encrypt_key)`，IV 取密文前 16 字节 |
 | 5 | Verification Token | 兼容 `header.token`（v2 事件）与顶层 `token`（url_verification / 旧版卡片回调） |

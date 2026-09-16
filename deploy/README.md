@@ -377,6 +377,7 @@ grep -i "飞书回调" logs/*.log | tail -20
 | `Verification Token 不匹配` | Token 填错 |
 | `解密结果填充非法` | Encrypt Key 对不上的另一种表现 |
 | `时间戳偏差 Ns 超过 300s` | 服务器时钟不准，查 `timedatectl status` |
+| `时间戳非法：'2026-… +0800 CST m=+…'` | 卡片回调的时间戳是 Go 的 `time.Time` 字符串（事件订阅那条给的是 Unix 秒），旧版本只认数字。升级到含该修复的版本即可 |
 | `来源 IP 不在白名单内` | 应用层白名单没放行飞书出口段 |
 | 点了机器人菜单没反应 | ① 飞书后台没订阅 `application.bot.menu_v6`（菜单与事件订阅是两处配置）；② 菜单类型选成了「跳转链接」；③ 平台侧没开「允许单聊发起执行」——这种会收到一张说明卡，不是没反应 |
 | 日志里**什么都没有** | 请求没到 Django。查 nginx：`grep feishu deploy/nginx/logs/ops-manager.api.access.log`，403 = IP 白名单挡住（**空的白名单文件 = 拒绝所有回调**） |

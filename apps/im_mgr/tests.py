@@ -4,7 +4,7 @@ import base64
 import hashlib
 import json
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -2356,3 +2356,71 @@ class FeishuBotMenuTests(TestCase):
             resp = handlers.handle_card_action(self.app, payload)
         runner.assert_not_called()
         self.assertIn('未被授权', ''.join(_texts(resp['card']['data'])))
+
+
+class FeishuTimestampParseTests(TestCase):
+    """时间戳解析：事件订阅给 Unix 秒，卡片回调给 Go 的 time.Time 字符串。
+
+    联调踩到：卡片按钮全被拒，日志是
+    `时间戳非法：'2026-09-16 17:22:51.152344108 +0800 CST m=+526362.485448901'`。
+    签名那道是过的——签名用的是原样字符串，只有解析这一步认死了数字。
+    """
+
+    def test_unix_seconds(self):
+        self.assertEqual(crypto.parse_timestamp('1758014571'), 1758014571)
+
+    def test_unix_millis(self):
+        """有的接口给毫秒；按量级判，别让「1970 年」的偏差把请求拒掉。"""
+        self.assertEqual(crypto.parse_timestamp('1758014571000'), 1758014571)
+
+    def test_go_time_string(self):
+        parsed = crypto.parse_timestamp(
+            '2026-09-16 17:22:51.152344108 +0800 CST m=+526362.485448901')
+        expected = int(datetime(2026, 9, 16, 17, 22, 51,
+                                tzinfo=timezone(timedelta(hours=8))).timestamp())
+        self.assertEqual(parsed, expected)
+
+    def test_go_time_without_nanos(self):
+        self.assertEqual(
+            crypto.parse_timestamp('2026-09-16 17:22:51 +0800 CST'),
+            crypto.parse_timestamp('2026-09-16 17:22:51.999 +0800 CST'))
+
+    def test_rejects_garbage(self):
+        for bad in ('', 'not-a-time', '2026/09/16 17:22:51'):
+            with self.assertRaises(crypto.CallbackError):
+                crypto.parse_timestamp(bad)
+
+    def test_window_still_enforced_for_go_format(self):
+        """能解析了，但过期的照样拒。"""
+        stale = datetime.now(timezone(timedelta(hours=8))) - timedelta(seconds=600)
+        text = stale.strftime('%Y-%m-%d %H:%M:%S.000000000 %z CST m=+1.0')
+        with self.assertRaises(crypto.CallbackError):
+            crypto.verify_timestamp(text)
+
+    def test_card_callback_with_go_timestamp_passes(self):
+        """端到端：带 Go 格式时间戳的卡片回调应当被接受。"""
+        app = FeishuApp.load()
+        for key, value in FULL_CONFIG.items():
+            setattr(app, key, value)
+        app.ip_whitelist = '127.0.0.1'
+        app.enabled = True
+        app.save()
+        cache.clear()
+
+        payload = {'schema': '2.0',
+                   'header': {'token': 'token-value', 'event_id': 'ca-go',
+                              'event_type': 'card.action.trigger'},
+                   'event': {'operator': {'open_id': 'ou_1'},
+                             'context': {'open_chat_id': 'oc_1', 'open_message_id': 'om_1'},
+                             'action': {'tag': 'button', 'value': {'act': 'cancel'}}}}
+        body = _callback_body('encrypt-value', payload)
+        ts = datetime.now(timezone(timedelta(hours=8))).strftime(
+            '%Y-%m-%d %H:%M:%S.123456789 %z CST m=+1.5')
+        nonce = f'n-{time.time_ns()}'
+        resp = APIClient().post(
+            app.card_path, data=body, content_type='application/json',
+            HTTP_X_LARK_REQUEST_TIMESTAMP=ts,
+            HTTP_X_LARK_REQUEST_NONCE=nonce,
+            HTTP_X_LARK_SIGNATURE=_sign('encrypt-value', ts, nonce, body))
+        # cancel 动作会回一张「已取消」的定格卡
+        self.assertIn('已取消', ''.join(_texts(resp.json()['card']['data'])))

@@ -26,7 +26,9 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import time
+from datetime import datetime
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -93,12 +95,41 @@ def verify_signature(encrypt_key, timestamp, nonce, body, signature):
         raise CallbackError('签名校验失败')
 
 
+#: 卡片回调的时间戳不是 Unix 秒，而是 Go 的 time.Time 默认格式：
+#:   2026-09-16 17:22:51.152344108 +0800 CST m=+526362.485448901
+#: 事件订阅那条给的又是秒。两条路不一致，只认数字会把卡片按钮全拒掉。
+#: 只取日期时间与 ±HHMM 偏移，纳秒、时区缩写（CST 这种缩写有歧义）与 Go 的
+#: 单调时钟尾巴（m=+…）一律忽略。
+GO_TIME_RE = re.compile(
+    r'^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})(?:\.\d+)?\s*([+-]\d{4})')
+#: 毫秒时间戳的下界（2001-09-09 之后的秒级时间戳都小于它）
+MILLIS_THRESHOLD = 10 ** 11
+
+
+def parse_timestamp(timestamp):
+    """把飞书给的时间戳解析成 Unix 秒。解析不了抛 CallbackError。"""
+    raw = str(timestamp or '').strip()
+    if not raw:
+        raise CallbackError('缺少时间戳')
+    if raw.lstrip('-').isdigit():
+        value = int(raw)
+        # 有的接口给毫秒；按量级判，别让 1970 年的偏差把请求拒掉
+        return value // 1000 if value >= MILLIS_THRESHOLD else value
+    matched = GO_TIME_RE.match(raw)
+    if not matched:
+        raise CallbackError(f'时间戳非法：{raw!r}')
+    text, offset = matched.groups()
+    try:
+        parsed = datetime.strptime(f'{text.replace("T", " ")} {offset}',
+                                   '%Y-%m-%d %H:%M:%S %z')
+    except ValueError as exc:
+        raise CallbackError(f'时间戳非法：{raw!r}') from exc
+    return int(parsed.timestamp())
+
+
 def verify_timestamp(timestamp, now=None):
     """时间戳偏差校验（秒级）。"""
-    try:
-        sent = int(str(timestamp).strip())
-    except (TypeError, ValueError) as exc:
-        raise CallbackError(f'时间戳非法：{timestamp!r}') from exc
+    sent = parse_timestamp(timestamp)
     drift = abs((now if now is not None else int(time.time())) - sent)
     if drift > TIMESTAMP_WINDOW:
         raise CallbackError(f'时间戳偏差 {drift}s 超过 {TIMESTAMP_WINDOW}s，拒绝处理')
