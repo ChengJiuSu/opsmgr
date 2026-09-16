@@ -199,6 +199,10 @@ TRUSTED_PROXIES = [
 # API 凭证默认限速（DRF 速率语法 `次数/周期`，周期取 s/m/h/day）。
 # 单个凭证可在页面上覆盖；key 泄露时这是唯一还在拦的东西。
 API_KEY_DEFAULT_RATE = config('API_KEY_DEFAULT_RATE', default='60/min')
+# 飞书回调入口按来源 IP 的限速（DRF 速率语法）。验签在应用层，扫描流量到不了
+# 那里就该被挡掉；nginx 的 limit_req 是同一目的的外层。定义在这里而不是下面的
+# 飞书配置块：REST_FRAMEWORK 在本文件更早处引用它
+FEISHU_CALLBACK_RATE = config('FEISHU_CALLBACK_RATE', default='240/min')
 # 凭证校验失败的锁定策略（复用 common/ratelimit.py，按 key_id 计数）：
 # 窗口内失败达阈值即锁定，锁定期内直接 429。防的是拿到 key_id 后暴力猜 secret。
 API_KEY_FAIL_LIMIT = config('API_KEY_FAIL_LIMIT', default=20, cast=int)
@@ -228,6 +232,8 @@ REST_FRAMEWORK = {
     # 只作用于显式声明了 ApiKeyThrottle 的机读接口（登录用户走 JWT，不限速）
     'DEFAULT_THROTTLE_RATES': {
         'apikey': API_KEY_DEFAULT_RATE,
+        # 飞书回调（公网入口）按来源 IP 限速，见 apps/im_mgr/views.py
+        'feishu_callback': FEISHU_CALLBACK_RATE,
     },
 }
 

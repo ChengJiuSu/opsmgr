@@ -5,7 +5,11 @@ from common.request import client_ip
 
 logger = logging.getLogger(__name__)
 
-SKIP_PATHS = ('/api/schema', '/admin/jsi18n')
+# 飞书回调（/api/feishu/callback/…）整段跳过：群里每条消息都是一次事件回调，
+# 落进审计表只有噪声（匿名用户 + 一坨密文），而真正要留痕的是「谁从飞书发起了
+# 执行」——那条由 im_mgr 在识别出操作人后显式写审计。飞书**配置面**
+# （/api/feishu/app/、/api/feishu/channels/）不在此列，照常审计。
+SKIP_PATHS = ('/api/schema', '/admin/jsi18n', '/api/feishu/callback/')
 WRITE_METHODS = ('POST', 'PUT', 'PATCH', 'DELETE')
 
 BODY_LIMIT = 2000

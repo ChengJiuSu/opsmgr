@@ -29,14 +29,15 @@ import logging
 import time
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from django.core.cache import cache
+
+from . import dedupe
 
 logger = logging.getLogger(__name__)
 
 #: 时间戳允许的偏差（秒），双向
 TIMESTAMP_WINDOW = 300
-#: nonce 去重的缓存前缀与保留时长（取窗口两倍，覆盖时钟漂移两端）
-NONCE_PREFIX = 'feishu:nonce:'
+#: nonce 去重的命名空间与保留时长（取窗口两倍，覆盖时钟漂移两端）
+NONCE_NAMESPACE = 'nonce'
 NONCE_TTL = TIMESTAMP_WINDOW * 2
 
 AES_BLOCK_SIZE = 16
@@ -104,19 +105,14 @@ def verify_timestamp(timestamp, now=None):
 
 
 def consume_nonce(nonce):
-    """消费一次 nonce；窗口内重复出现即判为重放。
-
-    用 `cache.add`（原子的 set-if-absent），不是 get + set——后者在并发重放下
-    两个请求会同时读到「不存在」然后都放行。
-    """
+    """消费一次 nonce；窗口内重复出现即判为重放（判重实现见 dedupe.py）。"""
     if not nonce:
         raise CallbackError('缺少 nonce')
     try:
-        fresh = cache.add(NONCE_PREFIX + str(nonce), 1, timeout=NONCE_TTL)
-    except Exception:  # noqa: BLE001 - 缓存后端异常类型由实现决定
+        fresh = dedupe.consume(NONCE_NAMESPACE, str(nonce), NONCE_TTL)
+    except dedupe.DedupeUnavailable as exc:
         # fail-closed：判不了重就当重放。放行的后果是可被重放触发生产执行
-        logger.warning('nonce 去重缓存不可用，按重放处理', exc_info=True)
-        raise CallbackError('去重缓存不可用，拒绝处理')
+        raise CallbackError('去重缓存不可用，拒绝处理') from exc
     if not fresh:
         raise CallbackError('nonce 重复，疑似重放请求')
 

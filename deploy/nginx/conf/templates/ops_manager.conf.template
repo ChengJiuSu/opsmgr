@@ -49,6 +49,14 @@ gzip_types
 # 再发，减少大静态文件的小包数量
 tcp_nopush on;
 
+# -----------------------------------------------------------------------------
+# 飞书回调入口的限速桶（http 级，conf.d 在 http 块内）
+# -----------------------------------------------------------------------------
+# 回调是本站唯一「任何人都能直接 POST」的公网入口。验签在应用层，扫描流量在
+# 到达验签之前就该被挡掉，否则每个探测包都会让后端做一次 SHA256 + 一次 AES。
+# 10m 的共享内存约能跟踪 16 万个 IP，足够有余。
+limit_req_zone $binary_remote_addr zone=feishu_callback:10m rate=60r/m;
+
 # 后端上游：宿主机上由 Supervisor 托管的 Gunicorn
 upstream ops_manager_backend {
     server ${OPS_UPSTREAM_ADDR};
@@ -182,6 +190,33 @@ server {
         proxy_request_buffering off;
         proxy_read_timeout ${OPS_PROXY_TIMEOUT};
         proxy_send_timeout ${OPS_PROXY_TIMEOUT};
+    }
+
+    # ---- 飞书回调入口（公网，免登录，走签名校验）-------------------------------
+    # 必须排在下面的 ^/(api|admin)/ 之前：nginx 的正则 location 按定义顺序匹配，
+    # 写在后面就永远命中不到，IP 白名单与限速全部失效（且没有任何报错）。
+    #
+    # 正则里的 {32} 必须放在引号内 —— nginx 会把裸的 { } 当配置块边界。
+    #
+    # 三层防护在此处收口：网络层白名单（本 location）+ 应用层白名单（DB 里的
+    # ip_whitelist，用 auth_client_ip 解析可信代理链）+ 签名/时间戳/nonce 校验。
+    location ~ "^/api/feishu/callback/[0-9a-f]{32}/(event|card)/$" {
+        # ⚠ 空白名单 = 拒绝所有回调。填法见该文件内的 TODO
+        include /etc/nginx/snippets/feishu_callback_ips.conf;
+        deny all;
+
+        limit_req zone=feishu_callback burst=20 nodelay;
+        limit_req_status 429;
+
+        access_log /var/log/nginx/ops-manager.api.access.log ops_timing;
+
+        include /etc/nginx/snippets/proxy_backend.conf;
+        proxy_pass http://ops_manager_backend;
+
+        # 卡片回调要求 3 秒内回包，真正的发卡/执行都是异步的：这里给短超时，
+        # 免得一次后端卡顿把 nginx 的连接也一起占着
+        proxy_read_timeout 10s;
+        proxy_send_timeout 10s;
     }
 
     # ---- 后端 API / Django admin ---------------------------------------------

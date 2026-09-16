@@ -349,7 +349,7 @@ class FeishuCryptoTests(TestCase):
         crypto.consume_nonce('nonce-2')
 
     def test_consume_nonce_fail_closed_when_cache_down(self):
-        with patch('apps.im_mgr.crypto.cache.add', side_effect=RuntimeError('redis down')):
+        with patch('apps.im_mgr.dedupe.cache.add', side_effect=RuntimeError('redis down')):
             with self.assertRaises(crypto.CallbackError):
                 crypto.consume_nonce('nonce-3')
 
@@ -512,3 +512,195 @@ class FeishuClientTests(TestCase):
         user, session = self._run(responses, lambda: client.get_user('ou_1'))
         self.assertEqual(user['union_id'], 'on_1')
         self.assertEqual(session.calls[-1]['params'], {'user_id_type': 'open_id'})
+
+
+# ══════════════════════════════════════════════════════════
+# T3：回调入口（公网，免登录）
+# ══════════════════════════════════════════════════════════
+
+class FeishuCallbackViewTests(TestCase):
+    ENCRYPT_KEY = 'encrypt-value'
+    TOKEN = 'token-value'
+
+    def setUp(self):
+        cache.clear()
+        self.app = FeishuApp.load()
+        for key, value in FULL_CONFIG.items():
+            setattr(self.app, key, value)
+        # 测试客户端来自回环，白名单必须含它，否则每条回调都会被 IP 那道拦下
+        self.app.ip_whitelist = '127.0.0.1'
+        self.app.enabled = True
+        self.app.save()
+        self.client = APIClient()
+        self.event_url = self.app.event_path
+        self.card_url = self.app.card_path
+
+    def _post(self, url, payload, *, nonce=None, timestamp=None,
+              signature=None, encrypt_key=None, **extra):
+        key = encrypt_key or self.ENCRYPT_KEY
+        body = _callback_body(key, payload)
+        ts = timestamp or str(int(time.time()))
+        nonce = nonce or f'n-{time.time_ns()}'
+        sig = signature or _sign(key, ts, nonce, body)
+        return self.client.post(
+            url, data=body, content_type='application/json',
+            HTTP_X_LARK_REQUEST_TIMESTAMP=ts,
+            HTTP_X_LARK_REQUEST_NONCE=nonce,
+            HTTP_X_LARK_SIGNATURE=sig,
+            **extra,
+        )
+
+    def _event(self, event_id='ev-1', event_type='im.message.receive_v1'):
+        return {'schema': '2.0',
+                'header': {'token': self.TOKEN, 'event_id': event_id,
+                           'event_type': event_type},
+                'event': {'message': {'chat_id': 'oc_1'}}}
+
+    def _card(self, event_id='ca-1'):
+        return {'schema': '2.0',
+                'header': {'token': self.TOKEN, 'event_id': event_id,
+                           'event_type': 'card.action.trigger'},
+                'action': {'value': {'act': 'run', 'task': 1}}}
+
+    # ── 正常路径 ──────────────────────────────────────────
+    def test_url_verification_echoes_challenge(self):
+        payload = {'type': 'url_verification', 'token': self.TOKEN,
+                   'challenge': 'chal-123'}
+        resp = self._post(self.event_url, payload)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['challenge'], 'chal-123')
+
+    def test_event_dispatched(self):
+        with patch('apps.im_mgr.handlers.handle_event', return_value=None) as handler:
+            resp = self._post(self.event_url, self._event())
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {'code': 0})
+        handler.assert_called_once()
+
+    def test_card_action_dispatched(self):
+        with patch('apps.im_mgr.handlers.handle_card_action',
+                   return_value={'toast': {'content': '已提交'}}) as handler:
+            resp = self._post(self.card_url, self._card())
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {'toast': {'content': '已提交'}})
+        handler.assert_called_once()
+
+    def test_card_default_ack_is_empty_object(self):
+        with patch('apps.im_mgr.handlers.handle_card_action', return_value=None):
+            resp = self._post(self.card_url, self._card())
+        self.assertEqual(resp.json(), {})
+
+    def test_callback_needs_no_login(self):
+        """回调不走 JWT，也不该被 MFA 强制挡住（认证类置空）。"""
+        resp = self._post(self.event_url, self._event())
+        self.assertEqual(resp.status_code, 200)
+
+    # ── 各道门 ────────────────────────────────────────────
+    def test_bad_signature_rejected_silently(self):
+        with patch('apps.im_mgr.handlers.handle_event') as handler:
+            resp = self._post(self.event_url, self._event(), signature='deadbeef')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {'code': 0})
+        handler.assert_not_called()
+
+    def test_wrong_slug_rejected_silently(self):
+        url = f'{FeishuApp.CALLBACK_PREFIX}{"0" * 32}/event/'
+        with patch('apps.im_mgr.handlers.handle_event') as handler:
+            resp = self._post(url, self._event())
+        self.assertEqual(resp.status_code, 200)
+        handler.assert_not_called()
+
+    def test_malformed_slug_is_404(self):
+        """形状不对的连路由都进不去（正则限定 32 位 hex）。"""
+        resp = self.client.post(f'{FeishuApp.CALLBACK_PREFIX}short/event/',
+                                data=b'{}', content_type='application/json')
+        self.assertEqual(resp.status_code, 404)
+
+    def test_ip_not_allowed_rejected(self):
+        FeishuApp.objects.filter(pk=FeishuApp.SINGLETON_PK).update(
+            ip_whitelist='203.0.113.0/24')
+        with patch('apps.im_mgr.handlers.handle_event') as handler:
+            resp = self._post(self.event_url, self._event())
+        self.assertEqual(resp.status_code, 200)
+        handler.assert_not_called()
+
+    def test_spoofed_xff_does_not_bypass_ip_check(self):
+        """伪造的 XFF 左段无效：可信代理链从右往左剥，右端才是 nginx 追加的真实来源。"""
+        FeishuApp.objects.filter(pk=FeishuApp.SINGLETON_PK).update(
+            ip_whitelist='203.0.113.5')
+        with patch('apps.im_mgr.handlers.handle_event') as handler:
+            resp = self._post(self.event_url, self._event(),
+                              HTTP_X_FORWARDED_FOR='203.0.113.5, 198.51.100.9')
+        self.assertEqual(resp.status_code, 200)
+        handler.assert_not_called()
+
+    def test_disabled_app_rejected(self):
+        FeishuApp.objects.filter(pk=FeishuApp.SINGLETON_PK).update(enabled=False)
+        with patch('apps.im_mgr.handlers.handle_event') as handler:
+            resp = self._post(self.event_url, self._event())
+        self.assertEqual(resp.status_code, 200)
+        handler.assert_not_called()
+
+    def test_token_mismatch_rejected(self):
+        payload = self._event()
+        payload['header']['token'] = 'wrong'
+        with patch('apps.im_mgr.handlers.handle_event') as handler:
+            resp = self._post(self.event_url, payload)
+        self.assertEqual(resp.status_code, 200)
+        handler.assert_not_called()
+
+    def test_stale_timestamp_rejected(self):
+        old = str(int(time.time()) - crypto.TIMESTAMP_WINDOW - 60)
+        with patch('apps.im_mgr.handlers.handle_event') as handler:
+            resp = self._post(self.event_url, self._event(), timestamp=old)
+        self.assertEqual(resp.status_code, 200)
+        handler.assert_not_called()
+
+    # ── 幂等 ──────────────────────────────────────────────
+    def test_duplicate_event_id_handled_once(self):
+        """飞书投递重试换了 nonce 与签名，靠 event_id 判重。"""
+        payload = self._event(event_id='ev-dup')
+        with patch('apps.im_mgr.handlers.handle_event') as handler:
+            first = self._post(self.event_url, payload)
+            second = self._post(self.event_url, payload)
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(handler.call_count, 1)
+
+    def test_replayed_request_rejected_by_nonce(self):
+        payload = self._event(event_id='ev-replay')
+        body = _callback_body(self.ENCRYPT_KEY, payload)
+        ts, nonce = str(int(time.time())), 'n-fixed'
+        sig = _sign(self.ENCRYPT_KEY, ts, nonce, body)
+        headers = {'HTTP_X_LARK_REQUEST_TIMESTAMP': ts,
+                   'HTTP_X_LARK_REQUEST_NONCE': nonce,
+                   'HTTP_X_LARK_SIGNATURE': sig}
+        with patch('apps.im_mgr.handlers.handle_event') as handler:
+            self.client.post(self.event_url, data=body,
+                             content_type='application/json', **headers)
+            self.client.post(self.event_url, data=body,
+                             content_type='application/json', **headers)
+        self.assertEqual(handler.call_count, 1)
+
+    def test_dedupe_cache_down_is_fail_closed(self):
+        with patch('apps.im_mgr.dedupe.cache.add', side_effect=RuntimeError('down')):
+            with patch('apps.im_mgr.handlers.handle_event') as handler:
+                resp = self._post(self.event_url, self._event())
+        self.assertEqual(resp.status_code, 200)
+        handler.assert_not_called()
+
+    # ── 健壮性 ────────────────────────────────────────────
+    def test_handler_exception_still_acks(self):
+        """业务异常不能改变回包形态，否则错误差异就是一份探测反馈。"""
+        with patch('apps.im_mgr.handlers.handle_event', side_effect=RuntimeError('boom')):
+            resp = self._post(self.event_url, self._event())
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {'code': 0})
+
+    def test_callback_not_audited(self):
+        """群里每条消息都是一次回调，落审计表只有噪声（见 audit/middleware.SKIP_PATHS）。"""
+        from apps.audit.models import AuditLog
+
+        self._post(self.event_url, self._event())
+        self.assertFalse(AuditLog.objects.filter(path__startswith=
+                                                 FeishuApp.CALLBACK_PREFIX).exists())

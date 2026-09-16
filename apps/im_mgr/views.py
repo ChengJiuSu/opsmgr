@@ -9,18 +9,28 @@
   白名单，等于一份「怎么打这两条公网入口」的说明书，GET 也不能对所有人开；
 - **sudo**：改这里等于改安全边界，而登录那次 MFA 可能是 60 分钟前的事。
 """
+import hmac
+import logging
+
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema
 from rest_framework import viewsets
+from rest_framework.permissions import AllowAny
+from rest_framework.response import Response
+from rest_framework.throttling import SimpleRateThrottle
 from rest_framework.views import APIView
 
 from apps.auth_mgr.permissions import module_perm
 from common.pagination import StandardPagination
+from common.request import auth_client_ip
 from common.response import ok
 from common.sudo import SudoRequired
 
+from . import crypto, dedupe, handlers
 from .models import FeishuApp, FeishuChannel
 from .serializers import FeishuAppSerializer, FeishuChannelSerializer
+
+logger = logging.getLogger(__name__)
 
 CONFIG_PERMISSIONS = [module_perm('system', min_level='write'), SudoRequired]
 
@@ -91,3 +101,148 @@ class FeishuChannelViewSet(viewsets.ModelViewSet):
 
             qs = qs.filter(Q(name__icontains=keyword) | Q(chat_id__icontains=keyword))
         return qs
+
+
+# ══════════════════════════════════════════════════════════
+# 回调入口（公网，免登录）
+# ══════════════════════════════════════════════════════════
+
+class FeishuCallbackThrottle(SimpleRateThrottle):
+    """按来源 IP 给回调入口限速。
+
+    验签发生在应用层，扫描流量在到达验签之前就该被挡掉，否则每个探测包都会
+    让后端做一次 SHA256 + 一次 AES。nginx 的 limit_req 是同一目的的外层，
+    两层都要——nginx 那层管不到「已经在 IP 白名单里、但开始刷请求」的情况。
+    """
+
+    scope = 'feishu_callback'
+
+    def get_cache_key(self, request, view):
+        # 鉴权口径的 IP（可信代理链解析），不吃伪造的 XFF
+        return f'throttle_{self.scope}_{auth_client_ip(request) or "unknown"}'
+
+
+class FeishuCallbackView(APIView):
+    """飞书回调入口基类：只管「这条请求可不可信」与「怎么回包」。
+
+    **认证与权限刻意置空**：这条路走的是签名校验，不是 JWT。`authentication_classes
+    = []` 覆盖全局的 MfaJWTAuthentication（否则请求会被 MFA 强制挡在门外），
+    与机器接口 X-API-KEY 走自己的认证类是同一类处置。
+
+    **回包恒定**：无论哪一道没过，一律 200 + 固定包体，失败原因只进日志。回包
+    有差异本身就是一份探测反馈——攻击者能据此区分「路径不对」「IP 不对」
+    「签名不对」，逐步逼近。飞书后台的地址验证失败时，看服务端日志，不看回包。
+
+    门的顺序（贵的排后面）：
+    路径随机串 → 配置就绪 → 来源 IP → 签名/时间戳/nonce/解密/token → 幂等。
+    """
+
+    authentication_classes = []
+    permission_classes = [AllowAny]
+    throttle_classes = [FeishuCallbackThrottle]
+
+    #: 恒定回包体
+    ACK = {'code': 0}
+    #: 幂等窗口：飞书的投递重试跨度按小时算
+    DEDUPE_TTL = 3600
+    #: 子类覆盖：dedupe 的命名空间
+    DEDUPE_NAMESPACE = 'callback'
+
+    def _ack(self):
+        return Response(self.ACK)
+
+    def _reject_reason(self, request, app, slug):
+        """返回中文拒绝原因；None 表示可以继续。"""
+        if not hmac.compare_digest(str(slug), str(app.callback_slug)):
+            return '回调标识不匹配'
+        if not app.is_ready():
+            missing = app.missing_fields()
+            return f'飞书接入未就绪（{"、".join(missing) if missing else "未启用"}）'
+        if not app.ip_allowed(auth_client_ip(request)):
+            return '来源 IP 不在白名单内'
+        return None
+
+    def post(self, request, slug):
+        app = FeishuApp.load()
+        ip = auth_client_ip(request)
+
+        reason = self._reject_reason(request, app, slug)
+        if reason:
+            logger.warning('飞书回调被拒：%s（path=%s ip=%s）', reason, request.path, ip)
+            return self._ack()
+
+        try:
+            payload = crypto.verify_callback(
+                app,
+                request.headers.get('X-Lark-Request-Timestamp'),
+                request.headers.get('X-Lark-Request-Nonce'),
+                request.headers.get('X-Lark-Signature'),
+                # 必须是原始字节：解析后重新序列化会改键序与空格，签名必不匹配
+                request.body,
+            )
+        except crypto.CallbackError as exc:
+            logger.warning('飞书回调校验失败：%s（path=%s ip=%s）', exc, request.path, ip)
+            return self._ack()
+
+        # 事件订阅地址验证：飞书要求原样回显 challenge，这一条不能走恒定回包
+        if payload.get('type') == 'url_verification':
+            logger.info('飞书回调地址验证通过（path=%s）', request.path)
+            return Response({'challenge': str(payload.get('challenge') or '')})
+
+        if not self._first_delivery(payload):
+            return self._ack()
+
+        try:
+            extra = self.dispatch_payload(app, payload)
+        except Exception:  # noqa: BLE001 - 业务异常不能改变回包形态
+            logger.exception('飞书回调处理异常（path=%s）', request.path)
+            return self._ack()
+        return Response(extra if isinstance(extra, dict) else self.ACK)
+
+    def _first_delivery(self, payload):
+        """事件/动作级幂等：飞书的投递重试换了 nonce 与签名，nonce 判重挡不住。"""
+        event_id = handlers.event_id(payload)
+        if not event_id:
+            return True  # 没有 event_id 的形态，靠 nonce 判重兜底
+        try:
+            fresh = dedupe.consume(self.DEDUPE_NAMESPACE, event_id, self.DEDUPE_TTL)
+        except dedupe.DedupeUnavailable:
+            logger.warning('判重缓存不可用，丢弃回调 event_id=%s（fail-closed）', event_id)
+            return False
+        if not fresh:
+            logger.info('飞书回调重复投递，已忽略：event_id=%s', event_id)
+        return fresh
+
+    def dispatch_payload(self, app, payload):
+        raise NotImplementedError
+
+
+class FeishuEventView(FeishuCallbackView):
+    """POST /api/feishu/callback/<slug>/event/ —— 事件订阅。"""
+
+    DEDUPE_NAMESPACE = 'event'
+
+    @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
+    def post(self, request, slug):
+        return super().post(request, slug)
+
+    def dispatch_payload(self, app, payload):
+        return handlers.handle_event(app, payload)
+
+
+class FeishuCardView(FeishuCallbackView):
+    """POST /api/feishu/callback/<slug>/card/ —— 卡片按钮回调。
+
+    回包用空对象而不是 `{"code": 0}`：卡片回调的响应体是留给 toast / 整张新
+    卡片的，回一个无关的业务码没有意义。
+    """
+
+    DEDUPE_NAMESPACE = 'card'
+    ACK = {}
+
+    @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
+    def post(self, request, slug):
+        return super().post(request, slug)
+
+    def dispatch_payload(self, app, payload):
+        return handlers.handle_card_action(app, payload)

@@ -160,13 +160,18 @@ class FeishuApp(models.Model):
         return ip_matches_rules(ip, self.ip_whitelist)
 
     # ── 回调地址 ──────────────────────────────────────────
+    #: 回调入口的公共前缀。与配置面路径分开（不是 /api/feishu/<slug>/…），
+    #: 这样审计中间件能整段跳过回调流量而不影响配置接口的审计——群里每条消息
+    #: 都是一次事件回调，落进审计表只有噪声（匿名 + 一坨密文），没有价值
+    CALLBACK_PREFIX = '/api/feishu/callback/'
+
     @property
     def event_path(self):
-        return f'/api/feishu/{self.callback_slug}/event/'
+        return f'{self.CALLBACK_PREFIX}{self.callback_slug}/event/'
 
     @property
     def card_path(self):
-        return f'/api/feishu/{self.callback_slug}/card/'
+        return f'{self.CALLBACK_PREFIX}{self.callback_slug}/card/'
 
     def rotate_callback_slug(self):
         """轮换回调标识，返回新值。旧地址立即失效，飞书后台必须同步改。"""

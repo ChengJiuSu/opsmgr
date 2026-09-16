@@ -33,6 +33,8 @@ apps/im_mgr/
 ├── apps.py          # AppConfig
 ├── models.py        # FeishuApp（单例）/ FeishuChannel
 ├── crypto.py        # 回调解密与验签（公网入口的第一道门）
+├── dedupe.py        # 一次性消费：nonce / event_id / 卡片 token 共用，fail-closed
+├── handlers.py      # 回调的业务路由（事件 / 卡片动作）
 ├── client.py        # 出站客户端：token 缓存 + 统一请求封装 + 消息接口
 ├── serializers.py   # 秘密 write_only + has_xxx 回显、启用前置校验
 ├── views.py         # 配置单例 APIView + 会话 ViewSet
@@ -113,6 +115,60 @@ apps/im_mgr/
 
 `CallbackError` 的消息只进日志，**不回给调用方**：回包必须恒定，否则错误差异
 本身就是一份探测反馈。
+
+---
+
+## 回调入口（views.py）
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/feishu/callback/<slug>/event/` | 事件订阅 |
+| POST | `/api/feishu/callback/<slug>/card/` | 卡片按钮回调 |
+
+`<slug>` 即 `FeishuApp.callback_slug`，路由正则限定 32 位十六进制——形状不对的
+请求连视图都进不去。
+
+**认证与权限刻意置空**（`authentication_classes = []` + `AllowAny`）：这条路走的
+是签名校验，不是 JWT。不置空的话请求会被全局的 `MfaJWTAuthentication` 挡在门外，
+与机器接口走自己的认证类是同一类处置。
+
+**回包恒定**：无论哪一道没过，一律 `200` + 固定包体（event 回 `{"code":0}`，
+card 回 `{}`），失败原因只进日志。回包有差异本身就是一份探测反馈——攻击者能据此
+区分「路径不对」「IP 不对」「签名不对」，逐步逼近。**飞书后台地址验证失败时看
+服务端日志，不看回包。**
+
+唯一的例外是事件订阅地址验证（`type=url_verification`），飞书要求原样回显
+`challenge`。
+
+**幂等两层**：nonce 判重挡的是原样重放；飞书自己的**投递重试**换了 nonce 与签名，
+靠 `header.event_id` 再判一次（窗口 1 小时）。两者都 fail-closed。
+
+**回调不写审计**：`/api/feishu/callback/` 整段在 `audit/middleware.SKIP_PATHS` 里。
+群里每条消息都是一次事件回调，落进审计表只有噪声（匿名 + 一坨密文）；真正要留痕的
+「谁从飞书发起了执行」由 im_mgr 在识别出操作人后显式写审计（T8）。飞书**配置面**
+接口不在此列，照常审计。
+
+**限速**：`FeishuCallbackThrottle` 按 `auth_client_ip` 分桶（默认 `240/min`，
+`FEISHU_CALLBACK_RATE` 可调）。与 nginx 的 `limit_req` 两层——nginx 那层管不到
+「已经在 IP 白名单里、但开始刷请求」的情况。
+
+---
+
+## nginx（deploy/nginx）
+
+```
+conf/templates/ops_manager.conf.template   # limit_req_zone + 回调 location
+conf/snippets/feishu_callback_ips.conf     # 来源 IP 白名单（⚠ 待填）
+```
+
+三处要点：
+
+- 回调 location **必须排在 `~ ^/(api|admin)/` 之前**。nginx 的正则 location 按
+  定义顺序匹配，写在后面就永远命中不到，IP 白名单与限速全部失效，且没有任何报错。
+- 正则里的 `{32}` **必须放在引号内**，否则 nginx 把裸的 `{ }` 当配置块边界。
+- `feishu_callback_ips.conf` **为空 = 拒绝所有回调**（后面紧跟 `deny all;`）。
+  上线前必须填入飞书公布的回调出口 IP 段并 reload；调试期可临时 `allow all;`，
+  应用层白名单与签名校验仍然生效。
 
 ---
 
@@ -198,4 +254,7 @@ apps/im_mgr/
 
 - 秘密只经配置页录入、加密落库，**不进仓库、不进 .env**。
 - 回调地址（`event_url` / `card_url`）在配置页直接复制到飞书开放平台。
-- nginx 侧的 IP 白名单与限速见 T3（`deploy/nginx`），与库内白名单是两层。
+- **上线顺序有依赖**：飞书后台填回调地址时会立刻发一次地址验证，而验证请求同样
+  要过全部校验。所以必须先在平台侧配齐四项凭据 + IP 白名单并 `enabled=true`、
+  且 nginx 的 `feishu_callback_ips.conf` 已填好，再去飞书后台保存回调地址。
+- 轮换 `callback_slug` 后旧地址立即失效，飞书后台必须同步更新。
