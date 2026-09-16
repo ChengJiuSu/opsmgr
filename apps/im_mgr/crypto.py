@@ -66,7 +66,14 @@ def decrypt(encrypt_key, encrypt_value):
     iv, ciphertext = data[:AES_BLOCK_SIZE], data[AES_BLOCK_SIZE:]
     decryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
     padded = decryptor.update(ciphertext) + decryptor.finalize()
-    return _unpad(padded).decode('utf-8', errors='strict')
+    try:
+        return _unpad(padded).decode('utf-8', errors='strict')
+    except UnicodeDecodeError as exc:
+        # key 不对时解出来是随机字节，PKCS#7 去填充有一定概率**碰巧通过**
+        # （末字节恰好落在 1..16 且长度够），于是错误从「填充非法」变成解码失败。
+        # 不转成 CallbackError 的话它会穿透视图的 except，回包变成 500——
+        # 而恒定回包正是这条公网入口的安全前提
+        raise CallbackError('解密结果不是合法 UTF-8（Encrypt Key 可能配置错误）') from exc
 
 
 def _unpad(padded):
@@ -74,13 +81,24 @@ def _unpad(padded):
 
     填充长度非法通常意味着 Encrypt Key 配错（解出来是随机字节），报错比返回
     半截明文好——后者会变成一个「JSON 解析失败」的假象，指向完全错误的方向。
+
+    **必须校验每一个填充字节**，不能只看末字节的范围：随机字节的末位恰好落在
+    1..16 的概率是 6.25%，只看末字节等于把错误 key 的检出率白扔掉一个数量级。
+    其中末字节恰好是 16 时（1/256）整块都被当成填充，返回空 bytes、decode 成功，
+    于是 decrypt() **一声不响地返回空字符串**——契约就坏在这里。
     """
     if not padded:
         raise CallbackError('解密结果为空（Encrypt Key 可能配置错误）')
     size = padded[-1]
     if not 1 <= size <= AES_BLOCK_SIZE or len(padded) < size:
         raise CallbackError('解密结果填充非法（Encrypt Key 可能配置错误）')
-    return padded[:-size]
+    if padded[-size:] != bytes([size]) * size:
+        raise CallbackError('解密结果填充非法（Encrypt Key 可能配置错误）')
+    body = padded[:-size]
+    if not body:
+        # 飞书的回调体不可能是空的；能走到这里说明解出来的是随机字节
+        raise CallbackError('解密结果为空（Encrypt Key 可能配置错误）')
+    return body
 
 
 def verify_signature(encrypt_key, timestamp, nonce, body, signature):

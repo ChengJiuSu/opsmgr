@@ -196,7 +196,14 @@ class FeishuCallbackView(APIView):
                 # 必须是原始字节：解析后重新序列化会改键序与空格，签名必不匹配
                 request.body,
             )
-        except crypto.CallbackError as exc:
+        except Exception as exc:  # noqa: BLE001 - 见下：回包必须恒定
+            # 刻意连非 CallbackError 一起兜住。校验链路里任何一个没预料到的异常
+            # （畸形密文解出非法 UTF-8、第三方库自己抛的错）如果穿透出去，回包就
+            # 从恒定的 200 变成 500——攻击者据此就能区分「哪一道拒的」，而回包
+            # 恒定正是这条公网入口的安全前提。真异常照样进日志，不会被吞掉
+            if not isinstance(exc, crypto.CallbackError):
+                logger.exception('飞书回调校验出现未预料的异常（path=%s ip=%s）',
+                                 request.path, ip)
             # 把收到的飞书请求头一并记下来：回包是恒定的，飞书后台只会显示
             # 「没返回 challenge」，排查全靠这一行。「带了哪些头」往往直接指出
             # 是飞书侧没开加密，还是中间某一跳把头丢了

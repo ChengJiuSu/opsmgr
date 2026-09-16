@@ -306,9 +306,31 @@ class FeishuCryptoTests(TestCase):
         self.assertEqual(crypto.decrypt(self.ENCRYPT_KEY, cipher), '你好 feishu')
 
     def test_decrypt_wrong_key(self):
-        cipher = _encrypt(self.ENCRYPT_KEY, 'payload')
-        with self.assertRaises(crypto.CallbackError):
-            crypto.decrypt('another-key', cipher)
+        """key 不对一律抛 CallbackError。
+
+        跑多轮是必要的：IV 随机，PKCS#7 去填充有一定概率碰巧通过，于是错误从
+        「填充非法」变成解码失败——单跑一次抓不到，而漏掉它的后果是异常穿透
+        视图、回包从恒定的 200 变成 500。
+        """
+        for _ in range(60):
+            cipher = _encrypt(self.ENCRYPT_KEY, 'payload')
+            with self.assertRaises(crypto.CallbackError):
+                crypto.decrypt('another-key', cipher)
+
+    def test_callback_stays_constant_on_unexpected_error(self):
+        """校验链路抛任何异常，回包都必须还是那个恒定包。"""
+        self.app.ip_whitelist = '127.0.0.1'
+        self.app.save(update_fields=['ip_whitelist'])
+        body = _callback_body(self.ENCRYPT_KEY, self._event())
+        ts, nonce = str(int(time.time())), 'n-boom'
+        with patch('apps.im_mgr.crypto.parse_body', side_effect=RuntimeError('boom')):
+            resp = APIClient().post(
+                self.app.event_path, data=body, content_type='application/json',
+                HTTP_X_LARK_REQUEST_TIMESTAMP=ts,
+                HTTP_X_LARK_REQUEST_NONCE=nonce,
+                HTTP_X_LARK_SIGNATURE=_sign(self.ENCRYPT_KEY, ts, nonce, body))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {'code': 0})
 
     def test_decrypt_bad_input(self):
         with self.assertRaises(crypto.CallbackError):
