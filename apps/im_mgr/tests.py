@@ -1,12 +1,20 @@
 """im_mgr 接口测试：飞书应用配置（单例/秘密不回显/启用前置校验）、
 回调标识轮换、会话白名单 CRUD 与权限。"""
+import base64
+import hashlib
+import json
+import time
+from unittest.mock import patch
+
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.db import connection
 from django.test import TestCase
 from rest_framework.test import APIClient
 
 from common.testing import grant_sudo
 
+from apps.im_mgr import client, crypto
 from apps.im_mgr.models import FeishuApp, FeishuChannel
 
 PASSWORD = 'Pass!2345xyz'
@@ -239,3 +247,268 @@ class FeishuChannelApiTests(BaseApiTest):
     def test_non_admin_forbidden(self):
         member = self._client(is_staff=False)
         self.assertEqual(member.get('/api/feishu/channels/').status_code, 403)
+
+
+# ══════════════════════════════════════════════════════════
+# T2：回调验签/解密 与 出站客户端
+# ══════════════════════════════════════════════════════════
+
+def _encrypt(encrypt_key, plaintext):
+    """测试侧的加密（飞书发过来的密文是这么造的）：AES-256-CBC + PKCS#7。"""
+    import os
+
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    key = hashlib.sha256(encrypt_key.encode('utf-8')).digest()
+    iv = os.urandom(16)
+    raw = plaintext.encode('utf-8')
+    pad = 16 - len(raw) % 16
+    encryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
+    body = encryptor.update(raw + bytes([pad]) * pad) + encryptor.finalize()
+    return base64.b64encode(iv + body).decode('ascii')
+
+
+def _callback_body(encrypt_key, payload):
+    """造一份飞书回调的原始请求体字节。"""
+    inner = json.dumps(payload, ensure_ascii=False)
+    return json.dumps({'encrypt': _encrypt(encrypt_key, inner)}).encode('utf-8')
+
+
+def _sign(encrypt_key, timestamp, nonce, body):
+    return hashlib.sha256(
+        f'{timestamp}{nonce}{encrypt_key}'.encode('utf-8') + body).hexdigest()
+
+
+class FeishuCryptoTests(TestCase):
+    ENCRYPT_KEY = 'encrypt-value'
+    TOKEN = 'token-value'
+
+    def setUp(self):
+        cache.clear()
+        self.app = FeishuApp.load()
+        for key, value in FULL_CONFIG.items():
+            setattr(self.app, key, value)
+        self.app.enabled = True
+        self.app.save()
+
+    def _event(self, **extra):
+        payload = {'schema': '2.0',
+                   'header': {'token': self.TOKEN, 'event_type': 'im.message.receive_v1'},
+                   'event': {'message': {'chat_id': 'oc_1'}}}
+        payload.update(extra)
+        return payload
+
+    def test_decrypt_roundtrip(self):
+        cipher = _encrypt(self.ENCRYPT_KEY, '你好 feishu')
+        self.assertEqual(crypto.decrypt(self.ENCRYPT_KEY, cipher), '你好 feishu')
+
+    def test_decrypt_wrong_key(self):
+        cipher = _encrypt(self.ENCRYPT_KEY, 'payload')
+        with self.assertRaises(crypto.CallbackError):
+            crypto.decrypt('another-key', cipher)
+
+    def test_decrypt_bad_input(self):
+        with self.assertRaises(crypto.CallbackError):
+            crypto.decrypt(self.ENCRYPT_KEY, '不是base64!!')
+        with self.assertRaises(crypto.CallbackError):
+            crypto.decrypt(self.ENCRYPT_KEY, '')
+
+    def test_verify_signature(self):
+        body = b'{"encrypt":"x"}'
+        sig = _sign(self.ENCRYPT_KEY, '1700000000', 'n1', body)
+        crypto.verify_signature(self.ENCRYPT_KEY, '1700000000', 'n1', body, sig)
+        with self.assertRaises(crypto.CallbackError):
+            crypto.verify_signature(self.ENCRYPT_KEY, '1700000000', 'n1', body, 'deadbeef')
+        with self.assertRaises(crypto.CallbackError):
+            crypto.verify_signature(self.ENCRYPT_KEY, '1700000000', 'n1', body, '')
+
+    def test_signature_is_over_raw_bytes(self):
+        """重新序列化过的请求体验不过签——这正是必须留住原始 bytes 的原因。"""
+        body = b'{"encrypt":"x"}'
+        sig = _sign(self.ENCRYPT_KEY, '1700000000', 'n1', body)
+        reserialized = json.dumps(json.loads(body)).encode('utf-8')
+        self.assertNotEqual(body, reserialized)
+        with self.assertRaises(crypto.CallbackError):
+            crypto.verify_signature(
+                self.ENCRYPT_KEY, '1700000000', 'n1', reserialized, sig)
+
+    def test_verify_timestamp_window(self):
+        now = 1700000000
+        crypto.verify_timestamp(str(now - 10), now=now)
+        with self.assertRaises(crypto.CallbackError):
+            crypto.verify_timestamp(str(now - crypto.TIMESTAMP_WINDOW - 1), now=now)
+        with self.assertRaises(crypto.CallbackError):
+            crypto.verify_timestamp(str(now + crypto.TIMESTAMP_WINDOW + 1), now=now)
+        with self.assertRaises(crypto.CallbackError):
+            crypto.verify_timestamp('not-a-number', now=now)
+
+    def test_consume_nonce_rejects_replay(self):
+        crypto.consume_nonce('nonce-1')
+        with self.assertRaises(crypto.CallbackError):
+            crypto.consume_nonce('nonce-1')
+        crypto.consume_nonce('nonce-2')
+
+    def test_consume_nonce_fail_closed_when_cache_down(self):
+        with patch('apps.im_mgr.crypto.cache.add', side_effect=RuntimeError('redis down')):
+            with self.assertRaises(crypto.CallbackError):
+                crypto.consume_nonce('nonce-3')
+
+    def test_verify_callback_ok(self):
+        body = _callback_body(self.ENCRYPT_KEY, self._event())
+        ts, nonce = str(int(time.time())), 'n-ok'
+        payload = crypto.verify_callback(
+            self.app, ts, nonce, _sign(self.ENCRYPT_KEY, ts, nonce, body), body)
+        self.assertEqual(payload['header']['event_type'], 'im.message.receive_v1')
+
+    def test_verify_callback_rejects_token_mismatch(self):
+        event = self._event()
+        event['header']['token'] = 'wrong-token'
+        body = _callback_body(self.ENCRYPT_KEY, event)
+        ts, nonce = str(int(time.time())), 'n-token'
+        with self.assertRaises(crypto.CallbackError):
+            crypto.verify_callback(
+                self.app, ts, nonce, _sign(self.ENCRYPT_KEY, ts, nonce, body), body)
+
+    def test_verify_callback_rejects_replay(self):
+        body = _callback_body(self.ENCRYPT_KEY, self._event())
+        ts, nonce = str(int(time.time())), 'n-replay'
+        sig = _sign(self.ENCRYPT_KEY, ts, nonce, body)
+        crypto.verify_callback(self.app, ts, nonce, sig, body)
+        with self.assertRaises(crypto.CallbackError):
+            crypto.verify_callback(self.app, ts, nonce, sig, body)
+
+    def test_payload_token_accepts_both_shapes(self):
+        self.assertEqual(crypto.payload_token({'header': {'token': 'a'}}), 'a')
+        self.assertEqual(crypto.payload_token({'token': 'b'}), 'b')
+        self.assertEqual(crypto.payload_token({}), '')
+
+
+class FakeResponse:
+    def __init__(self, body, status_code=200, text=''):
+        self._body = body
+        self.status_code = status_code
+        self.text = text or str(body)
+
+    def json(self):
+        if isinstance(self._body, Exception):
+            raise self._body
+        return self._body
+
+
+class FakeSession:
+    """记录请求并按队列返回响应；队列耗尽后重复最后一条。"""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+        self.trust_env = True
+
+    def request(self, method, url, headers=None, json=None, params=None, timeout=None):
+        self.calls.append({'method': method, 'url': url, 'headers': headers or {},
+                           'json': json, 'params': params})
+        item = self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
+        if isinstance(item, FakeResponse):
+            return item
+        if isinstance(item, Exception):
+            raise item  # 网络层异常
+        return FakeResponse(item)
+
+
+TOKEN_OK = {'code': 0, 'msg': 'ok', 'tenant_access_token': 't-1', 'expire': 7200}
+TOKEN_OK2 = {'code': 0, 'msg': 'ok', 'tenant_access_token': 't-2', 'expire': 7200}
+
+
+class FeishuClientTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        app = FeishuApp.load()
+        for key, value in FULL_CONFIG.items():
+            setattr(app, key, value)
+        app.enabled = True
+        app.save()
+
+    def _run(self, responses, fn):
+        session = FakeSession(responses)
+        with patch('apps.im_mgr.client.requests.Session', return_value=session):
+            return fn(), session
+
+    def test_token_cached_across_calls(self):
+        def run():
+            first = client.get_tenant_token()
+            second = client.get_tenant_token()
+            return first, second
+
+        (first, second), session = self._run([TOKEN_OK], run)
+        self.assertEqual(first, 't-1')
+        self.assertEqual(second, 't-1')
+        # 只打了一次取 token 的接口
+        self.assertEqual(len(session.calls), 1)
+
+    def test_token_error_raises(self):
+        with self.assertRaises(client.FeishuError):
+            self._run([{'code': 10003, 'msg': 'app not found'}],
+                      client.get_tenant_token)
+
+    def test_disabled_app_raises(self):
+        FeishuApp.objects.filter(pk=FeishuApp.SINGLETON_PK).update(enabled=False)
+        with self.assertRaises(client.FeishuError) as ctx:
+            client.get_tenant_token()
+        self.assertIn('飞书接入不可用', str(ctx.exception))
+
+    def test_send_card_returns_message_id(self):
+        responses = [TOKEN_OK, {'code': 0, 'data': {'message_id': 'om_1'}}]
+        message_id, session = self._run(
+            responses, lambda: client.send_card('oc_1', {'config': {}}))
+        self.assertEqual(message_id, 'om_1')
+        sent = session.calls[-1]
+        self.assertEqual(sent['method'], 'POST')
+        self.assertEqual(sent['params'], {'receive_id_type': 'chat_id'})
+        self.assertEqual(sent['headers']['Authorization'], 'Bearer t-1')
+        # content 必须是 JSON 字符串而不是对象
+        self.assertIsInstance(sent['json']['content'], str)
+
+    def test_update_card_uses_patch(self):
+        responses = [TOKEN_OK, {'code': 0, 'data': {}}]
+        _, session = self._run(
+            responses, lambda: client.update_card('om_1', {'config': {}}))
+        sent = session.calls[-1]
+        self.assertEqual(sent['method'], 'PATCH')
+        self.assertTrue(sent['url'].endswith('/open-apis/im/v1/messages/om_1'))
+
+    def test_invalid_token_refreshes_once(self):
+        responses = [
+            TOKEN_OK,
+            {'code': 99991663, 'msg': 'invalid access token'},
+            TOKEN_OK2,
+            {'code': 0, 'data': {'message_id': 'om_2'}},
+        ]
+        message_id, session = self._run(
+            responses, lambda: client.send_card('oc_1', {'config': {}}))
+        self.assertEqual(message_id, 'om_2')
+        self.assertEqual(len(session.calls), 4)
+        self.assertEqual(session.calls[-1]['headers']['Authorization'], 'Bearer t-2')
+
+    def test_business_error_raises_without_retry(self):
+        responses = [TOKEN_OK, {'code': 230001, 'msg': 'bot not in chat'}]
+        with self.assertRaises(client.FeishuError) as ctx:
+            self._run(responses, lambda: client.send_card('oc_1', {'config': {}}))
+        self.assertEqual(ctx.exception.code, 230001)
+
+    def test_network_error_wrapped(self):
+        import requests as _requests
+
+        with self.assertRaises(client.FeishuError):
+            self._run([_requests.ConnectionError('boom')], client.get_tenant_token)
+
+    def test_non_json_response_wrapped(self):
+        session = FakeSession([FakeResponse(ValueError('no json'), text='<html>502</html>')])
+        with patch('apps.im_mgr.client.requests.Session', return_value=session):
+            with self.assertRaises(client.FeishuError):
+                client.get_tenant_token()
+
+    def test_get_user(self):
+        responses = [TOKEN_OK, {'code': 0, 'data': {'user': {'union_id': 'on_1',
+                                                             'email': 'a@b.com'}}}]
+        user, session = self._run(responses, lambda: client.get_user('ou_1'))
+        self.assertEqual(user['union_id'], 'on_1')
+        self.assertEqual(session.calls[-1]['params'], {'user_id_type': 'open_id'})

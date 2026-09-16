@@ -343,6 +343,19 @@ MFA_RECOVERY_CODES = config('MFA_RECOVERY_CODES', default=10, cast=int)
 # 绑当前访问令牌的 jti，换 token 即失效（见 common/sudo.py）
 SUDO_TTL = config('SUDO_TTL', default=600, cast=int)
 
+# ── 飞书接入（apps/im_mgr）──────────────────────────────────
+# 开放平台域名：飞书（国内）open.feishu.cn / Lark（海外）open.larksuite.com
+FEISHU_BASE_URL = config('FEISHU_BASE_URL', default='https://open.feishu.cn')
+# 是否使用环境变量里的 http(s)_proxy 访问飞书。飞书在公网，多数部署需要走代理
+# 才出得去，故默认 True——与 common/jumpserver.py 的 trust_env=False 相反，
+# 那边的目标在内网，吃了开发机代理会得到 502
+FEISHU_TRUST_ENV = config('FEISHU_TRUST_ENV', default=True, cast=bool)
+# 出站请求超时（连接秒, 读取秒）：卡片回调必须 3 秒内回包，读超时不能太长
+FEISHU_TIMEOUT = (
+    config('FEISHU_CONNECT_TIMEOUT', default=5, cast=int),
+    config('FEISHU_READ_TIMEOUT', default=10, cast=int),
+)
+
 # ── 缓存（登录失败限速等跨进程状态）───────────────────────
 # CACHE_BACKEND 选层：
 #   redis  —— 跨进程共享，复用 celery 同一 Redis（KEY_PREFIX 隔开键空间）。

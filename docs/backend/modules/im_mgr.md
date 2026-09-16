@@ -32,6 +32,8 @@ API 凭证触发同一段校验与落库逻辑）。
 apps/im_mgr/
 ├── apps.py          # AppConfig
 ├── models.py        # FeishuApp（单例）/ FeishuChannel
+├── crypto.py        # 回调解密与验签（公网入口的第一道门）
+├── client.py        # 出站客户端：token 缓存 + 统一请求封装 + 消息接口
 ├── serializers.py   # 秘密 write_only + has_xxx 回显、启用前置校验
 ├── views.py         # 配置单例 APIView + 会话 ViewSet
 ├── urls.py          # 路由
@@ -82,6 +84,70 @@ apps/im_mgr/
 
 `allow_execute` 与 `notify_enabled` 分开：多数群只需要收发布播报，不需要也不该
 能从群里直接推生产。
+
+---
+
+## 回调校验（crypto.py）
+
+任何人都能直接 POST 那两条公网地址，路径随机串只是让扫描器打不到入口，**真正
+的门是验签**。`verify_callback(app, timestamp, nonce, signature, body)` 一次做完，
+顺序固定、任一不过即拒：
+
+| 序 | 校验 | 说明 |
+|----|------|------|
+| 0 | 来源 IP | 在视图层（T3）用 `app.ip_allowed(auth_client_ip(request))`，取 IP 需要 request |
+| 1 | 签名 | `sha256(timestamp + nonce + encrypt_key + 原始请求体)`，恒定时间比对 |
+| 2 | 时间戳 | 偏差 > ±300s 拒，压缩重放窗口 |
+| 3 | nonce | `cache.add` 原子判重，窗口内只接受一次，重放窗口压到 0 |
+| 4 | 解密 | AES-256-CBC，key = `sha256(encrypt_key)`，IV 取密文前 16 字节 |
+| 5 | Verification Token | 兼容 `header.token`（v2 事件）与顶层 `token`（url_verification / 旧版卡片回调） |
+
+三处容易写错的点，已固化进实现与测试：
+
+- **签的是原始请求体字节**。解析后再 `json.dumps` 会改键序与空格，签名必不匹配；
+  视图层必须把 `request.body` 原样传进来。
+- **前三道排在解密之前**。它们不需要做密码学运算，便宜且能挡掉绝大多数噪声，
+  也避免拿重放请求去跑 AES。
+- **nonce 判重 fail-closed**。缓存不可用时按「已重放」拒绝——放行的后果是可被
+  重放触发生产执行，拒绝的后果只是飞书那边报个失败（与 `common/sudo.py` 同取舍）。
+
+`CallbackError` 的消息只进日志，**不回给调用方**：回包必须恒定，否则错误差异
+本身就是一份探测反馈。
+
+---
+
+## 出站客户端（client.py）
+
+所有出站调用统一从这里走。
+
+- **token 缓存**：`tenant_access_token` 有效期 2 小时，缓存到共享缓存层（生产
+  Redis），提前 300 秒判过期。WSGI / celery 多进程共用一份。
+- **token 失效自愈**：飞书返回 `99991661/99991663/99991664/99991668` 时清缓存、
+  重取、重试**一次**。不自愈的表现是「接下来两小时飞书全挂」；重试超过一次没有
+  意义——真的是 App Secret 被改了的话，快点报错更有用。
+- **缓存不可用时 fail-open**：退化为每次现取。这里失败只多打几次接口，与 nonce
+  判重那种「放行即可被重放」不同，不需要 fail-closed。
+- **失败一律抛 `FeishuError`**：调用方只 catch 一种异常。异步发卡任务只记日志，
+  绝不能把飞书抖动回写成任务执行结果。
+
+| 函数 | 说明 |
+|------|------|
+| `get_tenant_token(app=None, force_refresh=False)` | 取 token（默认读缓存） |
+| `call(method, path, *, payload, params, app)` | 调业务接口，返回 `data`，业务错误码抛异常 |
+| `send_card(receive_id, card, receive_id_type='chat_id')` | 发交互卡片，返回 `message_id`（更新卡片要用，务必落库） |
+| `update_card(message_id, card)` | 整体替换卡片内容（执行进度刷新） |
+| `send_text(receive_id, text, ...)` | 纯文本兜底 |
+| `get_user(open_id)` | 通讯录取 `union_id` / `email`，供 SSO 绑定 |
+
+`content` 字段必须是 JSON **字符串**而不是对象，传对象飞书报参数非法。
+
+### 相关配置（settings / .env）
+
+| 配置项 | 默认 | 说明 |
+|--------|------|------|
+| `FEISHU_BASE_URL` | `https://open.feishu.cn` | Lark（海外）改 `open.larksuite.com` |
+| `FEISHU_TRUST_ENV` | `True` | 是否吃环境代理。与 `common/jumpserver.py` 的 `trust_env=False` 相反——那边目标在内网 |
+| `FEISHU_CONNECT_TIMEOUT` / `FEISHU_READ_TIMEOUT` | 5 / 10 | 卡片回调要 3 秒内回包，真正的发卡走异步任务 |
 
 ---
 
