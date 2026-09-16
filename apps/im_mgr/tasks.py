@@ -66,6 +66,27 @@ def dispatch_update_card(message_id, card):
         _in_thread(update_card, message_id, card)
 
 
+def refresh_card(log_id):
+    """按 log_id 现读现渲染并更新卡片；失败只记日志。"""
+    from . import notify
+
+    try:
+        notify.refresh(log_id)
+    except Exception:  # noqa: BLE001 - 通知链路不该外溢
+        logger.warning('飞书卡片刷新失败：log=%s', log_id, exc_info=True)
+
+
+def dispatch_refresh_card(log_id):
+    """按配置后端异步刷新执行卡片。"""
+    backend = getattr(settings, 'TASK_EXEC_BACKEND', 'thread')
+    if backend == 'sync':
+        refresh_card(log_id)
+    elif backend == 'celery':
+        refresh_card_task.delay(log_id)
+    else:
+        _in_thread(refresh_card, log_id)
+
+
 def _in_thread(func, *args):
     """线程后端：守护线程发出去，请求线程不等。
 
@@ -93,5 +114,9 @@ try:  # pragma: no cover - 未装 celery 的环境（开发机）照常工作
     @shared_task(ignore_result=True)
     def update_card_task(message_id, card):
         update_card(message_id, card)
+
+    @shared_task(ignore_result=True)
+    def refresh_card_task(log_id):
+        refresh_card(log_id)
 except ImportError:  # pragma: no cover
-    send_card_task = update_card_task = None
+    send_card_task = update_card_task = refresh_card_task = None

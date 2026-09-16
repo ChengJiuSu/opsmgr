@@ -175,6 +175,7 @@ apps/task_exec/
 ├── webhook.py       # TaskTriggerView：API 凭证鉴权的机读触发入口
 ├── log_files.py     # 日志文件浏览：TASK_LOG_DIR 只读目录树 / 文本分段读 / 原文件下载（exec read）
 ├── runner.py        # 任务流执行：逐模块解析主机 + 动态 inventory + 变量注入 + ansible 调用，失败中止
+├── signals.py       # execution_updated：给模块外的订阅者（飞书卡片刷新）广播状态变化
 ├── live.py          # 实时输出汇聚 + 敏感变量打码（mask_secrets / LiveSink.add_secrets）
 ├── live.py          # LiveSink：流式日志汇聚（节流写库预览 + 落盘 + WebSocket 推送）
 ├── consumers.py     # TaskLogConsumer：/ws/task-logs/<task_id>/ 日志推送（子协议 JWT 鉴权）

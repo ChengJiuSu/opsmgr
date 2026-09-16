@@ -33,6 +33,8 @@ from asgiref.sync import async_to_sync
 
 from channels.layers import get_channel_layer
 
+from . import signals
+
 logger = logging.getLogger('apps.task_exec')
 
 # ── 两个预览上限（刻意拆开，口径不同）────────────────────
@@ -292,6 +294,7 @@ def push_status(task_id):
         'return_code': task.return_code,
         'duration': task.duration,
     })
+    signals.notify(task_id, kind='status')
 
 
 class LiveSink:
@@ -362,6 +365,8 @@ class LiveSink:
             except Exception as exc:  # noqa: BLE001 - 写库失败不中断执行
                 logger.warning('任务 %s 模块表写库失败：%s', self.task_id, exc)
         push(self.task_id, {'kind': 'steps', 'steps': steps})
+        # 同一处收口广播给模块外的订阅者（飞书卡片刷新），见 task_exec/signals.py
+        signals.notify(self.task_id, self.log_id, kind='steps')
 
     @staticmethod
     def _new_block(order=0, header=''):

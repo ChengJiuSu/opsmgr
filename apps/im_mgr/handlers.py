@@ -33,7 +33,7 @@ from django.conf import settings
 from apps.task_exec import trigger
 from apps.task_exec.models import ExecutionTask
 
-from . import access, cards, tasks
+from . import access, cards, notify, tasks
 from .models import FeishuBinding, FeishuConfirmToken
 
 logger = logging.getLogger(__name__)
@@ -228,14 +228,14 @@ def handle_card_action(app, payload):
                        tip='用飞书登录一次运维平台即可自动绑定。')
 
     open_id, _ = operator_ids(payload)
-    chat_id, _message_id = context_ids(payload)
+    chat_id, message_id = context_ids(payload)
 
     if act == cards.ACT_PICK_TASK:
         return _on_pick(user, chat_id, option)
     if act == cards.ACT_RUN:
-        return _on_run(user, chat_id, open_id, value)
+        return _on_run(user, chat_id, open_id, value, message_id)
     if act == cards.ACT_CONFIRM_PROD:
-        return _on_confirm_prod(user, chat_id, open_id, value)
+        return _on_confirm_prod(user, chat_id, open_id, value, message_id)
     if act == cards.ACT_PAUSE:
         # T10：暂停处理（continue/abort、retry/skip/abort）
         logger.info('飞书暂停处理动作待接入：%s', value)
@@ -266,7 +266,7 @@ def _on_pick(user, chat_id, option):
         step_count=task.steps.count()))
 
 
-def _on_run(user, chat_id, open_id, value):
+def _on_run(user, chat_id, open_id, value, message_id=''):
     """点「执行」：非生产直接发起，生产再要一次确认。"""
     task = _load_task(value.get('task'))
     if task is None:
@@ -282,10 +282,10 @@ def _on_run(user, chat_id, open_id, value):
         return card_response(cards.production_confirm(
             task, server_count=task.matched_servers().count(),
             step_count=task.steps.count(), token=token.token, ttl_seconds=ttl))
-    return _launch(task, user, chat_id, confirmed_prod=False)
+    return _launch(task, user, chat_id, message_id, confirmed_prod=False)
 
 
-def _on_confirm_prod(user, chat_id, open_id, value):
+def _on_confirm_prod(user, chat_id, open_id, value, message_id=''):
     """生产二次确认：消费一次性票据后发起。"""
     token, error = FeishuConfirmToken.consume(value.get('token'), open_id)
     if error:
@@ -300,10 +300,10 @@ def _on_confirm_prod(user, chat_id, open_id, value):
     error = access.check(user, task, chat_id)
     if error:
         return _reject('无法执行', error)
-    return _launch(task, user, chat_id, confirmed_prod=True)
+    return _launch(task, user, chat_id, message_id, confirmed_prod=True)
 
 
-def _launch(task, user, chat_id, *, confirmed_prod):
+def _launch(task, user, chat_id, message_id='', *, confirmed_prod):
     """走 task_exec 的统一发起入口，返回进度卡。"""
     error = trigger.preflight(task)
     if error:
@@ -316,6 +316,10 @@ def _launch(task, user, chat_id, *, confirmed_prod):
         triggered_by=user, trigger_type='feishu')
     if error:
         return _reject('无法执行', error)
+
+    # 记住这次执行对应哪条消息：后续的进度与终态就地改这张卡（见 notify.py）。
+    # 按钮动作替换的正是这条消息，所以群里始终是同一条消息在原地变化
+    notify.bind(log, chat_id, message_id)
 
     logger.warning('飞书触发任务流 %s（用户 %s，%s 个模块，%s 台主机，log=%s）',
                    task.name, user.username, len(steps), len(selected), log.id)

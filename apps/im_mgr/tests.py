@@ -15,8 +15,10 @@ from rest_framework.test import APIClient
 
 from common.testing import grant_sudo
 
-from apps.im_mgr import access, cards, client, crypto, handlers, sso
-from apps.im_mgr.models import FeishuApp, FeishuBinding, FeishuChannel, FeishuConfirmToken
+from apps.im_mgr import access, cards, client, crypto, handlers, notify, sso, tasks
+from apps.im_mgr.models import (
+    FeishuApp, FeishuBinding, FeishuCardMessage, FeishuChannel, FeishuConfirmToken,
+)
 
 PASSWORD = 'Pass!2345xyz'
 #: 配齐一份可启用的配置（IP 白名单用文档示例段，测试不依赖真实出口 IP）
@@ -1537,3 +1539,179 @@ class FeishuHandlerTests(TestCase):
         resp, runner = self._run_card(_card_payload({'act': 'nope'}))
         runner.assert_not_called()
         self.assertIsNone(resp)
+
+
+# ══════════════════════════════════════════════════════════
+# T9：执行进度回显（就地刷新同一张卡片）
+# ══════════════════════════════════════════════════════════
+
+@override_settings(TASK_EXEC_BACKEND='sync', SITE_BASE_URL='https://ops.example.com')
+class FeishuProgressTests(TestCase):
+    def setUp(self):
+        from apps.asset_mgr.models import Channel, Environment, ProjectGroup
+        from apps.task_exec.models import ExecutionTask, TaskExecutionLog
+
+        cache.clear()
+        self.app = FeishuApp.load()
+        for key, value in FULL_CONFIG.items():
+            setattr(self.app, key, value)
+        self.app.enabled = True
+        self.app.save()
+        pg = ProjectGroup.objects.create(name='主项目', code='p-proj')
+        ch = Channel.objects.create(name='官服', code='p-ch')
+        env = Environment.objects.create(name='测试环境', code='p-env')
+        self.task = ExecutionTask.objects.create(
+            name='重启网关', project_group=pg, channel=ch, environment=env, im_enabled=True)
+        self.log = TaskExecutionLog.objects.create(
+            task=self.task, status='running', trigger_type='feishu',
+            steps_result=[{'order': 1, 'name': '重启', 'status': 'running'}])
+
+    def _bind(self):
+        return notify.bind(self.log, 'oc_ops', 'om_1')
+
+    # ── 绑定 ──────────────────────────────────────────────
+    def test_bind_and_rebind(self):
+        self._bind()
+        notify.bind(self.log, 'oc_ops', 'om_2')
+        self.assertEqual(FeishuCardMessage.objects.count(), 1)
+        self.assertEqual(FeishuCardMessage.objects.get().message_id, 'om_2')
+
+    def test_bind_skips_without_message_id(self):
+        self.assertIsNone(notify.bind(self.log, 'oc_ops', ''))
+        self.assertFalse(FeishuCardMessage.objects.exists())
+
+    # ── 调度与节流 ────────────────────────────────────────
+    def test_no_dispatch_without_binding(self):
+        """页面发起的执行没绑卡片，整条通知链路要在最早处短路。"""
+        with patch('apps.im_mgr.tasks.dispatch_refresh_card') as job:
+            notify.on_execution_updated(None, task_id=self.task.id, log_id=self.log.id)
+        job.assert_not_called()
+
+    def test_dispatch_when_bound(self):
+        self._bind()
+        with patch('apps.im_mgr.tasks.dispatch_refresh_card') as job:
+            notify.on_execution_updated(None, task_id=self.task.id, log_id=self.log.id)
+        job.assert_called_once_with(self.log.id)
+
+    def test_intermediate_updates_are_throttled(self):
+        self._bind()
+        with patch('apps.im_mgr.tasks.dispatch_refresh_card') as job:
+            for _ in range(5):
+                notify.on_execution_updated(None, task_id=self.task.id, log_id=self.log.id)
+        self.assertEqual(job.call_count, 1)
+
+    def test_terminal_status_bypasses_throttle(self):
+        """中间态丢一帧无所谓，终态丢了就永远停在「执行中」。"""
+        self._bind()
+        with patch('apps.im_mgr.tasks.dispatch_refresh_card') as job:
+            notify.on_execution_updated(None, task_id=self.task.id, log_id=self.log.id)
+            self.log.status = 'success'
+            self.log.save(update_fields=['status'])
+            notify.on_execution_updated(None, task_id=self.task.id, log_id=self.log.id)
+        self.assertEqual(job.call_count, 2)
+
+    def test_resolves_latest_log_when_only_task_given(self):
+        """push_status 只给 task_id。"""
+        self._bind()
+        with patch('apps.im_mgr.tasks.dispatch_refresh_card') as job:
+            notify.on_execution_updated(None, task_id=self.task.id, log_id=None)
+        job.assert_called_once_with(self.log.id)
+
+    def test_receiver_never_raises(self):
+        """信号在执行线程里同步触发，接收端抛异常会把任务执行带停。"""
+        with patch('apps.im_mgr.notify._schedule', side_effect=RuntimeError('boom')):
+            notify.on_execution_updated(None, task_id=self.task.id, log_id=self.log.id)
+
+    # ── 渲染与发送 ────────────────────────────────────────
+    def test_refresh_sends_progress_card(self):
+        self._bind()
+        with patch('apps.im_mgr.client.update_card') as update:
+            notify.refresh(self.log.id)
+        message_id, card = update.call_args[0]
+        self.assertEqual(message_id, 'om_1')
+        text = ''.join(_texts(card))
+        self.assertIn('⏳ 重启', text)
+        self.assertIn(f'https://ops.example.com/task/executions/{self.task.id}/logs/{self.log.id}',
+                      text)
+
+    def test_refresh_sends_result_card_on_finish(self):
+        self._bind()
+        self.log.status = 'failed'
+        self.log.output = '致命错误：端口被占用'
+        self.log.steps_result = [{'order': 1, 'name': '重启', 'status': 'failed'}]
+        self.log.save()
+        with patch('apps.im_mgr.client.update_card') as update:
+            notify.refresh(self.log.id)
+        card = update.call_args[0][1]
+        self.assertEqual(card['header']['template'], 'red')
+        self.assertIn('端口被占用', ''.join(_texts(card)))
+
+    def test_refresh_reads_current_state_not_scheduled_state(self):
+        """异步之间没有顺序保证：晚到的进度帧必须渲染出当下（已终态）的样子。"""
+        self._bind()
+        from apps.task_exec.models import TaskExecutionLog
+
+        TaskExecutionLog.objects.filter(pk=self.log.id).update(status='success')
+        with patch('apps.im_mgr.client.update_card') as update:
+            notify.refresh(self.log.id)   # 按「执行中」时投递的帧来刷
+        card = update.call_args[0][1]
+        self.assertEqual(card['header']['template'], 'green')
+
+    def test_refresh_noop_without_binding(self):
+        with patch('apps.im_mgr.client.update_card') as update:
+            notify.refresh(self.log.id)
+        update.assert_not_called()
+
+    def test_refresh_noop_when_feishu_disabled(self):
+        self._bind()
+        FeishuApp.objects.filter(pk=FeishuApp.SINGLETON_PK).update(enabled=False)
+        with patch('apps.im_mgr.client.update_card') as update:
+            notify.refresh(self.log.id)
+        update.assert_not_called()
+
+    def test_feishu_failure_does_not_escape(self):
+        """飞书发不出去是飞书的事，绝不能回写任务状态或抛回执行链路。"""
+        self._bind()
+        with patch('apps.im_mgr.client.update_card',
+                   side_effect=client.FeishuError('bot not in chat')):
+            tasks.refresh_card(self.log.id)
+        self.log.refresh_from_db()
+        self.assertEqual(self.log.status, 'running')
+
+    # ── 与执行链路对接 ────────────────────────────────────
+    def test_live_steps_update_triggers_refresh(self):
+        """真正的触发点：live.publish_steps 写完模块表就广播。"""
+        from apps.task_exec.live import LiveSink
+
+        self._bind()
+        sink = LiveSink(self.task.id, self.log.id)
+        with patch('apps.im_mgr.tasks.dispatch_refresh_card') as job:
+            sink.bind_steps([{'order': 1, 'name': '重启', 'status': 'running'}])
+        job.assert_called_once_with(self.log.id)
+
+    def test_launch_binds_card_message(self):
+        """从飞书发起时绑的是被按钮替换掉的那条消息。"""
+        from apps.asset_mgr.models import Server, ServerService, ServiceType
+        from apps.task_exec.models import TaskStep
+
+        service = ServiceType.objects.create(name='网关', code='p-gw')
+        server = Server.objects.create(
+            name='web1', private_ip='10.0.0.1',
+            project_group=self.task.project_group, channel=self.task.channel,
+            environment=self.task.environment)
+        ServerService.objects.create(server=server, service_type=service, status='planned')
+        TaskStep.objects.create(task=self.task, order=1, name='m',
+                                command='echo hi', service_type=service)
+        user = get_user_model().objects.create(username='p_ops', is_staff=True)
+        FeishuBinding.objects.create(user=user, union_id='on_p', open_id='ou_p')
+        FeishuChannel.objects.create(chat_id='oc_ops', name='运维群', allow_execute=True)
+        self.task.default_select_all = True
+        self.task.save(update_fields=['default_select_all'])
+
+        payload = _card_payload({'act': cards.ACT_RUN, 'task': self.task.id},
+                                open_id='ou_p', union_id='on_p')
+        with patch('apps.task_exec.tasks.execute_task'):
+            handlers.handle_card_action(self.app, payload)
+        binding = FeishuCardMessage.objects.exclude(log=self.log).get()
+        self.assertEqual(binding.message_id, 'om_1')
+        self.assertEqual(binding.chat_id, 'oc_ops')

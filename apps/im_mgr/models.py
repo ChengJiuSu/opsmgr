@@ -362,3 +362,33 @@ class FeishuConfirmToken(models.Model):
         if not updated:
             return None, '该确认已处理过，请勿重复点击。'
         return row, None
+
+
+class FeishuCardMessage(models.Model):
+    """一次执行 ↔ 那张卡片消息的对应关系。
+
+    执行进度靠**改同一条消息**呈现，不是不停发新消息——飞书不适合流式日志，
+    刷屏的代价比看不到中间态高得多。要改就得记住 message_id：飞书只认这个。
+
+    一次执行只绑一张卡（OneToOne）。从飞书发起时绑的是「被按钮替换掉的那条
+    消息」，所以群里始终是同一条消息在原地变化。日志删除时一并删掉（CASCADE）：
+    留着一条指向不存在执行的映射没有任何用处。
+    """
+
+    log = models.OneToOneField(
+        'task_exec.TaskExecutionLog', verbose_name='执行日志',
+        on_delete=models.CASCADE, related_name='feishu_card',
+    )
+    chat_id = models.CharField('会话 ID', max_length=128)
+    message_id = models.CharField('消息 ID', max_length=128)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = '飞书执行卡片'
+        verbose_name_plural = '飞书执行卡片'
+        db_table = 'im_feishu_card_message'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'log={self.log_id} msg={self.message_id}'
