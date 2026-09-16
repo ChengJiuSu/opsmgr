@@ -2134,3 +2134,39 @@ class FeishuUrlVerificationTests(TestCase):
             resp = self._post(event, sign=True)
         self.assertEqual(resp.json(), {'code': 0})
         handler.assert_called_once()
+
+
+class FeishuErrorDetailTests(TestCase):
+    """错误描述的提取：飞书不同接口的错误信封字段名不一样。"""
+
+    def test_prefers_msg(self):
+        self.assertEqual(client.error_detail({'code': 1, 'msg': '权限不足'}), '权限不足')
+
+    def test_falls_back_to_oauth_style(self):
+        """网页免登那几条走 OAuth 风格信封，描述在 error_description 里。
+
+        只取 msg 的话错误会打成「调用失败：None（code=20024）」——错误码得去翻文档，
+        而那句描述本来就写着原因。
+        """
+        self.assertEqual(
+            client.error_detail({'code': 20024, 'error_description': 'code is expired'}),
+            'code is expired')
+        self.assertEqual(client.error_detail({'code': 20024, 'error': 'invalid_grant'}),
+                         'invalid_grant')
+
+    def test_falls_back_to_raw_body(self):
+        detail = client.error_detail({'code': 20024, 'msg': ''})
+        self.assertIn('20024', detail)
+
+    def test_surfaces_in_exception(self):
+        session = FakeSession([TOKEN_OK, {'code': 20024, 'error_description': 'bad code'}])
+        app = FeishuApp.load()
+        for key, value in FULL_CONFIG.items():
+            setattr(app, key, value)
+        app.enabled = True
+        app.save()
+        cache.clear()
+        with patch('apps.im_mgr.client.requests.Session', return_value=session):
+            with self.assertRaises(client.FeishuError) as ctx:
+                client.call('POST', '/open-apis/authen/v1/oidc/access_token')
+        self.assertIn('bad code', str(ctx.exception))

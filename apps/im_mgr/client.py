@@ -95,6 +95,21 @@ def _request(session, method, path, *, headers=None, payload=None, params=None):
     return body
 
 
+def error_detail(body):
+    """从飞书的错误响应里凑出一句能看的描述。
+
+    `msg` 不是所有接口都有：网页免登那几条（authen/v1/oidc/*）走的是 OAuth 风格的
+    信封，描述在 `error_description` 或 `error` 里。只取 `msg` 的话错误会打成
+    「调用失败：None（code=20024）」——错误码得去翻文档，而那句描述本来就写着
+    原因。都取不到就把响应体截一段贴出来，总比 None 强。
+    """
+    for key in ('msg', 'error_description', 'error', 'message'):
+        value = body.get(key)
+        if value:
+            return str(value)
+    return json.dumps(body, ensure_ascii=False)[:300]
+
+
 def _fetch_token(app, path, field, cache_key):
     """取一把应用级 token 并写缓存。"""
     body = _request(
@@ -103,7 +118,7 @@ def _fetch_token(app, path, field, cache_key):
     )
     if body.get('code'):
         raise FeishuError(
-            f'获取 {field} 失败：{body.get("msg")}（code={body.get("code")}）',
+            f'获取 {field} 失败：{error_detail(body)}（code={body.get("code")}）',
             code=body.get('code'),
         )
     token = body.get(field)
@@ -173,7 +188,8 @@ def call(method, path, *, payload=None, params=None, app=None, token=None):
                         headers={'Authorization': f'Bearer {token}'})
         if body.get('code'):
             raise FeishuError(
-                f'飞书接口 {path} 调用失败：{body.get("msg")}（code={body.get("code")}）',
+                f'飞书接口 {path} 调用失败：{error_detail(body)}'
+                f'（code={body.get("code")}）',
                 code=body.get('code'))
         return body.get('data') or {}
     for attempt in (1, 2):
@@ -190,7 +206,7 @@ def call(method, path, *, payload=None, params=None, app=None, token=None):
             drop_token_cache()
             continue
         raise FeishuError(
-            f'飞书接口 {path} 调用失败：{body.get("msg")}（code={code}）', code=code)
+            f'飞书接口 {path} 调用失败：{error_detail(body)}（code={code}）', code=code)
     raise FeishuError(f'飞书接口 {path} 重试后仍失败')
 
 
