@@ -2048,3 +2048,89 @@ class FeishuBindingAdminTests(TestCase):
                               {'email': 'zhangsan@corp.com'}, format='json')
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()['data']['name'], '')
+
+
+class FeishuUrlVerificationTests(TestCase):
+    """事件订阅地址验证：飞书**不给这一次请求带签名头**。
+
+    联调时踩到的：实现原本把 verify_signature 放在最前面，对验证请求也强制要求
+    签名，于是飞书后台永远显示「Challenge code 没有返回」。
+    """
+
+    ENCRYPT_KEY = 'encrypt-value'
+    TOKEN = 'token-value'
+
+    def setUp(self):
+        cache.clear()
+        self.app = FeishuApp.load()
+        for key, value in FULL_CONFIG.items():
+            setattr(self.app, key, value)
+        self.app.ip_whitelist = '127.0.0.1'
+        self.app.enabled = True
+        self.app.save()
+        self.client = APIClient()
+
+    def _post(self, payload, *, encrypt=True, sign=False):
+        if encrypt:
+            body = _callback_body(self.ENCRYPT_KEY, payload)
+        else:
+            body = json.dumps(payload).encode('utf-8')
+        headers = {}
+        if sign:
+            ts, nonce = str(int(time.time())), f'n-{time.time_ns()}'
+            headers = {
+                'HTTP_X_LARK_REQUEST_TIMESTAMP': ts,
+                'HTTP_X_LARK_REQUEST_NONCE': nonce,
+                'HTTP_X_LARK_SIGNATURE': _sign(self.ENCRYPT_KEY, ts, nonce, body),
+            }
+        return self.client.post(self.app.event_path, data=body,
+                                content_type='application/json', **headers)
+
+    def test_unsigned_encrypted_challenge_passes(self):
+        """飞书配了 Encrypt Key 时的验证请求：加密、但没有签名头。"""
+        resp = self._post({'type': 'url_verification', 'token': self.TOKEN,
+                           'challenge': 'chal-abc'})
+        self.assertEqual(resp.json()['challenge'], 'chal-abc')
+
+    def test_unsigned_plaintext_challenge_passes(self):
+        """飞书侧尚未开加密时的验证请求：明文、也没有签名头。"""
+        resp = self._post({'type': 'url_verification', 'token': self.TOKEN,
+                           'challenge': 'chal-plain'}, encrypt=False)
+        self.assertEqual(resp.json()['challenge'], 'chal-plain')
+
+    def test_unsigned_challenge_still_checks_token(self):
+        """放行的只是签名那三道，Verification Token 仍要对。"""
+        resp = self._post({'type': 'url_verification', 'token': 'wrong',
+                           'challenge': 'chal-x'})
+        self.assertEqual(resp.json(), {'code': 0})
+
+    def test_unsigned_real_event_rejected(self):
+        """不能让「不带签名」变成绕开验签的通道。"""
+        event = {'schema': '2.0',
+                 'header': {'token': self.TOKEN, 'event_type': 'im.message.receive_v1'},
+                 'event': {}}
+        with patch('apps.im_mgr.handlers.handle_event') as handler:
+            resp = self._post(event)
+        self.assertEqual(resp.json(), {'code': 0})
+        handler.assert_not_called()
+
+    def test_signed_plaintext_rejected(self):
+        """带签名却没加密：飞书不会这么发，当异常来源处理。"""
+        event = {'schema': '2.0',
+                 'header': {'token': self.TOKEN, 'event_type': 'im.message.receive_v1'},
+                 'event': {}}
+        with patch('apps.im_mgr.handlers.handle_event') as handler:
+            resp = self._post(event, encrypt=False, sign=True)
+        self.assertEqual(resp.json(), {'code': 0})
+        handler.assert_not_called()
+
+    def test_signed_event_still_works(self):
+        """正式事件推送那条路一道都没少。"""
+        event = {'schema': '2.0',
+                 'header': {'token': self.TOKEN, 'event_id': 'ev-signed',
+                            'event_type': 'im.message.receive_v1'},
+                 'event': {}}
+        with patch('apps.im_mgr.handlers.handle_event', return_value=None) as handler:
+            resp = self._post(event, sign=True)
+        self.assertEqual(resp.json(), {'code': 0})
+        handler.assert_called_once()

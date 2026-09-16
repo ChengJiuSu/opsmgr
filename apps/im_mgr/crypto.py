@@ -138,23 +138,25 @@ def verify_token(expected, payload):
         raise CallbackError('Verification Token 不匹配')
 
 
-def verify_callback(app, timestamp, nonce, signature, body):
-    """完整校验一次回调，返回解密后的明文 payload（dict）。
+#: 事件订阅地址验证：飞书**不给这一次请求带签名头**（那一步它只想确认你能解密并
+#: 回显 challenge），所以这条路径单独放行签名/时间戳/nonce 三道
+TYPE_URL_VERIFICATION = 'url_verification'
 
-    调用方（视图）只需先判来源 IP 与 `app.is_ready()`，其余全在这里。
-    顺序刻意是「签名 → 时间戳 → nonce → 解密 → token」：前三道都不需要解密，
-    便宜且能挡掉绝大多数噪声；nonce 放在解密前，避免用重放请求做解密运算。
+
+def parse_body(app, body):
+    """请求体 → (明文 payload, 是否加密过)。加密的解密，明文的原样返回。
+
+    返回「是否加密」而不是在这里拦：正式事件必须加密、地址验证可以明文，
+    这个判断属于调用方的策略，解析函数只负责把体变成 dict。
     """
-    verify_signature(app.encrypt_key, timestamp, nonce, body, signature)
-    verify_timestamp(timestamp)
-    consume_nonce(nonce)
-
     try:
         raw = json.loads((body or b'').decode('utf-8'))
     except (ValueError, UnicodeDecodeError) as exc:
         raise CallbackError(f'请求体不是合法 JSON：{exc}') from exc
     if not isinstance(raw, dict):
         raise CallbackError('请求体不是 JSON 对象')
+    if 'encrypt' not in raw:
+        return raw, False
 
     plain = decrypt(app.encrypt_key, raw.get('encrypt'))
     try:
@@ -163,6 +165,37 @@ def verify_callback(app, timestamp, nonce, signature, body):
         raise CallbackError(f'解密结果不是合法 JSON：{exc}') from exc
     if not isinstance(payload, dict):
         raise CallbackError('解密结果不是 JSON 对象')
+    return payload, True
 
+
+def verify_callback(app, timestamp, nonce, signature, body):
+    """完整校验一次回调，返回明文 payload（dict）。
+
+    调用方（视图）只需先判来源 IP 与 `app.is_ready()`，其余全在这里。
+
+    **带签名头**（正式事件推送）走完整五道，顺序是「签名 → 时间戳 → nonce →
+    解密 → token」：前三道都不需要解密，便宜且能挡掉绝大多数噪声；nonce 放在
+    解密前，避免用重放请求做解密运算。
+
+    **不带签名头**只放行一种情况：事件订阅的地址验证（`url_verification`）。
+    飞书在那一步不发签名头——它只想确认你能解密并回显 challenge。这条路径仍要
+    通过解密与 Verification Token 两道（伪造者没有 Encrypt Key 就构造不出可解密
+    的体），而且它**不触发任何业务动作**，只回显一个 challenge，放行的面是封闭的。
+    除此之外，缺签名头一律拒——不能让「不带签名」变成绕开验签的通道。
+    """
+    if signature:
+        verify_signature(app.encrypt_key, timestamp, nonce, body, signature)
+        verify_timestamp(timestamp)
+        consume_nonce(nonce)
+        payload, encrypted = parse_body(app, body)
+        if not encrypted:
+            # 带签名却没加密：飞书不会这么发，当异常来源处理
+            raise CallbackError('请求体未加密（飞书事件订阅未开启加密？）')
+        verify_token(app.verification_token, payload)
+        return payload
+
+    payload, _encrypted = parse_body(app, body)
+    if payload.get('type') != TYPE_URL_VERIFICATION:
+        raise CallbackError('缺少签名头 X-Lark-Signature')
     verify_token(app.verification_token, payload)
     return payload

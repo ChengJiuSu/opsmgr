@@ -193,7 +193,12 @@ class FeishuCallbackView(APIView):
                 request.body,
             )
         except crypto.CallbackError as exc:
-            logger.warning('飞书回调校验失败：%s（path=%s ip=%s）', exc, request.path, ip)
+            # 把收到的飞书请求头一并记下来：回包是恒定的，飞书后台只会显示
+            # 「没返回 challenge」，排查全靠这一行。「带了哪些头」往往直接指出
+            # 是飞书侧没开加密，还是中间某一跳把头丢了
+            received = sorted(k for k in request.headers if k.lower().startswith('x-lark'))
+            logger.warning('飞书回调校验失败：%s（path=%s ip=%s 飞书请求头=%s）',
+                           exc, request.path, ip, received or '无')
             return self._ack()
 
         # 事件订阅地址验证：飞书要求原样回显 challenge，这一条不能走恒定回包
