@@ -247,7 +247,7 @@ def handle_event(app, payload):
         return None
 
     available = list(access.available_tasks(user, chat_id, is_p2p=p2p)[:50])
-    reply(cards.task_picker(available))
+    reply(cards.task_picker(available, p2p=p2p))
     return None
 
 
@@ -276,8 +276,10 @@ def handle_card_action(app, payload):
 
     open_id, _ = operator_ids(payload)
     chat_id, message_id = context_ids(payload)
-    # 卡片回调的 context 里没有 chat_type：拿不到 chat_id 就是单聊里的卡片
-    p2p = not chat_id or str(chat_id).startswith('p2p')
+    # 卡片回调的 context 里**没有 chat_type**，而单聊的 chat_id 同样是 oc_ 开头
+    #（飞书没有 p2p_ 这种前缀），从 id 上分不出群聊还是单聊。所以发卡时就把场景
+    # 写进按钮 value 带回来；拿不到标记时退回「没有 chat_id 即单聊」
+    p2p = bool(value.get('p2p')) or not chat_id
 
     if act == cards.ACT_PICK_TASK:
         return _on_pick(user, chat_id, option, p2p)
@@ -310,7 +312,7 @@ def _on_pick(user, chat_id, option, p2p=False):
         return _reject('无法执行', error)
     return card_response(cards.task_detail(
         task, server_count=task.matched_servers().count(),
-        step_count=task.steps.count()))
+        step_count=task.steps.count(), p2p=p2p))
 
 
 def _on_run(user, chat_id, open_id, value, message_id='', p2p=False):
@@ -328,7 +330,8 @@ def _on_run(user, chat_id, open_id, value, message_id='', p2p=False):
         token = FeishuConfirmToken.issue(task, user, open_id, chat_id, ttl)
         return card_response(cards.production_confirm(
             task, server_count=task.matched_servers().count(),
-            step_count=task.steps.count(), token=token.token, ttl_seconds=ttl))
+            step_count=task.steps.count(), token=token.token, ttl_seconds=ttl,
+            p2p=p2p))
     return _launch(task, user, chat_id, message_id, confirmed_prod=False)
 
 

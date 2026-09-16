@@ -155,7 +155,7 @@ def env_tag(task):
 
 # ── 交互卡片 ──────────────────────────────────────────────
 
-def task_picker(tasks, *, tip=None):
+def task_picker(tasks, *, tip=None, p2p=False):
     """任务选择卡：下拉列出该用户在本会话可发起的任务。
 
     列表为空时不渲染下拉——一个点开只有「无选项」的下拉比一句说明更让人困惑。
@@ -170,7 +170,10 @@ def task_picker(tasks, *, tip=None):
             'tag': 'select_static',
             'placeholder': {'tag': 'plain_text', 'content': '请选择任务'},
             'options': options,
-            'value': {'act': ACT_PICK_TASK},
+            # 场景随按钮一路带下去：卡片回调的 context 里**没有 chat_type**，而
+            # 单聊的 chat_id 同样是 oc_ 开头，从 id 上分不出群聊还是单聊
+            #（照前缀猜的后果是单聊卡片全被当成未授权的群）
+            'value': {'act': ACT_PICK_TASK, 'p2p': p2p},
         }))
     else:
         elements = [md('**当前没有可从飞书发起的任务。**')]
@@ -181,7 +184,7 @@ def task_picker(tasks, *, tip=None):
     return card('运维任务执行', elements)
 
 
-def task_detail(task, server_count, step_count, *, token=None):
+def task_detail(task, server_count, step_count, *, token=None, p2p=False):
     """任务确认卡：展示本次要跑什么，按钮发起执行。"""
     elements = [
         md(f'**{esc(task.name)}**'),
@@ -197,7 +200,7 @@ def task_detail(task, server_count, step_count, *, token=None):
 
     run_button = button(
         '⚠ 执行到生产' if is_prod(task) else '执行',
-        {'act': ACT_RUN, 'task': task.id, 'token': token},
+        {'act': ACT_RUN, 'task': task.id, 'token': token, 'p2p': p2p},
         style='danger' if is_prod(task) else 'primary',
     )
     elements.append(actions(run_button, button('取消', {'act': ACT_CANCEL})))
@@ -206,7 +209,7 @@ def task_detail(task, server_count, step_count, *, token=None):
     return card('确认执行', elements, template='red' if is_prod(task) else 'blue')
 
 
-def production_confirm(task, server_count, step_count, token, ttl_seconds):
+def production_confirm(task, server_count, step_count, token, ttl_seconds, *, p2p=False):
     """生产二次确认卡。
 
     机器触发没有「弹窗再确认」这一步，把确认动作前移到这张卡上：一次性 token、
@@ -221,7 +224,7 @@ def production_confirm(task, server_count, step_count, token, ttl_seconds):
         hr(),
         actions(
             button('确认执行到生产',
-                   {'act': ACT_CONFIRM_PROD, 'task': task.id, 'token': token},
+                   {'act': ACT_CONFIRM_PROD, 'task': task.id, 'token': token, 'p2p': p2p},
                    style='danger'),
             button('取消', {'act': ACT_CANCEL}),
         ),

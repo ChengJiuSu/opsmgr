@@ -1189,7 +1189,8 @@ class FeishuCardTests(TestCase):
         self.assertIn('60 秒内有效', text)
         confirm = _buttons(payload)[0]
         self.assertEqual(confirm['value'],
-                         {'act': cards.ACT_CONFIRM_PROD, 'task': self.task.id, 'token': 'tk1'})
+                         {'act': cards.ACT_CONFIRM_PROD, 'task': self.task.id,
+                          'token': 'tk1', 'p2p': False})
 
     # ── 状态卡 ────────────────────────────────────────────
     def test_progress_shows_step_icons(self):
@@ -2424,3 +2425,73 @@ class FeishuTimestampParseTests(TestCase):
             HTTP_X_LARK_SIGNATURE=_sign('encrypt-value', ts, nonce, body))
         # cancel 动作会回一张「已取消」的定格卡
         self.assertIn('已取消', ''.join(_texts(resp.json()['card']['data'])))
+
+
+@override_settings(TASK_EXEC_BACKEND='sync')
+class FeishuP2pScopeTests(TestCase):
+    """会话场景必须随按钮 value 带回来。
+
+    联调踩到：菜单私聊唤出任务列表、点执行却报「当前会话未被授权发起任务执行」
+    ——那是**群聊**分支的文案。原因是用 chat_id 前缀猜场景，而**单聊的 chat_id
+    同样是 oc_ 开头**（飞书没有 p2p_ 这种前缀），单聊卡片全被当成未授权的群。
+    """
+
+    def setUp(self):
+        from apps.asset_mgr.models import Channel, Environment, ProjectGroup, ServerService, ServiceType
+        from apps.asset_mgr.models import Server
+        from apps.task_exec.models import ExecutionTask, TaskStep
+
+        cache.clear()
+        self.app = FeishuApp.load()
+        for key, value in FULL_CONFIG.items():
+            setattr(self.app, key, value)
+        self.app.enabled = True
+        self.app.allow_p2p_execute = True
+        self.app.save()
+        pg = ProjectGroup.objects.create(name='主项目', code='s-proj')
+        ch = Channel.objects.create(name='官服', code='s-ch')
+        env = Environment.objects.create(name='测试环境', code='s-env')
+        service = ServiceType.objects.create(name='网关', code='s-gw')
+        server = Server.objects.create(name='web1', private_ip='10.0.0.1',
+                                       project_group=pg, channel=ch, environment=env)
+        ServerService.objects.create(server=server, service_type=service, status='planned')
+        self.task = ExecutionTask.objects.create(
+            name='重启网关', project_group=pg, channel=ch, environment=env,
+            im_enabled=True, default_select_all=True)
+        TaskStep.objects.create(task=self.task, order=1, name='重启',
+                                command='echo hi', service_type=service)
+        self.user = get_user_model().objects.create(username='scope_ops', is_staff=True)
+        FeishuBinding.objects.create(user=self.user, union_id='on_1', open_id='ou_1')
+
+    def test_picker_carries_scope(self):
+        card = cards.task_picker([self.task], p2p=True)
+        select = card['elements'][1]['actions'][0]
+        self.assertTrue(select['value']['p2p'])
+
+    def test_run_button_carries_scope(self):
+        card = cards.task_detail(self.task, server_count=1, step_count=1, p2p=True)
+        self.assertTrue(_buttons(card)[0]['value']['p2p'])
+
+    def test_p2p_run_works_with_oc_chat_id(self):
+        """单聊的 chat_id 也是 oc_ 开头：靠 value 里的标记，不靠前缀猜。"""
+        payload = _card_payload({'act': cards.ACT_RUN, 'task': self.task.id, 'p2p': True},
+                                chat_id='oc_p2p_looks_like_group')
+        with patch('apps.task_exec.tasks.execute_task') as runner:
+            resp = handlers.handle_card_action(self.app, payload)
+        runner.assert_called_once()
+        self.assertEqual(resp['toast']['type'], 'success')
+
+    def test_group_card_without_scope_still_uses_whitelist(self):
+        payload = _card_payload({'act': cards.ACT_RUN, 'task': self.task.id, 'p2p': False},
+                                chat_id='oc_unlisted')
+        with patch('apps.task_exec.tasks.execute_task') as runner:
+            resp = handlers.handle_card_action(self.app, payload)
+        runner.assert_not_called()
+        self.assertIn('未被授权', ''.join(_texts(resp['card']['data'])))
+
+    def test_pick_passes_scope_to_detail_card(self):
+        payload = _card_payload({'act': cards.ACT_PICK_TASK, 'p2p': True},
+                                chat_id='oc_p2p_looks_like_group',
+                                option=str(self.task.id))
+        resp = handlers.handle_card_action(self.app, payload)
+        self.assertTrue(_buttons(resp['card']['data'])[0]['value']['p2p'])
