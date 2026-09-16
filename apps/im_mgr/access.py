@@ -19,10 +19,23 @@
 from apps.task_exec import trigger
 from apps.task_exec.models import ExecutionTask
 
-from .models import FeishuChannel
+from .models import FeishuApp, FeishuChannel
 
 
-def available_tasks(user, chat_id=None):
+def session_allowed(chat_id=None, is_p2p=False):
+    """这个会话能不能摆出执行入口。
+
+    群/未知会话看白名单；**单聊看总开关**——菜单事件里压根没有 chat_id，
+    没法登记，只能用 `FeishuApp.allow_p2p_execute` 表达同一个授权意思。
+    """
+    if is_p2p:
+        return FeishuApp.load().allow_p2p_execute
+    if chat_id is None:
+        return True
+    return FeishuChannel.executable(chat_id)
+
+
+def available_tasks(user, chat_id=None, is_p2p=False):
     """该用户在该会话里可发起的任务查询集（供卡片的任务下拉用）。
 
     这里只做「列得出来」的收窄；真正发起前仍要过 `check()`——列表是按任务属性
@@ -32,12 +45,12 @@ def available_tasks(user, chat_id=None):
           .filter(im_enabled=True, default_select_all=True)
           .select_related('project_group', 'channel', 'environment')
           .order_by('name', 'id'))
-    if chat_id is not None and not FeishuChannel.executable(chat_id):
+    if not session_allowed(chat_id, is_p2p):
         return qs.none()
     return user.narrow(qs)
 
 
-def check(user, task, chat_id=None):
+def check(user, task, chat_id=None, is_p2p=False):
     """能否从飞书发起这条任务；返回中文拒绝原因，None 表示放行。"""
     if user is None:
         return '你的飞书账号尚未绑定平台用户，请联系管理员绑定后再操作。'
@@ -47,7 +60,10 @@ def check(user, task, chat_id=None):
         # 正常情况下序列化器已经拦住这种组合，这里兜存量数据与直接改库的情况
         return (f'任务「{task.name}」已关闭「默认全选主机」，需在页面上人工勾选主机后执行，'
                 f'不支持飞书触发。')
-    if chat_id is not None and not FeishuChannel.executable(chat_id):
+    if not session_allowed(chat_id, is_p2p):
+        if is_p2p:
+            return ('当前未开放「单聊发起执行」，请到群里操作，'
+                    '或联系管理员在「飞书接入」中开启。')
         return '当前会话未被授权发起任务执行，请联系管理员在「飞书接入」中登记。'
     return trigger.permission_error(user, task)
 

@@ -67,6 +67,12 @@ class FeishuApp(models.Model):
     # 授权回调地址（浏览器跳回的前端页），必须与飞书后台「重定向 URL」白名单
     # 一致。留空则按请求域名推导出 <scheme>://<host>/login/feishu
     sso_redirect_uri = models.CharField('飞书登录回调地址', max_length=500, blank=True)
+    # 允许在「与机器人的单聊」里发起执行（机器人自定义菜单、私聊 @机器人）。
+    # 默认关：会话白名单管的是「哪些会话能摆出执行入口」，单聊没有 chat_id 可登记
+    # （菜单事件里压根没有），只能用一个显式总开关表达同一个意思。
+    # 单聊天然一对一、只有绑定用户本人可见，群里那种「谁都能点」的风险不存在，
+    # 但「只许从运维群发起、不许私聊发起」是合理诉求，所以仍要管理员点头
+    allow_p2p_execute = models.BooleanField('允许单聊发起执行', default=False)
     # 飞书账号在平台里找不到对应用户时是否自动建号。默认关：开了等于全公司飞书
     # 员工都能进后台，而「谁能进平台」不该由通讯录决定
     auto_create_user = models.BooleanField('未绑定用户时自动创建', default=False)

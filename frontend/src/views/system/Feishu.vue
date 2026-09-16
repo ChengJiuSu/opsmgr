@@ -90,6 +90,12 @@
         />
         <div class="tip">须与飞书后台「重定向 URL」白名单一致。</div>
       </el-form-item>
+      <el-form-item label="允许单聊发起执行">
+        <el-switch v-model="form.allow_p2p_execute" />
+        <span class="tip inline">
+          机器人自定义菜单、私聊 @机器人 都走这个开关；群里仍按会话白名单
+        </span>
+      </el-form-item>
       <el-form-item label="未绑定时自动建号">
         <el-switch v-model="form.auto_create_user" @change="onAutoCreateChange" />
         <span class="tip inline danger" v-if="form.auto_create_user">
@@ -242,7 +248,7 @@ const form = reactive({
   app_id: '', app_secret: '', encrypt_key: '', verification_token: '',
   ip_unrestricted: false, ip_whitelist: '',
   enabled: false, sso_enabled: false, sso_redirect_uri: '',
-  auto_create_user: false, remark: '',
+  allow_p2p_execute: false, auto_create_user: false, remark: '',
 })
 
 const defaultRedirect = computed(() => `${window.location.origin}/login/feishu`)
@@ -261,6 +267,7 @@ async function loadApp() {
       enabled: res.data.enabled,
       sso_enabled: res.data.sso_enabled,
       sso_redirect_uri: res.data.sso_redirect_uri || '',
+      allow_p2p_execute: res.data.allow_p2p_execute,
       auto_create_user: res.data.auto_create_user,
       remark: res.data.remark || '',
     })

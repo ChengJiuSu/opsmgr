@@ -1376,10 +1376,12 @@ class FeishuHandlerTests(TestCase):
             handlers.handle_event(self.app, _event_payload(event_type='im.chat.updated_v1'))
         send.assert_not_called()
 
-    def test_event_in_unlisted_chat_lists_nothing(self):
+    def test_event_in_unlisted_chat_says_why(self):
+        """未授权的群要说清原因：空下拉只会让人以为「没有任务」。"""
         with patch('apps.im_mgr.tasks.dispatch_send_card') as send:
             handlers.handle_event(self.app, _event_payload(chat_id='oc_random'))
-        self.assertIn('没有可从飞书发起的任务', ''.join(_texts(send.call_args[0][1])))
+        text = ''.join(_texts(send.call_args[0][1]))
+        self.assertIn('未被授权', text)
 
     # ── 选择任务 ──────────────────────────────────────────
     def test_pick_task_returns_detail(self):
@@ -2235,3 +2237,122 @@ class FeishuTokenCacheScopeTests(TestCase):
 
         api.put('/api/feishu/app/', {'app_secret': 'rotated-secret'}, format='json')
         self.assertIsNone(cache.get(client.TOKEN_CACHE_PREFIX + 'cli_test0001'))
+
+
+def _menu_payload(open_id='ou_1', union_id='on_1', event_key='run_task'):
+    """机器人自定义菜单事件：没有 chat_id，操作人还多嵌一层 operator_id。"""
+    return {
+        'schema': '2.0',
+        'header': {'event_id': f'menu-{time.time_ns()}',
+                   'event_type': 'application.bot.menu_v6'},
+        'event': {
+            'operator': {'operator_id': {'open_id': open_id, 'union_id': union_id}},
+            'event_key': event_key,
+            'timestamp': str(int(time.time())),
+        },
+    }
+
+
+@override_settings(TASK_EXEC_BACKEND='sync')
+class FeishuBotMenuTests(TestCase):
+    """机器人自定义菜单 + 单聊发起执行。"""
+
+    def setUp(self):
+        from apps.asset_mgr.models import Channel, Environment, ProjectGroup, ServerService, ServiceType
+        from apps.asset_mgr.models import Server
+        from apps.task_exec.models import ExecutionTask, TaskStep
+
+        cache.clear()
+        self.app = FeishuApp.load()
+        for key, value in FULL_CONFIG.items():
+            setattr(self.app, key, value)
+        self.app.enabled = True
+        self.app.save()
+        pg = ProjectGroup.objects.create(name='主项目', code='m-proj')
+        ch = Channel.objects.create(name='官服', code='m-ch')
+        env = Environment.objects.create(name='测试环境', code='m-env')
+        service = ServiceType.objects.create(name='网关', code='m-gw')
+        server = Server.objects.create(name='web1', private_ip='10.0.0.1',
+                                       project_group=pg, channel=ch, environment=env)
+        ServerService.objects.create(server=server, service_type=service, status='planned')
+        self.task = ExecutionTask.objects.create(
+            name='重启网关', project_group=pg, channel=ch, environment=env,
+            im_enabled=True, default_select_all=True)
+        TaskStep.objects.create(task=self.task, order=1, name='重启',
+                                command='echo hi', service_type=service)
+        self.user = get_user_model().objects.create(username='menu_ops', is_staff=True)
+        FeishuBinding.objects.create(user=self.user, union_id='on_1', open_id='ou_1')
+
+    def _enable_p2p(self):
+        FeishuApp.objects.filter(pk=FeishuApp.SINGLETON_PK).update(allow_p2p_execute=True)
+
+    # ── payload 解析 ──────────────────────────────────────
+    def test_operator_id_is_nested_one_level_deeper(self):
+        """照着卡片回调的路径取会拿到空值，表现成「账号未绑定」，指向完全错误的方向。"""
+        self.assertEqual(handlers.operator_ids(_menu_payload()), ('ou_1', 'on_1'))
+
+    def test_menu_counts_as_p2p(self):
+        self.assertTrue(handlers.is_p2p(_menu_payload()))
+
+    # ── 菜单点击 ──────────────────────────────────────────
+    def test_menu_replies_privately(self):
+        """菜单不属于任何会话，只能按 open_id 私聊回。"""
+        self._enable_p2p()
+        with patch('apps.im_mgr.tasks.dispatch_send_card') as send:
+            handlers.handle_event(self.app, _menu_payload())
+        receive_id, card = send.call_args[0][:2]
+        self.assertEqual(receive_id, 'ou_1')
+        self.assertEqual(send.call_args[1]['receive_id_type'], 'open_id')
+        self.assertIn('重启网关', ''.join(_texts(card)))
+
+    def test_menu_blocked_when_p2p_disabled(self):
+        """默认不开单聊执行：说清原因，不要给空下拉。"""
+        with patch('apps.im_mgr.tasks.dispatch_send_card') as send:
+            handlers.handle_event(self.app, _menu_payload())
+        text = ''.join(_texts(send.call_args[0][1]))
+        self.assertIn('单聊尚未开放', text)
+
+    def test_menu_from_unbound_account(self):
+        self._enable_p2p()
+        with patch('apps.im_mgr.tasks.dispatch_send_card') as send:
+            handlers.handle_event(self.app, _menu_payload(open_id='ou_x', union_id='on_x'))
+        self.assertIn('还没有绑定平台用户', ''.join(_texts(send.call_args[0][1])))
+
+    # ── 单聊消息 ──────────────────────────────────────────
+    def test_p2p_message_needs_switch(self):
+        payload = _event_payload(chat_id='oc_p2p')
+        payload['event']['message']['chat_type'] = 'p2p'
+        with patch('apps.im_mgr.tasks.dispatch_send_card') as send:
+            handlers.handle_event(self.app, payload)
+        self.assertIn('单聊尚未开放', ''.join(_texts(send.call_args[0][1])))
+
+        self._enable_p2p()
+        with patch('apps.im_mgr.tasks.dispatch_send_card') as send:
+            handlers.handle_event(self.app, payload)
+        self.assertIn('重启网关', ''.join(_texts(send.call_args[0][1])))
+
+    # ── 单聊里点执行 ──────────────────────────────────────
+    def test_p2p_card_run_blocked_when_disabled(self):
+        payload = _card_payload({'act': cards.ACT_RUN, 'task': self.task.id}, chat_id='')
+        with patch('apps.task_exec.tasks.execute_task') as runner:
+            resp = handlers.handle_card_action(self.app, payload)
+        runner.assert_not_called()
+        self.assertIn('单聊', ''.join(_texts(resp['card']['data'])))
+
+    def test_p2p_card_run_allowed_when_enabled(self):
+        self._enable_p2p()
+        payload = _card_payload({'act': cards.ACT_RUN, 'task': self.task.id}, chat_id='')
+        with patch('apps.task_exec.tasks.execute_task') as runner:
+            resp = handlers.handle_card_action(self.app, payload)
+        runner.assert_called_once()
+        self.assertEqual(resp['toast']['type'], 'success')
+
+    def test_group_still_uses_whitelist(self):
+        """开了单聊开关不等于群里也放开。"""
+        self._enable_p2p()
+        payload = _card_payload({'act': cards.ACT_RUN, 'task': self.task.id},
+                                chat_id='oc_unlisted')
+        with patch('apps.task_exec.tasks.execute_task') as runner:
+            resp = handlers.handle_card_action(self.app, payload)
+        runner.assert_not_called()
+        self.assertIn('未被授权', ''.join(_texts(resp['card']['data'])))

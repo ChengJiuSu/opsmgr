@@ -40,6 +40,9 @@ logger = logging.getLogger(__name__)
 
 #: 事件订阅：v2 事件类型在 header.event_type
 EVENT_MESSAGE_RECEIVE = 'im.message.receive_v1'
+#: 机器人自定义菜单被点击。**没有 chat_id**（菜单不属于某个会话），只能按
+#: 操作人的 open_id 私聊回卡片；操作人也藏得更深（operator.operator_id）
+EVENT_BOT_MENU = 'application.bot.menu_v6'
 #: 生产二次确认票据的有效期（秒）
 CONFIRM_TTL = 60
 #: 审计里记的路径：**不带 callback_slug**——审计的读权限比系统配置宽，
@@ -72,9 +75,20 @@ def _event(payload):
 
 
 def operator_ids(payload):
-    """点这次按钮 / 发这条消息的人，返回 (open_id, union_id)。"""
+    """点这次按钮 / 发这条消息 / 点菜单的人，返回 (open_id, union_id)。
+
+    三种事件把人放在三个位置，且**菜单事件还多嵌了一层**
+    （`operator.operator_id`）——照着卡片回调的路径取会拿到空值，表现是
+    「你的飞书账号还没有绑定平台用户」，指向完全错误的方向。
+    """
     event = _event(payload)
-    for holder in (event.get('operator'), (event.get('sender') or {}).get('sender_id')):
+    operator = event.get('operator')
+    holders = [
+        operator,
+        (operator or {}).get('operator_id') if isinstance(operator, dict) else None,
+        (event.get('sender') or {}).get('sender_id'),
+    ]
+    for holder in holders:
         if isinstance(holder, dict) and (holder.get('open_id') or holder.get('union_id')):
             return str(holder.get('open_id') or ''), str(holder.get('union_id') or '')
     # v1 卡片回调把 open_id 放在顶层
@@ -108,6 +122,17 @@ def action_payload(payload):
         except ValueError:
             value = {}
     return (value if isinstance(value, dict) else {}), str(action.get('option') or '')
+
+
+def is_p2p(payload):
+    """这次交互是不是发生在与机器人的单聊里。
+
+    菜单事件没有会话概念，按单聊处理——它只能是本人点的。
+    """
+    if event_type(payload) == EVENT_BOT_MENU:
+        return True
+    message = _event(payload).get('message') or {}
+    return str(message.get('chat_type') or '') == 'p2p'
 
 
 def message_text(payload):
@@ -172,35 +197,57 @@ def audit(user, summary):
 # ── 事件：@机器人 ─────────────────────────────────────────
 
 def handle_event(app, payload):
-    """处理一条事件订阅回调。返回 None——事件没有响应体，卡片异步发出去。"""
+    """处理一条事件订阅回调。返回 None——事件没有响应体，卡片异步发出去。
+
+    两种入口殊途同归，都回一张任务选择卡：
+
+    - `im.message.receive_v1`：群里 @机器人 或私聊发消息，回到该会话；
+    - `application.bot.menu_v6`：点机器人自定义菜单。菜单不属于任何会话，
+      **payload 里没有 chat_id**，只能按操作人的 open_id 私聊回。
+    """
     kind = event_type(payload)
-    if kind != EVENT_MESSAGE_RECEIVE:
+    if kind not in (EVENT_MESSAGE_RECEIVE, EVENT_BOT_MENU):
         logger.info('飞书事件 %s 未订阅处理，忽略', kind or '(未知)')
         return None
 
-    chat_id, _ = context_ids(payload)
-    if not chat_id:
-        logger.warning('飞书消息事件缺少 chat_id，忽略')
+    open_id, _ = operator_ids(payload)
+    p2p = is_p2p(payload)
+    chat_id, _message_id = context_ids(payload)
+    # 菜单事件没有 chat_id，用 open_id 当收件人（receive_id_type 随之切换）
+    receive_id = chat_id or open_id
+    receive_id_type = 'chat_id' if chat_id else 'open_id'
+    if not receive_id:
+        logger.warning('飞书事件 %s 既没有 chat_id 也没有 open_id，忽略', kind)
         return None
+
+    def reply(card):
+        tasks.dispatch_send_card(receive_id, card, receive_id_type=receive_id_type)
 
     user = resolve_user(payload)
     if user is None:
-        open_id, _ = operator_ids(payload)
-        logger.info('飞书消息来自未绑定账号 %s', open_id)
-        tasks.dispatch_send_card(chat_id, cards.notice(
+        logger.info('飞书事件来自未绑定账号 %s', open_id)
+        reply(cards.notice(
             '尚未绑定',
             '你的飞书账号还没有绑定平台用户，无法发起任务执行。',
             tip='用飞书登录一次运维平台即可自动绑定（按企业邮箱匹配），'
                 '匹配不上时请联系管理员。'))
         return None
 
-    text = message_text(payload)
-    if text in ('help', '帮助', '?', '？'):
-        tasks.dispatch_send_card(chat_id, _help_card())
+    if kind == EVENT_MESSAGE_RECEIVE and message_text(payload) in ('help', '帮助', '?', '？'):
+        reply(_help_card())
         return None
 
-    available = list(access.available_tasks(user, chat_id)[:50])
-    tasks.dispatch_send_card(chat_id, cards.task_picker(available))
+    if not access.session_allowed(chat_id, p2p):
+        # 列表为空的选择卡只会让人以为「没有任务」，这里把原因说清楚
+        reply(cards.notice(
+            '当前会话未开放执行',
+            '单聊尚未开放发起执行，请到已授权的群里操作。' if p2p
+            else '当前群未被授权发起任务执行。',
+            tip='管理员可在「系统管理 → 飞书接入」开启。'))
+        return None
+
+    available = list(access.available_tasks(user, chat_id, is_p2p=p2p)[:50])
+    reply(cards.task_picker(available))
     return None
 
 
@@ -229,13 +276,15 @@ def handle_card_action(app, payload):
 
     open_id, _ = operator_ids(payload)
     chat_id, message_id = context_ids(payload)
+    # 卡片回调的 context 里没有 chat_type：拿不到 chat_id 就是单聊里的卡片
+    p2p = not chat_id or str(chat_id).startswith('p2p')
 
     if act == cards.ACT_PICK_TASK:
-        return _on_pick(user, chat_id, option)
+        return _on_pick(user, chat_id, option, p2p)
     if act == cards.ACT_RUN:
-        return _on_run(user, chat_id, open_id, value, message_id)
+        return _on_run(user, chat_id, open_id, value, message_id, p2p)
     if act == cards.ACT_CONFIRM_PROD:
-        return _on_confirm_prod(user, chat_id, open_id, value, message_id)
+        return _on_confirm_prod(user, chat_id, open_id, value, message_id, p2p)
     if act == cards.ACT_PAUSE:
         return _on_pause(user, value)
 
@@ -251,12 +300,12 @@ def _load_task(task_id):
         return None
 
 
-def _on_pick(user, chat_id, option):
+def _on_pick(user, chat_id, option, p2p=False):
     """下拉选中一条任务 → 确认卡。"""
     task = _load_task(option)
     if task is None:
         return _reject('任务不存在', '该任务已被删除，请重新发起。')
-    error = access.check(user, task, chat_id)
+    error = access.check(user, task, chat_id, is_p2p=p2p)
     if error:
         return _reject('无法执行', error)
     return card_response(cards.task_detail(
@@ -264,13 +313,13 @@ def _on_pick(user, chat_id, option):
         step_count=task.steps.count()))
 
 
-def _on_run(user, chat_id, open_id, value, message_id=''):
+def _on_run(user, chat_id, open_id, value, message_id='', p2p=False):
     """点「执行」：非生产直接发起，生产再要一次确认。"""
     task = _load_task(value.get('task'))
     if task is None:
         return _reject('任务不存在', '该任务已被删除，请重新发起。')
     # 重新判一次权限：卡片可能是十分钟前发的，期间角色/开关都可能变
-    error = access.check(user, task, chat_id)
+    error = access.check(user, task, chat_id, is_p2p=p2p)
     if error:
         return _reject('无法执行', error)
 
@@ -283,7 +332,7 @@ def _on_run(user, chat_id, open_id, value, message_id=''):
     return _launch(task, user, chat_id, message_id, confirmed_prod=False)
 
 
-def _on_confirm_prod(user, chat_id, open_id, value, message_id=''):
+def _on_confirm_prod(user, chat_id, open_id, value, message_id='', p2p=False):
     """生产二次确认：消费一次性票据后发起。"""
     token, error = FeishuConfirmToken.consume(value.get('token'), open_id)
     if error:
@@ -295,7 +344,7 @@ def _on_confirm_prod(user, chat_id, open_id, value, message_id=''):
     if task is None:
         return _reject('任务不存在', '该任务已被删除，请重新发起。')
     # 票据只证明「确认有效」，权限仍按当下重判
-    error = access.check(user, task, chat_id)
+    error = access.check(user, task, chat_id, is_p2p=p2p)
     if error:
         return _reject('无法执行', error)
     return _launch(task, user, chat_id, message_id, confirmed_prod=True)
