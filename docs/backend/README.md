@@ -20,4 +20,5 @@
 | [构建制品与 Jenkins 集成](modules/artifacts.md) | Jenkins 触发构建/日志同步、制品上报（X-API-KEY）、CD 制品变量注入 |
 | [审计模块](modules/audit.md) | 中间件自动审计、只读 API |
 | [系统配置模块](modules/system.md) | 键值对配置管理 |
+| [飞书接入模块](modules/im_mgr.md) | 飞书应用凭据、回调入口与来源 IP 白名单、会话白名单 |
 | [公共工具](modules/common.md) | 标准分页、统一响应、异常处理 |
