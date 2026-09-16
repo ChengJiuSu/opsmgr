@@ -896,3 +896,37 @@ class FeishuSsoMfaInteropTests(TestCase):
         client = self._client_with(issue_after_sso(self.user))
         resp = client.post('/api/auth/mfa/sudo/', {'password': PASSWORD}, format='json')
         self.assertEqual(resp.status_code, 200)
+
+
+class FeishuMyBindingTests(TestCase):
+    """个人页的绑定状态（只读，不提供自助解绑）。"""
+
+    def setUp(self):
+        cache.clear()
+        self.user = get_user_model().objects.create(username='bind_me')
+        self.user.set_password(PASSWORD)
+        self.user.save()
+        self.client = APIClient()
+        resp = self.client.post('/api/auth/login/',
+                                {'username': 'bind_me', 'password': PASSWORD}, format='json')
+        self.client.credentials(HTTP_AUTHORIZATION='Bearer ' + resp.json()['access'])
+
+    def test_unbound(self):
+        data = self.client.get('/api/feishu/sso/binding/').json()['data']
+        self.assertFalse(data['bound'])
+        self.assertFalse(data['sso_enabled'])
+
+    def test_bound_shows_masked_union_id(self):
+        FeishuBinding.objects.create(
+            user=self.user, union_id='on_union_abcdef', open_id='ou_1',
+            feishu_name='张三', feishu_email='z@corp.com', source='email')
+        data = self.client.get('/api/feishu/sso/binding/').json()['data']
+        self.assertTrue(data['bound'])
+        self.assertEqual(data['feishu_name'], '张三')
+        self.assertEqual(data['source_display'], '邮箱自动匹配')
+        # union_id 只回尾段：展示只为确认「绑的是我这个飞书号」
+        self.assertEqual(data['union_id_tail'], 'abcdef')
+        self.assertNotIn('union_id', data)
+
+    def test_requires_login(self):
+        self.assertEqual(APIClient().get('/api/feishu/sso/binding/').status_code, 401)

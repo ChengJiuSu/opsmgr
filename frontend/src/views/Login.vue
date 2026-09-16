@@ -48,6 +48,18 @@
             登 录
           </el-button>
         </el-form-item>
+        <!-- 飞书登录：后端未启用时整块不渲染，避免点了才报错 -->
+        <template v-if="ssoEnabled">
+          <el-divider class="sso-divider">或</el-divider>
+          <el-button
+            :loading="ssoLoading"
+            style="width: 100%"
+            @click="handleFeishuLogin"
+          >
+            <el-icon style="margin-right:6px"><ChatDotRound /></el-icon>
+            飞书登录
+          </el-button>
+        </template>
       </el-form>
 
       <!-- 第二步：验证器验证码（可切换为恢复码） -->
@@ -107,11 +119,12 @@
 </template>
 
 <script setup>
-import { ref, reactive, nextTick } from 'vue'
+import { ref, reactive, nextTick, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { User, Lock, Monitor, Key } from '@element-plus/icons-vue'
+import { User, Lock, Monitor, Key, ChatDotRound } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { useAuthStore } from '../stores/auth'
+import { getSsoStatus, getAuthorizeUrl } from '../api/feishu'
 
 const router = useRouter()
 const authStore = useAuthStore()
@@ -126,9 +139,32 @@ const code = ref('')
 const form = reactive({ username: '', password: '' })
 let lastVerified = ''   // 已提交过的验证码，防重复提交（票据一次性）
 
+const ssoEnabled = ref(false)
+const ssoLoading = ref(false)
+
 const rules = {
   username: [{ required: true, message: '请输入用户名', trigger: 'blur' }],
   password: [{ required: true, message: '请输入密码', trigger: 'blur' }],
+}
+
+onMounted(async () => {
+  try {
+    const res = await getSsoStatus()
+    ssoEnabled.value = !!res.data?.enabled
+  } catch {
+    // 取不到就当没开：密码登录始终可用，不能因为这个探测失败把登录页搞挂
+  }
+})
+
+async function handleFeishuLogin() {
+  ssoLoading.value = true
+  try {
+    const res = await getAuthorizeUrl()
+    // 整页跳转而不是弹窗：飞书授权页不允许被内嵌
+    window.location.href = res.data.authorize_url
+  } catch {
+    ssoLoading.value = false
+  }
 }
 
 async function handleLogin() {
@@ -236,6 +272,14 @@ function onCodeInput(value) {
   margin: 0;
   color: #909399;
   font-size: 13px;
+}
+.sso-divider {
+  margin: 4px 0 16px;
+  --el-border-color: #e4e7ed;
+}
+.sso-divider :deep(.el-divider__text) {
+  color: #909399;
+  font-size: 12px;
 }
 .mfa-actions {
   display: flex;

@@ -10,6 +10,14 @@ const router = createRouter({
       meta: { public: true },
     },
     {
+      // 飞书授权回调落地页：飞书把浏览器带回这里，带 code 与 state。
+      // 地址要与飞书后台「重定向 URL」白名单、以及 FeishuApp.sso_redirect_uri 一致
+      path: '/login/feishu',
+      name: 'LoginFeishu',
+      component: () => import('../views/LoginFeishu.vue'),
+      meta: { public: true },
+    },
+    {
       path: '/',
       component: () => import('../views/Layout.vue'),
       redirect: '/dashboard',
@@ -184,6 +192,12 @@ const router = createRouter({
           name: 'SystemConfigs',
           component: () => import('../views/system/Configs.vue'),
           meta: { title: '系统配置', perm: ['system', 'write'] },
+        },
+        {
+          path: 'system/feishu',
+          name: 'SystemFeishu',
+          component: () => import('../views/system/Feishu.vue'),
+          meta: { title: '飞书接入', perm: ['system', 'write'] },
         },
         // 二次认证（所有人可见，入口在右上角头像菜单，不进侧边栏）
         {

@@ -127,6 +127,44 @@
       </template>
     </el-card>
 
+    <!-- 飞书绑定：只读展示。解绑属于管理动作（自动建号的账号没有可用密码，
+         自助解绑就再也进不来了），放在用户管理里由管理员操作 -->
+    <el-card v-if="feishu.sso_enabled || feishu.bound" style="margin-top:16px">
+      <template #header>
+        <div class="card-header">
+          <span>飞书登录</span>
+          <el-tag :type="feishu.bound ? 'success' : 'info'" size="small">
+            {{ feishu.bound ? '已绑定' : '未绑定' }}
+          </el-tag>
+        </div>
+      </template>
+      <el-descriptions v-if="feishu.bound" :column="2" border>
+        <el-descriptions-item label="飞书昵称">
+          {{ feishu.feishu_name || '—' }}
+        </el-descriptions-item>
+        <el-descriptions-item label="飞书邮箱">
+          {{ feishu.feishu_email || '—' }}
+        </el-descriptions-item>
+        <el-descriptions-item label="绑定来源">
+          {{ feishu.source_display }}
+        </el-descriptions-item>
+        <el-descriptions-item label="最近飞书登录">
+          {{ formatTime(feishu.last_login_at) || '—' }}
+        </el-descriptions-item>
+      </el-descriptions>
+      <p class="intro" style="margin-top:12px">
+        <template v-if="feishu.bound">
+          飞书登录视为已通过二次认证，不会再要求输入验证码。
+          但修改凭据、用户、系统配置这类配置数据时仍要再验一次（验证器或登录密码）。
+          需要解绑请联系管理员。
+        </template>
+        <template v-else>
+          本账号尚未绑定飞书。用飞书登录一次即可自动绑定（按企业邮箱匹配），
+          匹配不上时请联系管理员手工绑定。
+        </template>
+      </p>
+    </el-card>
+
     <!-- 敏感操作：密码 + 当前验证码双确认 -->
     <el-dialog v-model="sensitive.visible" :title="sensitive.title" width="420px">
       <el-alert v-if="sensitive.action === 'disable'" type="warning" :closable="false" show-icon
@@ -188,6 +226,7 @@ import { ElMessage } from 'element-plus'
 import {
   getMfaStatus, mfaSetup, mfaActivate, mfaDisable, mfaRegenerateCodes,
 } from '../api/auth'
+import { getMyBinding } from '../api/feishu'
 import { useAuthStore } from '../stores/auth'
 
 const authStore = useAuthStore()
@@ -205,8 +244,20 @@ const enroll = reactive({
 })
 const sensitive = reactive({ visible: false, action: '', title: '', form: { password: '', code: '' } })
 const newCodes = reactive({ visible: false, list: [] })
+const feishu = ref({ sso_enabled: false, bound: false })
 
-onMounted(fetchStatus)
+onMounted(() => {
+  fetchStatus()
+  fetchFeishuBinding()
+})
+
+async function fetchFeishuBinding() {
+  try {
+    feishu.value = (await getMyBinding()).data
+  } catch {
+    // 飞书接入未配置时这里会失败：本页主体是 MFA，不该被它带挂
+  }
+}
 
 async function fetchStatus() {
   loading.value = true

@@ -224,7 +224,12 @@ conf/snippets/feishu_callback_ips.conf     # 来源 IP 白名单（⚠ 待填）
 GET  /api/feishu/sso/status/      登录页据此决定是否渲染「飞书登录」（公开，只回布尔）
 GET  /api/feishu/sso/authorize/   取授权跳转地址 + 一次性 state
 POST /api/feishu/sso/callback/    {code, state} → {access, refresh}
+GET  /api/feishu/sso/binding/     当前用户的绑定状态（个人页展示，只读）
 ```
+
+`binding` **不提供自助解绑**：自动创建的账号没有可用密码，解绑后就再也进不来了。
+解绑属于管理动作，放在用户管理里（T11）。`union_id` 只回显尾段——它是内部标识，
+展示只为让人确认「绑的是我这个飞书号」。
 
 **不需要为 SSO 额外开放公网**：授权码由用户浏览器带回，飞书服务器不访问回调
 地址；换 token 是平台的**出站**请求。所以 `sso_redirect_uri` 是给浏览器用的前端

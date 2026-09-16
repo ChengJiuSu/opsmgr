@@ -6,6 +6,7 @@ import {
   getMe,
   mfaVerify as apiMfaVerify,
 } from '../api/auth'
+import { ssoLogin as apiSsoLogin } from '../api/feishu'
 
 export const useAuthStore = defineStore('auth', () => {
   const accessToken = ref(localStorage.getItem('access_token') || '')
@@ -110,6 +111,16 @@ export const useAuthStore = defineStore('auth', () => {
     mfaToken.value = ''
   }
 
+  /**
+   * 飞书登录：授权码 + state → 正式令牌。
+   * 拿到的令牌 amr=['sso']，后端视为已过第二因子，不会再要 MFA 绑定，
+   * 所以这里不需要像密码登录那样处理 mfa_required 分支。
+   */
+  async function loginWithFeishu(code, state) {
+    const res = await apiSsoLogin({ code, state })
+    await finishLogin(res, username.value)
+  }
+
   async function fetchMe() {
     const res = await getMe()
     user.value = res.data
@@ -148,7 +159,7 @@ export const useAuthStore = defineStore('auth', () => {
     accessToken, refreshToken, username, user,
     mfaEnrollmentRequired, mfaToken,
     isLoggedIn, isStaff, perms, can, capability,
-    login, verifyMfa, cancelMfa, logout, fetchMe,
+    login, verifyMfa, cancelMfa, loginWithFeishu, logout, fetchMe,
     persistTokens, setEnrollmentRequired,
   }
 })

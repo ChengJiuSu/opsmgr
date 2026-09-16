@@ -31,7 +31,7 @@ from common.sudo import SudoRequired
 
 from . import crypto, dedupe, handlers, sso
 from .client import FeishuError
-from .models import FeishuApp, FeishuChannel
+from .models import FeishuApp, FeishuBinding, FeishuChannel
 from .serializers import FeishuAppSerializer, FeishuChannelSerializer
 
 logger = logging.getLogger(__name__)
@@ -328,3 +328,34 @@ class FeishuSsoCallbackView(APIView):
         update_last_login(None, user)
         logger.info('用户 %s 经飞书登录成功（ip=%s）', user.username, ip)
         return Response(tokens)
+
+
+class FeishuMyBindingView(APIView):
+    """GET /api/feishu/sso/binding/ —— 当前用户的飞书绑定状态（个人页展示）。
+
+    只读。**不提供自助解绑**：没有可用密码的账号（自动创建的）解绑后就再也进不
+    来了，解绑属于管理动作，放在用户管理里由管理员操作。
+
+    union_id 只回显尾段：它是内部标识，展示只为让人确认「绑的是我这个飞书号」，
+    给全量没有用处。
+    """
+
+    @extend_schema(responses=OpenApiTypes.OBJECT)
+    def get(self, request):
+        app = FeishuApp.load()
+        binding = FeishuBinding.objects.filter(user=request.user).first()
+        data = {
+            'sso_enabled': bool(app.is_ready() and app.sso_enabled),
+            'bound': binding is not None,
+        }
+        if binding:
+            data.update({
+                'feishu_name': binding.feishu_name,
+                'feishu_email': binding.feishu_email,
+                'union_id_tail': binding.union_id[-6:],
+                'source': binding.source,
+                'source_display': binding.get_source_display(),
+                'last_login_at': binding.last_login_at,
+                'created_at': binding.created_at,
+            })
+        return ok(data)
