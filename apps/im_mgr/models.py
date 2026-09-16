@@ -25,6 +25,7 @@
 被接管」——不该被同一个开关连带打开。
 """
 import secrets
+from datetime import timedelta
 
 from django.conf import settings
 from django.db import models
@@ -283,3 +284,81 @@ class FeishuBinding(models.Model):
         if open_id:
             return query.filter(open_id=open_id).first()
         return None
+
+
+class FeishuConfirmToken(models.Model):
+    """生产执行的一次性确认票据。
+
+    机器触发没有「弹窗再确认」那一步，所以确认被前移到第二张卡片上。票据把三件
+    事钉死，缺一件这道确认就形同虚设：
+
+    - **一次性**：`used_at` 条件更新消费，并发双击只有一次生效；
+    - **限本人**：`open_id` 必须与点按钮的人一致——群里的卡片谁都看得见，
+      不限人的话「A 发起、B 确认」就绕过了 A 的权限判定；
+    - **短有效期**：过期作废，防止卡片被翻旧账再点一次。
+
+    票据只是「这次确认有效」的凭据，**不携带任何执行参数**：任务、主机范围都在
+    消费时按库里的当前值重新解析，卡片上的值只用于展示。
+    """
+
+    token = models.CharField('票据', max_length=64, unique=True)
+    task = models.ForeignKey(
+        'task_exec.ExecutionTask', verbose_name='任务', on_delete=models.CASCADE,
+        related_name='feishu_confirm_tokens',
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, verbose_name='发起人', on_delete=models.CASCADE,
+        related_name='feishu_confirm_tokens',
+    )
+    open_id = models.CharField('发起人 OpenID', max_length=128)
+    chat_id = models.CharField('会话 ID', max_length=128, blank=True)
+    expires_at = models.DateTimeField('过期时间')
+    used_at = models.DateTimeField('消费时间', null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = '飞书确认票据'
+        verbose_name_plural = '飞书确认票据'
+        db_table = 'im_feishu_confirm_token'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'{self.token[:8]}…({self.task_id})'
+
+    @classmethod
+    def issue(cls, task, user, open_id, chat_id, ttl_seconds):
+        """签发一张票据，顺手清掉过期一天以上的旧票据。"""
+        from django.utils import timezone
+
+        now = timezone.now()
+        cls.objects.filter(expires_at__lt=now - timedelta(days=1)).delete()
+        return cls.objects.create(
+            token=secrets.token_urlsafe(24), task=task, user=user,
+            open_id=open_id or '', chat_id=chat_id or '',
+            expires_at=now + timedelta(seconds=ttl_seconds),
+        )
+
+    @classmethod
+    def consume(cls, token, open_id):
+        """消费票据，返回 (票据, 中文错误)；错误非空时未做任何写入。
+
+        先查后条件更新：直接用一条 update 也能保证一次性，但那样所有失败原因都
+        会塌成「无效或已过期」，出问题时没法判断是点晚了、点错人了还是重复点。
+        并发安全由 `used_at__isnull=True` 的条件更新保证，不靠这次查询。
+        """
+        from django.utils import timezone
+
+        row = cls.objects.select_related('task', 'user').filter(token=str(token or '')).first()
+        if row is None:
+            return None, '确认票据无效，请重新发起执行。'
+        if row.open_id and row.open_id != (open_id or ''):
+            return None, '只有发起人本人可以确认这次生产执行。'
+        if row.used_at is not None:
+            return None, '该确认已处理过，请勿重复点击。'
+        if row.expires_at <= timezone.now():
+            return None, '确认已超时，请重新发起执行。'
+        updated = cls.objects.filter(pk=row.pk, used_at__isnull=True).update(
+            used_at=timezone.now())
+        if not updated:
+            return None, '该确认已处理过，请勿重复点击。'
+        return row, None

@@ -361,6 +361,9 @@ FEISHU_TRUST_ENV = config('FEISHU_TRUST_ENV', default=True, cast=bool)
 # /open-apis/authen/v1/index），单独抽成配置项，真换了改一行就行
 FEISHU_AUTHORIZE_PATH = config(
     'FEISHU_AUTHORIZE_PATH', default='/open-apis/authen/v1/authorize')
+# 生产执行的二次确认票据有效期（秒）。短是刻意的：这张卡的意义是「当场确认」，
+# 留久了就变成一张可以被翻出来再点一次的按钮
+FEISHU_CONFIRM_TTL = config('FEISHU_CONFIRM_TTL', default=60, cast=int)
 FEISHU_TIMEOUT = (
     config('FEISHU_CONNECT_TIMEOUT', default=5, cast=int),
     config('FEISHU_READ_TIMEOUT', default=10, cast=int),

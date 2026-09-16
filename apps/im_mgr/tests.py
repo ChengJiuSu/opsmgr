@@ -4,18 +4,19 @@ import base64
 import hashlib
 import json
 import time
+from datetime import timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.db import connection
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
 from common.testing import grant_sudo
 
-from apps.im_mgr import access, cards, client, crypto, sso
-from apps.im_mgr.models import FeishuApp, FeishuBinding, FeishuChannel
+from apps.im_mgr import access, cards, client, crypto, handlers, sso
+from apps.im_mgr.models import FeishuApp, FeishuBinding, FeishuChannel, FeishuConfirmToken
 
 PASSWORD = 'Pass!2345xyz'
 #: 配齐一份可启用的配置（IP 白名单用文档示例段，测试不依赖真实出口 IP）
@@ -1267,3 +1268,272 @@ class FeishuCardTests(TestCase):
         self.log.status = 'failed'
         payload = cards.result(self.task, self.log, tail='x' * 10000)
         self.assertLess(len(json.dumps(payload, ensure_ascii=False)), 20000)
+
+
+# ══════════════════════════════════════════════════════════
+# T8：执行动作链路（事件 → 选择 → 确认 → 发起）
+# ══════════════════════════════════════════════════════════
+
+def _event_payload(text='执行', open_id='ou_1', chat_id='oc_ops',
+                   event_type='im.message.receive_v1', union_id='on_1'):
+    return {
+        'schema': '2.0',
+        'header': {'event_id': f'ev-{time.time_ns()}', 'event_type': event_type},
+        'event': {
+            'sender': {'sender_id': {'open_id': open_id, 'union_id': union_id}},
+            'message': {'chat_id': chat_id, 'message_id': 'om_1',
+                        'message_type': 'text',
+                        'content': json.dumps({'text': f'@_user_1 {text}'})},
+        },
+    }
+
+
+def _card_payload(value, *, open_id='ou_1', chat_id='oc_ops', option=None,
+                  union_id='on_1'):
+    action = {'tag': 'button', 'value': value}
+    if option is not None:
+        action = {'tag': 'select_static', 'value': value, 'option': option}
+    return {
+        'schema': '2.0',
+        'header': {'event_id': f'ca-{time.time_ns()}', 'event_type': 'card.action.trigger'},
+        'event': {
+            'operator': {'open_id': open_id, 'union_id': union_id},
+            'context': {'open_chat_id': chat_id, 'open_message_id': 'om_1'},
+            'action': action,
+        },
+    }
+
+
+@override_settings(TASK_EXEC_BACKEND='sync')
+class FeishuHandlerTests(TestCase):
+    """卡片动作链路。执行落到 task_exec.trigger，ansible 调用整体 mock 掉。"""
+
+    def setUp(self):
+        from apps.asset_mgr.models import Channel, Environment, ProjectGroup, ServerService, ServiceType
+        from apps.asset_mgr.models import Server
+        from apps.task_exec.models import ExecutionTask, TaskStep
+
+        cache.clear()
+        self.app = FeishuApp.load()
+        self.pg = ProjectGroup.objects.create(name='主项目', code='h-proj')
+        self.ch = Channel.objects.create(name='官服', code='h-ch')
+        self.env = Environment.objects.create(name='测试环境', code='h-env')
+        self.prod = Environment.objects.create(name='生产环境', code='h-prod', is_prod=True)
+        self.service = ServiceType.objects.create(name='网关', code='h-gw')
+        server = Server.objects.create(
+            name='web1', private_ip='10.0.0.1',
+            project_group=self.pg, channel=self.ch, environment=self.env)
+        ServerService.objects.create(server=server, service_type=self.service, status='planned')
+        prod_server = Server.objects.create(
+            name='prod1', private_ip='10.0.1.1',
+            project_group=self.pg, channel=self.ch, environment=self.prod)
+        ServerService.objects.create(server=prod_server, service_type=self.service, status='planned')
+
+        self.task = ExecutionTask.objects.create(
+            name='重启网关', project_group=self.pg, channel=self.ch, environment=self.env,
+            im_enabled=True, default_select_all=True)
+        TaskStep.objects.create(task=self.task, order=1, name='重启',
+                                command='echo hi', service_type=self.service)
+        self.prod_task = ExecutionTask.objects.create(
+            name='发版生产', project_group=self.pg, channel=self.ch, environment=self.prod,
+            im_enabled=True, default_select_all=True)
+        TaskStep.objects.create(task=self.prod_task, order=1, name='发版',
+                                command='echo deploy', service_type=self.service)
+
+        FeishuChannel.objects.create(chat_id='oc_ops', name='运维群', allow_execute=True)
+        self.user = get_user_model().objects.create(username='ops_zhang', is_staff=True)
+        FeishuBinding.objects.create(user=self.user, union_id='on_1', open_id='ou_1')
+
+    def _run_card(self, payload):
+        """执行一次卡片动作，ansible 那步不真跑。"""
+        with patch('apps.task_exec.tasks.execute_task') as runner:
+            resp = handlers.handle_card_action(self.app, payload)
+        return resp, runner
+
+    # ── 事件：@机器人 ─────────────────────────────────────
+    def test_event_sends_task_picker(self):
+        with patch('apps.im_mgr.tasks.dispatch_send_card') as send:
+            handlers.handle_event(self.app, _event_payload())
+        card = send.call_args[0][1]
+        self.assertIn('重启网关', ''.join(_texts(card)))
+
+    def test_event_from_unbound_account(self):
+        with patch('apps.im_mgr.tasks.dispatch_send_card') as send:
+            handlers.handle_event(self.app, _event_payload(
+                open_id='ou_stranger', union_id='on_stranger'))
+        text = ''.join(_texts(send.call_args[0][1]))
+        self.assertIn('还没有绑定平台用户', text)
+
+    def test_event_help(self):
+        with patch('apps.im_mgr.tasks.dispatch_send_card') as send:
+            handlers.handle_event(self.app, _event_payload(text='帮助'))
+        self.assertIn('运维机器人', ''.join(_texts(send.call_args[0][1])))
+
+    def test_event_other_type_ignored(self):
+        with patch('apps.im_mgr.tasks.dispatch_send_card') as send:
+            handlers.handle_event(self.app, _event_payload(event_type='im.chat.updated_v1'))
+        send.assert_not_called()
+
+    def test_event_in_unlisted_chat_lists_nothing(self):
+        with patch('apps.im_mgr.tasks.dispatch_send_card') as send:
+            handlers.handle_event(self.app, _event_payload(chat_id='oc_random'))
+        self.assertIn('没有可从飞书发起的任务', ''.join(_texts(send.call_args[0][1])))
+
+    # ── 选择任务 ──────────────────────────────────────────
+    def test_pick_task_returns_detail(self):
+        payload = _card_payload({'act': cards.ACT_PICK_TASK}, option=str(self.task.id))
+        resp, _ = self._run_card(payload)
+        text = ''.join(_texts(resp['card']['data']))
+        self.assertIn('重启网关', text)
+        self.assertIn('当前匹配 1 台', text)
+
+    def test_pick_task_missing(self):
+        payload = _card_payload({'act': cards.ACT_PICK_TASK}, option='99999')
+        resp, _ = self._run_card(payload)
+        self.assertIn('已被删除', ''.join(_texts(resp['card']['data'])))
+
+    def test_pick_task_rechecks_access(self):
+        """卡片可能是十分钟前发的，开关期间可能被关掉。"""
+        self.task.im_enabled = False
+        self.task.save(update_fields=['im_enabled'])
+        payload = _card_payload({'act': cards.ACT_PICK_TASK}, option=str(self.task.id))
+        resp, _ = self._run_card(payload)
+        self.assertIn('未开启飞书执行', ''.join(_texts(resp['card']['data'])))
+
+    # ── 非生产执行 ────────────────────────────────────────
+    def test_run_launches_and_audits(self):
+        from apps.audit.models import AuditLog
+        from apps.task_exec.models import TaskExecutionLog
+
+        payload = _card_payload({'act': cards.ACT_RUN, 'task': self.task.id})
+        resp, runner = self._run_card(payload)
+        runner.assert_called_once()
+        log = TaskExecutionLog.objects.get(task=self.task)
+        self.assertEqual(log.trigger_type, 'feishu')
+        self.assertEqual(log.triggered_by_id, self.user.id)
+        self.assertEqual(resp['toast']['type'], 'success')
+        # 回调路径整段不入审计，但「谁从飞书发起了执行」必须留痕
+        entry = AuditLog.objects.get(user=self.user)
+        self.assertNotIn(self.app.callback_slug, entry.path)   # 不把回调随机串写进审计
+        self.assertIn('"task_id"', entry.body)
+
+    def test_run_unbound_user_rejected(self):
+        payload = _card_payload({'act': cards.ACT_RUN, 'task': self.task.id},
+                                open_id='ou_stranger', union_id='on_stranger')
+        resp, runner = self._run_card(payload)
+        runner.assert_not_called()
+        self.assertIn('还没有绑定平台用户', ''.join(_texts(resp['card']['data'])))
+
+    def test_run_in_unlisted_chat_rejected(self):
+        payload = _card_payload({'act': cards.ACT_RUN, 'task': self.task.id},
+                                chat_id='oc_random')
+        resp, runner = self._run_card(payload)
+        runner.assert_not_called()
+        self.assertIn('未被授权', ''.join(_texts(resp['card']['data'])))
+
+    def test_cancel(self):
+        resp, runner = self._run_card(_card_payload({'act': cards.ACT_CANCEL}))
+        runner.assert_not_called()
+        self.assertIn('已取消', ''.join(_texts(resp['card']['data'])))
+
+    # ── 生产二次确认 ──────────────────────────────────────
+    def test_prod_run_requires_confirm(self):
+        payload = _card_payload({'act': cards.ACT_RUN, 'task': self.prod_task.id})
+        resp, runner = self._run_card(payload)
+        runner.assert_not_called()
+        text = ''.join(_texts(resp['card']['data']))
+        self.assertIn('生产环境', text)
+        self.assertEqual(FeishuConfirmToken.objects.count(), 1)
+
+    def _issue_prod_token(self):
+        payload = _card_payload({'act': cards.ACT_RUN, 'task': self.prod_task.id})
+        self._run_card(payload)
+        return FeishuConfirmToken.objects.get().token
+
+    def test_prod_confirm_launches(self):
+        from apps.task_exec.models import TaskExecutionLog
+
+        token = self._issue_prod_token()
+        resp, runner = self._run_card(
+            _card_payload({'act': cards.ACT_CONFIRM_PROD, 'token': token}))
+        runner.assert_called_once()
+        self.assertEqual(TaskExecutionLog.objects.filter(task=self.prod_task).count(), 1)
+        self.assertEqual(resp['toast']['type'], 'success')
+
+    def test_prod_confirm_by_another_person_rejected(self):
+        """群里的卡片谁都点得到：不限人就等于「A 发起、B 确认」绕过 A 的判定。"""
+        other = get_user_model().objects.create(username='ops_li', is_staff=True)
+        FeishuBinding.objects.create(user=other, union_id='on_2', open_id='ou_2')
+        token = self._issue_prod_token()
+        payload = _card_payload({'act': cards.ACT_CONFIRM_PROD, 'token': token},
+                                open_id='ou_2', union_id='on_2')
+        resp, runner = self._run_card(payload)
+        runner.assert_not_called()
+        self.assertIn('只有发起人本人', ''.join(_texts(resp['card']['data'])))
+
+    def test_prod_confirm_is_single_use(self):
+        token = self._issue_prod_token()
+        first, runner1 = self._run_card(
+            _card_payload({'act': cards.ACT_CONFIRM_PROD, 'token': token}))
+        runner1.assert_called_once()
+        second, runner2 = self._run_card(
+            _card_payload({'act': cards.ACT_CONFIRM_PROD, 'token': token}))
+        runner2.assert_not_called()
+        self.assertIn('已处理过', ''.join(_texts(second['card']['data'])))
+
+    def test_prod_confirm_expires(self):
+        from django.utils import timezone
+
+        token = self._issue_prod_token()
+        FeishuConfirmToken.objects.filter(token=token).update(
+            expires_at=timezone.now() - timedelta(seconds=1))
+        resp, runner = self._run_card(
+            _card_payload({'act': cards.ACT_CONFIRM_PROD, 'token': token}))
+        runner.assert_not_called()
+        self.assertIn('超时', ''.join(_texts(resp['card']['data'])))
+
+    def test_prod_confirm_unknown_token(self):
+        resp, runner = self._run_card(
+            _card_payload({'act': cards.ACT_CONFIRM_PROD, 'token': 'not-a-token'}))
+        runner.assert_not_called()
+        self.assertIn('票据无效', ''.join(_texts(resp['card']['data'])))
+
+    def test_prod_confirm_rechecks_capability(self):
+        """票据只证明「确认有效」，权限仍按当下重判。"""
+        from apps.auth_mgr.models import Role
+
+        token = self._issue_prod_token()
+        role = Role.objects.create(code='h-noprod', name='不可生产',
+                                   permissions={'exec': 'read'},
+                                   can_execute=True, can_exec_prod=False)
+        self.user.role = role
+        self.user.save(update_fields=['role'])
+        resp, runner = self._run_card(
+            _card_payload({'act': cards.ACT_CONFIRM_PROD, 'token': token}))
+        runner.assert_not_called()
+        self.assertIn('不允许对生产环境', ''.join(_texts(resp['card']['data'])))
+
+    # ── payload 形态兼容 ──────────────────────────────────
+    def test_value_as_json_string(self):
+        """部分客户端把 value 序列化成字符串回传。"""
+        payload = _card_payload({'act': cards.ACT_CANCEL})
+        payload['event']['action']['value'] = json.dumps({'act': cards.ACT_CANCEL})
+        resp, _ = self._run_card(payload)
+        self.assertIn('已取消', ''.join(_texts(resp['card']['data'])))
+
+    def test_v1_payload_shape(self):
+        """旧版卡片回调把 open_id 与 action 放在顶层。"""
+        payload = {
+            'open_id': 'ou_1',
+            'open_chat_id': 'oc_ops',
+            'open_message_id': 'om_1',
+            'action': {'tag': 'button', 'value': {'act': cards.ACT_RUN, 'task': self.task.id}},
+        }
+        resp, runner = self._run_card(payload)
+        runner.assert_called_once()
+        self.assertEqual(resp['toast']['type'], 'success')
+
+    def test_unknown_action_ignored(self):
+        resp, runner = self._run_card(_card_payload({'act': 'nope'}))
+        runner.assert_not_called()
+        self.assertIsNone(resp)
