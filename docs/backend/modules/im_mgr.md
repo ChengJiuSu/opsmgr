@@ -238,6 +238,10 @@ conf/snippets/feishu_callback_ips.conf     # 来源 IP 白名单（⚠ 待填）
 
 - **token 缓存**：`tenant_access_token` 有效期 2 小时，缓存到共享缓存层（生产
   Redis），提前 300 秒判过期。WSGI / celery 多进程共用一份。
+  **缓存键带 App ID**，且保存配置时 `drop_token_cache()`——换自建应用（个人版 →
+  企业版）或只换 App Secret 时，不隔离/不清缓存都会继续用旧 token，而飞书报的是
+  「The authorization code does not match the provided application credential」，
+  错误指向授权码、实际问题在凭证，排查会绕很大一圈。
 - **token 失效自愈**：飞书返回 `99991661/99991663/99991664/99991668` 时清缓存、
   重取、重试**一次**。不自愈的表现是「接下来两小时飞书全挂」；重试超过一次没有
   意义——真的是 App Secret 被改了的话，快点报错更有用。

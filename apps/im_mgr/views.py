@@ -68,6 +68,10 @@ class FeishuAppView(APIView):
             app, data=request.data, partial=True, context={'request': request})
         serializer.is_valid(raise_exception=True)
         serializer.save()
+        # 凭据变了就得把缓存的 token 丢掉。不丢的话接下来两小时都在用旧应用/旧
+        # 密钥换来的 token——现象是「授权码与应用凭证不匹配」，错误指向授权码，
+        # 实际问题在这里，排查会绕很大一圈
+        client.drop_token_cache(app)
         return ok(serializer.data, msg='已保存。')
 
 

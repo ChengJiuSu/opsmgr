@@ -2170,3 +2170,68 @@ class FeishuErrorDetailTests(TestCase):
             with self.assertRaises(client.FeishuError) as ctx:
                 client.call('POST', '/open-apis/authen/v1/oidc/access_token')
         self.assertIn('bad code', str(ctx.exception))
+
+
+class FeishuTokenCacheScopeTests(TestCase):
+    """token 缓存必须按 App ID 隔离，改凭据时必须清。
+
+    联调踩到：从个人版应用换成企业版应用后，缓存里还是旧应用的 app_access_token，
+    拿它去换新应用产生的授权码，飞书回「The authorization code ... does not match
+    the provided application credential」——错误指向授权码，实际问题在凭证。
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.app = FeishuApp.load()
+        for key, value in FULL_CONFIG.items():
+            setattr(self.app, key, value)
+        self.app.enabled = True
+        self.app.save()
+
+    def test_cache_key_includes_app_id(self):
+        session = FakeSession([TOKEN_OK])
+        with patch('apps.im_mgr.client.requests.Session', return_value=session):
+            client.get_tenant_token()
+        self.assertEqual(cache.get(client.TOKEN_CACHE_PREFIX + 'cli_test0001'), 't-1')
+
+    def test_switching_app_does_not_reuse_old_token(self):
+        session = FakeSession([TOKEN_OK])
+        with patch('apps.im_mgr.client.requests.Session', return_value=session):
+            client.get_tenant_token()
+
+        # 换一个自建应用（个人版 → 企业版就是这么换的）
+        FeishuApp.objects.filter(pk=FeishuApp.SINGLETON_PK).update(app_id='cli_other')
+        session2 = FakeSession([TOKEN_OK2])
+        with patch('apps.im_mgr.client.requests.Session', return_value=session2):
+            token = client.get_tenant_token()
+        self.assertEqual(token, 't-2')          # 重新取，没吃旧缓存
+        self.assertEqual(len(session2.calls), 1)
+
+    def test_drop_token_cache_clears_both(self):
+        # 两把 token 是不同接口、不同字段名，队列要各给一条
+        app_token_ok = {'code': 0, 'app_access_token': 'a-1', 'expire': 7200}
+        session = FakeSession([TOKEN_OK, app_token_ok])
+        with patch('apps.im_mgr.client.requests.Session', return_value=session):
+            client.get_tenant_token()
+            client.get_app_token()
+        client.drop_token_cache()
+        self.assertIsNone(cache.get(client.TOKEN_CACHE_PREFIX + 'cli_test0001'))
+        self.assertIsNone(cache.get(client.APP_TOKEN_CACHE_PREFIX + 'cli_test0001'))
+
+    def test_saving_config_drops_cache(self):
+        """App Secret 改了但 App ID 没变时，键是同一个，不清就会用两小时的废 token。"""
+        session = FakeSession([TOKEN_OK])
+        with patch('apps.im_mgr.client.requests.Session', return_value=session):
+            client.get_tenant_token()
+
+        admin = get_user_model().objects.create(username='admin_tok', is_staff=True)
+        admin.set_password(PASSWORD)
+        admin.save()
+        api = APIClient()
+        resp = api.post('/api/auth/login/',
+                        {'username': 'admin_tok', 'password': PASSWORD}, format='json')
+        api.credentials(HTTP_AUTHORIZATION='Bearer ' + resp.json()['access'])
+        grant_sudo(api)
+
+        api.put('/api/feishu/app/', {'app_secret': 'rotated-secret'}, format='json')
+        self.assertIsNone(cache.get(client.TOKEN_CACHE_PREFIX + 'cli_test0001'))

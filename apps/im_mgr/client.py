@@ -25,8 +25,12 @@ from .models import FeishuApp
 
 logger = logging.getLogger(__name__)
 
-TOKEN_CACHE_KEY = 'feishu:tenant_access_token'
-APP_TOKEN_CACHE_KEY = 'feishu:app_access_token'
+#: token 缓存键**带 App ID**。换了自建应用（比如从个人版换到企业版）而键不变的话，
+#: 缓存里还是旧应用的 token，拿它去换新应用产生的授权码，飞书会回
+#: 「The authorization code ... does not match the provided application credential」
+#: ——错误指向授权码，实际问题在凭证，排查会绕很大一圈
+TOKEN_CACHE_PREFIX = 'feishu:tenant_access_token:'
+APP_TOKEN_CACHE_PREFIX = 'feishu:app_access_token:'
 #: 提前这么多秒判定过期，避免拿着一张「还有 3 秒到期」的 token 去发请求
 TOKEN_SAFETY_MARGIN = 300
 #: 飞书返回这些错误码 = token 不可用，清缓存重取一次
@@ -141,33 +145,48 @@ def _cached_token(cache_key):
         return None
 
 
+def _cache_key(prefix, app):
+    return prefix + (app.app_id or '-')
+
+
 def get_tenant_token(app=None, force_refresh=False):
     """取 tenant_access_token（发消息、读通讯录用），默认读缓存。
 
     缓存不可用时退化为每次现取（fail-open）：这里失败的后果只是多打几次接口，
     与 nonce 去重那种「放行即可被重放」的判定不同，不需要 fail-closed。
     """
+    app = app or _app()
+    key = _cache_key(TOKEN_CACHE_PREFIX, app)
     if not force_refresh:
-        cached = _cached_token(TOKEN_CACHE_KEY)
+        cached = _cached_token(key)
         if cached:
             return cached
-    return _fetch_token(app or _app(), TOKEN_PATH,
-                        'tenant_access_token', TOKEN_CACHE_KEY)
+    return _fetch_token(app, TOKEN_PATH, 'tenant_access_token', key)
 
 
 def get_app_token(app=None, force_refresh=False):
     """取 app_access_token（网页免登换 user_access_token 用）。"""
+    app = app or _app()
+    key = _cache_key(APP_TOKEN_CACHE_PREFIX, app)
     if not force_refresh:
-        cached = _cached_token(APP_TOKEN_CACHE_KEY)
+        cached = _cached_token(key)
         if cached:
             return cached
-    return _fetch_token(app or _app(), APP_TOKEN_PATH,
-                        'app_access_token', APP_TOKEN_CACHE_KEY)
+    return _fetch_token(app, APP_TOKEN_PATH, 'app_access_token', key)
 
 
-def drop_token_cache():
+def drop_token_cache(app=None):
+    """清掉两把应用级 token 的缓存。
+
+    改凭据后必须清：App Secret 换了但 App ID 没变时，键是同一个，不清的话
+    接下来两小时都在用一把已经失效的 token。
+    """
+    from .models import FeishuApp
+
+    app = app or FeishuApp.load()
     try:
-        cache.delete_many([TOKEN_CACHE_KEY, APP_TOKEN_CACHE_KEY])
+        cache.delete_many([_cache_key(TOKEN_CACHE_PREFIX, app),
+                           _cache_key(APP_TOKEN_CACHE_PREFIX, app)])
     except Exception:  # noqa: BLE001
         logger.warning('飞书 token 缓存清理失败', exc_info=True)
 
@@ -203,7 +222,7 @@ def call(method, path, *, payload=None, params=None, app=None, token=None):
             return body.get('data') or {}
         if code in INVALID_TOKEN_CODES and attempt == 1:
             logger.warning('飞书 token 失效（code=%s），清缓存重试一次', code)
-            drop_token_cache()
+            drop_token_cache(app)
             continue
         raise FeishuError(
             f'飞书接口 {path} 调用失败：{error_detail(body)}（code={code}）', code=code)

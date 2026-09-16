@@ -353,7 +353,8 @@ grep -i "飞书回调" logs/*.log | tail -20
 | `来源 IP 不在白名单内` | 应用层白名单没放行飞书出口段 |
 | 日志里**什么都没有** | 请求没到 Django。查 nginx：`grep feishu deploy/nginx/logs/ops-manager.api.access.log`，403 = IP 白名单挡住（**空的白名单文件 = 拒绝所有回调**） |
 | 浏览器 `20029 Invalid redirect URL` | 飞书后台「安全设置 → 重定向 URL」里没有我们传的那个地址。以**浏览器地址栏里的 `redirect_uri` 参数**为准去对，不要用 `feishu_check` 打印的那行（命令行没有 request，它按 `SITE_BASE_URL` 推导） |
-| 登录日志 `oidc/access_token 调用失败（code=20024）` | 授权码换令牌失败。常见三种：① 授权码被用过（刷新了带 `code` 的回调页，码是一次性的）；② 登录的飞书账号不属于该自建应用所在的企业租户（跨租户不行）；③ 应用改过能力后没重新发布 / 还在审核中。错误描述见日志里 `code=` 前面那句 |
+| `The authorization code ... does not match the provided application credential`（20024） | 授权码与换 token 用的凭证不是同一个应用。换过自建应用（如个人版 → 企业版）时最常见；token 缓存已按 App ID 隔离、且保存配置会自动清缓存，若仍报错，检查**浏览器里那个授权链接是不是旧页面留下的**（带旧 `app_id`），从登录页重新发起一次 |
+| 登录日志 `oidc/access_token 调用失败（其他 20024）` | ① 授权码被用过（刷新了带 `code` 的回调页，码是一次性的）；② 登录的飞书账号不属于该自建应用所在的企业租户；③ 应用改过能力后没重新发布 / 还在审核中。错误描述见日志里 `code=` 前面那句 |
 
 绕过 nginx 直接打后端，判断是哪一层的问题：
 
