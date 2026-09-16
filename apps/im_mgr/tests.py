@@ -1715,3 +1715,200 @@ class FeishuProgressTests(TestCase):
         binding = FeishuCardMessage.objects.exclude(log=self.log).get()
         self.assertEqual(binding.message_id, 'om_1')
         self.assertEqual(binding.chat_id, 'oc_ops')
+
+
+# ══════════════════════════════════════════════════════════
+# T10：暂停确认（等待确认 / 失败待处理）
+# ══════════════════════════════════════════════════════════
+
+@override_settings(TASK_EXEC_BACKEND='sync', SITE_BASE_URL='https://ops.example.com')
+class FeishuPauseTests(TestCase):
+    def setUp(self):
+        from apps.asset_mgr.models import Channel, Environment, ProjectGroup
+        from apps.task_exec.models import ExecutionTask, TaskExecutionLog, TaskStep
+
+        cache.clear()
+        self.app = FeishuApp.load()
+        for key, value in FULL_CONFIG.items():
+            setattr(self.app, key, value)
+        self.app.enabled = True
+        self.app.save()
+        pg = ProjectGroup.objects.create(name='主项目', code='pz-proj')
+        ch = Channel.objects.create(name='官服', code='pz-ch')
+        env = Environment.objects.create(name='测试环境', code='pz-env')
+        self.user = get_user_model().objects.create(username='pz_ops', is_staff=True)
+        FeishuBinding.objects.create(user=self.user, union_id='on_1', open_id='ou_1')
+        self.task = ExecutionTask.objects.create(
+            name='发布流程', project_group=pg, channel=ch, environment=env,
+            im_enabled=True, status='paused', pause_type='confirm')
+        TaskStep.objects.create(task=self.task, order=1, name='人工确认', task_type='pause')
+        self.log = TaskExecutionLog.objects.create(
+            task=self.task, status='paused', trigger_type='feishu',
+            triggered_by=self.user,
+            steps_result=[
+                {'order': 1, 'name': '拉包', 'status': 'success', 'duration': 3},
+                {'order': 2, 'name': '人工确认', 'status': 'running'},
+            ])
+
+    def _pause_payload(self, do, *, log_id=None, chat_id='oc_ops', open_id='ou_1',
+                       union_id='on_1'):
+        return _card_payload(
+            {'act': cards.ACT_PAUSE, 'task': self.task.id,
+             'log': log_id or self.log.id, 'do': do},
+            chat_id=chat_id, open_id=open_id, union_id=union_id)
+
+    # ── 渲染 ──────────────────────────────────────────────
+    def test_render_confirm_pause(self):
+        card = notify.render(self.log)
+        dos = [b['value']['do'] for b in _buttons(card)]
+        self.assertEqual(dos, ['continue', 'abort'])
+        self.assertIn('人工确认', ''.join(_texts(card)))
+
+    def test_render_failed_pause_includes_log(self):
+        """要判断该重试还是中止，靠的就是这几行日志。"""
+        self.task.pause_type = 'failed'
+        self.task.save(update_fields=['pause_type'])
+        self.log.output = 'fatal: 连接超时'
+        self.log.steps_result = [{'order': 1, 'name': '重启', 'status': 'failed'}]
+        self.log.save()
+        card = notify.render(self.log)
+        dos = [b['value']['do'] for b in _buttons(card)]
+        self.assertEqual(dos, ['retry', 'skip', 'abort'])
+        text = ''.join(_texts(card))
+        self.assertIn('连接超时', text)
+        self.assertIn('重启', text)
+
+    def test_render_confirm_pause_has_no_log_block(self):
+        """等待确认不是失败，贴一段日志只会让人以为出错了。"""
+        self.log.output = '不该出现在卡片上'
+        self.log.save(update_fields=['output'])
+        self.assertNotIn('不该出现在卡片上', ''.join(_texts(notify.render(self.log))))
+
+    # ── 处理动作 ──────────────────────────────────────────
+    def test_continue_writes_pause_action(self):
+        from apps.audit.models import AuditLog
+        from apps.task_exec.models import ExecutionTask
+
+        resp = handlers.handle_card_action(self.app, self._pause_payload('continue'))
+        self.task.refresh_from_db()
+        self.assertEqual(ExecutionTask.objects.get(pk=self.task.id).pause_action, 'continue')
+        self.assertIn('已继续执行', ''.join(_texts(resp['card']['data'])))
+        self.assertEqual(_buttons(resp['card']['data']), [])   # 定格，防重复点
+        self.assertTrue(AuditLog.objects.filter(user=self.user).exists())
+
+    def test_action_must_match_pause_type(self):
+        """failed 状态收到 continue 信号会让 runner 走错分支。"""
+        resp = handlers.handle_card_action(self.app, self._pause_payload('retry'))
+        self.assertIn('仅支持动作', ''.join(_texts(resp['card']['data'])))
+
+    def test_failed_pause_accepts_retry(self):
+        from apps.task_exec.models import ExecutionTask
+
+        ExecutionTask.objects.filter(pk=self.task.id).update(pause_type='failed')
+        handlers.handle_card_action(self.app, self._pause_payload('retry'))
+        self.assertEqual(ExecutionTask.objects.get(pk=self.task.id).pause_action, 'retry')
+
+    def test_rejected_when_not_paused(self):
+        from apps.task_exec.models import ExecutionTask
+
+        ExecutionTask.objects.filter(pk=self.task.id).update(status='running')
+        resp = handlers.handle_card_action(self.app, self._pause_payload('continue'))
+        self.assertIn('不在「等待处理」状态', ''.join(_texts(resp['card']['data'])))
+
+    def test_double_click_only_takes_once(self):
+        from apps.task_exec.models import ExecutionTask
+
+        first = handlers.handle_card_action(self.app, self._pause_payload('continue'))
+        # runner 消费掉信号并恢复执行
+        ExecutionTask.objects.filter(pk=self.task.id).update(status='running', pause_action='')
+        second = handlers.handle_card_action(self.app, self._pause_payload('continue'))
+        self.assertIn('已继续执行', ''.join(_texts(first['card']['data'])))
+        self.assertIn('不在「等待处理」状态', ''.join(_texts(second['card']['data'])))
+
+    def test_stale_card_from_previous_run_rejected(self):
+        """任务本体的 paused 只属于最近一次执行，拿旧卡片点等于对着另一次执行下指令。"""
+        from apps.task_exec.models import TaskExecutionLog
+
+        newer = TaskExecutionLog.objects.create(task=self.task, status='paused')
+        resp = handlers.handle_card_action(self.app, self._pause_payload('continue'))
+        self.assertIn('对应的执行已经结束', ''.join(_texts(resp['card']['data'])))
+        self.assertIsNotNone(newer)
+
+    def test_unknown_log_rejected(self):
+        resp = handlers.handle_card_action(self.app, self._pause_payload('continue', log_id=99999))
+        self.assertIn('已被删除', ''.join(_texts(resp['card']['data'])))
+
+    # ── 权限 ──────────────────────────────────────────────
+    def test_chat_whitelist_not_required(self):
+        """私聊推过来的卡片，那个会话不可能在白名单里。"""
+        resp = handlers.handle_card_action(
+            self.app, self._pause_payload('continue', chat_id='p2p_random'))
+        self.assertIn('已继续执行', ''.join(_texts(resp['card']['data'])))
+
+    def test_capability_required(self):
+        """continue/retry/skip 都会让剩余模块真跑起来，只在发起那头拦是留后门。"""
+        other = get_user_model().objects.create(username='pz_member', is_staff=False)
+        FeishuBinding.objects.create(user=other, union_id='on_2', open_id='ou_2')
+        resp = handlers.handle_card_action(
+            self.app, self._pause_payload('continue', open_id='ou_2', union_id='on_2'))
+        self.assertIn('没有发起任务执行的权限', ''.join(_texts(resp['card']['data'])))
+
+    def test_unbound_user_rejected(self):
+        resp = handlers.handle_card_action(
+            self.app, self._pause_payload('continue', open_id='ou_x', union_id='on_x'))
+        self.assertIn('还没有绑定平台用户', ''.join(_texts(resp['card']['data'])))
+
+    # ── 页面发起的任务：私聊推送 ──────────────────────────
+    def test_paused_without_card_triggers_private_push(self):
+        with patch('apps.im_mgr.tasks.dispatch_pause_push') as job:
+            notify.on_execution_updated(None, task_id=self.task.id, log_id=self.log.id)
+        job.assert_called_once_with(self.log.id)
+
+    def test_push_pause_sends_and_binds(self):
+        with patch('apps.im_mgr.client.send_card', return_value='om_p') as send:
+            notify.push_pause(self.log.id)
+        receive_id, card = send.call_args[0][:2]
+        self.assertEqual(receive_id, 'ou_1')
+        self.assertEqual(send.call_args[1]['receive_id_type'], 'open_id')
+        self.assertEqual(FeishuCardMessage.objects.get(log=self.log).message_id, 'om_p')
+        self.assertIn('人工确认', ''.join(_texts(card)))
+
+    def test_push_pause_only_once(self):
+        """失败重试后再次失败会重复广播 paused，不能每次都推一条新消息。"""
+        with patch('apps.im_mgr.client.send_card', return_value='om_p') as send:
+            notify.push_pause(self.log.id)
+            notify.push_pause(self.log.id)
+        self.assertEqual(send.call_count, 1)
+
+    def test_push_pause_skips_when_already_bound(self):
+        notify.bind(self.log, 'oc_ops', 'om_1')
+        with patch('apps.im_mgr.client.send_card') as send:
+            notify.push_pause(self.log.id)
+        send.assert_not_called()
+
+    def test_push_pause_skips_unbound_operator(self):
+        from apps.task_exec.models import TaskExecutionLog
+
+        stranger = get_user_model().objects.create(username='pz_nofeishu')
+        TaskExecutionLog.objects.filter(pk=self.log.id).update(triggered_by=stranger)
+        with patch('apps.im_mgr.client.send_card') as send:
+            notify.push_pause(self.log.id)
+        send.assert_not_called()
+
+    def test_push_pause_skips_when_no_longer_paused(self):
+        from apps.task_exec.models import TaskExecutionLog
+
+        TaskExecutionLog.objects.filter(pk=self.log.id).update(status='running')
+        with patch('apps.im_mgr.client.send_card') as send:
+            notify.push_pause(self.log.id)
+        send.assert_not_called()
+
+    def test_bound_card_refreshes_into_pause_card(self):
+        """从飞书发起的执行：暂停时就地刷成处理卡，不另发消息。"""
+        notify.bind(self.log, 'oc_ops', 'om_1')
+        with patch('apps.im_mgr.client.update_card') as update, \
+                patch('apps.im_mgr.client.send_card') as send:
+            notify.on_execution_updated(None, task_id=self.task.id, log_id=self.log.id)
+        send.assert_not_called()
+        dos = [b['value']['do'] for b in _buttons(update.call_args[0][1])]
+        self.assertEqual(dos, ['continue', 'abort'])

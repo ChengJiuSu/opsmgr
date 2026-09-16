@@ -36,6 +36,39 @@ def permission_error(user, task):
     return None
 
 
+#: 暂停类型 -> 允许的处理动作（'' 兼容存量：视为暂停确认）
+PAUSE_ACTIONS = {
+    'confirm': ('continue', 'abort'),
+    'failed': ('retry', 'skip', 'abort'),
+}
+
+
+def apply_pause_action(task_id, action):
+    """人工处理一次暂停：写入 pause_action 交给 runner 消费。
+
+    返回中文错误消息；None 表示已写入。与 preflight/launch 同处的理由一样——
+    页面与飞书卡片共用这一段，各写一份早晚有一边漏掉「动作与暂停类型是否匹配」
+    这道校验，而那会让 failed 状态收到一个 continue 信号。
+
+    状态判定用条件更新（`status='paused'`）而不是先查后写：两个人同时点、或者
+    runner 刚好消费完信号，条件更新是唯一能保证只生效一次的写法。
+    """
+    from .models import ExecutionTask
+
+    if action not in ('continue', 'abort', 'retry', 'skip'):
+        return 'action 必须为 continue/abort（暂停确认）或 retry/skip/abort（失败处理）'
+    row = ExecutionTask.objects.filter(pk=task_id).values_list('status', 'pause_type').first()
+    if row is None or row[0] != 'paused':
+        return '任务当前不在「等待处理」状态，无法操作'
+    allowed = PAUSE_ACTIONS[row[1] or 'confirm']
+    if action not in allowed:
+        return f'当前暂停类型仅支持动作：{"/".join(allowed)}'
+    updated = ExecutionTask.objects.filter(pk=task_id, status='paused').update(pause_action=action)
+    if not updated:
+        return '任务当前不在「等待处理」状态，无法操作'
+    return None
+
+
 def preflight(task):
     """发起前的任务级校验，返回中文错误消息；None 表示可以继续。"""
     if task.status in ('running', 'paused'):

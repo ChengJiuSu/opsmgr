@@ -22,7 +22,7 @@ from django.conf import settings
 from django.core.cache import cache
 
 from . import cards, tasks
-from .models import FeishuApp, FeishuCardMessage
+from .models import FeishuApp, FeishuBinding, FeishuCardMessage
 
 logger = logging.getLogger(__name__)
 
@@ -60,11 +60,14 @@ def _schedule(task_id, log_id):
                   .order_by('-created_at', '-id').values_list('id', flat=True).first())
     if log_id is None:
         return
-    # 没绑卡片的执行（页面发起的）直接短路，不必为它查状态、投任务
-    if not FeishuCardMessage.objects.filter(log_id=log_id).exists():
-        return
     status = (TaskExecutionLog.objects.filter(pk=log_id)
               .values_list('status', flat=True).first())
+    if not FeishuCardMessage.objects.filter(log_id=log_id).exists():
+        # 没绑卡片的执行（页面发起的）平时不打扰：只有转「等待处理」时才私聊
+        # 推给发起人——需要人处理是唯一值得主动打断的时刻
+        if status == 'paused':
+            tasks.dispatch_pause_push(log_id)
+        return
     if not _should_push(log_id, status):
         return
     tasks.dispatch_refresh_card(log_id)
@@ -90,6 +93,15 @@ def log_url(log):
     return f'{base}/task/executions/{log.task_id}/logs/{log.id}' if base else None
 
 
+def current_step_name(log, pause_type):
+    """暂停时停在哪个模块上。"""
+    wanted = 'failed' if pause_type == 'failed' else 'running'
+    for item in (log.steps_result or []):
+        if item.get('status') == wanted:
+            return item.get('name') or f'模块{item.get("order")}'
+    return ''
+
+
 def render(log):
     """按当前状态渲染卡片。"""
     task = log.task
@@ -97,7 +109,55 @@ def render(log):
     if log.status in ('success', 'failed'):
         # tail 用库里的输出预览：它就是完整日志的尾部，够判断成败原因
         return cards.result(task, log, url=url, tail=log.output)
+    if log.status == 'paused':
+        # 暂停类型在任务本体上（runner 消费 pause_action 时清），日志里没有
+        pause_type = task.pause_type or 'confirm'
+        return cards.pause(
+            task, log, pause_type,
+            current_step=current_step_name(log, pause_type),
+            # 失败待处理才贴日志：要判断该重试还是中止，靠的就是这几行
+            tail=log.output if pause_type == 'failed' else None,
+            url=url)
     return cards.progress(task, log, url=url)
+
+
+PAUSE_PUSH_PREFIX = 'feishu:pausepush:'
+
+
+def push_pause(log_id):
+    """页面发起的任务卡在「等待处理」时，私聊推一张处理卡给发起人。
+
+    推完就把这条消息绑到本次执行上：后续的进度与终态照常就地刷新，于是私聊里
+    也始终是同一条消息在变，不会因为一次暂停而多出一串消息。
+
+    **只推一次**：runner 可能反复广播同一个 paused 状态（失败重试后再次失败），
+    缓存标记挡住重复推送；真正的去重是绑定关系——绑上之后就走刷新那条路了。
+    """
+    from apps.task_exec.models import TaskExecutionLog
+
+    log = (TaskExecutionLog.objects
+           .select_related('task', 'task__project_group', 'task__channel',
+                           'task__environment', 'triggered_by')
+           .filter(pk=log_id).first())
+    if log is None or log.status != 'paused' or log.triggered_by is None:
+        return
+    if FeishuCardMessage.objects.filter(log_id=log_id).exists():
+        return
+    if not FeishuApp.load().is_ready():
+        return
+
+    binding = FeishuBinding.objects.filter(user=log.triggered_by).first()
+    if binding is None or not binding.open_id:
+        return
+    try:
+        if not cache.add(PAUSE_PUSH_PREFIX + str(log_id), 1, timeout=3600):
+            return
+    except Exception:  # noqa: BLE001 - 缓存不可用时照推（绑定关系会挡住第二次）
+        logger.warning('暂停推送去重缓存不可用，按未推送处理', exc_info=True)
+
+    message_id = tasks.send_card(binding.open_id, render(log), receive_id_type='open_id')
+    if message_id:
+        bind(log, binding.open_id, message_id)
 
 
 def refresh(log_id):

@@ -52,6 +52,21 @@ def check(user, task, chat_id=None):
     return trigger.permission_error(user, task)
 
 
+def check_pause(user, task):
+    """能否从飞书处理这次暂停；返回中文拒绝原因，None 表示放行。
+
+    与发起执行的四道闸相比，**刻意不判会话白名单与任务开关**：白名单管的是
+    「哪些会话能把执行入口摆出来」，而暂停卡是针对一次**已经发起**的执行，
+    甚至可能是页面发起后私聊推给发起人的——那个会话不可能在白名单里。
+
+    但人的权限一道不能少：continue / retry / skip 都会让剩余模块真的跑起来，
+    只在发起那头拦等于留了个后门（页面上的 confirm 接口也是同一道口径）。
+    """
+    if user is None:
+        return '你的飞书账号尚未绑定平台用户，请联系管理员绑定后再操作。'
+    return trigger.permission_error(user, task)
+
+
 def needs_production_confirm(task):
     """是否要走生产二次确认卡片。
 

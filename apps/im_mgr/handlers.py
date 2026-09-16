@@ -237,9 +237,7 @@ def handle_card_action(app, payload):
     if act == cards.ACT_CONFIRM_PROD:
         return _on_confirm_prod(user, chat_id, open_id, value, message_id)
     if act == cards.ACT_PAUSE:
-        # T10：暂停处理（continue/abort、retry/skip/abort）
-        logger.info('飞书暂停处理动作待接入：%s', value)
-        return None
+        return _on_pause(user, value)
 
     logger.info('飞书卡片动作未识别：%s', value)
     return None
@@ -301,6 +299,56 @@ def _on_confirm_prod(user, chat_id, open_id, value, message_id=''):
     if error:
         return _reject('无法执行', error)
     return _launch(task, user, chat_id, message_id, confirmed_prod=True)
+
+
+#: 暂停处理动作 → 定格卡片上的说法
+PAUSE_LABELS = {
+    'continue': '已继续执行',
+    'abort': '已中止任务',
+    'retry': '已重试该模块',
+    'skip': '已跳过该模块，继续后续',
+}
+
+
+def _on_pause(user, value):
+    """处理「等待确认」/「失败待处理」。
+
+    **不判会话白名单**：这张卡可能是页面发起后私聊推过来的，那个会话不可能在
+    白名单里。白名单管的是「哪里能摆出执行入口」，而这里处理的是一次已经发起的
+    执行——判的是人的权限（见 access.check_pause）。
+    """
+    from apps.task_exec.models import TaskExecutionLog
+
+    log = (TaskExecutionLog.objects.select_related(
+        'task', 'task__project_group', 'task__channel', 'task__environment')
+        .filter(pk=value.get('log')).first())
+    if log is None:
+        return _reject('无法处理', '该执行记录已被删除。')
+    task = log.task
+
+    error = access.check_pause(user, task)
+    if error:
+        return _reject('无法处理', error)
+
+    # 卡片可能是上一次执行留下的：任务本体的 paused 状态只属于最近一次执行，
+    # 拿旧卡片去点等于对着另一次执行下指令
+    latest_id = (task.logs.order_by('-created_at', '-id')
+                 .values_list('id', flat=True).first())
+    if latest_id != log.id:
+        return _reject('无法处理', '这张卡片对应的执行已经结束，请查看最新的执行记录。')
+
+    do = str(value.get('do') or '')
+    error = trigger.apply_pause_action(task.id, do)
+    if error:
+        return _reject('无法处理', error)
+
+    label = PAUSE_LABELS.get(do, '已处理')
+    logger.warning('飞书处理任务流 %s 的暂停：%s（用户 %s，log=%s）',
+                   task.name, do, user.username, log.id)
+    audit(user, {'act': 'pause', 'do': do, 'task_id': task.id, 'task': task.name,
+                 'log_id': log.id})
+    return card_response(cards.handled(label, by=user.username),
+                         toast=label, toast_type='success')
 
 
 def _launch(task, user, chat_id, message_id='', *, confirmed_prod):

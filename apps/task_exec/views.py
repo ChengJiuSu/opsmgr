@@ -513,12 +513,6 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
             msg=f'已发起执行（{len(steps)} 个模块，{task.get_exec_mode_display()}）',
         )
 
-    # 暂停类型 -> 允许的处理动作（'' 兼容存量：视为暂停确认）
-    PAUSE_ACTIONS = {
-        'confirm': ('continue', 'abort'),
-        'failed': ('retry', 'skip', 'abort'),
-    }
-
     @action(
         detail=True, methods=['post'],
         # 与 execute 同一道口径：处理暂停会让剩余模块真的跑起来，属「执行」而非
@@ -541,19 +535,9 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
         if error:
             return fail(error, status=403)
         action_value = request.data.get('action')
-        if action_value not in ('continue', 'abort', 'retry', 'skip'):
-            return fail('action 必须为 continue/abort（暂停确认）或 retry/skip/abort（失败处理）')
-        from .models import ExecutionTask
-
-        row = ExecutionTask.objects.filter(pk=pk).values_list('status', 'pause_type').first()
-        if row is None or row[0] != 'paused':
-            return fail('任务当前不在「等待处理」状态，无法操作')
-        allowed = self.PAUSE_ACTIONS[row[1] or 'confirm']
-        if action_value not in allowed:
-            return fail(f'当前暂停类型仅支持动作：{"/".join(allowed)}')
-        updated = ExecutionTask.objects.filter(pk=pk, status='paused').update(pause_action=action_value)
-        if not updated:
-            return fail('任务当前不在「等待处理」状态，无法操作')
+        error = trigger.apply_pause_action(pk, action_value)
+        if error:
+            return fail(error)
         return ok({'action': action_value})
 
     @action(detail=True, methods=['get'])

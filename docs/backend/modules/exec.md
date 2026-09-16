@@ -170,7 +170,7 @@ apps/task_exec/
 │                    #   match_executable_servers：全局/模块维度匹配共用口径
 ├── serializers.py   # 变量 key 校验、凭据脱敏、嵌套模块整体读写与内容校验、方法 service_type 执行校验
 ├── views.py         # 变量/凭据/任务 ViewSet + matched_servers/execute/output/logs 动作 + 剧本列表
-├── trigger.py       # 权限判定 + 发起前置校验 + 主机快照固化 + 调度
+├── trigger.py       # 权限判定 + 发起前置校验 + 主机快照固化 + 调度 + 暂停处理
 │                    #   （页面执行 / 接口触发 / 飞书卡片共用同一段）
 ├── webhook.py       # TaskTriggerView：API 凭证鉴权的机读触发入口
 ├── log_files.py     # 日志文件浏览：TASK_LOG_DIR 只读目录树 / 文本分段读 / 原文件下载（exec read）

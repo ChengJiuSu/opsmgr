@@ -87,6 +87,27 @@ def dispatch_refresh_card(log_id):
         _in_thread(refresh_card, log_id)
 
 
+def pause_push(log_id):
+    """私聊推送暂停处理卡；失败只记日志。"""
+    from . import notify
+
+    try:
+        notify.push_pause(log_id)
+    except Exception:  # noqa: BLE001 - 通知链路不该外溢
+        logger.warning('飞书暂停卡推送失败：log=%s', log_id, exc_info=True)
+
+
+def dispatch_pause_push(log_id):
+    """按配置后端异步推送暂停处理卡。"""
+    backend = getattr(settings, 'TASK_EXEC_BACKEND', 'thread')
+    if backend == 'sync':
+        pause_push(log_id)
+    elif backend == 'celery':
+        pause_push_task.delay(log_id)
+    else:
+        _in_thread(pause_push, log_id)
+
+
 def _in_thread(func, *args):
     """线程后端：守护线程发出去，请求线程不等。
 
@@ -118,5 +139,9 @@ try:  # pragma: no cover - 未装 celery 的环境（开发机）照常工作
     @shared_task(ignore_result=True)
     def refresh_card_task(log_id):
         refresh_card(log_id)
+
+    @shared_task(ignore_result=True)
+    def pause_push_task(log_id):
+        pause_push(log_id)
 except ImportError:  # pragma: no cover
-    send_card_task = update_card_task = refresh_card_task = None
+    send_card_task = update_card_task = refresh_card_task = pause_push_task = None
