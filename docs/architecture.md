@@ -14,9 +14,10 @@ flowchart TB
         BROWSER["运维/研发浏览器<br/>Vue 3 SPA"]
         CI["Jenkins CI 脚本<br/>X-API-KEY 上报制品"]
         MACHINE["机读客户端 / Webhook<br/>X-API-KEY + 签名"]
+        FEISHU["飞书开放平台<br/>事件订阅 + 卡片回调<br/>IP 白名单 + 签名 + nonce"]
     end
 
-    NGINX["nginx<br/>TLS 终止 · 静态资源 · 反代<br/>/api /admin → 8000 · /ws/ → 8001<br/>/_artifacts/ 内部重定向发包"]
+    NGINX["nginx<br/>TLS 终止 · 静态资源 · 反代<br/>/api /admin → 8000 · /ws/ → 8001<br/>/api/feishu/callback/ 独立白名单 + 限速<br/>/_artifacts/ 内部重定向发包"]
 
     subgraph APP["ops-manager 应用层（同一份代码，四类进程）"]
         WSGI["gunicorn (WSGI) :8000<br/>gthread 4×8 preload<br/>全部 REST API"]
@@ -37,6 +38,7 @@ flowchart TB
         JMS["JumpServer<br/>资产注册（直连或经 agent）"]
         DNS["阿里云 / 腾讯云<br/>DNS OpenAPI"]
         ACME["ACME (Let's Encrypt)<br/>DNS-01 签发"]
+        LARK["飞书开放平台 API<br/>发卡 / 改卡 / 通讯录 / 网页免登"]
     end
 
     subgraph TARGET["被管资源"]
@@ -48,6 +50,7 @@ flowchart TB
     BROWSER --> NGINX
     CI --> NGINX
     MACHINE --> NGINX
+    FEISHU --> NGINX
     NGINX --> WSGI
     NGINX --> WS
 
@@ -73,6 +76,8 @@ flowchart TB
     CDEF --> DNS
     CDEF --> ACME
     WSGI --> DNS
+    WSGI -. "卡片 / 通讯录（出站）" .-> LARK
+    CDEF -. "异步发卡 / 改卡" .-> LARK
 
     AGENT -- "wss（方向恒为 agent → manager）" --> NGINX
     WS <-. "指令下发 / 日志回传" .-> AGENT
@@ -86,6 +91,10 @@ flowchart TB
 - **写请求不在 web 进程里干活**：web 只落库 + 置状态 + 投 Redis，真正的 ansible/acme 在 celery worker 里跑。worker 没起 = 任务永远排队且页面无报错。
 - **两个 celery worker 不共队列**：`task_exec` 队列跑任务执行，默认队列跑证书，互不抢占；同机运行必须给不同 `-n` node 名。
 - **连接方向恒为 agent → manager**，manager 从不主动连 agent，NAT 内网主机零改造。
+- **飞书是第四类接入方**：入站只有 `/api/feishu/callback/<slug>/{event,card}/` 两条，
+  nginx 侧独立 IP 白名单 + 限速，应用层再验签名/时间戳/nonce；出站（发卡、改卡、
+  通讯录、换 token）走默认 celery 队列异步发，**绝不在执行线程里发**。飞书发不出去
+  不影响任何一次任务执行。
 
 ---
 
@@ -158,6 +167,10 @@ flowchart TB
         ART["artifact_mgr<br/>Artifact 上报 / 签名下载"]
     end
 
+    subgraph L35["协同接入"]
+        IM["im_mgr<br/>飞书应用 · 绑定 · 会话白名单<br/>回调验签 / 卡片 / SSO / 进度回显"]
+    end
+
     subgraph L4["云控与视图"]
         CLOUD["cloud_mgr<br/>域名 · 解析（审批/风险）· 证书 · 分发"]
         TOPO["topo_mgr<br/>画布 · 节点 · 边"]
@@ -184,14 +197,22 @@ flowchart TB
     DASH --> CLOUD
     DASH --> TOPO
     DASH --> AUDIT
+    IM --> EXEC
+    IM --> AUTHM
 
     L1 -.-> COMMON
+    L35 -.-> COMMON
     L2 -.-> COMMON
     L3 -.-> COMMON
     L4 -.-> COMMON
 ```
 
 依赖只朝一个方向流：**台账 ← 执行面 ← 聚合视图**。`dashboard` / `topo_mgr` 只读别人的表，不建自己的台账；`config_mgr` / `dashboard` 无模型。
+
+`im_mgr` 单向依赖 `task_exec` 与 `auth_mgr`，**反向一处都没有**：task_exec 不能知道
+飞书的存在，否则「装不装飞书」就成了执行链路的依赖。需要反向通知的地方（执行进度
+刷卡片）走 `task_exec.signals.execution_updated`——信号定义在 task_exec，订阅在
+im_mgr 的 `AppConfig.ready()`。
 
 ---
 

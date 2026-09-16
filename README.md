@@ -18,6 +18,7 @@
 | 任务执行 | 命令下发 / 调用平台方法执行，凭据管理，实时输出（均经 Ansible 调用） |
 | 构建制品 | Jenkins CI 完成后脚本上报压缩包（版本/md5，关联项目组/渠道/环境），CD 执行自动注入最新制品变量 |
 | 拓扑画布 | 按「项目组×渠道×环境×地域」画接入链路图：平台资源节点（主机/域名/解析/证书，实时状态）+ 外部资源节点（GA/负载均衡/CDN 手录），自动编排按维度拉平台已有资源并连出解析/落地关系，dagre 自动排版；影响面反查（主机/域名反查所在链路与上下游）、按维度克隆、导入导出 JSON；节点健康度（主机状态/Agent 在线/解析停用/证书天数）与值班模式（只读定时刷新+异常高亮），异常汇总进概览页 |
+| 飞书接入 | 群里 @机器人 选任务发起执行（生产强制二次确认卡，一次性票据限本人 60s）；执行进度就地刷同一张卡；暂停确认/失败待处理直接在飞书处理（页面发起的任务会私聊推给发起人）；飞书扫码登录（视为已过二次认证，sudo 仍要验证码）；回调走 IP 白名单 + 签名 + 时间戳 + nonce 四道校验 |
 | 操作审计 | 自动记录所有写操作（POST/PUT/PATCH/DELETE），多维过滤 |
 | 系统配置 | 键值对形式的全局配置管理 |
 | 概览首页 | 值班视角：异常（证书过期/卡死、域名与解析异常、失败执行、Agent 离线、拓扑画布异常节点）+ 待处理（暂停任务、DNS 待审批、MFA 未启用）+ 运行态 + 资产盘子（主机分布、服务规划三态、各环境当前制品版本）与近 7 天执行趋势（成功/失败分色）；区块可按人隐藏 |
@@ -132,6 +133,7 @@ devops-manager/
 │   ├── cloud_mgr/            # 云控（域名、解析审批、证书签发与分发）
 │   │   └── providers/        # 阿里云 / 腾讯云 DNS（零 SDK，直连 OpenAPI）
 │   ├── topo_mgr/             # 拓扑画布（画布/节点/边）
+│   ├── im_mgr/               # 飞书接入（回调验签、卡片交互、SSO、进度回显、绑定）
 │   └── portal_mgr/           # 内部导航页配置
 ├── common/                   # 公共工具（分页、响应、权限、数据范围、ansible、
 │                             #   jumpserver、加解密、TOTP、限速）
@@ -209,6 +211,11 @@ Authorization: Bearer <access_token>
 | POST | `/api/exec/tasks/{id}/rerun/` | 重新执行任务 |
 | GET | `/api/exec/tasks/{id}/output/` | 轮询任务状态与输出 |
 | GET/POST | `/api/exec/credentials/` | 连接凭据列表 / 创建（仅管理员） |
+| GET/PUT | `/api/feishu/app/` | 飞书应用配置（system write + sudo，密钥不回显） |
+| GET/POST | `/api/feishu/channels/` | 飞书会话白名单 |
+| GET/POST/DELETE | `/api/feishu/bindings/` | 飞书绑定关系（account write + sudo） |
+| GET/POST | `/api/feishu/sso/*` | 飞书登录：状态 / 授权地址 / 授权码换令牌 / 我的绑定 |
+| POST | `/api/feishu/callback/<slug>/{event,card}/` | 飞书回调（免登录，走签名校验，恒定回包） |
 
 完整接口文档见 [docs/backend/api-reference.md](docs/backend/api-reference.md) 或访问 `/api/docs/`。
 

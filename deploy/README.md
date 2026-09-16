@@ -260,6 +260,50 @@ docker compose --profile mysql up -d --build
    以上就绪并通知到位后，才在「系统配置」把 `mfa.enforce_scope` 从 `off` 改成
    `staff` 或 `all`。改完存量 token 因缺 `amr` 声明会被挡，所有人需重新登录一次。
 
+6. 接入飞书（可选）时**顺序不能反**，见下节。
+
+## 飞书接入上线顺序
+
+模块说明见 `docs/backend/modules/im_mgr.md`。顺序有硬依赖：**飞书后台一保存回调
+地址就会立刻发一次地址验证，而那次验证同样要过全部校验**。平台侧没准备好就去
+保存，验证必然失败，且回包是恒定的（安全要求），从飞书后台完全看不出原因——
+只能翻服务端日志。所以：
+
+1. 飞书开放平台建自建应用，拿到 App ID / App Secret / Encrypt Key /
+   Verification Token；申请权限：`im:message`、`im:message:send_as_bot`、
+   `im:chat:readonly`、`contact:user.base:readonly`、`contact:user.email:readonly`，
+   以及网页免登（`authen`）。事件订阅先**不填**回调地址。
+
+2. nginx 填回调来源 IP 白名单——飞书帮助中心「配置企业内网防火墙域名和 IP 白名单」：
+
+   ```bash
+   vim deploy/nginx/conf/snippets/feishu_callback_ips.conf   # ⚠ 该文件为空 = 拒绝所有回调
+   docker compose -f deploy/nginx/docker-compose.yaml exec nginx nginx -s reload
+   ```
+
+3. 平台「系统管理 → 飞书接入」录入四项凭据（加密落库，**不进 .env、不进仓库**），
+   填同一份 IP 白名单（应用层是主、nginx 是兜底），保存并勾选**启用飞书接入**。
+   缺项时页面会直接列出还差什么。
+
+4. 把页面上的**事件订阅地址**与**卡片回调地址**复制到飞书开放平台保存——
+   这一步才会触发地址验证。失败时看 `logs/`，不要看飞书后台的提示。
+
+5. 要用飞书登录：勾选**启用飞书登录**，并把 `https://<域名>/login/feishu` 加进
+   飞书后台的「重定向 URL」白名单。
+
+6. 「系统管理 → 飞书接入」登记允许交互的群/单聊（`chat_id`），需要从群里发起执行
+   的才勾「允许发起任务执行」。
+
+7. 任务侧逐条开放：任务编辑页勾「允许从飞书发起执行」（默认关，且要求
+   「执行时默认全选主机」）。
+
+8. 验证：群里 @机器人 → 出任务下拉 → 选一条非生产任务执行 → 卡片应随执行进度刷新。
+
+上线后 **把对话/工单里出现过的 App Secret 在飞书后台重置一次**，再到配置页重新录入。
+
+轮换回调地址（配置页上的「轮换回调地址」）会让旧地址**立即失效**，必须同步更新
+飞书后台，否则所有回调被拒。
+
 ## 日常更新
 
 **走 Jenkins CD（主路径）**：解包新制品后执行
