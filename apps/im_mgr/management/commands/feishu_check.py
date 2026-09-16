@@ -267,8 +267,14 @@ class Command(BaseCommand):
                                           receive_id_type=receive_id_type)
         except client.FeishuError as exc:
             self.stdout.write(BAD + f'发送失败：{exc}')
-            self.stdout.write(INFO + '常见原因：机器人不在该群 / 对方没跟机器人建立过会话、'
-                                     '或缺 im:message:send_as_bot 权限')
+            # 卡片 JSON 被拒时，「机器人不在群里」这类提示纯属误导——飞书自己
+            # 已经把出错的属性和路径指出来了，照着改就行
+            if 'card json' in str(exc).lower() or 'unknown property' in str(exc).lower():
+                self.stdout.write(INFO + '卡片结构被飞书拒了（严格校验，多一个属性都不行）：'
+                                         '按上面的 property / path 改卡片模板')
+            else:
+                self.stdout.write(INFO + '常见原因：机器人不在该群 / 对方没跟机器人建立过会话、'
+                                         '或缺 im:message:send_as_bot 权限')
             return True
         self.stdout.write(OK + f'已发出，message_id={message_id}')
         if probe_select:

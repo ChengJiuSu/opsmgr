@@ -352,7 +352,13 @@ def probe_multi_select(options, *, preselect=None):
     事：2.0 在这个企业的客户端渲染正常，以及提交时 `form_value` 的实际结构
     （文档对字段名讲得不清楚，照着猜写一版再返工不划算）。
 
-    默认选中两种写法都放进去，哪种生效一眼看得出来。
+    实测结论（2026-09-16）：**只认 `selected_values`**，`initial_options` 会被拒：
+
+        unknown property, property: initial_options, path: ROOT -> body ->
+        elements -> [1](tag: form) -> elements -> [0](tag: multi_select_static)
+
+    顺带确认了飞书的卡片 JSON 是**严格校验**——多一个属性整张卡都发不出去，
+    所以别为了「兼容」往里塞备选字段。
     """
     preselect = list(preselect if preselect is not None else [o['value'] for o in options])
     choices = [{'text': {'tag': 'plain_text', 'content': o['label']}, 'value': o['value']}
@@ -377,8 +383,6 @@ def probe_multi_select(options, *, preselect=None):
                                             'content': '选择主机（默认全选）'},
                             'options': choices,
                             'selected_values': preselect,
-                            'initial_options': [c for c in choices
-                                                if c['value'] in preselect],
                         },
                         {
                             'tag': 'button',
