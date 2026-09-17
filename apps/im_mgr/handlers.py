@@ -347,6 +347,8 @@ def handle_card_action(app, payload):
         return _on_confirm_prod(user, chat_id, open_id, value, message_id, p2p)
     if act == cards.ACT_PAUSE:
         return _on_pause(user, value)
+    if act == cards.ACT_SUDO:
+        return _on_sudo(user, open_id, value)
     if act == cards.ACT_PROBE:
         # 组件探针：把飞书回传的 action 原样打回去，用来确认多选组件的数据结构
         action = _event(payload).get('action') or payload.get('action') or {}
@@ -355,6 +357,29 @@ def handle_card_action(app, payload):
 
     logger.info('飞书卡片动作未识别：%s', value)
     return None
+
+
+def _on_sudo(user, open_id, value):
+    """在飞书上确认一次敏感操作。
+
+    这里**只把请求标记为已确认**，真正开 sudo 窗口由网页那边轮询时完成——
+    窗口要绑发起它的那个访问令牌 jti，而卡片回调里没有那条会话。
+    """
+    from .models import FeishuSudoRequest
+
+    row, error = FeishuSudoRequest.approve(value.get('token'), open_id)
+    if error:
+        return _reject('确认未通过', error)
+    if row.user_id != user.id:
+        # open_id 已经比过一次，这里兜住「绑定关系在这期间被改了」
+        return _reject('确认未通过', '只有发起人本人可以确认这次操作。')
+    logger.warning('用户 %s 经飞书确认了敏感操作：%s（来源 IP %s）',
+                   row.user.username, row.action or '-', row.client_ip or '-')
+    audit(user, {'act': 'sudo_confirm', 'action': row.action,
+                 'client_ip': row.client_ip})
+    return card_response(cards.handled('已确认，请回到页面继续操作',
+                                       by=user.username),
+                         toast='已确认', toast_type='success')
 
 
 def _load_task(task_id):

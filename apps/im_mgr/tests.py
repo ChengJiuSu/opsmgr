@@ -2963,3 +2963,164 @@ class FeishuBroadcastTests(TestCase):
         send = self._broadcast()
         self.assertEqual(send.call_args[0][0], 'ou_me')
         self.assertEqual(send.call_args[1]['receive_id_type'], 'open_id')
+
+
+@override_settings(FEISHU_SUDO_TTL=120)
+class FeishuSudoConfirmTests(TestCase):
+    """sudo 卡片确认：给「既没验证器也没可用密码」的账号一条路。"""
+
+    def setUp(self):
+        from apps.im_mgr.models import FeishuSudoRequest
+
+        cache.clear()
+        self.app = FeishuApp.load()
+        for key, value in FULL_CONFIG.items():
+            setattr(self.app, key, value)
+        self.app.enabled = True
+        self.app.save()
+        self.user = get_user_model().objects.create(username='sudo_ops', is_staff=True)
+        self.user.set_password(PASSWORD)
+        self.user.save()
+        FeishuBinding.objects.create(user=self.user, union_id='on_1', open_id='ou_1')
+        self.model = FeishuSudoRequest
+        self.client_ = self._login()
+
+    def _login(self):
+        api = APIClient()
+        resp = api.post('/api/auth/login/',
+                        {'username': 'sudo_ops', 'password': PASSWORD}, format='json')
+        api.credentials(HTTP_AUTHORIZATION='Bearer ' + resp.json()['access'])
+        return api
+
+    def _request_confirm(self, api=None):
+        api = api or self.client_
+        with patch('apps.im_mgr.client.send_card', return_value='om_sudo') as send:
+            resp = api.post('/api/feishu/sudo/', {'action': '修改系统配置'}, format='json')
+        return resp, send
+
+    def _approve(self, token, open_id='ou_1', union_id='on_1'):
+        payload = _card_payload({'act': cards.ACT_SUDO, 'token': token},
+                                open_id=open_id, union_id=union_id)
+        return handlers.handle_card_action(self.app, payload)
+
+    # ── 可用性判定 ────────────────────────────────────────
+    def test_available_when_no_authenticator(self):
+        data = self.client_.get('/api/feishu/sudo/').json()['data']
+        self.assertTrue(data['available'])
+
+    def test_not_available_when_authenticator_bound(self):
+        """绑了验证器就用验证器：卡片确认摩擦小，容易养成随手点的习惯。"""
+        from apps.auth_mgr.models import UserMFA
+
+        UserMFA.objects.create(user=self.user, enabled=True)
+        data = self.client_.get('/api/feishu/sudo/').json()['data']
+        self.assertFalse(data['available'])
+        self.assertIn('验证器', data['reason'])
+
+    def test_all_mode_allows_even_with_authenticator(self):
+        from apps.auth_mgr.models import UserMFA
+
+        UserMFA.objects.create(user=self.user, enabled=True)
+        FeishuApp.objects.filter(pk=FeishuApp.SINGLETON_PK).update(sudo_confirm='all')
+        self.assertTrue(self.client_.get('/api/feishu/sudo/').json()['data']['available'])
+
+    def test_off_mode(self):
+        FeishuApp.objects.filter(pk=FeishuApp.SINGLETON_PK).update(sudo_confirm='off')
+        self.assertFalse(self.client_.get('/api/feishu/sudo/').json()['data']['available'])
+
+    def test_unbound_user_cannot_use_it(self):
+        FeishuBinding.objects.all().delete()
+        resp = self.client_.post('/api/feishu/sudo/', {}, format='json')
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('未绑定飞书', resp.json()['msg'])
+
+    # ── 正常流程 ──────────────────────────────────────────
+    def test_full_flow_opens_sudo_window(self):
+        resp, send = self._request_confirm()
+        token = resp.json()['data']['token']
+        # 卡片发到本人私聊，且写明了操作与来源 IP
+        self.assertEqual(send.call_args[0][0], 'ou_1')
+        text = ''.join(_texts(send.call_args[0][1]))
+        self.assertIn('修改系统配置', text)
+        self.assertIn('127.0.0.1', text)
+
+        # 轮询：还没确认
+        self.assertEqual(
+            self.client_.get(f'/api/feishu/sudo/?token={token}').json()['data']['state'],
+            'pending')
+
+        self._approve(token)
+        granted = self.client_.get(f'/api/feishu/sudo/?token={token}').json()['data']
+        self.assertEqual(granted['state'], 'granted')
+
+        # 窗口真的开了：受 sudo 保护的接口现在放行
+        write = self.client_.put('/api/feishu/app/', {'remark': 'x'}, format='json')
+        self.assertEqual(write.status_code, 200)
+
+    def test_window_not_open_before_confirm(self):
+        self._request_confirm()
+        resp = self.client_.put('/api/feishu/app/', {'remark': 'x'}, format='json')
+        self.assertEqual(resp.json().get('error_code'), 'sudo_required')
+
+    # ── 安全边界 ──────────────────────────────────────────
+    def test_only_the_owner_can_approve(self):
+        other = get_user_model().objects.create(username='sudo_other')
+        FeishuBinding.objects.create(user=other, union_id='on_2', open_id='ou_2')
+        resp, _ = self._request_confirm()
+        token = resp.json()['data']['token']
+        reply = self._approve(token, open_id='ou_2', union_id='on_2')
+        self.assertIn('只有发起人本人', ''.join(_texts(reply['card']['data'])))
+        self.assertEqual(self.model.objects.get().state, 'pending')
+
+    def test_single_use(self):
+        """消费一次就完了：再轮询只报状态，不会第二次开窗口。"""
+        resp, _ = self._request_confirm()
+        token = resp.json()['data']['token']
+        self._approve(token)
+        first = self.client_.get(f'/api/feishu/sudo/?token={token}').json()['data']
+        self.assertEqual(first['state'], 'granted')
+        again = self.client_.get(f'/api/feishu/sudo/?token={token}').json()['data']
+        self.assertEqual(again['state'], 'consumed')
+        self.assertNotIn('expires_in', again)
+
+    def test_expired_request_rejected(self):
+        from django.utils import timezone
+
+        resp, _ = self._request_confirm()
+        token = resp.json()['data']['token']
+        self.model.objects.filter(token=token).update(
+            expires_at=timezone.now() - timedelta(seconds=1))
+        reply = self._approve(token)
+        self.assertIn('超时', ''.join(_texts(reply['card']['data'])))
+
+    def test_window_belongs_to_the_session_that_asked(self):
+        """A 会话发起、B 会话消费 = 把「刚刚证明过是本人」挪到了另一条会话上。"""
+        resp, _ = self._request_confirm()
+        token = resp.json()['data']['token']
+        self._approve(token)
+        other_session = self._login()      # 另一条会话（不同 jti）
+        reply = other_session.get(f'/api/feishu/sudo/?token={token}')
+        self.assertEqual(reply.status_code, 400)
+        self.assertIn('会话已变化', reply.json()['msg'])
+
+    def test_new_request_invalidates_the_previous_one(self):
+        """连点两次会收到两张卡；旧的那张还能用的话，过期时间等于被悄悄延长。"""
+        first, _ = self._request_confirm()
+        first_token = first.json()['data']['token']
+        self._request_confirm()
+        reply = self._approve(first_token)
+        self.assertIn('已处理过', ''.join(_texts(reply['card']['data'])))
+
+    def test_unknown_token(self):
+        reply = self._approve('nope')
+        self.assertIn('不存在', ''.join(_texts(reply['card']['data'])))
+
+    def test_send_failure_reported(self):
+        with patch('apps.im_mgr.client.send_card',
+                   side_effect=client.FeishuError('bot blocked')):
+            resp = self.client_.post('/api/feishu/sudo/', {}, format='json')
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('发送失败', resp.json()['msg'])
+
+    def test_requires_login(self):
+        self.assertEqual(APIClient().get('/api/feishu/sudo/').status_code, 401)

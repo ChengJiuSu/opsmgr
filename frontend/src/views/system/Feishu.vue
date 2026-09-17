@@ -96,6 +96,18 @@
           机器人自定义菜单、私聊 @机器人 都走这个开关；群里仍按会话白名单
         </span>
       </el-form-item>
+      <el-form-item label="sudo 卡片确认">
+        <el-radio-group v-model="form.sudo_confirm">
+          <el-radio value="off">关闭</el-radio>
+          <el-radio value="fallback">仅未绑验证器</el-radio>
+          <el-radio value="all">所有人</el-radio>
+        </el-radio-group>
+        <div class="tip">
+          敏感操作二次验证时，允许在飞书上点一下代替输验证码。
+          默认只兜底给没有其他手段的账号（飞书自动建号的没有可用密码）——
+          卡片确认摩擦小，容易养成随手点的习惯，而 MFA fatigue 正是靠这个得手。
+        </div>
+      </el-form-item>
       <el-form-item label="未绑定时自动建号">
         <el-switch v-model="form.auto_create_user" @change="onAutoCreateChange" />
         <span class="tip inline danger" v-if="form.auto_create_user">
@@ -287,6 +299,7 @@ const form = reactive({
   ip_unrestricted: false, ip_whitelist: '',
   enabled: false, sso_enabled: false, sso_redirect_uri: '',
   allow_p2p_execute: false, auto_create_user: false, remark: '',
+  sudo_confirm: 'fallback',
 })
 
 const defaultRedirect = computed(() => `${window.location.origin}/login/feishu`)
@@ -306,6 +319,7 @@ async function loadApp() {
       sso_enabled: res.data.sso_enabled,
       sso_redirect_uri: res.data.sso_redirect_uri || '',
       allow_p2p_execute: res.data.allow_p2p_execute,
+      sudo_confirm: res.data.sudo_confirm || 'fallback',
       auto_create_user: res.data.auto_create_user,
       remark: res.data.remark || '',
     })

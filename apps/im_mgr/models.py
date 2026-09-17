@@ -73,6 +73,18 @@ class FeishuApp(models.Model):
     # 单聊天然一对一、只有绑定用户本人可见，群里那种「谁都能点」的风险不存在，
     # 但「只许从运维群发起、不许私聊发起」是合理诉求，所以仍要管理员点头
     allow_p2p_execute = models.BooleanField('允许单聊发起执行', default=False)
+
+    SUDO_CHOICES = [
+        ('off', '关闭'),
+        ('fallback', '仅未绑定验证器的用户'),
+        ('all', '所有人'),
+    ]
+    # 敏感操作二次验证（sudo）可否用飞书卡片确认代替验证码。
+    # 默认 fallback：飞书点一下比翻验证器摩擦小，容易养成「随手确认」的习惯，
+    # 而 MFA fatigue 正是靠这个得手的。绑了验证器的人用验证器，没有其他手段的
+    # （飞书自动建号、没有可用密码）才走卡片——那类账号否则连配置页都改不了
+    sudo_confirm = models.CharField('sudo 卡片确认', max_length=20,
+                                    choices=SUDO_CHOICES, default='fallback')
     # 飞书账号在平台里找不到对应用户时是否自动建号。默认关：开了等于全公司飞书
     # 员工都能进后台，而「谁能进平台」不该由通讯录决定
     auto_create_user = models.BooleanField('未绑定用户时自动创建', default=False)
@@ -446,3 +458,105 @@ class FeishuCardMessage(models.Model):
 
     def __str__(self):
         return f'log={self.log_id} msg={self.message_id}'
+
+
+class FeishuSudoRequest(models.Model):
+    """sudo 卡片确认的一次待确认请求。
+
+    解决的问题：`SudoView` 要求验证器验证码，没绑则回退登录密码——而飞书登录
+    自动创建的账号**两者都没有**（不设可用密码是刻意的），于是做不了任何配置面的
+    写操作。给这类账号一条「在飞书上确认一次」的路。
+
+    安全上与生产执行确认同一套做法：一次性、限本人 `open_id`、短过期，并且
+    **绑定发起它的那个会话**（`jti`）——否则 A 会话发起、B 会话消费，等于把
+    「刚刚证明过是本人」这件事挪到了另一条会话上。
+
+    卡片上写明**请求来源 IP、时间与要做的操作**：卡片确认的摩擦比翻验证器小，
+    容易被随手点掉，写清楚是唯一能让人「看一眼再点」的手段。
+    """
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, verbose_name='用户', on_delete=models.CASCADE,
+        related_name='feishu_sudo_requests',
+    )
+    token = models.CharField('票据', max_length=64, unique=True)
+    # 发起这次请求的访问令牌 jti：sudo 窗口就是按它开的（见 common/sudo.py）
+    jti = models.CharField('会话标识', max_length=64)
+    open_id = models.CharField('飞书 OpenID', max_length=128)
+    action = models.CharField('操作说明', max_length=200, blank=True)
+    client_ip = models.CharField('请求来源 IP', max_length=64, blank=True)
+    expires_at = models.DateTimeField('过期时间')
+    approved_at = models.DateTimeField('确认时间', null=True, blank=True)
+    consumed_at = models.DateTimeField('消费时间', null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = '飞书 sudo 确认'
+        verbose_name_plural = '飞书 sudo 确认'
+        db_table = 'im_feishu_sudo_request'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'{self.user_id}#{self.token[:8]}…'
+
+    @property
+    def expired(self):
+        from django.utils import timezone
+
+        return self.expires_at <= timezone.now()
+
+    @property
+    def state(self):
+        """pending / approved / consumed / expired。"""
+        if self.consumed_at:
+            return 'consumed'
+        if self.approved_at:
+            return 'approved'
+        return 'expired' if self.expired else 'pending'
+
+    @classmethod
+    def issue(cls, user, jti, open_id, ttl_seconds, action='', client_ip=''):
+        from django.utils import timezone
+
+        now = timezone.now()
+        cls.objects.filter(expires_at__lt=now - timedelta(days=1)).delete()
+        # 同一会话的旧请求作废：留着的话，用户连点两次会收到两张卡，
+        # 点了旧的那张也能开窗口，等于过期时间被悄悄延长
+        cls.objects.filter(user=user, jti=jti, consumed_at__isnull=True).update(
+            consumed_at=now)
+        return cls.objects.create(
+            user=user, token=secrets.token_urlsafe(24), jti=jti or '',
+            open_id=open_id or '', action=action[:200], client_ip=client_ip[:64],
+            expires_at=now + timedelta(seconds=ttl_seconds),
+        )
+
+    @classmethod
+    def approve(cls, token, open_id):
+        """飞书侧点确认；返回 (请求, 中文错误)。"""
+        from django.utils import timezone
+
+        row = cls.objects.select_related('user').filter(token=str(token or '')).first()
+        if row is None:
+            return None, '确认请求不存在，请回到页面重新发起。'
+        if row.open_id and row.open_id != (open_id or ''):
+            return None, '只有发起人本人可以确认这次操作。'
+        if row.consumed_at:
+            return None, '该确认已处理过。'
+        if row.approved_at:
+            return None, '已确认过了，请回到页面继续操作。'
+        if row.expired:
+            return None, '确认已超时，请回到页面重新发起。'
+        updated = cls.objects.filter(pk=row.pk, approved_at__isnull=True,
+                                     consumed_at__isnull=True).update(
+            approved_at=timezone.now())
+        if not updated:
+            return None, '该确认已处理过。'
+        row.refresh_from_db()
+        return row, None
+
+    def consume(self):
+        """标记为已消费（开完 sudo 窗口后调用），返回是否由本次消费掉。"""
+        from django.utils import timezone
+
+        return bool(type(self).objects.filter(
+            pk=self.pk, consumed_at__isnull=True).update(consumed_at=timezone.now()))

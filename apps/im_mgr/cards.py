@@ -25,6 +25,7 @@ ACT_CANCEL = 'cancel'             # 取消
 ACT_PAUSE = 'pause'               # 暂停处理（continue/abort/retry/skip）
 ACT_PICK_HOSTS = 'pick_hosts'     # 展开主机多选（默认全选）
 ACT_RUN_SELECTED = 'run_selected'  # 表单提交：按勾选的主机执行
+ACT_SUDO = 'sudo'                 # 敏感操作二次验证：在飞书上确认
 ACT_PROBE = 'probe'               # 组件探针：回显飞书实际回传的 action 结构
 
 #: 主机多选组件里最多列这么多台。超过就只给「全部执行」并提示去页面挑——
@@ -446,6 +447,33 @@ def host_select(task, servers, *, p2p=False, selected=None):
         ],
         template='red' if is_prod(task) else 'blue',
     )
+
+
+# ── 敏感操作确认（sudo）────────────────────────────────────
+
+def sudo_confirm(request_obj, ttl_seconds):
+    """sudo 卡片：在飞书上确认一次敏感操作。
+
+    **把「谁、从哪、要做什么、什么时候」四件事全写在卡上**。卡片确认的摩擦比翻
+    验证器小得多，容易被随手点掉，而 MFA fatigue 攻击正是靠这个得手——写清楚是
+    唯一能让人「看一眼再点」的手段。来源 IP 尤其重要：不是自己发起的操作，
+    IP 一眼就能看出不对。
+    """
+    from common.timeutil import local_dt
+
+    return card('敏感操作确认', [
+        md(f'**{esc(request_obj.action) or "配置面写操作"}**'),
+        md(f'**账号**：{esc(request_obj.user.username)}\n'
+           f'**来源 IP**：{esc(request_obj.client_ip) or "未知"}\n'
+           f'**发起时间**：{local_dt(request_obj.created_at) or ""}'),
+        hr(),
+        actions(
+            button('确认是我操作的',
+                   {'act': ACT_SUDO, 'token': request_obj.token}, style='primary'),
+            button('不是我', {'act': ACT_CANCEL}, style='danger'),
+        ),
+        note(f'{ttl_seconds} 秒内有效。**不是你本人发起的，请立即改密码并联系管理员。**'),
+    ], template='orange')
 
 
 # ── 组件探针 ──────────────────────────────────────────────

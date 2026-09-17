@@ -364,6 +364,9 @@ FEISHU_AUTHORIZE_PATH = config(
 # 生产执行的二次确认票据有效期（秒）。短是刻意的：这张卡的意义是「当场确认」，
 # 留久了就变成一张可以被翻出来再点一次的按钮
 FEISHU_CONFIRM_TTL = config('FEISHU_CONFIRM_TTL', default=60, cast=int)
+# sudo 卡片确认的有效期（秒）。比生产执行确认长一些：那张卡是「当场确认」，
+# 这张要等人从网页切到飞书再切回来
+FEISHU_SUDO_TTL = config('FEISHU_SUDO_TTL', default=120, cast=int)
 FEISHU_TIMEOUT = (
     config('FEISHU_CONNECT_TIMEOUT', default=5, cast=int),
     config('FEISHU_READ_TIMEOUT', default=10, cast=int),

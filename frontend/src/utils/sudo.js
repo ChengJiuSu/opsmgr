@@ -11,6 +11,9 @@ import { reactive } from 'vue'
 
 export const sudoState = reactive({
   visible: false,
+  // 这次要做什么（拦截器按请求方法+路径填），只用于飞书确认卡上的展示——
+  // 卡片确认的摩擦比翻验证器小，写清楚「要做什么、从哪来」才有人看一眼再点
+  action: '',
   loading: false,      // 正在查窗口状态（决定输验证码还是密码）
   mfaEnabled: false,   // true=输验证码，false=输登录密码（后端按此校验）
   submitting: false,
@@ -39,8 +42,9 @@ let pending = null      // 进行中的验证 Promise，并发请求共用
 let resolvePending = null
 
 /** 返回 Promise<boolean>：true=已验过可重放，false=用户取消。 */
-export function requestSudo() {
+export function requestSudo(action = '') {
   if (pending) return pending
+  sudoState.action = action
   // 该输验证码还是密码由弹窗打开时向后端确认（GET /api/auth/mfa/sudo/）：
   // 用户可能刚在别处绑定了 MFA，本地缓存的 user 是旧的
   sudoState.visible = true

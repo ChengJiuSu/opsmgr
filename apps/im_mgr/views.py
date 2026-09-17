@@ -24,15 +24,17 @@ from rest_framework.throttling import SimpleRateThrottle
 from rest_framework.views import APIView
 
 from apps.auth_mgr.permissions import module_perm
+from common import sudo
 from common.pagination import StandardPagination
 from common.ratelimit import blocked_seconds, record_failure, reset
 from common.request import auth_client_ip, client_ip
 from common.response import fail, ok
 from common.sudo import SudoRequired
 
-from . import client, crypto, dedupe, handlers, sso
+from . import cards, client, crypto, dedupe, handlers, sso
+from . import tasks as im_tasks
 from .client import FeishuError
-from .models import FeishuApp, FeishuBinding, FeishuChannel
+from .models import FeishuApp, FeishuBinding, FeishuChannel, FeishuSudoRequest
 from .serializers import (
     FeishuAppSerializer,
     FeishuBindingSerializer,
@@ -475,3 +477,91 @@ class FeishuBindingViewSet(mixins.ListModelMixin,
         return ok({'union_id': ids.get('union_id', ''),
                    'open_id': ids.get('open_id', ''),
                    'name': name, 'email': email, 'mobile': mobile})
+
+
+class FeishuSudoView(APIView):
+    """敏感操作二次验证的飞书确认通道。
+
+    - `GET  /api/feishu/sudo/`  当前用户能不能用这条路（登录页/弹框据此渲染入口）
+    - `POST /api/feishu/sudo/` 发起一次确认，推卡片到本人私聊
+    - `GET  /api/feishu/sudo/?token=…` 轮询状态；已确认则**当场开 sudo 窗口**
+
+    为什么开窗口放在轮询这一步：sudo 窗口绑的是发起它的那个访问令牌 `jti`
+    （见 common/sudo.py），而卡片回调里没有那条会话——飞书那边只负责「确认这是
+    本人」，窗口必须由本人的网页会话来领。
+    """
+
+    @extend_schema(responses=OpenApiTypes.OBJECT)
+    def get(self, request):
+        token = request.query_params.get('token')
+        if not token:
+            return ok(self._availability(request.user))
+        row = FeishuSudoRequest.objects.filter(
+            token=token, user=request.user).first()
+        if row is None:
+            return fail('确认请求不存在，请重新发起。')
+        if row.state != 'approved':
+            return ok({'state': row.state})
+        return self._grant(request, row)
+
+    @extend_schema(request=OpenApiTypes.OBJECT, responses=OpenApiTypes.OBJECT)
+    def post(self, request):
+        available = self._availability(request.user)
+        if not available['available']:
+            return fail(available['reason'])
+
+        jti = sudo.token_jti(request)
+        if not jti:
+            # 非 JWT 认证（机器接口）不该走到这里；给明确原因而不是静默失败
+            return fail('当前认证方式不支持二次验证。')
+        ttl = getattr(settings, 'FEISHU_SUDO_TTL', 120)
+        binding = FeishuBinding.objects.filter(user=request.user).first()
+        row = FeishuSudoRequest.issue(
+            request.user, jti, binding.open_id, ttl,
+            action=str(request.data.get('action') or '')[:200],
+            client_ip=client_ip(request) or '',
+        )
+        message_id = im_tasks.send_card(binding.open_id, cards.sudo_confirm(row, ttl),
+                                        receive_id_type='open_id')
+        if not message_id:
+            return fail('确认卡片发送失败，请改用验证码或稍后重试。')
+        logger.info('用户 %s 发起飞书 sudo 确认（%s）', request.user.username, row.action or '-')
+        return ok({'token': row.token, 'expires_in': ttl})
+
+    @staticmethod
+    def _availability(user):
+        """这条路对当前用户开不开。
+
+        默认只兜底给「没有别的手段」的人：绑了验证器就用验证器——卡片确认的摩擦
+        比翻验证器小，容易养成随手确认的习惯，而 MFA fatigue 正是靠这个得手。
+        """
+        from apps.auth_mgr import services
+
+        app = FeishuApp.load()
+        mode = app.sudo_confirm
+        if not app.is_ready() or mode == 'off':
+            return {'available': False, 'reason': '未开启飞书确认。'}
+        if not FeishuBinding.objects.filter(user=user, open_id__gt='').exists():
+            return {'available': False, 'reason': '当前账号未绑定飞书。'}
+        if mode == 'fallback' and services.is_enabled(user):
+            return {'available': False,
+                    'reason': '已绑定验证器，请使用验证器上的动态码。'}
+        return {'available': True, 'reason': ''}
+
+    @staticmethod
+    def _grant(request, row):
+        """确认已到位：开窗口。"""
+        jti = sudo.token_jti(request)
+        if jti != row.jti:
+            # 换了会话（刷新页面重登、并发另一个标签页）：窗口只能开给发起它的那条
+            return fail('登录会话已变化，请重新发起确认。')
+        if not row.consume():
+            return fail('该确认已使用过，请重新发起。')
+        try:
+            ttl = sudo.grant(request.user.pk, jti)
+        except Exception:  # noqa: BLE001 - 缓存不可用时明确拒绝（fail-closed）
+            logger.exception('sudo 窗口写入失败：user=%s', request.user.username)
+            return fail('二次验证服务暂不可用（缓存故障），请稍后再试。',
+                        status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        logger.info('用户 %s 经飞书确认开启 sudo 窗口（%ss）', request.user.username, ttl)
+        return ok({'state': 'granted', 'expires_in': ttl}, msg='二次验证通过')

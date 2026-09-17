@@ -28,3 +28,8 @@ export const createBinding = (data) => request.post('/api/feishu/bindings/', dat
 export const deleteBinding = (id) => request.delete(`/api/feishu/bindings/${id}/`)
 // 按邮箱/手机号在飞书通讯录里反查 union_id / open_id（手工绑定用）
 export const lookupFeishuUser = (data) => request.post('/api/feishu/bindings/lookup/', data)
+
+// ── 敏感操作二次验证（sudo）的飞书确认通道 ──
+// 无 token = 查当前用户能不能用这条路；带 token = 轮询状态，已确认则当场开窗口
+export const getFeishuSudo = (params) => request.get('/api/feishu/sudo/', { params })
+export const requestFeishuSudo = (data) => request.post('/api/feishu/sudo/', data)

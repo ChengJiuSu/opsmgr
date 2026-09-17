@@ -22,6 +22,27 @@ const NO_REFRESH_PATHS = ['/api/auth/login/', '/api/auth/token/refresh/', '/api/
 
 let refreshing = null   // 进行中的刷新请求，并发 401 共用同一个 Promise
 
+// 受 sudo 保护的路径 → 人话。用于飞书确认卡的展示，认不出就退回方法+路径
+const SUDO_ACTIONS = [
+  ['/api/feishu/app/', '修改飞书接入配置'],
+  ['/api/feishu/channels/', '修改飞书会话白名单'],
+  ['/api/feishu/bindings/', '修改飞书绑定关系'],
+  ['/api/auth/users/', '修改用户'],
+  ['/api/auth/roles/', '修改角色权限'],
+  ['/api/auth/api-credentials/', '修改 API 凭证'],
+  ['/api/system/configs/', '修改系统配置'],
+  ['/api/cloud/accounts/', '修改云账号'],
+  ['/api/exec/credentials/', '修改连接凭据'],
+  ['/api/agents/', '修改 Agent'],
+]
+
+function describeAction(config) {
+  const url = config?.url || ''
+  const hit = SUDO_ACTIONS.find(([prefix]) => url.startsWith(prefix))
+  if (hit) return hit[1]
+  return `${String(config?.method || '').toUpperCase()} ${url}`
+}
+
 function clearAuth() {
   localStorage.removeItem('access_token')
   localStorage.removeItem('refresh_token')
@@ -101,7 +122,9 @@ request.interceptors.response.use(
       const errorCode = error.response?.data?.error_code
       // 敏感操作（配置面写操作）：弹二次验证框，验过后重放原请求
       if (errorCode === 'sudo_required' && !config._sudoRetried) {
-        if (await requestSudo()) {
+        // 带上「这次要做什么」：飞书确认卡上要写清楚，否则那张卡只剩一个
+        // 「确认吗」的按钮，等于没确认
+        if (await requestSudo(describeAction(config))) {
           config._sudoRetried = true
           return await request(config)
         }

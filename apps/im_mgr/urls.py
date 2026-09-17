@@ -12,6 +12,7 @@ from .views import (
     FeishuSsoAuthorizeView,
     FeishuSsoCallbackView,
     FeishuSsoStatusView,
+    FeishuSudoView,
 )
 
 router = DefaultRouter()
@@ -34,6 +35,8 @@ urlpatterns = [
     path('sso/authorize/', FeishuSsoAuthorizeView.as_view(), name='feishu-sso-authorize'),
     path('sso/callback/', FeishuSsoCallbackView.as_view(), name='feishu-sso-callback'),
     path('sso/binding/', FeishuMyBindingView.as_view(), name='feishu-my-binding'),
+    # 敏感操作二次验证的飞书确认通道（需登录）
+    path('sudo/', FeishuSudoView.as_view(), name='feishu-sudo'),
 
     path('app/', FeishuAppView.as_view(), name='feishu-app'),
     path('app/rotate-slug/', FeishuAppCallbackSlugView.as_view(), name='feishu-app-rotate-slug'),

@@ -39,6 +39,25 @@
         />
       </el-form-item>
     </el-form>
+    <!-- 飞书确认：给「既没验证器、也没有可用密码」的账号一条路
+         （飞书登录自动创建的账号就是这种）。等待期间禁掉表单，避免两条路同时走 -->
+    <div v-if="feishu.available" class="feishu-row">
+      <el-divider class="feishu-divider">或</el-divider>
+      <el-button
+        style="width:100%"
+        :loading="feishu.waiting"
+        :disabled="sudoState.submitting"
+        @click="startFeishu"
+      >
+        <el-icon style="margin-right:6px"><ChatDotRound /></el-icon>
+        {{ feishu.waiting ? `已发到飞书，等待确认…（${feishu.left}s）` : '用飞书确认' }}
+      </el-button>
+      <div v-if="feishu.waiting" class="feishu-tip">
+        在飞书上点「确认是我操作的」。
+        <b>不是你发起的就点「不是我」</b>，并立即修改密码。
+      </div>
+    </div>
+
     <template #footer>
       <el-button @click="cancel">取消</el-button>
       <el-button type="primary" :loading="sudoState.submitting" @click="submit">
@@ -49,9 +68,11 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, nextTick } from 'vue'
+import { ref, reactive, computed, watch, nextTick, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
+import { ChatDotRound } from '@element-plus/icons-vue'
 import { getSudoStatus, grantSudo } from '../api/auth'
+import { getFeishuSudo, requestFeishuSudo } from '../api/feishu'
 import { sudoState, settleSudo, markGranted } from '../utils/sudo'
 
 const code = ref('')
@@ -61,6 +82,9 @@ const password = ref('')
 let lastSubmitted = ''
 const inputRef = ref()
 const ttl = ref(600)
+// 飞书确认：available 由后端判（未绑定 / 已绑验证器 / 未开启都会关掉这条路）
+const feishu = reactive({ available: false, waiting: false, left: 0 })
+let feishuTimer = null
 
 const visible = computed({
   get: () => sudoState.visible,
@@ -85,9 +109,59 @@ watch(() => sudoState.visible, async (open) => {
   } finally {
     sudoState.loading = false
   }
+  stopFeishu()
+  try {
+    feishu.available = !!(await getFeishuSudo()).data?.available
+  } catch {
+    feishu.available = false
+  }
   await nextTick()
   inputRef.value?.focus()
 })
+
+async function startFeishu() {
+  feishu.waiting = true
+  let token = ''
+  try {
+    const res = await requestFeishuSudo({ action: sudoState.action || '配置面写操作' })
+    token = res.data.token
+    feishu.left = res.data.expires_in || 120
+  } catch {
+    feishu.waiting = false
+    return
+  }
+  // 轮询而不是等推送：这条链路上没有 WebSocket，而 2 秒一次、最多两分钟的开销，
+  // 远小于为它单拉一条长连接
+  feishuTimer = setInterval(async () => {
+    feishu.left -= 2
+    if (feishu.left <= 0) {
+      stopFeishu()
+      ElMessage.warning('飞书确认已超时，请重试')
+      return
+    }
+    let data
+    try {
+      data = (await getFeishuSudo({ token })).data
+    } catch {
+      stopFeishu()          // 票据失效/会话变了，后端已给出提示
+      return
+    }
+    if (data.state !== 'granted') return
+    stopFeishu()
+    ttl.value = data.expires_in || ttl.value
+    markGranted(ttl.value)
+    settleSudo(true)
+  }, 2000)
+}
+
+function stopFeishu() {
+  if (feishuTimer) clearInterval(feishuTimer)
+  feishuTimer = null
+  feishu.waiting = false
+  feishu.left = 0
+}
+
+onUnmounted(stopFeishu)
 
 function onCodeInput(value) {
   // 只留数字（管理器填充常带空格），满 6 位自动提交
@@ -122,6 +196,7 @@ async function submit() {
 }
 
 function cancel() {
+  stopFeishu()
   settleSudo(false)
 }
 
@@ -130,3 +205,22 @@ function onClosed() {
   sudoState.submitting = false
 }
 </script>
+
+<style scoped>
+.feishu-row {
+  margin-top: -6px;
+}
+.feishu-divider {
+  margin: 4px 0 12px;
+}
+.feishu-divider :deep(.el-divider__text) {
+  color: #909399;
+  font-size: 12px;
+}
+.feishu-tip {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #909399;
+  line-height: 1.6;
+}
+</style>
