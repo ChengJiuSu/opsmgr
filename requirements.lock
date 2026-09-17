@@ -210,3 +210,25 @@ wcwidth==0.8.3
     # via prompt-toolkit
 zope-interface==8.6
     # via twisted
+
+# ── 以下为手工补入（飞书长连接 lark-oapi 及其依赖）────────────────────────
+# 本地跑不了 pip-compile（mysqlclient 要在 builder 容器里编），而不补的话目标机
+# 按本文件安装时不会装 lark-oapi，长连接进程起不来（ModuleNotFoundError）。
+# 下次在 builder 容器里 `make lock USE_DOCKER=true` 会把它们并入正文并排好序，
+# 届时本段可删。回调模式不需要这些包，装上也无害。
+anyio==4.15.1
+    # via httpx
+h11==0.16.0
+    # via httpcore
+httpcore==1.0.9
+    # via httpx
+httpx==0.28.1
+    # via lark-oapi
+lark-oapi==1.7.3
+    # via -r requirements.txt
+pycryptodome==3.23.0
+    # via lark-oapi
+requests-toolbelt==1.0.0
+    # via lark-oapi
+websockets==15.0.1
+    # via lark-oapi

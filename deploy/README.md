@@ -324,6 +324,15 @@ tail -f logs/feishu-ws.log      # 应看到「飞书长连接启动」
 进程没起来时的现象：群里 @机器人 毫无反应，且服务端**没有任何回调日志**——因为
 根本没有入站请求。先看 `logs/feishu-ws.log`。
 
+常见启动失败：
+
+| 报错 | 原因 |
+|------|------|
+| `ModuleNotFoundError: No module named 'lark_oapi'` | 依赖没装。源码树 `pip install -r requirements.lock`；CD 路径要重建 wheelhouse |
+| `当前事件接收方式是「回调」` | 平台侧还没切。页面上改，或 shell 里 `FeishuApp.load()` 改 `event_mode='websocket'` |
+| `TASK_EXEC_BACKEND=sync 与长连接不能共存` | `.env` 改成 `TASK_EXEC_BACKEND=celery` |
+| `飞书接入未就绪` | App ID / Secret 没配齐（长连接模式下只要这两项） |
+
 ### 飞书后台要配的四处
 
 在[飞书开放平台](https://open.feishu.cn/app)建**自建应用**，下面四处都要配，
