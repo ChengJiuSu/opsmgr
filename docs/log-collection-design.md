@@ -192,7 +192,7 @@ ISO 输出，因此原样出、由 Vector 解析成 `_time`：
 aggregator 的价值在于收敛连接数和集中做转换，现在两者都不构成问题，多一层就多一个
 故障点。
 
-配置文件在 [`deploy/log-server/vector.toml`](../deploy/log-server/vector.toml)
+配置文件在 [`deploy/log-server/vector.yaml`](../deploy/log-server/vector.yaml)
 （各机差异靠 systemd 的 `EnvironmentFile` 注入，不为每台机维护一份配置）。
 安装步骤与权限要求见 [`deploy/log-server/README.md`](../deploy/log-server/README.md)。
 
@@ -215,21 +215,27 @@ aggregator 的价值在于收敛连接数和集中做转换，现在两者都不
 
 ## 5. VictoriaLogs 侧（P1）
 
-systemd unit 在 [`deploy/log-server/victoria-logs.service`](../deploy/log-server/victoria-logs.service)，鉴权入口在 [`deploy/log-server/nginx-vlogs.conf.example`](../deploy/log-server/nginx-vlogs.conf.example)。
+systemd unit 在 [`deploy/log-server/victoria-logs.service`](../deploy/log-server/victoria-logs.service)，采集端配置见 [`deploy/log-server/README.md`](../deploy/log-server/README.md)。
 
 - 单机 `victoria-logs` 二进制即可，关键启动参数：
   - `-retentionPeriod=30d`——先定 30 天，看实际磁盘增长再调；
   - `-retention.maxDiskSpaceUsagePercent=80`——保留期之外的硬兜底，磁盘写满
     比日志少存几天严重得多；
-  - `-storageDataPath=` 指到数据盘，别用系统盘。
-- 查询：内置 vmui 在 `:9428/select/vmui`；Grafana 装 VictoriaLogs datasource 插件。
+  - `-storageDataPath=/home/homelab/data/victoria-logs`——这台机的数据盘挂在 `/home` 下，不用 `/var/lib`；
+    systemd 的 `ProtectHome=false` 与 `ReadWritePaths` 必须跟着一致。
+- 查询：内置 vmui 在 `http://<内网IP>:9428/select/vmui/`；Grafana 装 VictoriaLogs datasource 插件。
 
-> **安全：VictoriaLogs 自身没有认证。**`9428` 端口直接暴露 =
-> 全部日志可被任意读取，且 `/insert/*` 可被任意写入（伪造日志淹没真实记录）。
-> 上线前必须：
-> 1. 放在 nginx（basic auth / mTLS）或 vmauth 之后，**不直接暴露 9428**；
-> 2. 防火墙只放行各 Vector agent 的出口 IP 与运维查询来源；
-> 3. 采集链路用 HTTPS——日志里有内网 IP、路径、用户名，明文传等于沿途泄露。
+> **认证：内网环境，已决定不做**（无鉴权层、无 basic auth、采集链路走 HTTP）。
+>
+> VictoriaLogs 自身没有任何认证机制，所以这个决定意味着访问控制完全落在网络
+> 边界上：能连到 9428 的人即可读全部日志，也可往 `/insert/*` 写任意内容
+> （伪造日志淹没真实记录——需要查的时候恰好查不到）。
+>
+> 因此剩下的唯一控制点是监听地址：`-httpListenAddr` 写具体内网 IP，不要写
+> `:9428`（等价于 `0.0.0.0`）。日志服务器若有公网网卡，这一条就是公网与否的
+> 分界线。部署后核 `ss -lntp | grep 9428`。
+>
+> 若日后要开到内网之外，把 nginx basic auth / vmauth 补回来再说。
 
 ## 6. 查询示例（LogsQL）
 
@@ -255,7 +261,7 @@ _time:24h parse_error:true | stats count() by (host, service)
 | 期 | 内容 | 状态 |
 |---|---|---|
 | P0 | Django JSONFormatter、request_id 串联、日志文件按进程拆分、prod 去重、nginx/gunicorn JSON 格式 | **已完成** |
-| P1 | 部署 VictoriaLogs（含认证）、各机装 Vector、采应用 + nginx + gunicorn、nginx error log 解析 | 配置文件已备（`deploy/log-server/`），**未实机部署验证** |
+| P1 | 部署 VictoriaLogs（内网不做认证）、各机装 Vector、采应用 + nginx + gunicorn、nginx error log 解析 | 配置文件已备（`deploy/log-server/`），**未实机部署验证** |
 | P2 | 任务执行日志（脱敏 + 剥 ANSI）、ops-agent 主机接入 | 待做 |
 | P3 | 审计双写、Grafana 面板、vmalert 告警（ERROR 突增、5xx 比率） | 待做 |
 
