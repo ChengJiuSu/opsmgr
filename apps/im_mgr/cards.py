@@ -424,14 +424,28 @@ def probe_multi_select(options, *, preselect=None):
 
 
 def probe_result(action):
-    """把飞书回传的 action 原样展示出来（用 1.0，只是展示，不需要交互）。"""
+    """把飞书回传的 action 原样展示出来。
+
+    **必须是 2.0**：这张卡是用来替换那张 2.0 探针卡的，而一条消息的卡片版本不能
+    中途换——回调里塞一张 1.0 卡去更新 2.0 消息，飞书会直接报错（客户端上表现为
+    「出错了，请稍后重试 code: 200673」或干脆点了没反应）。
+    """
     import json as _json
 
     body = _json.dumps(action, ensure_ascii=False, indent=2)[:1500].replace('`', "'")
-    return card('探针回传', [
-        md('飞书这次回传的 action：'),
-        md(f'```\n{body}\n```'),
-    ], template='grey')
+    return {
+        'schema': '2.0',
+        'config': {'width_mode': 'fill', 'update_multi': True},
+        'header': {'title': {'tag': 'plain_text', 'content': '探针回传'},
+                   'template': 'grey'},
+        'body': {
+            'direction': 'vertical',
+            'elements': [
+                {'tag': 'markdown', 'content': '飞书这次回传的 action：'},
+                {'tag': 'markdown', 'content': f'```\n{body}\n```'},
+            ],
+        },
+    }
 
 
 # ── 主机勾选（卡片 2.0 表单）──────────────────────────────
