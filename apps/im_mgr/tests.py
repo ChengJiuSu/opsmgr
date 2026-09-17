@@ -2954,3 +2954,12 @@ class FeishuBroadcastTests(TestCase):
             tasks.broadcast(self.log.id)
         self.log.refresh_from_db()
         self.assertEqual(self.log.status, 'failed')
+
+    def test_personal_open_id_target(self):
+        """只用单聊的人同样要能收播报——单聊的 chat_id 拿不到，用 open_id 登记。"""
+        FeishuChannel.objects.all().delete()
+        FeishuChannel.objects.create(chat_id='ou_me', name='我', chat_type='p2p',
+                                     notify_enabled=True)
+        send = self._broadcast()
+        self.assertEqual(send.call_args[0][0], 'ou_me')
+        self.assertEqual(send.call_args[1]['receive_id_type'], 'open_id')

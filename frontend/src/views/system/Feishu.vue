@@ -197,7 +197,11 @@
   <el-dialog v-model="channelVisible" :title="editRow ? '编辑会话' : '新增会话'" width="520px">
     <el-form ref="channelFormRef" :model="channelForm" :rules="channelRules" label-width="120px">
       <el-form-item label="会话 ID" prop="chat_id">
-        <el-input v-model="channelForm.chat_id" placeholder="oc_xxx（群）/ ou_xxx（单聊对象）" />
+        <el-input v-model="channelForm.chat_id" placeholder="oc_xxx（群）/ ou_xxx（个人）" />
+        <div class="tip">
+          群 ID 用 <code>manage.py feishu_check --chats</code> 列出（飞书界面上不显示）；
+          个人订阅直接填对方的 open_id。
+        </div>
       </el-form-item>
       <el-form-item label="会话名称" prop="name">
         <el-input v-model="channelForm.name" maxlength="100" />

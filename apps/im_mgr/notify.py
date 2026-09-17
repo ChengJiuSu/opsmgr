@@ -207,7 +207,8 @@ def broadcast(log_id):
     for channel in targets:
         if channel.chat_id == bound:
             continue
-        tasks.send_card(channel.chat_id, card)
+        tasks.send_card(channel.chat_id, card,
+                        receive_id_type=channel.receive_id_type)
 
 
 def refresh(log_id):

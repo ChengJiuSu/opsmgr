@@ -212,7 +212,9 @@ class FeishuChannel(models.Model):
         ('all', '全部结果'),
     ]
 
-    chat_id = models.CharField('会话 ID', max_length=128, unique=True)
+    # 群用 chat_id（oc_…），也接受个人 open_id（ou_…）——只用单聊的人同样需要
+    # 收播报，而单聊的 chat_id 飞书界面上和 im/v1/chats 都拿不到
+    chat_id = models.CharField('会话 ID / 个人 OpenID', max_length=128, unique=True)
     name = models.CharField('会话名称', max_length=100)
     chat_type = models.CharField('会话类型', max_length=20, choices=TYPE_CHOICES, default='group')
     allow_execute = models.BooleanField('允许发起任务执行', default=False)
@@ -244,6 +246,11 @@ class FeishuChannel(models.Model):
 
     def __str__(self):
         return f'{self.name}({self.chat_id})'
+
+    @property
+    def receive_id_type(self):
+        """发消息时的收件人类型。飞书的 open_id 固定 `ou_` 前缀，群是 `oc_`。"""
+        return 'open_id' if str(self.chat_id).startswith('ou_') else 'chat_id'
 
     @classmethod
     def broadcast_targets(cls, task, status):
