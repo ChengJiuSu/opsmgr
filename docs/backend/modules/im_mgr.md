@@ -3,7 +3,28 @@
 **路由前缀：** `/api/feishu/`
 **App Label：** `im_mgr`
 
----
+> 本文讲**设计与实现**。怎么在飞书后台配、上线顺序、排错对照表见
+> [deploy/README.md 的「飞书接入」](../../../deploy/README.md#飞书接入)；
+> 页面部分见 [飞书接入页](../../frontend/views/system-feishu.md)、
+> [飞书绑定页](../../frontend/views/system-feishu-bindings.md)、
+> [飞书授权回调页](../../frontend/views/login-feishu.md)。
+
+## 本文导航
+
+| 看什么 | 去哪 |
+|--------|------|
+| 这个模块管什么、边界在哪 | [职责](#职责) |
+| 六张表分别存什么 | [数据模型](#数据模型) |
+| 回调怎么验、为什么回包恒定 | [入站：回调](#入站回调) |
+| token 怎么缓存、卡片为什么是 2.0 | [出站：客户端与卡片](#出站客户端与卡片) |
+| 飞书登录与 MFA 的关系 | [飞书登录（SSO）](#飞书登录ssopy) |
+| 谁能从哪发起执行 | [执行准入](#执行准入accesspy) |
+| 选任务 → 执行 → 生产确认 → 勾主机 | [交互链路](#交互链路handlerspy) |
+| 进度刷新与群播报 | [进度回显与播报](#进度回显与播报notifypy) |
+| 暂停确认怎么在飞书处理 | [暂停处理](#暂停处理) |
+| 没验证器的账号怎么做敏感操作 | [sudo 卡片确认](#sudo-卡片确认) |
+| 接口有哪些、权限怎么挂 | [权限与接口](#权限) |
+| 联调自检、怎么拿 chat_id | [自检命令](#自检命令) |
 
 ## 职责
 
@@ -49,7 +70,7 @@ apps/im_mgr/
 
 ---
 
-## 模型
+## 数据模型
 
 ### FeishuApp（单例，pk 恒为 1）
 
@@ -132,7 +153,12 @@ apps/im_mgr/
 
 ---
 
-## 回调校验（crypto.py）
+
+## 入站：回调
+
+回调是本平台唯一「任何人都能直接 POST」的公网入口，这一段的每一行都直接影响它的安全性。
+
+### 回调校验（crypto.py）
 
 任何人都能直接 POST 那两条公网地址，路径随机串只是让扫描器打不到入口，**真正
 的门是验签**。`verify_callback(app, timestamp, nonce, signature, body)` 一次做完，
@@ -147,7 +173,7 @@ apps/im_mgr/
 | 4 | 解密 | AES-256-CBC，key = `sha256(encrypt_key)`，IV 取密文前 16 字节 |
 | 5 | Verification Token | 兼容 `header.token`（v2 事件）与顶层 `token`（url_verification / 旧版卡片回调） |
 
-### 地址验证是例外（联调踩到的）
+#### 地址验证是例外（联调踩到的）
 
 **飞书不给事件订阅的地址验证请求带签名头**——那一步它只想确认你能解密并回显
 challenge。实现最初把签名放在最前面、对验证请求也强制要求，结果飞书后台永远显示
@@ -183,7 +209,7 @@ challenge。实现最初把签名放在最前面、对验证请求也强制要�
 
 ---
 
-## 回调入口（views.py）
+### 回调入口（views.py）
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
@@ -219,25 +245,24 @@ card 回 `{}`），失败原因只进日志。回包有差异本身就是一份�
 
 ---
 
-## nginx（deploy/nginx）
+### nginx
 
 ```
 conf/templates/ops_manager.conf.template   # limit_req_zone + 回调 location
-conf/snippets/feishu_callback_ips.conf     # 来源 IP 白名单（⚠ 待填）
+conf/snippets/feishu_callback_ips.conf     # 来源 IP 白名单
 ```
 
-三处要点：
+三处要点（配置步骤见 [deploy/README](../../../deploy/README.md#飞书接入)）：
 
-- 回调 location **必须排在 `~ ^/(api|admin)/` 之前**。nginx 的正则 location 按
-  定义顺序匹配，写在后面就永远命中不到，IP 白名单与限速全部失效，且没有任何报错。
+- 回调 location **必须排在 `~ ^/(api|admin)/` 之前**。nginx 的正则 location 按定义
+  顺序匹配，写在后面就永远命中不到，IP 白名单与限速全部失效，**且没有任何报错**。
 - 正则里的 `{32}` **必须放在引号内**，否则 nginx 把裸的 `{ }` 当配置块边界。
 - `feishu_callback_ips.conf` **为空 = 拒绝所有回调**（后面紧跟 `deny all;`）。
-  上线前必须填入飞书公布的回调出口 IP 段并 reload；调试期可临时 `allow all;`，
-  应用层白名单与签名校验仍然生效。
+  顺序上先填白名单再让配置生效，反了会把已经跑通的回调全部挡死。
 
----
+## 出站：客户端与卡片
 
-## 出站客户端（client.py）
+### 出站客户端（client.py）
 
 所有出站调用统一从这里走。
 
@@ -266,13 +291,158 @@ conf/snippets/feishu_callback_ips.conf     # 来源 IP 白名单（⚠ 待填）
 
 `content` 字段必须是 JSON **字符串**而不是对象，传对象飞书报参数非法。
 
-### 相关配置（settings / .env）
+#### 相关配置（settings / .env）
 
 | 配置项 | 默认 | 说明 |
 |--------|------|------|
 | `FEISHU_BASE_URL` | `https://open.feishu.cn` | Lark（海外）改 `open.larksuite.com` |
 | `FEISHU_TRUST_ENV` | `True` | 是否吃环境代理。与 `common/jumpserver.py` 的 `trust_env=False` 相反——那边目标在内网 |
 | `FEISHU_CONNECT_TIMEOUT` / `FEISHU_READ_TIMEOUT` | 5 / 10 | 卡片回调要 3 秒内回包，真正的发卡走异步任务 |
+
+---
+
+### 出站异步（tasks.py）
+
+需要**主动发卡**的路径（事件回调）走 `tasks.dispatch_send_card`：回调线程里发一次
+出站 HTTP，少则几百毫秒、多则撞上飞书抖动直接把回调拖超时，飞书随即重试，同一件
+事就被处理两次。调度后端沿用 `TASK_EXEC_BACKEND`（thread / celery / sync），与
+task_exec、cloud_mgr 同一套口径。**失败只记日志**——飞书发不出去是飞书的事，
+绝不能影响任务执行本身。
+
+### 卡片模板（cards.py）
+
+**纯函数**：入参是普通对象，出参是可直接 `json.dumps` 的 dict。不碰数据库、
+不发请求——卡片是这套交互里最容易反复改的部分，保持可单测、改起来才不用提心吊胆。
+
+#### 全部是卡片 2.0
+
+**一条消息的卡片版本不能中途切换**：在 1.0 消息的回调里返回 2.0 卡片（反之亦然）
+会被飞书拒掉，客户端上表现为「出错了，请稍后重试 code: 200673」或干脆点了没反应。
+所以整套统一 2.0，没有混用的余地。
+
+升 2.0 的直接动因是**主机勾选需要表单容器**：1.0 的交互组件各自独立回调，点「执行」
+时拿不到之前选了什么，只能在服务端暂存选择状态——多一份会过期、会串会话的状态。
+
+真机撞出来的 2.0 规则（每条都对应一次失败）：
+
+| 规则 | 报错 |
+|------|------|
+| 骨架是 `schema` + `body.elements`，不是顶层 `elements` | — |
+| 文本用 `markdown`，没有 `div` + `lark_md` 嵌套 | — |
+| **没有 `note` 标签** | `cards of schema V2 no longer support this capability` |
+| **没有 `action` 容器**，横排用 `column_set` | — |
+| 回调值在 `behaviors[].value`，顶层 `value` 不再接受 | — |
+| 多选默认值只认 `selected_values` | `unknown property: initial_options` |
+
+飞书的卡片 JSON 是**严格校验且逐个报错**——多一个未知属性整张卡都发不出去，每次
+只告诉你第一个问题。所以别为了「兼容」往里塞备选字段，塞了就是下一次报错。排错时
+看 `ErrPath`：它精确到元素下标与标签名。
+
+| 函数 | 用途 |
+|------|------|
+| `task_picker(tasks)` | 任务下拉；列表为空时**不渲染下拉**，只给说明 |
+| `task_detail(task, server_count, step_count)` | 确认卡；0 台主机时只给「重新选择」 |
+| `production_confirm(task, …, token, ttl)` | 生产二次确认（红标题，写死环境名与主机数） |
+| `progress(task, log)` | 执行进度，随 `steps_result` 刷新同一条消息 |
+| `result(task, log, tail=…)` | 终态；失败附日志尾段与失败模块名 |
+| `pause(task, log, pause_type, …)` | 暂停处理：continue/abort 或 retry/skip/abort |
+| `handled(text, by=…)` | 动作处理后的定格卡，按钮换成结论 |
+| `notice(title, content)` | 拒绝原因等通用提示 |
+
+按钮回传值约定 `{'act': 动作, ...}`，动作常量在模块顶部，handlers 从这里 import。
+**value 只放标识不放状态**：卡片可能被翻出来重点，状态必须以库里为准。
+
+三条硬约束（都是会出事的地方）：
+
+- **用户内容一律走 `esc()`**：任务名里一个 `*` 或 `` ` `` 就能把卡片的 markdown
+  结构带歪。飞书的 lark_md 不支持反斜杠转义，所以用全角同形字符替换。
+- **日志尾段要剥反引号**：贴进代码块的日志若自带 ```` ``` ````，围栏会提前闭合，
+  后面的内容直接当 markdown 渲染出去。
+- **模块列表要截断**（`MAX_STEPS_SHOWN`）：卡片有大小上限，50 个模块的任务流
+  全渲染会超。测试里用「50 模块 + 超长名字 + 10KB 日志」压着这条线。
+
+生产二次确认的文案**写死环境名与主机数**：确认的意义在于让人看清自己在对什么
+下手，只写「确认执行吗」等于没确认。按钮上那个飞书原生 `confirm` 弹窗不承担
+安全职责——它只是客户端提示，拦不住重放，真正的确认是带一次性 token 的第二张卡。
+
+---
+
+## 飞书登录（sso.py）
+
+```
+GET  /api/feishu/sso/status/      登录页据此决定是否渲染「飞书登录」（公开，只回布尔）
+GET  /api/feishu/sso/authorize/   取授权跳转地址 + 一次性 state
+POST /api/feishu/sso/callback/    {code, state} → {access, refresh}
+GET  /api/feishu/sso/binding/     当前用户的绑定状态（个人页展示，只读）
+```
+
+`binding` **不提供自助解绑**：自动创建的账号没有可用密码，解绑后就再也进不来了。
+解绑属于管理动作，放在用户管理里（T11）。`union_id` 只回显尾段——它是内部标识，
+展示只为让人确认「绑的是我这个飞书号」。
+
+**不需要为 SSO 额外开放公网**：授权码由用户浏览器带回，飞书服务器不访问回调
+地址；换 token 是平台的**出站**请求。所以 `sso_redirect_uri` 是给浏览器用的前端
+路由（默认 `/login/feishu`），与 `/api/feishu/callback/` 那两条入站入口无关。
+
+身份落地顺序：
+
+1. `union_id` → `open_id` 查 `FeishuBinding`；
+2. 查不到则按**企业邮箱**唯一匹配平台账号（个人邮箱是用户自己填的，拿它匹配等于
+   让用户自选绑定对象），匹配到多个一律放弃；
+3. 仍无：`auto_create_user` 关（默认）→ 明确拒绝并提示找管理员；开 → 建账号，
+   **不设可用密码、不给角色**（落到无角色分支：只读矩阵、无执行能力）。
+
+停用账号与服务账号一律拒登。`state` 后端签发、缓存 5 分钟、用掉即删，防登录 CSRF；
+缓存不可用时**拒绝登录**（fail-closed）——这是登录路径。回调按来源 IP 限速，与
+密码登录同一套 `common.ratelimit` 参数。
+
+`FEISHU_AUTHORIZE_PATH` 单独抽成配置项：飞书文档上这条地址换过名字（旧版是
+`/open-apis/authen/v1/index`），真换了改一行就行。
+
+### MFA 口径
+
+飞书登录签发的令牌 `amr=['sso']`，被 `MfaJWTAuthentication` 视为**已过第二因子**
+（`auth_mgr.services.AMR_STRONG`）。理由：飞书登录本身已经是「受信设备上的飞书
+客户端 + 飞书自身的二次验证」，再叠一层本平台 TOTP 是重复劳动。
+
+**但 sudo 窗口不吃这一条**：改凭据 / 用户 / 系统配置仍要当场证明是本人——绑了
+TOTP 用 TOTP，没绑的回退密码。登录一次能用 60 分钟而 sudo 只有 10 分钟，两者防的
+不是同一件事。由此推出一个刻意的结果：**自动创建的账号没有可用密码，做不了配置面
+的写操作**，那类账号本就不该直接拿到配置权限。
+
+本地密码登录始终保留——飞书挂了要能进平台。管理员账号建议保留密码 + TOTP。
+
+---
+
+## 执行准入（access.py）
+
+飞书那边所有「能不能跑」的判断都走这里，**不在 handlers/cards 里各写一段**。
+四道闸叠加，任一不过即拒：
+
+| 序 | 闸 | 说明 |
+|----|----|------|
+| 1 | `ExecutionTask.im_enabled` | 默认关。开放哪几条任务是一次有意识的选择，不能全挂群里 |
+| 2 | `default_select_all` | 飞书里没法逐模块勾主机；关掉默认全选的任务本就是要求人工确认（与接口触发同口径） |
+| 3 | 会话白名单 | `FeishuChannel.executable(chat_id)`：未登记 / 停用 / 只收播报的会话都不给执行入口 |
+| 4 | 人的权限 | 直接调 `task_exec.trigger.permission_error`（能力位 → 生产环境 → 数据范围），**不另写一份** |
+
+`im_enabled` 与 `default_select_all` 的依赖关系在 `ExecutionTaskSerializer.validate`
+里也拦一道，页面上勾不出非法组合；`access.check` 仍然兜一次存量数据与直接改库的情况。
+
+**鉴权按点按钮的人判，不是按发卡片的人**：群里的卡片谁都看得见、按钮谁都点得到。
+调用方必须先把 `open_id` 解析成平台 User（`FeishuBinding`），拿不到就传 `None`，
+`check()` 直接拒。
+
+`available_tasks(user, chat_id)` 给卡片的任务下拉用，只做「列得出来」的收窄
+（任务属性 + 数据范围）；真正发起前仍要过一次 `check()`。
+
+`needs_production_confirm(task)` 决定要不要走生产二次确认卡片——机器触发没有
+「弹窗再确认」这一步，把确认动作前移到卡片上（一次性 token、限发起人本人、
+60 秒有效，T8）。
+
+第四道为什么要复用而不是新写：飞书这条路最容易被当成「内部工具」而放松，
+它恰恰是最该跟页面一样严的。`permission_error` 因此从 `task_exec/views.py`
+移到了 `task_exec/trigger.py`——那里本来就是页面执行与接口触发的共用入口。
 
 ---
 
@@ -361,71 +531,10 @@ chat_id**（菜单不属于任何会话，只能按操作人 open_id 私聊回�
 - **3 秒内回包**。按钮动作全部在响应体里直接回新卡片
   （`{'card': {'type': 'raw', 'data': …}, 'toast': …}`），一次往返搞定，不发出站请求。
 
-### 群播报（notify.broadcast）
 
-执行终态播报给订阅了的会话。**与卡片刷新互不依赖**：页面发起的执行没有卡片，
-但它的失败同样该让值班的人看见——这正是播报存在的理由。
+## 进度回显与播报（notify.py）
 
-三条规矩：
-
-- **只播一次**：终态可能被重复广播（状态推送与模块表写入各来一次），缓存标记挡住
-  重复。缓存不可用时**宁可多播一条**——漏播的代价是没人知道生产挂了（与 nonce
-  判重的 fail-closed 刻意相反）。
-- **跳过已经有卡片的那个会话**：从飞书发起的执行，那张卡已经在群里刷成终态了，
-  再播一条一模一样的是纯噪声。
-- **默认只播失败**，成功要 `notify_scope='all'` 才播。
-
-播报内容复用终态卡（`cards.result`）：失败附日志尾段与失败模块名，带「查看完整
-日志」链接。播报没有按钮——它是通知，不是操作入口。
-
-### 暂停处理（收益最大的一张卡）
-
-在此之前，任务卡在 `paused` 必须有人盯着页面。现在两条路都能处理：
-
-- **从飞书发起的执行**：那张卡就地刷成处理卡（`continue/abort` 或
-  `retry/skip/abort`），不另发消息；
-- **页面发起的执行**：转 `paused` 时私聊推一张处理卡给发起人，并把这条消息绑到
-  本次执行上——后续进度与终态照常就地刷新，私聊里也是同一条消息在变。
-
-页面发起的执行**平时不打扰**（没绑卡片就短路），只有「需要人处理」时才推送。
-推送只推一次：失败重试后再次失败会重复广播 `paused`，缓存标记挡住重复，真正的
-去重是绑定关系——绑上之后就走刷新那条路了。
-
-失败待处理的卡片附日志尾段，等待确认的不附：等待确认不是失败，贴一段日志只会
-让人以为出错了。
-
-**不判会话白名单**（`access.check_pause`）：这张卡可能是私聊推过来的，那个会话
-不可能在白名单里。白名单管的是「哪些会话能把执行入口摆出来」，而这里处理的是一次
-**已经发起**的执行。但人的权限一道不能少——`continue/retry/skip` 都会让剩余模块
-真的跑起来，只在发起那头拦等于留了个后门（页面的 confirm 接口也是同一道口径）。
-
-动作校验复用 `task_exec.trigger.apply_pause_action`（从 `views.confirm` 抽出）：
-动作与暂停类型是否匹配这道校验各写一份的话，早晚有一边让 `failed` 状态收到一个
-`continue` 信号。状态判定用条件更新，两人同时点只有一次生效。
-
-还多一道**旧卡片**校验：任务本体的 `paused` 只属于最近一次执行，拿上一次执行留下
-的卡片去点等于对着另一次执行下指令。
-
-### 出站异步（tasks.py）
-
-需要**主动发卡**的路径（事件回调）走 `tasks.dispatch_send_card`：回调线程里发一次
-出站 HTTP，少则几百毫秒、多则撞上飞书抖动直接把回调拖超时，飞书随即重试，同一件
-事就被处理两次。调度后端沿用 `TASK_EXEC_BACKEND`（thread / celery / sync），与
-task_exec、cloud_mgr 同一套口径。**失败只记日志**——飞书发不出去是飞书的事，
-绝不能影响任务执行本身。
-
-### 审计
-
-回调路径整段在 `audit/middleware.SKIP_PATHS` 里，但「谁从飞书发起了执行」由
-`handlers.audit()` 手写一条补上，只在识别出操作人之后记，记的是动作本身
-（任务、log_id、模块数、主机数、是否经过生产确认）而不是那坨密文。
-
-审计里的 `path` **刻意不带 `callback_slug`**：审计的读权限比系统配置宽，把回调
-地址的随机串写进去等于把那层共享密钥降级保管。
-
----
-
-## 进度回显（notify.py）
+### 执行进度
 
 订阅 `task_exec.signals.execution_updated`（在 `live.publish_steps` /
 `live.push_status` 处广播），把「该刷卡片了」异步丢出去。
@@ -455,6 +564,51 @@ im_mgr 的存在，否则「装不装飞书」就成了执行链路的依赖，�
 「查看完整日志」链接用 `SITE_BASE_URL` 拼执行详情页。
 
 ---
+
+### 群播报
+
+执行终态播报给订阅了的会话。**与卡片刷新互不依赖**：页面发起的执行没有卡片，
+但它的失败同样该让值班的人看见——这正是播报存在的理由。
+
+三条规矩：
+
+- **只播一次**：终态可能被重复广播（状态推送与模块表写入各来一次），缓存标记挡住
+  重复。缓存不可用时**宁可多播一条**——漏播的代价是没人知道生产挂了（与 nonce
+  判重的 fail-closed 刻意相反）。
+- **跳过已经有卡片的那个会话**：从飞书发起的执行，那张卡已经在群里刷成终态了，
+  再播一条一模一样的是纯噪声。
+- **默认只播失败**，成功要 `notify_scope='all'` 才播。
+
+播报内容复用终态卡（`cards.result`）：失败附日志尾段与失败模块名，带「查看完整
+日志」链接。播报没有按钮——它是通知，不是操作入口。
+
+## 暂停处理（收益最大的一张卡）
+
+在此之前，任务卡在 `paused` 必须有人盯着页面。现在两条路都能处理：
+
+- **从飞书发起的执行**：那张卡就地刷成处理卡（`continue/abort` 或
+  `retry/skip/abort`），不另发消息；
+- **页面发起的执行**：转 `paused` 时私聊推一张处理卡给发起人，并把这条消息绑到
+  本次执行上——后续进度与终态照常就地刷新，私聊里也是同一条消息在变。
+
+页面发起的执行**平时不打扰**（没绑卡片就短路），只有「需要人处理」时才推送。
+推送只推一次：失败重试后再次失败会重复广播 `paused`，缓存标记挡住重复，真正的
+去重是绑定关系——绑上之后就走刷新那条路了。
+
+失败待处理的卡片附日志尾段，等待确认的不附：等待确认不是失败，贴一段日志只会
+让人以为出错了。
+
+**不判会话白名单**（`access.check_pause`）：这张卡可能是私聊推过来的，那个会话
+不可能在白名单里。白名单管的是「哪些会话能把执行入口摆出来」，而这里处理的是一次
+**已经发起**的执行。但人的权限一道不能少——`continue/retry/skip` 都会让剩余模块
+真的跑起来，只在发起那头拦等于留了个后门（页面的 confirm 接口也是同一道口径）。
+
+动作校验复用 `task_exec.trigger.apply_pause_action`（从 `views.confirm` 抽出）：
+动作与暂停类型是否匹配这道校验各写一份的话，早晚有一边让 `failed` 状态收到一个
+`continue` 信号。状态判定用条件更新，两人同时点只有一次生效。
+
+还多一道**旧卡片**校验：任务本体的 `paused` 只属于最近一次执行，拿上一次执行留下
+的卡片去点等于对着另一次执行下指令。
 
 ## sudo 卡片确认
 
@@ -487,140 +641,15 @@ GET  /api/feishu/sudo/?token=…    轮询；已确认则**当场开 sudo 窗口
 
 ---
 
-## 卡片模板（cards.py）
 
-**纯函数**：入参是普通对象，出参是可直接 `json.dumps` 的 dict。不碰数据库、
-不发请求——卡片是这套交互里最容易反复改的部分，保持可单测、改起来才不用提心吊胆。
+## 审计
 
-### 全部是卡片 2.0
+回调路径整段在 `audit/middleware.SKIP_PATHS` 里，但「谁从飞书发起了执行」由
+`handlers.audit()` 手写一条补上，只在识别出操作人之后记，记的是动作本身
+（任务、log_id、模块数、主机数、是否经过生产确认）而不是那坨密文。
 
-**一条消息的卡片版本不能中途切换**：在 1.0 消息的回调里返回 2.0 卡片（反之亦然）
-会被飞书拒掉，客户端上表现为「出错了，请稍后重试 code: 200673」或干脆点了没反应。
-所以整套统一 2.0，没有混用的余地。
-
-升 2.0 的直接动因是**主机勾选需要表单容器**：1.0 的交互组件各自独立回调，点「执行」
-时拿不到之前选了什么，只能在服务端暂存选择状态——多一份会过期、会串会话的状态。
-
-真机撞出来的 2.0 规则（每条都对应一次失败）：
-
-| 规则 | 报错 |
-|------|------|
-| 骨架是 `schema` + `body.elements`，不是顶层 `elements` | — |
-| 文本用 `markdown`，没有 `div` + `lark_md` 嵌套 | — |
-| **没有 `note` 标签** | `cards of schema V2 no longer support this capability` |
-| **没有 `action` 容器**，横排用 `column_set` | — |
-| 回调值在 `behaviors[].value`，顶层 `value` 不再接受 | — |
-| 多选默认值只认 `selected_values` | `unknown property: initial_options` |
-
-飞书的卡片 JSON 是**严格校验且逐个报错**——多一个未知属性整张卡都发不出去，每次
-只告诉你第一个问题。所以别为了「兼容」往里塞备选字段，塞了就是下一次报错。排错时
-看 `ErrPath`：它精确到元素下标与标签名。
-
-| 函数 | 用途 |
-|------|------|
-| `task_picker(tasks)` | 任务下拉；列表为空时**不渲染下拉**，只给说明 |
-| `task_detail(task, server_count, step_count)` | 确认卡；0 台主机时只给「重新选择」 |
-| `production_confirm(task, …, token, ttl)` | 生产二次确认（红标题，写死环境名与主机数） |
-| `progress(task, log)` | 执行进度，随 `steps_result` 刷新同一条消息 |
-| `result(task, log, tail=…)` | 终态；失败附日志尾段与失败模块名 |
-| `pause(task, log, pause_type, …)` | 暂停处理：continue/abort 或 retry/skip/abort |
-| `handled(text, by=…)` | 动作处理后的定格卡，按钮换成结论 |
-| `notice(title, content)` | 拒绝原因等通用提示 |
-
-按钮回传值约定 `{'act': 动作, ...}`，动作常量在模块顶部，handlers 从这里 import。
-**value 只放标识不放状态**：卡片可能被翻出来重点，状态必须以库里为准。
-
-三条硬约束（都是会出事的地方）：
-
-- **用户内容一律走 `esc()`**：任务名里一个 `*` 或 `` ` `` 就能把卡片的 markdown
-  结构带歪。飞书的 lark_md 不支持反斜杠转义，所以用全角同形字符替换。
-- **日志尾段要剥反引号**：贴进代码块的日志若自带 ```` ``` ````，围栏会提前闭合，
-  后面的内容直接当 markdown 渲染出去。
-- **模块列表要截断**（`MAX_STEPS_SHOWN`）：卡片有大小上限，50 个模块的任务流
-  全渲染会超。测试里用「50 模块 + 超长名字 + 10KB 日志」压着这条线。
-
-生产二次确认的文案**写死环境名与主机数**：确认的意义在于让人看清自己在对什么
-下手，只写「确认执行吗」等于没确认。按钮上那个飞书原生 `confirm` 弹窗不承担
-安全职责——它只是客户端提示，拦不住重放，真正的确认是带一次性 token 的第二张卡。
-
----
-
-## 执行准入（access.py）
-
-飞书那边所有「能不能跑」的判断都走这里，**不在 handlers/cards 里各写一段**。
-四道闸叠加，任一不过即拒：
-
-| 序 | 闸 | 说明 |
-|----|----|------|
-| 1 | `ExecutionTask.im_enabled` | 默认关。开放哪几条任务是一次有意识的选择，不能全挂群里 |
-| 2 | `default_select_all` | 飞书里没法逐模块勾主机；关掉默认全选的任务本就是要求人工确认（与接口触发同口径） |
-| 3 | 会话白名单 | `FeishuChannel.executable(chat_id)`：未登记 / 停用 / 只收播报的会话都不给执行入口 |
-| 4 | 人的权限 | 直接调 `task_exec.trigger.permission_error`（能力位 → 生产环境 → 数据范围），**不另写一份** |
-
-`im_enabled` 与 `default_select_all` 的依赖关系在 `ExecutionTaskSerializer.validate`
-里也拦一道，页面上勾不出非法组合；`access.check` 仍然兜一次存量数据与直接改库的情况。
-
-**鉴权按点按钮的人判，不是按发卡片的人**：群里的卡片谁都看得见、按钮谁都点得到。
-调用方必须先把 `open_id` 解析成平台 User（`FeishuBinding`），拿不到就传 `None`，
-`check()` 直接拒。
-
-`available_tasks(user, chat_id)` 给卡片的任务下拉用，只做「列得出来」的收窄
-（任务属性 + 数据范围）；真正发起前仍要过一次 `check()`。
-
-`needs_production_confirm(task)` 决定要不要走生产二次确认卡片——机器触发没有
-「弹窗再确认」这一步，把确认动作前移到卡片上（一次性 token、限发起人本人、
-60 秒有效，T8）。
-
-第四道为什么要复用而不是新写：飞书这条路最容易被当成「内部工具」而放松，
-它恰恰是最该跟页面一样严的。`permission_error` 因此从 `task_exec/views.py`
-移到了 `task_exec/trigger.py`——那里本来就是页面执行与接口触发的共用入口。
-
----
-
-## 飞书登录（sso.py）
-
-```
-GET  /api/feishu/sso/status/      登录页据此决定是否渲染「飞书登录」（公开，只回布尔）
-GET  /api/feishu/sso/authorize/   取授权跳转地址 + 一次性 state
-POST /api/feishu/sso/callback/    {code, state} → {access, refresh}
-GET  /api/feishu/sso/binding/     当前用户的绑定状态（个人页展示，只读）
-```
-
-`binding` **不提供自助解绑**：自动创建的账号没有可用密码，解绑后就再也进不来了。
-解绑属于管理动作，放在用户管理里（T11）。`union_id` 只回显尾段——它是内部标识，
-展示只为让人确认「绑的是我这个飞书号」。
-
-**不需要为 SSO 额外开放公网**：授权码由用户浏览器带回，飞书服务器不访问回调
-地址；换 token 是平台的**出站**请求。所以 `sso_redirect_uri` 是给浏览器用的前端
-路由（默认 `/login/feishu`），与 `/api/feishu/callback/` 那两条入站入口无关。
-
-身份落地顺序：
-
-1. `union_id` → `open_id` 查 `FeishuBinding`；
-2. 查不到则按**企业邮箱**唯一匹配平台账号（个人邮箱是用户自己填的，拿它匹配等于
-   让用户自选绑定对象），匹配到多个一律放弃；
-3. 仍无：`auto_create_user` 关（默认）→ 明确拒绝并提示找管理员；开 → 建账号，
-   **不设可用密码、不给角色**（落到无角色分支：只读矩阵、无执行能力）。
-
-停用账号与服务账号一律拒登。`state` 后端签发、缓存 5 分钟、用掉即删，防登录 CSRF；
-缓存不可用时**拒绝登录**（fail-closed）——这是登录路径。回调按来源 IP 限速，与
-密码登录同一套 `common.ratelimit` 参数。
-
-`FEISHU_AUTHORIZE_PATH` 单独抽成配置项：飞书文档上这条地址换过名字（旧版是
-`/open-apis/authen/v1/index`），真换了改一行就行。
-
-### MFA 口径
-
-飞书登录签发的令牌 `amr=['sso']`，被 `MfaJWTAuthentication` 视为**已过第二因子**
-（`auth_mgr.services.AMR_STRONG`）。理由：飞书登录本身已经是「受信设备上的飞书
-客户端 + 飞书自身的二次验证」，再叠一层本平台 TOTP 是重复劳动。
-
-**但 sudo 窗口不吃这一条**：改凭据 / 用户 / 系统配置仍要当场证明是本人——绑了
-TOTP 用 TOTP，没绑的回退密码。登录一次能用 60 分钟而 sudo 只有 10 分钟，两者防的
-不是同一件事。由此推出一个刻意的结果：**自动创建的账号没有可用密码，做不了配置面
-的写操作**，那类账号本就不该直接拿到配置权限。
-
-本地密码登录始终保留——飞书挂了要能进平台。管理员账号建议保留密码 + TOTP。
+审计里的 `path` **刻意不带 `callback_slug`**：审计的读权限比系统配置宽，把回调
+地址的随机串写进去等于把那层共享密钥降级保管。
 
 ---
 
@@ -663,8 +692,18 @@ open_id。查不到就明说「通讯录里没有」，**不返回半个 id**—
 | GET/POST | `/api/feishu/bindings/` | 绑定关系列表 / 手工绑定（**account** write + sudo） |
 | DELETE | `/api/feishu/bindings/<id>/` | 解绑 |
 | POST | `/api/feishu/bindings/lookup/` | 按邮箱/手机号在飞书通讯录反查 union_id / open_id |
+| GET | `/api/feishu/sso/status/` | 登录页据此决定是否渲染「飞书登录」（**公开**，只回布尔） |
+| GET | `/api/feishu/sso/authorize/` | 取授权跳转地址 + 一次性 state（**公开**） |
+| POST | `/api/feishu/sso/callback/` | 授权码换平台令牌（**公开**，按 IP 限速） |
+| GET | `/api/feishu/sso/binding/` | 当前用户的绑定状态（个人页，只读） |
+| GET/POST | `/api/feishu/sudo/` | sudo 卡片确认：可用性 / 发起 / 轮询（需登录） |
+| POST | `/api/feishu/callback/<slug>/event/` | 事件订阅（**免登录**，走签名校验，恒定回包） |
+| POST | `/api/feishu/callback/<slug>/card/` | 卡片回调（同上） |
 
 会话列表筛选：`chat_type`、`enabled`、`allow_execute`（`true`/`false`）、`keyword`。
+
+权限分三档：回调入口**免认证**（走签名）；`sso/*` 与 `sudo/` 按各自说明；
+其余配置面接口见[权限](#权限)。
 
 ---
 
@@ -688,9 +727,15 @@ open_id。查不到就明说「通讯录里没有」，**不返回半个 id**—
 
 ```bash
 ./venv/bin/python manage.py feishu_check                    # 配置 + 出站连通性 + 地址
+./venv/bin/python manage.py feishu_check --chats            # 列出机器人所在的群与 chat_id
 ./venv/bin/python manage.py feishu_check --email a@corp.com # 顺带验通讯录反查
-./venv/bin/python manage.py feishu_check --chat-id oc_xxx   # 真发一张测试卡片
+./venv/bin/python manage.py feishu_check --to <用户名>      # 私聊发一张测试卡片
+./venv/bin/python manage.py feishu_check --to oc_xxx --probe-select   # 多选组件探针
 ```
+
+> 生产上必须带 `--settings=ops_manager.settings.prod`。`manage.py` 默认是
+> `settings.dev`（本地 SQLite），不带就是在操作一个空库——`feishu_check` 会报
+> 「四项凭据全缺」，指向完全错误的方向。命令开头会打出当前连的是哪个库。
 
 **在去飞书后台保存回调地址之前跑它**。那一步一保存就立刻触发地址验证，而验证失败
 时回包是恒定的（安全要求），从飞书后台完全看不出原因——只能翻服务端日志。先用这条
@@ -719,11 +764,14 @@ open_id。查不到就明说「通讯录里没有」，**不返回半个 id**—
 
 ---
 
-## 部署提醒
+## 部署与排错
 
-- 秘密只经配置页录入、加密落库，**不进仓库、不进 .env**。
-- 回调地址（`event_url` / `card_url`）在配置页直接复制到飞书开放平台。
-- **上线顺序有依赖**：飞书后台填回调地址时会立刻发一次地址验证，而验证请求同样
-  要过全部校验。所以必须先在平台侧配齐四项凭据 + IP 白名单并 `enabled=true`、
-  且 nginx 的 `feishu_callback_ips.conf` 已填好，再去飞书后台保存回调地址。
-- 轮换 `callback_slug` 后旧地址立即失效，飞书后台必须同步更新。
+配置步骤、飞书后台要配的四处、权限清单、上线顺序与**排错对照表**（日志文案 → 原因）
+都在 [deploy/README.md 的「飞书接入」](../../../deploy/README.md#飞书接入)，
+这里不重复。只留三条最容易踩的：
+
+- **秘密只经配置页录入、加密落库**，不进仓库、不进 `.env`。
+- **上线顺序有硬依赖**：飞书后台一保存回调地址就立刻发一次地址验证，而那次验证同样
+  要过全部校验。平台侧没配齐就去保存，验证必然失败，且回包恒定——从飞书后台完全
+  看不出原因，只能翻服务端日志。
+- 轮换 `callback_slug` 后旧地址**立即失效**，飞书后台必须同步更新，否则所有回调被拒。

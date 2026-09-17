@@ -20,6 +20,7 @@
 | [系统配置](views/system-configs.md) | 键值对 CRUD、key 禁用逻辑 |
 | [飞书接入](views/system-feishu.md) | 飞书应用凭据、回调地址轮换、会话白名单 |
 | [飞书绑定](views/system-feishu-bindings.md) | 绑定关系维护、通讯录反查、解绑 |
+| [二次验证弹框](views/sudo-dialog.md) | 验证码 / 密码 / 飞书卡片三条路，验过重放原请求 |
 | [日志文件](views/task-log-files.md) | 日志目录浏览、分段读取、下载、复制 |
 | [API 凭证](views/api-credentials.md) | 机读凭证 CRUD、一次性明文、IP 白名单校验 |
 | [角色权限](views/roles.md) | 模块权限矩阵、执行能力位、用户绑角色 |
