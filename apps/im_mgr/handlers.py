@@ -374,8 +374,18 @@ def _on_pick(user, chat_id, option, p2p=False):
     if error:
         return _reject('无法执行', error)
     return card_response(cards.task_detail(
-        task, server_count=task.matched_servers().count(),
+        task, server_count=len(_target_servers(task)),
         step_count=task.steps.count(), p2p=p2p))
+
+
+def _target_servers(task):
+    """这次执行实际会动到的主机（各模块按服务类型收窄后的并集）。
+
+    全局范围里那些没有任何模块用得上的主机不该出现在卡片上——数字也好、
+    多选项也好，都按这个集合来，两处才对得上。
+    """
+    servers = access.selectable_servers(task)
+    return servers if servers is not None else list(task.matched_servers())
 
 
 def _on_pick_hosts(user, chat_id, value, p2p=False):
@@ -386,7 +396,7 @@ def _on_pick_hosts(user, chat_id, value, p2p=False):
     error = access.check(user, task, chat_id, is_p2p=p2p)
     if error:
         return _reject('无法执行', error)
-    servers = list(task.matched_servers())
+    servers = _target_servers(task)
     if not servers:
         return _reject('无法执行', '当前范围未匹配到可执行主机。')
     return card_response(cards.host_select(task, servers, p2p=p2p))
@@ -399,7 +409,7 @@ def _resolve_selected(task, selected_ids):
     可能已下线、改了维度或取消了服务规划。这与页面 execute 接口的口径一致
     （那边是「主机 id 不在全局范围匹配集内，请刷新执行页面后重试」）。
     """
-    matched = {str(s.id): s for s in task.matched_servers()}
+    matched = {str(s.id): s for s in _target_servers(task)}
     if not selected_ids:
         return list(matched.values()), None
     picked, stale = [], []
@@ -520,7 +530,7 @@ def _launch(task, user, chat_id, message_id='', *, confirmed_prod, servers=None)
         return _reject('无法执行', error)
 
     steps = list(task.steps.all())
-    selected = list(servers) if servers is not None else list(task.matched_servers())
+    selected = list(servers) if servers is not None else _target_servers(task)
     log, error = trigger.launch(
         task, steps, selected, picked={},
         triggered_by=user, trigger_type='feishu')

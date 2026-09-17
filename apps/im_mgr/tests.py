@@ -2722,3 +2722,109 @@ class FeishuHostSelectTests(TestCase):
         self._run(_card_payload({'act': cards.ACT_CONFIRM_PROD, 'token': token}))
         log = TaskExecutionLog.objects.get(task=self.task)
         self.assertEqual(len(log.servers_snapshot), 3)
+
+
+@override_settings(TASK_EXEC_BACKEND='sync')
+class FeishuServiceTypeScopeTests(TestCase):
+    """卡片上的主机必须按**模块服务类型**收窄。
+
+    联调发现：多选里混进了根本不会被任何模块执行的主机——因为
+    `task.matched_servers()` 只按三维度匹配，而服务类型是模块级的。
+    勾了不生效，还让人以为会在上面跑。
+    """
+
+    def setUp(self):
+        from apps.asset_mgr.models import Channel, Environment, ProjectGroup, ServerService, ServiceType
+        from apps.asset_mgr.models import Server
+        from apps.task_exec.models import ExecutionTask, TaskStep
+
+        cache.clear()
+        self.app = FeishuApp.load()
+        for key, value in FULL_CONFIG.items():
+            setattr(self.app, key, value)
+        self.app.enabled = True
+        self.app.save()
+        self.pg = ProjectGroup.objects.create(name='主项目', code='st-proj')
+        self.ch = Channel.objects.create(name='官服', code='st-ch')
+        self.env = Environment.objects.create(name='测试环境', code='st-env')
+        self.gateway = ServiceType.objects.create(name='网关', code='st-gw')
+        self.db = ServiceType.objects.create(name='数据库', code='st-db')
+
+        def server(name, ip, service):
+            obj = Server.objects.create(name=name, private_ip=ip, project_group=self.pg,
+                                        channel=self.ch, environment=self.env)
+            ServerService.objects.create(server=obj, service_type=service, status='planned')
+            return obj
+
+        self.gw1 = server('gw1', '10.0.0.1', self.gateway)
+        self.gw2 = server('gw2', '10.0.0.2', self.gateway)
+        self.db1 = server('db1', '10.0.0.3', self.db)   # 任务里没有模块用得上它
+
+        self.task = ExecutionTask.objects.create(
+            name='重启网关', project_group=self.pg, channel=self.ch, environment=self.env,
+            im_enabled=True, default_select_all=True)
+        TaskStep.objects.create(task=self.task, order=1, name='重启',
+                                command='echo hi', service_type=self.gateway)
+        FeishuChannel.objects.create(chat_id='oc_ops', name='运维群', allow_execute=True)
+        self.user = get_user_model().objects.create(username='st_ops', is_staff=True)
+        FeishuBinding.objects.create(user=self.user, union_id='on_1', open_id='ou_1')
+
+    def _run(self, payload):
+        with patch('apps.task_exec.tasks.execute_task') as runner:
+            resp = handlers.handle_card_action(self.app, payload)
+        return resp, runner
+
+    def test_three_dimensions_alone_are_too_wide(self):
+        """三维度匹配到 3 台，但只有 2 台是网关。"""
+        self.assertEqual(self.task.matched_servers().count(), 3)
+        names = {s.name for s in access.selectable_servers(self.task)}
+        self.assertEqual(names, {'gw1', 'gw2'})
+
+    def test_multi_select_lists_only_relevant_hosts(self):
+        payload = _card_payload({'act': cards.ACT_PICK_HOSTS, 'task': self.task.id})
+        resp, _ = self._run(payload)
+        select = resp['card']['data']['body']['elements'][1]['elements'][0]
+        labels = [o['text']['content'] for o in select['options']]
+        self.assertEqual(len(labels), 2)
+        self.assertFalse(any('db1' in label for label in labels))
+
+    def test_detail_count_matches_the_picker(self):
+        """两处对不上的话，「当前匹配 3 台」点进去只有 2 台，更让人困惑。"""
+        payload = _card_payload({'act': cards.ACT_PICK_TASK}, option=str(self.task.id))
+        resp, _ = self._run(payload)
+        self.assertIn('当前匹配 2 台', ''.join(_texts(resp['card']['data'])))
+
+    def test_picking_an_irrelevant_host_is_rejected(self):
+        payload = _card_payload(
+            {'act': cards.ACT_RUN_SELECTED, 'task': self.task.id, 'p2p': False})
+        payload['event']['action']['form_value'] = {cards.HOSTS_FIELD: [str(self.db1.id)]}
+        resp, runner = self._run(payload)
+        runner.assert_not_called()
+        self.assertIn('已不在当前范围', ''.join(_texts(resp['card']['data'])))
+
+    def test_run_all_skips_irrelevant_host(self):
+        from apps.task_exec.models import TaskExecutionLog
+
+        resp, runner = self._run(_card_payload({'act': cards.ACT_RUN, 'task': self.task.id}))
+        runner.assert_called_once()
+        log = TaskExecutionLog.objects.get(task=self.task)
+        self.assertEqual({row['name'] for row in log.servers_snapshot}, {'gw1', 'gw2'})
+
+    def test_multiple_step_types_take_the_union(self):
+        """两个模块分别面向网关与数据库时，并集里两种都有。"""
+        from apps.task_exec.models import TaskStep
+
+        TaskStep.objects.create(task=self.task, order=2, name='备份',
+                                command='echo db', service_type=self.db)
+        names = {s.name for s in access.selectable_servers(self.task)}
+        self.assertEqual(names, {'gw1', 'gw2', 'db1'})
+
+    def test_custom_scope_steps_do_not_offer_selection(self):
+        """自定义范围的模块按自己的维度实时匹配，压根不吃勾选。"""
+        from apps.task_exec.models import TaskStep
+
+        TaskStep.objects.filter(task=self.task).update(
+            use_custom_scope=True, project_group=self.pg, channel=self.ch,
+            environment=self.env)
+        self.assertIsNone(access.selectable_servers(self.task))
+        _ = TaskStep

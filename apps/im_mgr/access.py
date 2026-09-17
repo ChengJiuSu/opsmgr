@@ -83,6 +83,35 @@ def check_pause(user, task):
     return trigger.permission_error(user, task)
 
 
+def selectable_servers(task):
+    """飞书上该列出来的主机：**各模块真正会用到的那些**。
+
+    `task.matched_servers()` 只按三维度（项目组/渠道/环境）匹配，而服务类型是
+    **模块级**的（`TaskStep.service_type`）——页面上的口径是「在全局范围里勾主机，
+    每个模块再按自己的服务类型收窄」。照搬那个集合到卡片上，就会列出一批根本不会
+    被任何模块执行的主机：勾了不生效，还让人以为会在上面跑。
+
+    所以这里取**跟随全局范围的模块**按各自服务类型收窄后的**并集**：
+
+    - `use_custom_scope=True` 的模块按自己的维度实时匹配，压根不吃勾选，
+      它们的主机不该出现在多选里；
+    - `pause` 模块不涉及主机。
+
+    并集为空（比如所有模块都自定义了范围）时返回 None，调用方据此退回「整体执行」
+    ——那种任务在飞书上勾主机没有任何意义。
+    """
+    steps = [s for s in task.steps.all()
+             if s.task_type != 'pause' and not s.use_custom_scope]
+    if not steps:
+        return None
+    global_servers = list(task.matched_servers())
+    picked = {}
+    for step in steps:
+        for server in step.resolve_servers(global_servers):
+            picked[server.id] = server
+    return list(picked.values()) or None
+
+
 def needs_production_confirm(task):
     """是否要走生产二次确认卡片。
 
