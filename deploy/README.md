@@ -334,8 +334,8 @@ docker compose --profile mysql up -d --build
      `Bot ability is not activated`，code 232025）；
    - **版本管理与发布** → 创建版本并发布（自建应用要发布后才能被拉进群）；
    - 飞书群里：群设置 → **群机器人 → 添加机器人** → 选中本应用；
-   - `manage.py feishu_check --chats` 列出群的 `chat_id`（飞书界面上看不到它，
-     `im/v1/chats` 只返回机器人已加入的**群**，单聊不在其中）；
+   - `manage.py feishu_check --chats` 列出群的 `chat_id`（见下节「怎么拿
+     chat_id / open_id」）；
    - 「系统管理 → 飞书接入 → 会话白名单」登记该 `chat_id`，需要从群里发起执行的
      才勾「允许发起任务执行」。
 
@@ -370,6 +370,45 @@ docker compose --profile mysql up -d --build
 
 开关打开后，私聊直接 @机器人 发任意消息也会回任务列表，不止菜单。
 **群里仍按会话白名单**，两者互不影响。
+
+### 怎么拿 chat_id / open_id
+
+这两个值**飞书客户端界面上都不显示**，登记会话白名单、手工绑定用户时都要用到。
+三条路，都在 `feishu_check` 里（生产上记得带 `--settings=ops_manager.settings.prod`）：
+
+| 要拿什么 | 命令 | 前提 |
+|----------|------|------|
+| **群** `chat_id`（`oc_…`） | `feishu_check --chats` | 机器人已被拉进该群 |
+| **自己人**的 `open_id`（`ou_…`） | `feishu_check --to <平台用户名>` | 该用户已绑定飞书 |
+| **任意人**的 `open_id` / `union_id` | `feishu_check --email <企业邮箱>` | 有通讯录权限 |
+
+```bash
+# 列出机器人已加入的所有群
+venv/bin/python manage.py feishu_check --chats --settings=ops_manager.settings.prod
+#   [ok] 运维群　oc_xxxxxxxxxxxxxxxx
+#   [ok] 发布通知群　oc_yyyyyyyyyyyyyyyy
+
+# 拿某个平台用户的 open_id：看输出里的「收件人」那行
+venv/bin/python manage.py feishu_check --to zhangsan --settings=ops_manager.settings.prod
+#        收件人：ou_89ef8fc68115f6e2b22784ab17db7d39（open_id）
+
+# 按企业邮箱反查（对方不必已绑定平台账号）
+venv/bin/python manage.py feishu_check --email zhangsan@corp.com \
+    --settings=ops_manager.settings.prod
+#   [ok] union_id=on_xxx open_id=ou_xxx
+#   [ok] 姓名=张三　enterprise_email='zhangsan@corp.com'　email=''
+```
+
+两个坑：
+
+- **单聊没有可用的 `chat_id`**。`im/v1/chats` 只返回机器人已加入的**群**，
+  拿不到单聊。要让某个人私聊收播报，就在会话白名单里直接填他的 `open_id`
+  （`ou_…` 开头会自动按私聊发）。
+- **机器人菜单事件里没有 chat_id**，所以「单聊能不能发起执行」不靠白名单，
+  走「飞书接入」页上的**「允许单聊发起执行」**总开关。
+
+页面上的「飞书绑定 → 手工绑定」也能按邮箱/手机号反查，查到的 `UnionID` 会直接
+显示出来，不用开终端。
 
 ### 播报订阅
 
