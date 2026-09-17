@@ -8,16 +8,30 @@
 # $host / $uri / $remote_addr 等 nginx 内置变量保持原样。
 # =============================================================================
 
-# 自定义日志格式：combined 基础上追加请求耗时与上游各阶段耗时。
+# 自定义日志格式：字段与原 ops_timing 一一对应，改成 JSON 单行。
 #   rt  = 请求总耗时          uct = 与上游建连耗时
 #   uht = 上游返回响应头耗时   urt = 上游完整响应耗时
 #   ssl = 协商出的 TLS 版本    cip = 协商出的加密套件
-log_format ops_timing '$remote_addr - $remote_user [$time_local] "$request" '
-                      '$status $body_bytes_sent "$http_referer" '
-                      '"$http_user_agent" "$http_x_forwarded_for" '
-                      'rt=$request_time uct="$upstream_connect_time" '
-                      'uht="$upstream_header_time" urt="$upstream_response_time" '
-                      'ssl="$ssl_protocol" cip="$ssl_cipher"';
+#   rid = 请求 ID（$request_id 由 nginx 生成，同时经 proxy_backend.conf 下发给
+#         Django，两侧日志用同一个值串起来：`request_id:xxx` 一次查出全链路）
+#
+# ⚠ escape=json 不能省：UA 和 referer 是客户端可控字符串，里面的引号/反斜杠
+#   不转义会直接破坏 JSON 结构，采集端整行解析失败（而且是攻击者可主动触发的）。
+#   nginx 1.11.8+ 支持。
+#
+# 空值口径：nginx 对未命中的变量输出空串，$upstream_* 在非反代 location（静态
+# 文件）下就是空。因此耗时类字段一律加引号按字符串出，写成裸数字会产出
+# `"urt":` 后面直接跟逗号的坏 JSON。查询侧在 VictoriaLogs 里用 `urt:>1` 前
+# 需要 `math` 转换，代价远小于整行解析失败。
+log_format ops_json escape=json
+    '{"ts":"$time_iso8601","remote_addr":"$remote_addr","user":"$remote_user",'
+    '"method":"$request_method","uri":"$uri","args":"$args",'
+    '"status":$status,"bytes":$body_bytes_sent,'
+    '"referer":"$http_referer","ua":"$http_user_agent",'
+    '"xff":"$http_x_forwarded_for","rid":"$request_id",'
+    '"rt":"$request_time","uct":"$upstream_connect_time",'
+    '"uht":"$upstream_header_time","urt":"$upstream_response_time",'
+    '"ssl":"$ssl_protocol","cip":"$ssl_cipher"}';
 
 # -----------------------------------------------------------------------------
 # 响应压缩
@@ -97,7 +111,7 @@ server {
     server_name ${OPS_SERVER_NAME};
     server_tokens off;
 
-    access_log /var/log/nginx/ops-manager.access.log ops_timing;
+    access_log /var/log/nginx/ops-manager.access.log ops_json;
     error_log  /var/log/nginx/ops-manager.error.log warn;
 
     # 容器健康检查端点，不参与跳转（避免 healthcheck 拿到 301）
@@ -150,7 +164,7 @@ server {
     # CI 制品压缩包上报走 /api，放宽上传限制
     client_max_body_size ${OPS_CLIENT_MAX_BODY_SIZE};
 
-    access_log /var/log/nginx/ops-manager.access.log ops_timing;
+    access_log /var/log/nginx/ops-manager.access.log ops_json;
     error_log  /var/log/nginx/ops-manager.error.log warn;
 
     location = /nginx-health {
@@ -182,7 +196,7 @@ server {
     # client_body_temp 再转发，多一轮磁盘读写；这里关掉让它边收边转。
     # 精确匹配（=）优先级高于下面的正则，必须写在前面才生效。
     location = /api/artifacts/report/ {
-        access_log /var/log/nginx/ops-manager.api.access.log ops_timing;
+        access_log /var/log/nginx/ops-manager.api.access.log ops_json;
 
         include /etc/nginx/snippets/proxy_backend.conf;
         proxy_pass http://ops_manager_backend;
@@ -208,7 +222,7 @@ server {
         limit_req zone=feishu_callback burst=20 nodelay;
         limit_req_status 429;
 
-        access_log /var/log/nginx/ops-manager.api.access.log ops_timing;
+        access_log /var/log/nginx/ops-manager.api.access.log ops_json;
 
         include /etc/nginx/snippets/proxy_backend.conf;
         proxy_pass http://ops_manager_backend;
@@ -221,7 +235,7 @@ server {
 
     # ---- 后端 API / Django admin ---------------------------------------------
     location ~ ^/(api|admin)/ {
-        access_log /var/log/nginx/ops-manager.api.access.log ops_timing;
+        access_log /var/log/nginx/ops-manager.api.access.log ops_json;
 
         include /etc/nginx/snippets/proxy_backend.conf;
         proxy_pass http://ops_manager_backend;
@@ -247,7 +261,7 @@ server {
     #     allow 203.0.113.9;       # CI 出口
     #     deny all;
     #
-    #     access_log /var/log/nginx/ops-manager.api.access.log ops_timing;
+    #     access_log /var/log/nginx/ops-manager.api.access.log ops_json;
     #     proxy_pass http://ops_manager_backend;
     #     proxy_http_version 1.1;
     #     proxy_set_header Connection "";

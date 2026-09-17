@@ -1,13 +1,17 @@
-"""common 工具测试：TOTP（RFC 6238 官方向量）、Fernet 加解密、限速、鉴权用 IP 解析。"""
+"""common 工具测试：TOTP（RFC 6238 官方向量）、Fernet 加解密、限速、鉴权用 IP 解析、结构化日志。"""
 import base64
+import json
+import logging
 import time
 from types import SimpleNamespace
 from unittest import mock
 
 from django.core.cache import cache
-from django.test import SimpleTestCase, TestCase, override_settings
+from django.http import HttpResponse
+from django.test import RequestFactory, SimpleTestCase, TestCase, override_settings
 
 from . import crypto, fields, ratelimit, totp
+from . import logging as log_utils
 from . import request as request_utils
 
 # RFC 6238 附录 B 的 SHA1 测试向量（密钥 "12345678901234567890"）
@@ -237,3 +241,134 @@ class EncryptedFieldTests(SimpleTestCase):
         """像密文却解不开 = key 变了。静默当明文用会得到极难排查的认证失败。"""
         with self.assertRaises(crypto.DecryptError):
             self.field.from_db_value(fields.FERNET_PREFIX + 'broken', None, None)
+
+
+def make_record(msg='hello', level=logging.INFO, **extra):
+    """造一条 LogRecord，等价于 logger.log(level, msg, extra=extra)。"""
+    record = logging.LogRecord(
+        name='apps.task_exec.runner', level=level, pathname='/app/apps/task_exec/runner.py',
+        lineno=214, msg=msg, args=(), exc_info=None)
+    record.__dict__.update(extra)
+    return record
+
+
+class JSONFormatterTests(SimpleTestCase):
+    def setUp(self):
+        self.formatter = log_utils.JSONFormatter(service='celery-exec')
+
+    def emit(self, record):
+        return json.loads(self.formatter.format(record))
+
+    def test_base_fields(self):
+        payload = self.emit(make_record('任务执行失败', level=logging.ERROR))
+        self.assertEqual(payload['level'], 'ERROR')
+        self.assertEqual(payload['service'], 'celery-exec')
+        self.assertEqual(payload['logger'], 'apps.task_exec.runner')
+        self.assertEqual(payload['module'], 'runner')
+        self.assertEqual(payload['line'], 214)
+        self.assertEqual(payload['msg'], '任务执行失败')
+
+    def test_timestamp_is_rfc3339_utc_with_millis(self):
+        """服务端按 _time 排序，格式错等于时间轴错乱，这里钉死形状。"""
+        payload = self.emit(make_record())
+        self.assertRegex(payload['ts'], r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$')
+
+    def test_single_line_even_with_traceback(self):
+        """JSON 格式存在的首要理由：一条异常必须是一行，采集端无需猜多行边界。"""
+        try:
+            raise RuntimeError('boom')
+        except RuntimeError:
+            import sys
+            record = make_record('炸了', level=logging.ERROR)
+            record.exc_info = sys.exc_info()
+        line = self.formatter.format(record)
+        self.assertNotIn('\n', line)
+        payload = json.loads(line)
+        self.assertIn('RuntimeError: boom', payload['exc'])
+        self.assertEqual(payload['msg'], '炸了')
+
+    def test_extra_becomes_queryable_fields(self):
+        payload = self.emit(make_record(task_id=12, exec_id=43))
+        self.assertEqual(payload['task_id'], 12)
+        self.assertEqual(payload['exec_id'], 43)
+
+    def test_unserializable_extra_does_not_drop_the_log(self):
+        """extra 里塞对象是常态；一个值不可序列化不该让整条日志消失。"""
+        payload = self.emit(make_record(server=object()))
+        self.assertIn('object object at', payload['server'])
+        self.assertEqual(payload['msg'], 'hello')
+
+    def test_message_args_interpolated(self):
+        record = logging.LogRecord(
+            name='apps', level=logging.INFO, pathname='/app/apps/x.py', lineno=1,
+            msg='共 %s 台', args=(3,), exc_info=None)
+        self.assertEqual(json.loads(self.formatter.format(record))['msg'], '共 3 台')
+
+    def test_request_id_included_only_inside_request(self):
+        self.assertNotIn('request_id', self.emit(make_record()))
+        token = log_utils.set_request_id('abc123')
+        try:
+            self.assertEqual(self.emit(make_record())['request_id'], 'abc123')
+        finally:
+            log_utils.reset_request_id(token)
+
+
+class RequestIdTests(SimpleTestCase):
+    def setUp(self):
+        self.factory = RequestFactory()
+        self.seen = []
+        self.middleware = log_utils.RequestIDMiddleware(self._view)
+
+    def _view(self, request):
+        self.seen.append(log_utils.current_request_id())
+        return HttpResponse('ok')
+
+    def test_generates_id_and_echoes_it(self):
+        response = self.middleware(self.factory.get('/api/servers/'))
+        self.assertEqual(len(self.seen), 1)
+        self.assertTrue(self.seen[0])
+        self.assertEqual(response['X-Request-ID'], self.seen[0])
+
+    def test_reuses_upstream_id(self):
+        """与 nginx access log 对齐的关键：上游给了就用上游的，不另生成。"""
+        upstream = 'a' * 32
+        response = self.middleware(
+            self.factory.get('/api/servers/', HTTP_X_REQUEST_ID=upstream))
+        self.assertEqual(self.seen[0], upstream)
+        self.assertEqual(response['X-Request-ID'], upstream)
+
+    def test_malformed_upstream_id_replaced(self):
+        """直连 Django 时该头是客户端可控输入：超长/带控制字符的一律换掉。"""
+        for bad in ('x' * 65, 'bad id', 'inject\nnewline', '../../etc/passwd', ''):
+            with self.subTest(bad=bad):
+                self.seen.clear()
+                self.middleware(self.factory.get('/', HTTP_X_REQUEST_ID=bad))
+                self.assertNotEqual(self.seen[0], bad)
+                self.assertRegex(self.seen[0], log_utils.REQUEST_ID_RE)
+
+    def test_context_reset_after_response(self):
+        """gthread 下线程复用：不还原会让下一个请求继承上一个的 ID（串号）。"""
+        self.middleware(self.factory.get('/'))
+        self.assertEqual(log_utils.current_request_id(), '')
+
+    def test_context_reset_even_when_view_raises(self):
+        def boom(request):
+            raise RuntimeError('boom')
+
+        with self.assertRaises(RuntimeError):
+            log_utils.RequestIDMiddleware(boom)(self.factory.get('/'))
+        self.assertEqual(log_utils.current_request_id(), '')
+
+    async def test_async_path(self):
+        """daphne 的 ASGI HTTP 请求走这条：不支持异步会被 Django 包进线程池。"""
+        seen = []
+
+        async def view(request):
+            seen.append(log_utils.current_request_id())
+            return HttpResponse('ok')
+
+        middleware = log_utils.RequestIDMiddleware(view)
+        self.assertTrue(middleware.async_mode)
+        response = await middleware(self.factory.get('/'))
+        self.assertTrue(seen[0])
+        self.assertEqual(response['X-Request-ID'], seen[0])

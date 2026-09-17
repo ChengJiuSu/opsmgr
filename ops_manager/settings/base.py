@@ -17,6 +17,23 @@ LOGS_DIR.mkdir(exist_ok=True)
 
 LOG_LEVEL = config('LOG_LEVEL', default='INFO')
 
+# 文件日志格式：verbose = 人读的单行文本，json = 结构化单行 JSON。
+# 生产默认 json（见 settings/prod.py），因为要被 Vector 采集进 VictoriaLogs；
+# 本地默认 verbose，tail 时不用过一遍 jq。控制台永远是 verbose，不受此开关影响。
+LOG_FORMAT = config('LOG_FORMAT', default='verbose')
+# 本进程身份，写进每条 JSON 日志的 service 字段。一台机上 gunicorn / celery /
+# daphne / feishu-ws 各写各的文件，靠它在服务端区分，各 supervisor 配置里分别设。
+LOG_SERVICE = config('LOG_SERVICE', default='django')
+
+# 日志文件按进程身份分开。
+# 原先所有进程都写同一个 logs/ops_manager.log：homelab 这台机上 gunicorn、
+# daphne、celery-exec 三个进程各自持有一个 RotatingFileHandler 指向它，
+# 轮转时各写各的 rename + 重开，**互相覆盖，轮转瞬间的日志直接消失**。
+# 单机单进程时看不出来，多进程下是必然丢数据。文件名带上 service 后各写各的，
+# 采集端靠 JSON 里的 service 字段照样能合起来看。
+LOG_FILE = LOGS_DIR / f'ops_manager-{LOG_SERVICE}.log'
+LOG_ERROR_FILE = LOGS_DIR / f'error-{LOG_SERVICE}.log'
+
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
@@ -26,6 +43,10 @@ LOGGING = {
             'style': '{',
             'datefmt': '%Y-%m-%d %H:%M:%S',
         },
+        'json': {
+            '()': 'common.logging.JSONFormatter',
+            'service': LOG_SERVICE,
+        },
     },
     'handlers': {
         'console': {
@@ -34,19 +55,19 @@ LOGGING = {
         },
         'file': {
             'class': 'logging.handlers.RotatingFileHandler',
-            'filename': LOGS_DIR / 'ops_manager.log',
+            'filename': LOG_FILE,
             'maxBytes': 1024 * 1024 * 10,  # 10 MB
             'backupCount': 5,
-            'formatter': 'verbose',
+            'formatter': LOG_FORMAT,
             'encoding': 'utf-8',
         },
         'error_file': {
             'class': 'logging.handlers.RotatingFileHandler',
-            'filename': LOGS_DIR / 'error.log',
+            'filename': LOG_ERROR_FILE,
             'maxBytes': 1024 * 1024 * 10,
             'backupCount': 5,
             'level': 'ERROR',
-            'formatter': 'verbose',
+            'formatter': LOG_FORMAT,
             'encoding': 'utf-8',
         },
     },
@@ -125,6 +146,9 @@ LOCAL_APPS = [
 INSTALLED_APPS = ['daphne'] + DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
 
 MIDDLEWARE = [
+    # 请求 ID 必须最先入栈：它之后所有中间件（认证、审计）与视图产生的日志
+    # 才带得上同一个 request_id，nginx access log 里也记着同一个值
+    'common.logging.RequestIDMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',

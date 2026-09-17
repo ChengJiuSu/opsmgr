@@ -49,3 +49,22 @@ CSRF_COOKIE_SECURE = True
 LOGGING['root']['level'] = config('LOG_LEVEL', default='WARNING')
 LOGGING['loggers']['django']['level'] = config('LOG_LEVEL', default='WARNING')
 LOGGING['loggers']['apps']['level'] = config('LOG_LEVEL', default='WARNING')
+
+# ── 生产落盘格式：JSON ────────────────────────────────────────
+# 被 Vector 采集进 VictoriaLogs，字段口径见 docs/log-collection-design.md。
+# 设 LOG_FORMAT=verbose 可临时退回文本格式（采集端会解析失败，仅限应急排障）。
+LOG_FORMAT = config('LOG_FORMAT', default='json')
+for _handler in ('file', 'error_file'):
+    LOGGING['handlers'][_handler]['formatter'] = LOG_FORMAT
+
+# ── 去掉 console handler：同一行日志不要写两遍 ──────────────────
+# 生产由 supervisor 接管进程的 stdout/stderr 落到 ~/logs/ops-manager.log，
+# 而 file handler 同时把同样的内容写进 logs/ops_manager-<service>.log。两个文件都被
+# Vector 采集 = 每条日志在 VictoriaLogs 里存两份，磁盘与查询结果双倍噪声。
+# 保留 file handler（JSON、自带轮转）、去掉 console，supervisor 的那份就只剩
+# gunicorn/celery 自身的启动与崩溃输出——低频且正是 file handler 覆盖不到的部分。
+for _logger in (LOGGING['root'], *LOGGING['loggers'].values()):
+    _logger['handlers'] = [h for h in _logger['handlers'] if h != 'console']
+# django.db.backends 只挂了 console，剥掉会变成空 handlers（日志静默丢弃），
+# 给它补回 file：SQL 警告本来就该留档。
+LOGGING['loggers']['django.db.backends']['handlers'] = ['file']

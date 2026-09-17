@@ -10,7 +10,7 @@
 #
 # 文件名以 00- 开头有两个作用：
 #   1. include conf.d/*.conf 按文件名排序，本块最先解析，语义上是「兜底在最前」；
-#   2. 提醒不要在这里用 ops_timing —— 那个 log_format 定义在 ops_manager.conf，
+#   2. 提醒不要在这里用 ops_json —— 那个 log_format 定义在 ops_manager.conf，
 #      解析顺序在后，此处引用会报 unknown log format。故只用内置 combined。
 # default_server 是显式标记，实际生效与文件顺序无关。
 #
