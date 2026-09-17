@@ -1,0 +1,63 @@
+# VictoriaLogs 日志服务端（单机）
+#
+# 安装：
+#   useradd --system --no-create-home --shell /usr/sbin/nologin vlogs
+#   install -o vlogs -g vlogs -d /var/lib/victoria-logs
+#   install -m 0755 victoria-logs-prod /usr/local/bin/victoria-logs
+#   cp victoria-logs.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now victoria-logs
+#
+# ⚠ 安全：VictoriaLogs 自身【没有任何认证】。
+#   -httpListenAddr 刻意绑在 127.0.0.1，由 nginx 在前面做 basic auth + 限源 IP
+#   （见 nginx-vlogs.conf.example）。改成 0.0.0.0 等于：
+#     · 全部日志（含内网 IP、路径、用户名）可被任意读取；
+#     · /insert/* 可被任意写入，攻击者能用伪造日志把真实记录淹掉。
+#   要改成对外监听，必须先确认前面有鉴权层。
+
+[Unit]
+Description=VictoriaLogs
+Documentation=https://docs.victoriametrics.com/victorialogs/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vlogs
+Group=vlogs
+
+# -retentionPeriod：先定 30 天。日志量未实测，上线后按实际磁盘增长再调。
+# -retention.maxDiskSpaceUsagePercent：保留期之外的硬兜底。磁盘写满会让整个
+#   日志服务停摆（且常常连带同机的其他服务），比少存几天严重得多。
+# -storageDataPath：指到数据盘，别用系统盘。
+# -futureRetention：拒收时间戳过于超前的数据。采集端时钟跑偏或伪造的时间戳会
+#   在时间轴远端堆出永远不过期的数据。
+ExecStart=/usr/local/bin/victoria-logs \
+    -storageDataPath=/var/lib/victoria-logs \
+    -httpListenAddr=127.0.0.1:9428 \
+    -retentionPeriod=30d \
+    -retention.maxDiskSpaceUsagePercent=80 \
+    -futureRetention=2d \
+    -loggerFormat=json \
+    -loggerOutput=stderr
+
+Restart=always
+RestartSec=5s
+# 索引与合并会开大量文件句柄，默认 1024 不够
+LimitNOFILE=65536
+# 停止时给足时间把内存中的数据刷盘，SIGKILL 会丢最近一批
+TimeoutStopSec=60
+
+# ── 沙箱 ───────────────────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# ProtectSystem=strict 下整个文件系统只读，数据目录必须显式开写
+ReadWritePaths=/var/lib/victoria-logs
+
+[Install]
+WantedBy=multi-user.target

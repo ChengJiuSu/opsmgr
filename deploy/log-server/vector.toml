@@ -1,0 +1,245 @@
+# =============================================================================
+# Vector agent 配置（每台应用机一份，靠 /etc/vector/vector.env 区分本机差异）
+# -----------------------------------------------------------------------------
+# 字段口径见 docs/log-collection-design.md，改这里要同步改那份文档。
+#
+# 拓扑：每机一个 agent 直推 VictoriaLogs，不架 aggregator。机器数是个位数，
+# aggregator 的价值（收敛连接数、集中转换）在这个规模上不成立，多一层只多一个
+# 故障点。
+#
+# ${XXX} 由 systemd 的 EnvironmentFile 注入，Vector 启动时替换。
+# =============================================================================
+
+# 检查点（每个文件读到哪一行）与磁盘 buffer 都落这里。
+# 删掉它 = 所有文件从头重采一遍（重复数据），别在排障时随手 rm。
+data_dir = "/var/lib/vector"
+
+# nginx error log 的时间戳不带时区（`2026/09/17 15:49:35`），
+# 解析时按这个时区当本地时间处理。不设的话 VRL 按 UTC 解析，直接差 8 小时。
+timezone = "Asia/Shanghai"
+
+# -----------------------------------------------------------------------------
+# 源 1：Django / celery / daphne 应用日志（已是 JSON）
+# -----------------------------------------------------------------------------
+# 只采 ops_manager-*.log，【不采 error-*.log】：后者是前者中 ERROR 级的副本，
+# 两个都采等于报错在服务端存两份。error-*.log 留给人工 tail。
+[sources.app]
+type = "file"
+include = ["${OPS_APP_DIR}/logs/ops_manager-*.log"]
+# 首次启动从文件开头读。改成 "end" 会丢掉 Vector 装好之前积压的日志，
+# 而那批往往正是「为什么要上采集」的原因。
+read_from = "beginning"
+# 轮转后的 ops_manager-django.log.1 不匹配上面的 glob，天然不会重复采集
+
+[transforms.app_parsed]
+type = "remap"
+inputs = ["app"]
+source = '''
+parsed, err = parse_json(.message)
+if err != null {
+  # 解析失败不丢。最可能的原因是 LOG_FORMAT 被临时切回 verbose，或某个第三方
+  # 库绕过 formatter 直接写了文件。留原文 + 打标记，服务端能查出
+  # 「有多少行没解析成功、来自哪台机哪个 service」，格式统一是否彻底有据可查。
+  . = { "msg": .message, "service": "unknown", "parse_error": true }
+} else {
+  . = object!(parsed)
+}
+.host = get_hostname!()
+.app  = "ops-manager"
+.env  = "${OPS_ENV}"
+'''
+
+# -----------------------------------------------------------------------------
+# 源 2：supervisor 接管的进程 stdout/stderr
+# -----------------------------------------------------------------------------
+# prod 已去掉 console handler，所以这些文件里只剩 gunicorn/celery 自身的启动与
+# 崩溃输出——低频，且正是应用 file handler 覆盖不到的部分（进程起不来时，
+# Django 的 logging 根本没机会初始化），必须采。
+[sources.proc]
+type = "file"
+include = ["${OPS_LOG_DIR}/ops-manager*.log"]
+read_from = "beginning"
+
+# 纯文本，且崩溃栈是多行。按「下一行以时间戳/日志级别开头」切分不可靠
+# （gunicorn、celery、Python traceback 三种前缀各不相同），这里按空闲超时聚合：
+# 连续写入的行算一条，停顿 1s 后换条。粒度粗但不会把栈撕碎。
+[sources.proc.multiline]
+start_pattern = '^.'
+mode = "continue_through"
+condition_pattern = '^(\s|Traceback|  File|\[|\S+Error)'
+timeout_ms = 1000
+
+[transforms.proc_parsed]
+type = "remap"
+inputs = ["proc"]
+source = '''
+.msg = del(.message)
+.service = "supervisor"
+# 文件名里带进程名（ops-manager-celery-error.log），保留它才能区分是哪个进程。
+# 用局部变量而不是直接对 . 上的路径取值再判断：路径取值在 VRL 里是 any 类型，
+# contains/upcase 这类函数会因此变成可失败的，写起来要处处 ?? 兜底。
+logfile = to_string(.file) ?? ""
+.logfile = logfile
+.level = if contains(logfile, "-error") { "ERROR" } else { "INFO" }
+.host = get_hostname!()
+.app  = "ops-manager"
+.env  = "${OPS_ENV}"
+'''
+
+# -----------------------------------------------------------------------------
+# 源 3：gunicorn access log（JSON，但时间戳是 Apache 格式）
+# -----------------------------------------------------------------------------
+[sources.gunicorn]
+type = "file"
+include = ["${OPS_LOG_DIR}/gunicorn-access.log"]
+read_from = "beginning"
+
+[transforms.gunicorn_parsed]
+type = "remap"
+inputs = ["gunicorn"]
+source = '''
+parsed, err = parse_json(.message)
+if err != null {
+  # gunicorn 不做值转义（没有 nginx 的 escape=json），URI/query 里真出现裸引号
+  # 时这一行就是坏 JSON。原文照样入库，可用 parse_error:true 查出来有多少。
+  . = { "msg": .message, "service": "gunicorn", "parse_error": true }
+} else {
+  . = object!(parsed)
+  # %(t)s 的形状是 [17/Sep/2026:15:49:35 +0800]，gunicorn 不提供 ISO 输出。
+  # 解析成 timestamp 类型后，sink 编码 JSON 时会自动写成 RFC3339。
+  ts_raw = replace(to_string(.ts_clf) ?? "", r'[\[\]]', "")
+  .ts = parse_timestamp(ts_raw, "%d/%b/%Y:%H:%M:%S %z") ?? now()
+  del(.ts_clf)
+  method = to_string(.method) ?? ""
+  uri = to_string(.uri) ?? ""
+  status = to_string(.status) ?? ""
+  .msg = method + " " + uri + " " + status
+  rid = del(.rid)
+  if rid != null { .request_id = rid }
+}
+.host = get_hostname!()
+.app  = "ops-manager"
+.env  = "${OPS_ENV}"
+'''
+
+# -----------------------------------------------------------------------------
+# 源 4：nginx access log（JSON）—— 只有入口机有
+# -----------------------------------------------------------------------------
+[sources.nginx_access]
+type = "file"
+include = ["/var/log/nginx/ops-manager*.access.log"]
+read_from = "beginning"
+
+[transforms.nginx_access_parsed]
+type = "remap"
+inputs = ["nginx_access"]
+source = '''
+parsed, err = parse_json(.message)
+if err != null {
+  . = { "msg": .message, "service": "nginx", "parse_error": true }
+} else {
+  . = object!(parsed)
+  method = to_string(.method) ?? ""
+  uri = to_string(.uri) ?? ""
+  status = to_string(.status) ?? ""
+  .msg = method + " " + uri + " " + status
+  rid = del(.rid)
+  if rid != null { .request_id = rid }
+}
+.service = "nginx"
+.host = get_hostname!()
+.app  = "ops-manager"
+.env  = "${OPS_ENV}"
+'''
+
+# -----------------------------------------------------------------------------
+# 源 5：nginx error log（纯文本，多行）
+# -----------------------------------------------------------------------------
+# nginx 的 error_log 没有 JSON 格式可配（access_log 才有 escape=json），
+# 只能在这里解析。
+[sources.nginx_error]
+type = "file"
+include = ["/var/log/nginx/ops-manager*.error.log"]
+read_from = "beginning"
+
+# upstream 超时等错误会跟着多行上下文，按「下一条以 YYYY/MM/DD 开头」切分。
+# halt_before：遇到匹配 condition_pattern 的行就结束当前这条。
+[sources.nginx_error.multiline]
+start_pattern = '^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}'
+mode = "halt_before"
+condition_pattern = '^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}'
+timeout_ms = 1000
+
+[transforms.nginx_error_parsed]
+type = "remap"
+inputs = ["nginx_error"]
+source = '''
+parsed, err = parse_regex(.message, r'(?s)^(?P<ts_raw>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}) \[(?P<level>\w+)\] (?P<body>.*)$')
+if err != null {
+  . = { "msg": .message, "parse_error": true }
+} else {
+  # 时间戳不带时区，靠全局 timezone 选项按本地时间解析
+  ts_raw = to_string(parsed.ts_raw) ?? ""
+  .ts = parse_timestamp(ts_raw, "%Y/%m/%d %H:%M:%S") ?? now()
+  level = to_string(parsed.level) ?? "error"
+  .level = upcase(level)
+  .msg = to_string(parsed.body) ?? ""
+}
+.service = "nginx-error"
+.host = get_hostname!()
+.app  = "ops-manager"
+.env  = "${OPS_ENV}"
+'''
+
+# -----------------------------------------------------------------------------
+# 出口：VictoriaLogs
+# -----------------------------------------------------------------------------
+# 用 Elasticsearch bulk 端点：批量、重试、压缩都是 Vector 这个 sink 现成的，
+# /insert/jsonline 配 http sink 也能写进去但重试语义弱得多。
+[sinks.vlogs]
+type = "elasticsearch"
+inputs = [
+  "app_parsed",
+  "proc_parsed",
+  "gunicorn_parsed",
+  "nginx_access_parsed",
+  "nginx_error_parsed",
+]
+endpoints = ["${VLOGS_ENDPOINT}/insert/elasticsearch/"]
+mode = "bulk"
+api_version = "v8"
+compression = "gzip"
+# VictoriaLogs 没有 ES 的 /_cluster/health，健康检查必关，否则 sink 起不来
+healthcheck.enabled = false
+
+[sinks.vlogs.auth]
+strategy = "basic"
+user = "${VLOGS_USER}"
+password = "${VLOGS_PASSWORD}"
+
+# VictoriaLogs 靠这几个 URL 参数决定怎么解读送进来的 JSON
+[sinks.vlogs.query]
+_msg_field = "msg"
+_time_field = "ts"
+# ⚠ stream 字段只能放低基数字段。加 request_id / task_id / IP 会让每个新值建一条
+#   新 stream，几天就是百万级，写入和查询一起垮；而且【已写入的 stream 结构改不了】，
+#   只能等过保留期。改这一行之前先读 docs/log-collection-design.md 第 2 节。
+_stream_fields = "host,app,service,env"
+# Vector 自己加的元字段，对排障无用，不必入库
+ignore_fields = "source_type,file"
+
+[sinks.vlogs.bulk]
+index = "logs"
+
+[sinks.vlogs.batch]
+max_events = 1000
+timeout_secs = 5
+
+# 磁盘 buffer 必配。默认是内存 buffer，Vector 一重启缓冲里的日志就没了——
+# 而「服务端不可用」和「需要重启 Vector」这两件事经常同时发生。
+[sinks.vlogs.buffer]
+type = "disk"
+max_size = 536870912   # 512MB
+# block 而非 drop_newest：宁可让 Vector 卡住（表现为日志延迟，看得见），
+# 也不要静默丢日志（表现为什么都没有，看不见）。
+when_full = "block"

@@ -1,0 +1,57 @@
+# Vector 日志采集 agent（每台应用机各跑一个）
+#
+# 安装：
+#   useradd --system --no-create-home --shell /usr/sbin/nologin vector
+#   # nginx 日志属 adm 组，Vector 要能读；应用日志目录见 README 的权限一节
+#   usermod -aG adm vector
+#   install -o vector -g vector -d /var/lib/vector
+#   install -m 0755 vector /usr/local/bin/vector
+#   install -d /etc/vector
+#   cp vector.toml /etc/vector/
+#   cp vector.env.example /etc/vector/vector.env   # 按本机填写后 chmod 0640
+#   chown root:vector /etc/vector/vector.env
+#   cp vector.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now vector
+#
+# 改配置后：systemctl reload vector（SIGHUP 热加载，不断采集）
+
+[Unit]
+Description=Vector log agent
+Documentation=https://vector.dev/docs/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=vector
+Group=vector
+EnvironmentFile=/etc/vector/vector.env
+
+# 启动前先校验配置。不校验的话，写错一个字段 = 服务起不来且采集静默中断，
+# 而日志中断这件事本身没有日志会告诉你。validate 失败则 systemd 直接报错退出，
+# 老进程（reload 场景）还在跑，不影响正在采集的数据。
+ExecStartPre=/usr/local/bin/vector validate --config /etc/vector/vector.toml
+ExecStart=/usr/local/bin/vector --config /etc/vector/vector.toml
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=always
+RestartSec=5s
+LimitNOFILE=65536
+# 停止时给足时间把磁盘 buffer 里的数据推完
+TimeoutStopSec=60
+
+# ── 沙箱 ───────────────────────────────────────────────────
+# 注意：Vector 需要读应用日志与 nginx 日志，所以 ProtectHome 不能开
+# （应用日志在 /home/<user>/apps/...），ProtectSystem 也只能到 full。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# 检查点（读到哪一行）与磁盘 buffer 都落在这里，丢了会重复采集一批
+ReadWritePaths=/var/lib/vector
+
+[Install]
+WantedBy=multi-user.target

@@ -192,84 +192,32 @@ ISO 输出，因此原样出、由 Vector 解析成 `_time`：
 aggregator 的价值在于收敛连接数和集中做转换，现在两者都不构成问题，多一层就多一个
 故障点。
 
-```toml
-# /etc/vector/vector.toml
+配置文件在 [`deploy/log-server/vector.toml`](../deploy/log-server/vector.toml)
+（各机差异靠 systemd 的 `EnvironmentFile` 注入，不为每台机维护一份配置）。
+安装步骤与权限要求见 [`deploy/log-server/README.md`](../deploy/log-server/README.md)。
 
-[sources.app_json]
-type = "file"
-include = ["/home/homelab/apps/devops-manager/logs/ops_manager-*.log",
-           "/home/homelab/apps/devops-manager/logs/error-*.log"]
-# error-*.log 的内容是 ops_manager-*.log 的子集（ERROR 级重复落两个文件）。
-# 采集端按 host+service+ts+msg 去重不现实，所以这里【只采 ops_manager-*】，
-# error-*.log 留给人工 tail。上线时按此删掉上面的 error-* 一行。
-read_from = "beginning"
+要点：
 
-[transforms.app_parsed]
-type = "remap"
-inputs = ["app_json"]
-source = '''
-  parsed, err = parse_json(.message)
-  if err != null {
-    # 解析失败不丢：极可能是 LOG_FORMAT 被临时切回 verbose，或第三方库绕过
-    # formatter 直接写文件。留原文 + 标记，服务端能查到「有多少行没解析成功」
-    . = { "msg": .message, "service": "unknown", "parse_error": true }
-  } else {
-    . = object!(parsed)
-  }
-  .host = get_hostname!()
-  .app  = "ops-manager"
-  .env  = "prod"
-'''
-
-[sources.nginx_access]
-type = "file"
-include = ["/var/log/nginx/ops-manager*.access.log"]
-
-[transforms.nginx_parsed]
-type = "remap"
-inputs = ["nginx_access"]
-source = '''
-  . = object!(parse_json!(.message))
-  .service = "nginx"
-  .host = get_hostname!()
-  .app  = "ops-manager"
-  .env  = "prod"
-  .msg  = join!([.method, .uri, to_string(.status)], " ")
-  .request_id = del(.rid)
-'''
-
-[sinks.vlogs]
-type = "elasticsearch"
-inputs = ["app_parsed", "nginx_parsed"]
-endpoints = ["https://vlogs.internal/insert/elasticsearch/"]
-mode = "bulk"
-api_version = "v8"
-healthcheck.enabled = false
-compression = "gzip"
-
-[sinks.vlogs.query]
-_msg_field     = "msg"
-_time_field    = "ts"
-_stream_fields = "host,app,service,env"
-ignore_fields  = "file,source_type"
-
-[sinks.vlogs.buffer]
-type = "disk"
-max_size = 536870912   # 512MB：VictoriaLogs 挂掉或网络断时的缓冲，够扛数小时
-when_full = "block"    # block 而非 drop_newest：宁可 Vector 卡住也不静默丢日志
-```
+- **磁盘 buffer 必须配**，且 `when_full = "block"`。默认是内存 buffer，Vector 一重启
+  缓冲里的日志就没了——而「服务端不可用」和「需要重启 Vector」这两件事经常同时发生。
+  block 而非 drop_newest：宁可让 Vector 卡住（表现为日志延迟，看得见），
+  也不要静默丢日志（表现为什么都没有，看不见）。
+- **解析失败不丢**：所有 source 的 remap 都有 `parse_error: true` 兜底分支，原文照样入库。
+  `parse_error` 常年不为 0 = 还有日志源没纳入统一格式，这是验收项不是告警噪声。
+- **只采 `ops_manager-*.log`，不采 `error-*.log`**：后者是前者中 ERROR 级的副本。
+- `timezone = "Asia/Shanghai"` 是全局项：nginx error log 的时间戳不带时区，
+  不设的话按 UTC 解析，直接差 8 小时。
 
 用 Elasticsearch bulk 端点，是 VictoriaLogs 文档给出的 Vector 接法：批量、重试、
 压缩都是 Vector 的 `elasticsearch` sink 现成的。`/insert/jsonline` 配 `http` sink 也能
 写进去，但重试语义弱得多。若所用 Vector 版本已带原生 VictoriaLogs sink，可直接换，
 字段映射逻辑一致。
 
-**磁盘 buffer 必须配**。默认是内存 buffer，Vector 一重启缓冲里的日志就没了，
-而「服务端不可用」和「需要重启 Vector」这两件事经常同时发生。
-
 ## 5. VictoriaLogs 侧（P1）
 
-- 单机 `victoria-logs` 二进制即可，启动参数：
+systemd unit 在 [`deploy/log-server/victoria-logs.service`](../deploy/log-server/victoria-logs.service)，鉴权入口在 [`deploy/log-server/nginx-vlogs.conf.example`](../deploy/log-server/nginx-vlogs.conf.example)。
+
+- 单机 `victoria-logs` 二进制即可，关键启动参数：
   - `-retentionPeriod=30d`——先定 30 天，看实际磁盘增长再调；
   - `-retention.maxDiskSpaceUsagePercent=80`——保留期之外的硬兜底，磁盘写满
     比日志少存几天严重得多；
@@ -307,7 +255,7 @@ _time:24h parse_error:true | stats count() by (host, service)
 | 期 | 内容 | 状态 |
 |---|---|---|
 | P0 | Django JSONFormatter、request_id 串联、日志文件按进程拆分、prod 去重、nginx/gunicorn JSON 格式 | **已完成** |
-| P1 | 部署 VictoriaLogs（含认证）、各机装 Vector、采应用 + nginx + gunicorn、nginx error log 解析 | 待做 |
+| P1 | 部署 VictoriaLogs（含认证）、各机装 Vector、采应用 + nginx + gunicorn、nginx error log 解析 | 配置文件已备（`deploy/log-server/`），**未实机部署验证** |
 | P2 | 任务执行日志（脱敏 + 剥 ANSI）、ops-agent 主机接入 | 待做 |
 | P3 | 审计双写、Grafana 面板、vmalert 告警（ERROR 突增、5xx 比率） | 待做 |
 
