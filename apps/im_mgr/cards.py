@@ -23,7 +23,15 @@ ACT_RUN = 'run'                   # 确认执行（非生产）
 ACT_CONFIRM_PROD = 'confirm_prod'  # 生产二次确认
 ACT_CANCEL = 'cancel'             # 取消
 ACT_PAUSE = 'pause'               # 暂停处理（continue/abort/retry/skip）
+ACT_PICK_HOSTS = 'pick_hosts'     # 展开主机多选（默认全选）
+ACT_RUN_SELECTED = 'run_selected'  # 表单提交：按勾选的主机执行
 ACT_PROBE = 'probe'               # 组件探针：回显飞书实际回传的 action 结构
+
+#: 主机多选组件里最多列这么多台。超过就只给「全部执行」并提示去页面挑——
+#: 下拉塞几百个选项既卡片超限也没法用
+MAX_HOSTS_SELECTABLE = 50
+#: 表单里多选组件的 name，回传时按它从 form_value 里取
+HOSTS_FIELD = 'hosts'
 
 #: 模块列表最多渲染这么多条，其余折成一行说明
 MAX_STEPS_SHOWN = 20
@@ -200,11 +208,18 @@ def task_detail(task, server_count, step_count, *, token=None, p2p=False):
         return card('确认执行', elements, template='grey')
 
     run_button = button(
-        '⚠ 执行到生产' if is_prod(task) else '执行',
+        f'⚠ 执行到生产（全部 {server_count} 台）' if is_prod(task)
+        else f'执行（全部 {server_count} 台）',
         {'act': ACT_RUN, 'task': task.id, 'token': token, 'p2p': p2p},
         style='danger' if is_prod(task) else 'primary',
     )
-    elements.append(actions(run_button, button('取消', {'act': ACT_CANCEL})))
+    # 「选择主机」是可选支路：不点就是全部执行，默认路径一步都没多
+    pick_button = (button('选择主机', {'act': ACT_PICK_HOSTS, 'task': task.id, 'p2p': p2p})
+                   if server_count > 1 else None)
+    elements.append(actions(run_button, pick_button, button('取消', {'act': ACT_CANCEL})))
+    if server_count > MAX_HOSTS_SELECTABLE:
+        elements.append(note(f'主机超过 {MAX_HOSTS_SELECTABLE} 台，'
+                             f'飞书里只能整体执行；要挑主机请到平台页面操作。'))
     if is_prod(task):
         elements.append(note('目标是生产环境，点击后还需再确认一次。'))
     return card('确认执行', elements, template='red' if is_prod(task) else 'blue')
@@ -413,3 +428,72 @@ def probe_result(action):
         md('飞书这次回传的 action：'),
         md(f'```\n{body}\n```'),
     ], template='grey')
+
+
+# ── 主机勾选（卡片 2.0 表单）──────────────────────────────
+
+def host_select(task, servers, *, p2p=False, selected=None):
+    """主机多选卡（**卡片 2.0**）：表单容器一次把勾选结果带回来。
+
+    用 2.0 而不是 1.0：1.0 的交互组件各自独立回调，点「执行」时拿不到之前选了
+    什么，只能在服务端暂存选择状态——多一份会过期、会串会话的状态，不如让表单
+    一次带回。
+
+    默认**全部勾上**：默认路径（不点「选择主机」）与这里的默认值一致，改动才是
+    例外。`selected_values` 是唯一被飞书接受的默认选中写法（`initial_options`
+    会被严格校验直接拒掉）。
+    """
+    servers = list(servers)[:MAX_HOSTS_SELECTABLE]
+    values = [str(s.id) for s in servers]
+    chosen = [str(v) for v in (selected if selected is not None else values)]
+    options = [{
+        'text': {'tag': 'plain_text',
+                 'content': f'{s.name} · {getattr(s, "conn_ip", "") or ""}'[:100]},
+        'value': str(s.id),
+    } for s in servers]
+    return {
+        'schema': '2.0',
+        'config': {'width_mode': 'fill', 'update_multi': True},
+        'header': {
+            'title': {'tag': 'plain_text',
+                      'content': '选择执行主机' + ('（生产）' if is_prod(task) else '')},
+            'template': 'red' if is_prod(task) else 'blue',
+        },
+        'body': {
+            'direction': 'vertical',
+            'elements': [
+                {'tag': 'markdown',
+                 'content': f'**{esc(task.name)}**\n{scope_line(task)}　{env_tag(task)}'},
+                {
+                    'tag': 'form',
+                    'name': 'host_form',
+                    'elements': [
+                        {
+                            'tag': 'multi_select_static',
+                            'name': HOSTS_FIELD,
+                            'placeholder': {'tag': 'plain_text', 'content': '选择要执行的主机'},
+                            'options': options,
+                            'selected_values': chosen,
+                        },
+                        {
+                            'tag': 'button',
+                            'text': {'tag': 'plain_text',
+                                     'content': '执行所选主机'},
+                            'type': 'danger' if is_prod(task) else 'primary',
+                            'name': 'submit',
+                            'form_action_type': 'submit',
+                            'behaviors': [{
+                                'type': 'callback',
+                                'value': {'act': ACT_RUN_SELECTED, 'task': task.id, 'p2p': p2p},
+                            }],
+                        },
+                    ],
+                },
+                {'tag': 'note',
+                 'elements': [{'tag': 'plain_text',
+                               'content': '默认全选；取消勾选即可只跑部分主机。'
+                                          + ('生产环境仍需再确认一次。'
+                                             if is_prod(task) else '')}]},
+            ],
+        },
+    }

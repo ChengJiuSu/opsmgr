@@ -318,6 +318,9 @@ class FeishuConfirmToken(models.Model):
     )
     open_id = models.CharField('发起人 OpenID', max_length=128)
     chat_id = models.CharField('会话 ID', max_length=128, blank=True)
+    # 本次要执行的主机 id（空 = 全部匹配主机）。**存服务端不放卡片**：卡片上的
+    # 值只用于展示，而这批 id 决定了生产上到底动哪几台，必须由签发方持有
+    server_ids = models.JSONField('已选主机', default=list, blank=True)
     expires_at = models.DateTimeField('过期时间')
     used_at = models.DateTimeField('消费时间', null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -332,7 +335,7 @@ class FeishuConfirmToken(models.Model):
         return f'{self.token[:8]}…({self.task_id})'
 
     @classmethod
-    def issue(cls, task, user, open_id, chat_id, ttl_seconds):
+    def issue(cls, task, user, open_id, chat_id, ttl_seconds, server_ids=None):
         """签发一张票据，顺手清掉过期一天以上的旧票据。"""
         from django.utils import timezone
 
@@ -341,6 +344,7 @@ class FeishuConfirmToken(models.Model):
         return cls.objects.create(
             token=secrets.token_urlsafe(24), task=task, user=user,
             open_id=open_id or '', chat_id=chat_id or '',
+            server_ids=list(server_ids or []),
             expires_at=now + timedelta(seconds=ttl_seconds),
         )
 

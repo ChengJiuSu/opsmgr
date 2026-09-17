@@ -2517,3 +2517,196 @@ class FeishuP2pScopeTests(TestCase):
                                 option=str(self.task.id))
         resp = handlers.handle_card_action(self.app, payload)
         self.assertTrue(_buttons(resp['card']['data'])[0]['value']['p2p'])
+
+
+@override_settings(TASK_EXEC_BACKEND='sync')
+class FeishuHostSelectTests(TestCase):
+    """飞书侧勾选执行主机：默认全选，需要时再改。"""
+
+    def setUp(self):
+        from apps.asset_mgr.models import Channel, Environment, ProjectGroup, ServerService, ServiceType
+        from apps.asset_mgr.models import Server
+        from apps.task_exec.models import ExecutionTask, TaskStep
+
+        cache.clear()
+        self.app = FeishuApp.load()
+        for key, value in FULL_CONFIG.items():
+            setattr(self.app, key, value)
+        self.app.enabled = True
+        self.app.save()
+        self.pg = ProjectGroup.objects.create(name='主项目', code='h-proj')
+        self.ch = Channel.objects.create(name='官服', code='h-ch')
+        self.env = Environment.objects.create(name='测试环境', code='h-env')
+        self.prod = Environment.objects.create(name='生产环境', code='h-prod', is_prod=True)
+        self.service = ServiceType.objects.create(name='网关', code='h-gw')
+        self.servers = []
+        for i in range(1, 4):
+            server = Server.objects.create(
+                name=f'web{i}', private_ip=f'10.0.0.{i}',
+                project_group=self.pg, channel=self.ch, environment=self.env)
+            ServerService.objects.create(server=server, service_type=self.service,
+                                         status='planned')
+            self.servers.append(server)
+        self.task = ExecutionTask.objects.create(
+            name='重启网关', project_group=self.pg, channel=self.ch, environment=self.env,
+            im_enabled=True, default_select_all=True)
+        TaskStep.objects.create(task=self.task, order=1, name='重启',
+                                command='echo hi', service_type=self.service)
+        FeishuChannel.objects.create(chat_id='oc_ops', name='运维群', allow_execute=True)
+        self.user = get_user_model().objects.create(username='hs_ops', is_staff=True)
+        FeishuBinding.objects.create(user=self.user, union_id='on_1', open_id='ou_1')
+
+    def _run(self, payload):
+        with patch('apps.task_exec.tasks.execute_task') as runner:
+            resp = handlers.handle_card_action(self.app, payload)
+        return resp, runner
+
+    def _form_payload(self, hosts, *, task=None, chat_id='oc_ops'):
+        payload = _card_payload(
+            {'act': cards.ACT_RUN_SELECTED, 'task': (task or self.task).id, 'p2p': False},
+            chat_id=chat_id)
+        payload['event']['action']['form_value'] = {cards.HOSTS_FIELD: hosts}
+        return payload
+
+    # ── 容错解析 ──────────────────────────────────────────
+    def test_parses_every_shape_feishu_might_send(self):
+        """判错的后果是「明明勾了却按全量执行」，生产上不可接受。"""
+        shapes = [
+            ['1', '2'],
+            [1, 2],
+            '1,2',
+            ' 1 , 2 ',
+            [{'value': '1'}, {'value': '2'}],
+        ]
+        for raw in shapes:
+            payload = self._form_payload(raw)
+            self.assertEqual(handlers.selected_host_ids(payload), ['1', '2'], raw)
+
+    def test_parses_form_value_without_field_name(self):
+        payload = self._form_payload(None)
+        payload['event']['action']['form_value'] = ['7', '8']
+        self.assertEqual(handlers.selected_host_ids(payload), ['7', '8'])
+
+    def test_no_form_value_means_empty(self):
+        payload = _card_payload({'act': cards.ACT_RUN_SELECTED, 'task': self.task.id})
+        self.assertEqual(handlers.selected_host_ids(payload), [])
+
+    # ── 确认卡上的入口 ────────────────────────────────────
+    def test_detail_offers_host_picker(self):
+        card = cards.task_detail(self.task, server_count=3, step_count=1)
+        acts = [b['value']['act'] for b in _buttons(card)]
+        self.assertIn(cards.ACT_PICK_HOSTS, acts)
+        self.assertIn('全部 3 台', ''.join(_texts(card)))
+
+    def test_detail_hides_picker_for_single_host(self):
+        card = cards.task_detail(self.task, server_count=1, step_count=1)
+        acts = [b['value']['act'] for b in _buttons(card)]
+        self.assertNotIn(cards.ACT_PICK_HOSTS, acts)
+
+    def test_detail_warns_when_too_many_hosts(self):
+        card = cards.task_detail(self.task, server_count=200, step_count=1)
+        self.assertIn(f'超过 {cards.MAX_HOSTS_SELECTABLE} 台', ''.join(_texts(card)))
+
+    # ── 多选卡 ────────────────────────────────────────────
+    def test_pick_hosts_returns_form_card_all_selected(self):
+        payload = _card_payload({'act': cards.ACT_PICK_HOSTS, 'task': self.task.id})
+        resp, _ = self._run(payload)
+        card = resp['card']['data']
+        self.assertEqual(card['schema'], '2.0')
+        select = card['body']['elements'][1]['elements'][0]
+        self.assertEqual(select['tag'], 'multi_select_static')
+        self.assertEqual(len(select['options']), 3)
+        # 默认全勾；initial_options 会被飞书严格校验拒掉，只能用 selected_values
+        self.assertEqual(sorted(select['selected_values']),
+                         sorted(str(s.id) for s in self.servers))
+        self.assertNotIn('initial_options', select)
+
+    def test_pick_hosts_rechecks_access(self):
+        self.task.im_enabled = False
+        self.task.save(update_fields=['im_enabled'])
+        payload = _card_payload({'act': cards.ACT_PICK_HOSTS, 'task': self.task.id})
+        resp, _ = self._run(payload)
+        self.assertIn('未开启飞书执行', ''.join(_texts(resp['card']['data'])))
+
+    # ── 按勾选执行 ────────────────────────────────────────
+    def test_runs_only_selected_hosts(self):
+        from apps.task_exec.models import TaskExecutionLog
+
+        keep = [self.servers[0], self.servers[2]]
+        resp, runner = self._run(self._form_payload([str(s.id) for s in keep]))
+        runner.assert_called_once()
+        log = TaskExecutionLog.objects.get(task=self.task)
+        self.assertEqual({row['name'] for row in log.servers_snapshot},
+                         {'web1', 'web3'})
+        self.assertEqual(resp['toast']['type'], 'success')
+
+    def test_empty_selection_rejected(self):
+        """一台都没勾却提交，不能悄悄退回全量执行。"""
+        resp, runner = self._run(self._form_payload(['999999']))
+        runner.assert_not_called()
+        self.assertIn('已不在当前范围', ''.join(_texts(resp['card']['data'])))
+
+    def test_stale_host_rejected(self):
+        """卡片可能是几分钟前发的，期间主机可能下线或改了维度。"""
+        gone = self.servers[1]
+        ids = [str(s.id) for s in self.servers]
+        gone.environment = self.prod
+        gone.save(update_fields=['environment'])
+        resp, runner = self._run(self._form_payload(ids))
+        runner.assert_not_called()
+        self.assertIn('已不在当前范围', ''.join(_texts(resp['card']['data'])))
+
+    def test_plain_run_still_uses_all_hosts(self):
+        """默认路径一步没多：不点「选择主机」就是全部执行。"""
+        from apps.task_exec.models import TaskExecutionLog
+
+        resp, runner = self._run(
+            _card_payload({'act': cards.ACT_RUN, 'task': self.task.id}))
+        runner.assert_called_once()
+        log = TaskExecutionLog.objects.get(task=self.task)
+        self.assertEqual(len(log.servers_snapshot), 3)
+
+    # ── 生产：选择 → 确认 ─────────────────────────────────
+    def _to_prod(self):
+        from apps.asset_mgr.models import ServerService
+
+        for server in self.servers:
+            server.environment = self.prod
+            server.save(update_fields=['environment'])
+        ServerService.objects.filter(server__in=self.servers).update(status='planned')
+        self.task.environment = self.prod
+        self.task.save(update_fields=['environment'])
+
+    def test_prod_selection_rides_on_the_token(self):
+        """选中的主机存服务端：卡片上的值只用于展示。"""
+        self._to_prod()
+        keep = [self.servers[0]]
+        resp, runner = self._run(self._form_payload([str(s.id) for s in keep]))
+        runner.assert_not_called()
+        token = FeishuConfirmToken.objects.get()
+        self.assertEqual(token.server_ids, [keep[0].id])
+        self.assertIn('1 台主机', ''.join(_texts(resp['card']['data'])))
+
+    def test_prod_confirm_runs_only_selected(self):
+        from apps.task_exec.models import TaskExecutionLog
+
+        self._to_prod()
+        self._run(self._form_payload([str(self.servers[0].id)]))
+        token = FeishuConfirmToken.objects.get().token
+        resp, runner = self._run(
+            _card_payload({'act': cards.ACT_CONFIRM_PROD, 'token': token}))
+        runner.assert_called_once()
+        log = TaskExecutionLog.objects.get(task=self.task)
+        self.assertEqual([row['name'] for row in log.servers_snapshot], ['web1'])
+        self.assertEqual(resp['toast']['type'], 'success')
+
+    def test_prod_confirm_without_selection_runs_all(self):
+        """没经过勾选的生产执行，票据里 server_ids 为空 = 全部。"""
+        from apps.task_exec.models import TaskExecutionLog
+
+        self._to_prod()
+        self._run(_card_payload({'act': cards.ACT_RUN, 'task': self.task.id}))
+        token = FeishuConfirmToken.objects.get().token
+        self._run(_card_payload({'act': cards.ACT_CONFIRM_PROD, 'token': token}))
+        log = TaskExecutionLog.objects.get(task=self.task)
+        self.assertEqual(len(log.servers_snapshot), 3)

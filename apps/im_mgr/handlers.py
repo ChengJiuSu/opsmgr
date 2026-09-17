@@ -146,10 +146,46 @@ def is_p2p(payload):
 
 
 def form_value(payload):
-    """卡片 2.0 表单提交时，表单内各组件的值（name → 值）。"""
+    """卡片 2.0 表单提交时回传的表单值。
+
+    正常是 `{组件name: 值}`，但**不强制转成 dict**：实测飞书在有些形态下直接给
+    列表，硬判 dict 会把它吞成空——而「明明勾了却按全量执行」在生产上是不可
+    接受的。形状判断留给调用方（见 selected_host_ids）。
+    """
     action = _event(payload).get('action') or payload.get('action') or {}
-    values = action.get('form_value') if isinstance(action, dict) else None
-    return values if isinstance(values, dict) else {}
+    return action.get('form_value') if isinstance(action, dict) else None
+
+
+def selected_host_ids(payload):
+    """从表单回传里取勾选的主机 id 列表。
+
+    **刻意写得容错**：飞书在不同版本/组件上回传的形状不一致（可能是
+    `['1','2']`、`'1,2'`、`[{'value':'1'}]`，也可能整个 form_value 就是一个列表），
+    文档讲得不清楚。这里把几种都吃下来——判错的后果是「明明勾了却按全量执行」，
+    在生产上是不可接受的，而容错的成本只有这十几行。
+    """
+    raw = form_value(payload)
+    if isinstance(raw, dict):
+        raw = raw.get(cards.HOSTS_FIELD, raw.get('hosts'))
+    return _flatten_ids(raw)
+
+
+def _flatten_ids(raw):
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [part.strip() for part in raw.split(',') if part.strip()]
+    if isinstance(raw, dict):
+        # {'value': '1'} 或 {'1': True} 两种都见过
+        if 'value' in raw:
+            return _flatten_ids(raw['value'])
+        return [str(k) for k, v in raw.items() if v]
+    if isinstance(raw, (list, tuple)):
+        found = []
+        for item in raw:
+            found.extend(_flatten_ids(item))
+        return found
+    return [str(raw)]
 
 
 def message_text(payload):
@@ -300,8 +336,13 @@ def handle_card_action(app, payload):
 
     if act == cards.ACT_PICK_TASK:
         return _on_pick(user, chat_id, option, p2p)
+    if act == cards.ACT_PICK_HOSTS:
+        return _on_pick_hosts(user, chat_id, value, p2p)
     if act == cards.ACT_RUN:
         return _on_run(user, chat_id, open_id, value, message_id, p2p)
+    if act == cards.ACT_RUN_SELECTED:
+        return _on_run(user, chat_id, open_id, value, message_id, p2p,
+                       selected_ids=selected_host_ids(payload))
     if act == cards.ACT_CONFIRM_PROD:
         return _on_confirm_prod(user, chat_id, open_id, value, message_id, p2p)
     if act == cards.ACT_PAUSE:
@@ -337,7 +378,43 @@ def _on_pick(user, chat_id, option, p2p=False):
         step_count=task.steps.count(), p2p=p2p))
 
 
-def _on_run(user, chat_id, open_id, value, message_id='', p2p=False):
+def _on_pick_hosts(user, chat_id, value, p2p=False):
+    """点「选择主机」：换成多选表单卡，默认全部勾上。"""
+    task = _load_task(value.get('task'))
+    if task is None:
+        return _reject('任务不存在', '该任务已被删除，请重新发起。')
+    error = access.check(user, task, chat_id, is_p2p=p2p)
+    if error:
+        return _reject('无法执行', error)
+    servers = list(task.matched_servers())
+    if not servers:
+        return _reject('无法执行', '当前范围未匹配到可执行主机。')
+    return card_response(cards.host_select(task, servers, p2p=p2p))
+
+
+def _resolve_selected(task, selected_ids):
+    """把回传的主机 id 收敛成本次要执行的主机，返回 (主机列表, 中文错误)。
+
+    **按当前匹配集重新解析**，不信卡片给的值：卡片可能是几分钟前发的，期间主机
+    可能已下线、改了维度或取消了服务规划。这与页面 execute 接口的口径一致
+    （那边是「主机 id 不在全局范围匹配集内，请刷新执行页面后重试」）。
+    """
+    matched = {str(s.id): s for s in task.matched_servers()}
+    if not selected_ids:
+        return list(matched.values()), None
+    picked, stale = [], []
+    for raw in selected_ids:
+        server = matched.get(str(raw))
+        (picked if server else stale).append(server or raw)
+    if stale:
+        return None, (f'有 {len(stale)} 台主机已不在当前范围内（可能已下线或改了维度），'
+                      f'请重新发起选择。')
+    if not picked:
+        return None, '没有选中任何主机。'
+    return picked, None
+
+
+def _on_run(user, chat_id, open_id, value, message_id='', p2p=False, selected_ids=None):
     """点「执行」：非生产直接发起，生产再要一次确认。"""
     task = _load_task(value.get('task'))
     if task is None:
@@ -347,14 +424,21 @@ def _on_run(user, chat_id, open_id, value, message_id='', p2p=False):
     if error:
         return _reject('无法执行', error)
 
+    servers, error = _resolve_selected(task, selected_ids)
+    if error:
+        return _reject('无法执行', error)
+
     if access.needs_production_confirm(task):
         ttl = getattr(settings, 'FEISHU_CONFIRM_TTL', CONFIRM_TTL)
-        token = FeishuConfirmToken.issue(task, user, open_id, chat_id, ttl)
+        # 选中的主机随票据存服务端：卡片上的值只用于展示，而这批 id 决定生产上
+        # 到底动哪几台
+        token = FeishuConfirmToken.issue(task, user, open_id, chat_id, ttl,
+                                         server_ids=[s.id for s in servers])
         return card_response(cards.production_confirm(
-            task, server_count=task.matched_servers().count(),
+            task, server_count=len(servers),
             step_count=task.steps.count(), token=token.token, ttl_seconds=ttl,
             p2p=p2p))
-    return _launch(task, user, chat_id, message_id, confirmed_prod=False)
+    return _launch(task, user, chat_id, message_id, confirmed_prod=False, servers=servers)
 
 
 def _on_confirm_prod(user, chat_id, open_id, value, message_id='', p2p=False):
@@ -372,7 +456,11 @@ def _on_confirm_prod(user, chat_id, open_id, value, message_id='', p2p=False):
     error = access.check(user, task, chat_id, is_p2p=p2p)
     if error:
         return _reject('无法执行', error)
-    return _launch(task, user, chat_id, message_id, confirmed_prod=True)
+    # 票据里存的是签发那一刻选中的主机，这里仍要按当前匹配集重解析一次
+    servers, error = _resolve_selected(task, token.server_ids)
+    if error:
+        return _reject('无法执行', error)
+    return _launch(task, user, chat_id, message_id, confirmed_prod=True, servers=servers)
 
 
 #: 暂停处理动作 → 定格卡片上的说法
@@ -425,14 +513,14 @@ def _on_pause(user, value):
                          toast=label, toast_type='success')
 
 
-def _launch(task, user, chat_id, message_id='', *, confirmed_prod):
+def _launch(task, user, chat_id, message_id='', *, confirmed_prod, servers=None):
     """走 task_exec 的统一发起入口，返回进度卡。"""
     error = trigger.preflight(task)
     if error:
         return _reject('无法执行', error)
 
     steps = list(task.steps.all())
-    selected = list(task.matched_servers())
+    selected = list(servers) if servers is not None else list(task.matched_servers())
     log, error = trigger.launch(
         task, steps, selected, picked={},
         triggered_by=user, trigger_type='feishu')
@@ -450,6 +538,7 @@ def _launch(task, user, chat_id, message_id='', *, confirmed_prod):
         'log_id': log.id, 'chat_id': chat_id,
         'step_count': len(steps), 'server_count': len(selected),
         'production_confirmed': confirmed_prod,
+        'hosts_picked': servers is not None,
     })
     return card_response(cards.progress(task, log),
                          toast=f'已发起执行（{len(steps)} 个模块）', toast_type='success')
