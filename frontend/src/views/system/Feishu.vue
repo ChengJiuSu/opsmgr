@@ -96,6 +96,18 @@
           机器人自定义菜单、私聊 @机器人 都走这个开关；群里仍按会话白名单
         </span>
       </el-form-item>
+      <el-form-item label="双人复核">
+        <el-radio-group v-model="form.dual_review">
+          <el-radio value="off">关闭</el-radio>
+          <el-radio value="prod">仅生产环境</el-radio>
+          <el-radio value="all">所有任务</el-radio>
+        </el-radio-group>
+        <div class="tip">
+          开启后，发起人确认之后还要<b>另一个</b>有生产执行权限的人点「复核通过」才真执行。
+          拦的是「一个人在错误的时间对着错误的环境点了确认」。
+          <b>只在群里可用</b>——单聊里那张卡只有发起人看得见，没有第二个人能点。
+        </div>
+      </el-form-item>
       <el-form-item label="sudo 卡片确认">
         <el-radio-group v-model="form.sudo_confirm">
           <el-radio value="off">关闭</el-radio>
@@ -299,7 +311,7 @@ const form = reactive({
   ip_unrestricted: false, ip_whitelist: '',
   enabled: false, sso_enabled: false, sso_redirect_uri: '',
   allow_p2p_execute: false, auto_create_user: false, remark: '',
-  sudo_confirm: 'fallback',
+  sudo_confirm: 'fallback', dual_review: 'off',
 })
 
 const defaultRedirect = computed(() => `${window.location.origin}/login/feishu`)
@@ -320,6 +332,7 @@ async function loadApp() {
       sso_redirect_uri: res.data.sso_redirect_uri || '',
       allow_p2p_execute: res.data.allow_p2p_execute,
       sudo_confirm: res.data.sudo_confirm || 'fallback',
+      dual_review: res.data.dual_review || 'off',
       auto_create_user: res.data.auto_create_user,
       remark: res.data.remark || '',
     })

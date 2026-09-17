@@ -41,7 +41,7 @@ class FeishuAppSerializer(serializers.ModelSerializer):
             'callback_slug', 'event_url', 'card_url', 'missing_fields',
             'ip_unrestricted', 'ip_whitelist',
             'enabled', 'sso_enabled', 'sso_redirect_uri', 'auto_create_user',
-            'allow_p2p_execute', 'sudo_confirm',
+            'allow_p2p_execute', 'sudo_confirm', 'dual_review',
             'remark', 'created_at', 'updated_at',
         ]
 

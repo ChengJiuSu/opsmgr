@@ -347,6 +347,8 @@ def handle_card_action(app, payload):
         return _on_confirm_prod(user, chat_id, open_id, value, message_id, p2p)
     if act == cards.ACT_PAUSE:
         return _on_pause(user, value)
+    if act == cards.ACT_REVIEW:
+        return _on_review(user, chat_id, value, message_id, p2p)
     if act == cards.ACT_SUDO:
         return _on_sudo(user, open_id, value)
     if act == cards.ACT_PROBE:
@@ -495,7 +497,66 @@ def _on_confirm_prod(user, chat_id, open_id, value, message_id='', p2p=False):
     servers, error = _resolve_selected(task, token.server_ids)
     if error:
         return _reject('无法执行', error)
+
+    if access.needs_dual_review(task):
+        if p2p:
+            # 单聊里那张卡只有发起人看得见，没有第二个人能点——与其发出去让人
+            # 卡在那里猜，不如当场说清楚
+            return _reject('需要复核',
+                           '该执行需要另一个人复核，而单聊里只有你能看到卡片。'
+                           '请到已授权的运维群里发起。')
+        ttl = getattr(settings, 'FEISHU_REVIEW_TTL', REVIEW_TTL)
+        review = FeishuConfirmToken.issue(
+            task, user, open_id, chat_id, ttl,
+            server_ids=[s.id for s in servers], stage='review')
+        logger.warning('飞书生产执行进入复核：%s（发起人 %s，%s 台主机）',
+                       task.name, user.username, len(servers))
+        return card_response(
+            cards.review_request(task, user.username, len(servers),
+                                 task.steps.count(), review.token, ttl),
+            toast='已提交复核', toast_type='info')
+
     return _launch(task, user, chat_id, message_id, confirmed_prod=True, servers=servers)
+
+
+#: 等待复核的有效期（秒）。比发起人确认那道长得多——那是「当场确认」，
+#: 这是要等另一个人看到消息、判断、再点
+REVIEW_TTL = 600
+
+
+def _on_review(reviewer, chat_id, value, message_id='', p2p=False):
+    """另一个人点「复核通过」。
+
+    复核人要过的门与发起人**完全一样**（能力位、生产权限、数据范围），另加一条
+    「不能是发起人自己」——否则复核只是找个人点一下，不构成第二道判断。
+    """
+    token, error = FeishuConfirmToken.consume(value.get('token'), open_id=None)
+    if error:
+        return _reject('复核未通过', error)
+
+    task = _load_task(token.task_id)
+    if task is None:
+        return _reject('任务不存在', '该任务已被删除，请重新发起。')
+    error = access.review_error(reviewer, task, token.user_id, chat_id)
+    if error:
+        # 票据已经被消费掉了：复核人不够格时不该让这张卡还能被别人再点一次——
+        # 重新发起比留一张「谁都可以试试」的卡安全
+        return _reject('复核未通过', f'{error}请重新发起执行。')
+
+    servers, error = _resolve_selected(task, token.server_ids)
+    if error:
+        return _reject('无法执行', error)
+
+    FeishuConfirmToken.objects.filter(pk=token.pk).update(reviewer=reviewer)
+    logger.warning('飞书生产执行通过复核：%s（发起人 %s，复核人 %s）',
+                   task.name, token.user.username, reviewer.username)
+    # 复核单独记一条：执行那条记在发起人名下，「谁复核了什么」要能独立查出来
+    audit(reviewer, {'act': 'review', 'task_id': task.id, 'task': task.name,
+                     'initiator': token.user.username,
+                     'reviewer': reviewer.username,
+                     'server_count': len(servers)})
+    return _launch(task, token.user, chat_id, message_id,
+                   confirmed_prod=True, servers=servers, reviewer=reviewer)
 
 
 #: 暂停处理动作 → 定格卡片上的说法
@@ -548,7 +609,8 @@ def _on_pause(user, value):
                          toast=label, toast_type='success')
 
 
-def _launch(task, user, chat_id, message_id='', *, confirmed_prod, servers=None):
+def _launch(task, user, chat_id, message_id='', *, confirmed_prod, servers=None,
+            reviewer=None):
     """走 task_exec 的统一发起入口，返回进度卡。"""
     error = trigger.preflight(task)
     if error:
@@ -566,14 +628,18 @@ def _launch(task, user, chat_id, message_id='', *, confirmed_prod, servers=None)
     # 按钮动作替换的正是这条消息，所以群里始终是同一条消息在原地变化
     notify.bind(log, chat_id, message_id)
 
-    logger.warning('飞书触发任务流 %s（用户 %s，%s 个模块，%s 台主机，log=%s）',
-                   task.name, user.username, len(steps), len(selected), log.id)
+    logger.warning('飞书触发任务流 %s（用户 %s，%s 个模块，%s 台主机，log=%s%s）',
+                   task.name, user.username, len(steps), len(selected), log.id,
+                   f'，复核人 {reviewer.username}' if reviewer else '')
     audit(user, {
         'act': 'execute', 'task_id': task.id, 'task': task.name,
         'log_id': log.id, 'chat_id': chat_id,
         'step_count': len(steps), 'server_count': len(selected),
         'production_confirmed': confirmed_prod,
         'hosts_picked': servers is not None,
+        'reviewed_by': getattr(reviewer, 'username', None),
     })
-    return card_response(cards.progress(task, log),
-                         toast=f'已发起执行（{len(steps)} 个模块）', toast_type='success')
+    toast = f'已发起执行（{len(steps)} 个模块）'
+    if reviewer:
+        toast = f'复核通过，已发起执行（{len(steps)} 个模块）'
+    return card_response(cards.progress(task, log), toast=toast, toast_type='success')

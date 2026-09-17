@@ -83,6 +83,34 @@ def check_pause(user, task):
     return trigger.permission_error(user, task)
 
 
+def needs_dual_review(task):
+    """这次执行要不要第二个人复核。
+
+    拦的是「一个人在错误的时间对着错误的环境点了确认」——生产二次确认能让人看清
+    在对什么下手，但看错了照样只有他自己知道。默认关：多一个人在线才能发版是真实
+    代价，开不开由团队取舍。
+    """
+    mode = FeishuApp.load().dual_review
+    if mode == 'all':
+        return True
+    return mode == 'prod' and needs_production_confirm(task)
+
+
+def review_error(reviewer, task, initiator_id, chat_id=None):
+    """复核人够不够格；返回中文拒绝原因，None 表示放行。
+
+    **复核人自己也要满足发起执行的全部条件**（能力位、生产权限、数据范围）——
+    否则「复核」只是找个人点一下，不构成第二道判断。
+
+    比的是**平台用户**而不是飞书身份：换个飞书号绕不过去。
+    """
+    if reviewer is None:
+        return '你的飞书账号尚未绑定平台用户，无法复核。'
+    if reviewer.id == initiator_id:
+        return '复核需要另一个人：发起人不能复核自己的执行。'
+    return check(reviewer, task, chat_id)
+
+
 def selectable_servers(task):
     """飞书上该列出来的主机：**各模块真正会用到的那些**。
 

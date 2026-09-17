@@ -25,6 +25,7 @@ ACT_CANCEL = 'cancel'             # 取消
 ACT_PAUSE = 'pause'               # 暂停处理（continue/abort/retry/skip）
 ACT_PICK_HOSTS = 'pick_hosts'     # 展开主机多选（默认全选）
 ACT_RUN_SELECTED = 'run_selected'  # 表单提交：按勾选的主机执行
+ACT_REVIEW = 'review'             # 双人复核：另一个人点通过
 ACT_SUDO = 'sudo'                 # 敏感操作二次验证：在飞书上确认
 ACT_PROBE = 'probe'               # 组件探针：回显飞书实际回传的 action 结构
 
@@ -63,13 +64,17 @@ def esc(text):
     """转义用户内容里的 markdown 记号。
 
     任务名、模块名、主机名都是人填的，`*bold*`、`` `code` ``、`[link](x)` 这些
-    记号会把卡片结构带歪。飞书的 lark_md 不支持反斜杠转义，所以用全角同形字符
+    记号会把卡片结构带歪。飞书的 markdown 不支持反斜杠转义，所以用全角同形字符
     替换——看起来一样，不参与渲染。
+
+    **下划线刻意不转义**：它是用户名与主机名里最常见的字符（`ops_zhang`、
+    `web_01`），而单个下划线根本不触发格式，成对出现最多渲染成一段斜体——
+    只影响样式。真正会破坏结构的是反引号（吃掉代码块围栏）与方括号（造出假链接），
+    为了防一个样式问题把所有人的名字改成全角下划线，不划算。
     """
     if text is None:
         return ''
-    table = str.maketrans({'*': '＊', '_': '＿', '`': '｀', '~': '～',
-                           '[': '［', ']': '］'})
+    table = str.maketrans({'*': '＊', '`': '｀', '~': '～', '[': '［', ']': '］'})
     return str(text).translate(table)
 
 
@@ -447,6 +452,29 @@ def host_select(task, servers, *, p2p=False, selected=None):
         ],
         template='red' if is_prod(task) else 'blue',
     )
+
+
+# ── 双人复核 ──────────────────────────────────────────────
+
+def review_request(task, initiator, server_count, step_count, token, ttl_seconds):
+    """等待他人复核卡。
+
+    **写清楚谁发起的**：复核的意义是让第二个人独立判断一次，而判断的第一个输入
+    就是「谁要在什么时候动什么」。把发起人放在最显眼的位置，比只写任务名有用。
+    """
+    return card('⚠ 等待复核', [
+        md(f'**{esc(initiator)}** 请求对生产环境执行：**{esc(task.name)}**'),
+        md(f'**环境**：{esc(getattr(task.environment, "name", ""))}\n'
+           f'**范围**：{scope_line(task)}\n'
+           f'**影响**：{step_count} 个模块 × {server_count} 台主机'),
+        hr(),
+        actions(
+            button('复核通过，执行', {'act': ACT_REVIEW, 'token': token}, style='danger'),
+            button('驳回', {'act': ACT_CANCEL}, style='default'),
+        ),
+        note(f'需要**另一个**有生产执行权限的人确认，发起人不能自己复核。'
+             f'{ttl_seconds // 60} 分钟内有效。'),
+    ], template='red')
 
 
 # ── 敏感操作确认（sudo）────────────────────────────────────

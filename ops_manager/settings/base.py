@@ -367,6 +367,9 @@ FEISHU_CONFIRM_TTL = config('FEISHU_CONFIRM_TTL', default=60, cast=int)
 # sudo 卡片确认的有效期（秒）。比生产执行确认长一些：那张卡是「当场确认」，
 # 这张要等人从网页切到飞书再切回来
 FEISHU_SUDO_TTL = config('FEISHU_SUDO_TTL', default=120, cast=int)
+# 双人复核的等待时长（秒）。比发起人确认那道长得多——那是「当场确认」，
+# 这是要等另一个人看到消息、判断、再点
+FEISHU_REVIEW_TTL = config('FEISHU_REVIEW_TTL', default=600, cast=int)
 FEISHU_TIMEOUT = (
     config('FEISHU_CONNECT_TIMEOUT', default=5, cast=int),
     config('FEISHU_READ_TIMEOUT', default=10, cast=int),

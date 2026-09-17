@@ -1115,11 +1115,20 @@ def _buttons(payload):
 class FeishuCardHelperTests(TestCase):
     def test_esc_neutralizes_markdown(self):
         """任务名里一个 * 或 ` 就能把整张卡片的结构带歪。"""
-        raw = '重启*网关*_test_ `cmd` [x](y)'
+        raw = '重启*网关* `cmd` [x](y)'
         escaped = cards.esc(raw)
-        for ch in ('*', '_', '`', '[', ']'):
+        for ch in ('*', '`', '[', ']'):
             self.assertNotIn(ch, escaped)
         self.assertIn('重启', escaped)
+
+    def test_esc_keeps_underscores(self):
+        """下划线是用户名/主机名里最常见的字符，转掉它等于改所有人的名字。
+
+        单个下划线不触发格式，成对最多渲染成斜体——只影响样式；真正会破坏结构的
+        是反引号（吃掉代码块围栏）与方括号（造出假链接）。
+        """
+        self.assertEqual(cards.esc('ops_zhang'), 'ops_zhang')
+        self.assertEqual(cards.esc('web_01 · 10.0.0.1'), 'web_01 · 10.0.0.1')
 
     def test_esc_handles_none(self):
         self.assertEqual(cards.esc(None), '')
@@ -3124,3 +3133,164 @@ class FeishuSudoConfirmTests(TestCase):
 
     def test_requires_login(self):
         self.assertEqual(APIClient().get('/api/feishu/sudo/').status_code, 401)
+
+
+@override_settings(TASK_EXEC_BACKEND='sync', FEISHU_REVIEW_TTL=600)
+class FeishuDualReviewTests(TestCase):
+    """双人复核：发起人确认之后，还要另一个够格的人点一次才真跑。"""
+
+    def setUp(self):
+        from apps.asset_mgr.models import Channel, Environment, ProjectGroup, ServerService, ServiceType
+        from apps.asset_mgr.models import Server
+        from apps.task_exec.models import ExecutionTask, TaskStep
+
+        cache.clear()
+        self.app = FeishuApp.load()
+        for key, value in FULL_CONFIG.items():
+            setattr(self.app, key, value)
+        self.app.enabled = True
+        self.app.dual_review = 'prod'
+        self.app.save()
+        pg = ProjectGroup.objects.create(name='主项目', code='dr-proj')
+        ch = Channel.objects.create(name='官服', code='dr-ch')
+        self.prod = Environment.objects.create(name='生产环境', code='dr-prod', is_prod=True)
+        self.test_env = Environment.objects.create(name='测试环境', code='dr-test')
+        service = ServiceType.objects.create(name='网关', code='dr-gw')
+        server = Server.objects.create(name='prod1', private_ip='10.0.1.1',
+                                       project_group=pg, channel=ch, environment=self.prod)
+        ServerService.objects.create(server=server, service_type=service, status='planned')
+
+        self.task = ExecutionTask.objects.create(
+            name='发版生产', project_group=pg, channel=ch, environment=self.prod,
+            im_enabled=True, default_select_all=True)
+        TaskStep.objects.create(task=self.task, order=1, name='发版',
+                                command='echo deploy', service_type=service)
+        FeishuChannel.objects.create(chat_id='oc_ops', name='运维群', allow_execute=True)
+
+        self.initiator = get_user_model().objects.create(username='dr_a', is_staff=True)
+        FeishuBinding.objects.create(user=self.initiator, union_id='on_a', open_id='ou_a')
+        self.reviewer = get_user_model().objects.create(username='dr_b', is_staff=True)
+        FeishuBinding.objects.create(user=self.reviewer, union_id='on_b', open_id='ou_b')
+
+    def _run(self, payload):
+        with patch('apps.task_exec.tasks.execute_task') as runner:
+            resp = handlers.handle_card_action(self.app, payload)
+        return resp, runner
+
+    def _as(self, who, value, *, chat_id='oc_ops'):
+        ids = {'a': ('ou_a', 'on_a'), 'b': ('ou_b', 'on_b')}[who]
+        return _card_payload(value, open_id=ids[0], union_id=ids[1], chat_id=chat_id)
+
+    def _reach_review(self):
+        """发起 → 发起人确认 → 拿到复核票据。"""
+        self._run(self._as('a', {'act': cards.ACT_RUN, 'task': self.task.id}))
+        confirm = FeishuConfirmToken.objects.get(stage='confirm').token
+        resp, runner = self._run(
+            self._as('a', {'act': cards.ACT_CONFIRM_PROD, 'token': confirm}))
+        return resp, runner, FeishuConfirmToken.objects.get(stage='review').token
+
+    # ── 开关 ──────────────────────────────────────────────
+    def test_non_prod_task_skips_review_in_prod_mode(self):
+        from apps.task_exec.models import ExecutionTask
+
+        task = ExecutionTask.objects.get(pk=self.task.pk)
+        task.environment = self.test_env
+        task.save(update_fields=['environment'])
+        self.assertFalse(access.needs_dual_review(task))
+
+    def test_all_mode_covers_non_prod(self):
+        FeishuApp.objects.filter(pk=FeishuApp.SINGLETON_PK).update(dual_review='all')
+        self.task.environment = self.test_env
+        self.task.save(update_fields=['environment'])
+        self.assertTrue(access.needs_dual_review(self.task))
+
+    def test_off_mode_runs_directly(self):
+        FeishuApp.objects.filter(pk=FeishuApp.SINGLETON_PK).update(dual_review='off')
+        self._run(self._as('a', {'act': cards.ACT_RUN, 'task': self.task.id}))
+        confirm = FeishuConfirmToken.objects.get().token
+        _, runner = self._run(self._as('a', {'act': cards.ACT_CONFIRM_PROD, 'token': confirm}))
+        runner.assert_called_once()
+
+    # ── 正常流程 ──────────────────────────────────────────
+    def test_confirm_does_not_execute_yet(self):
+        resp, runner, _ = self._reach_review()
+        runner.assert_not_called()
+        text = ''.join(_texts(resp['card']['data']))
+        self.assertIn('等待复核', text)
+        self.assertIn('dr_a', text)      # 写清楚谁发起的
+
+    def test_another_person_can_approve(self):
+        from apps.audit.models import AuditLog
+        from apps.task_exec.models import TaskExecutionLog
+
+        _, _, review = self._reach_review()
+        resp, runner = self._run(self._as('b', {'act': cards.ACT_REVIEW, 'token': review}))
+        runner.assert_called_once()
+        log = TaskExecutionLog.objects.get(task=self.task)
+        # 执行记在发起人名下，复核人进审计
+        self.assertEqual(log.triggered_by_id, self.initiator.id)
+        self.assertEqual(FeishuConfirmToken.objects.get(stage='review').reviewer_id,
+                         self.reviewer.id)
+        entry = AuditLog.objects.filter(user=self.reviewer).first()
+        self.assertIsNotNone(entry)
+        self.assertIn('dr_b', entry.body)
+        self.assertIn('复核通过', resp['toast']['content'])
+
+    # ── 安全边界 ──────────────────────────────────────────
+    def test_initiator_cannot_review_self(self):
+        """否则复核只是走个过场。"""
+        _, _, review = self._reach_review()
+        resp, runner = self._run(self._as('a', {'act': cards.ACT_REVIEW, 'token': review}))
+        runner.assert_not_called()
+        self.assertIn('不能复核自己', ''.join(_texts(resp['card']['data'])))
+
+    def test_reviewer_needs_the_same_rights(self):
+        """复核人也要过能力位与生产权限，否则「复核」只是找个人点一下。"""
+        from apps.auth_mgr.models import Role
+
+        role = Role.objects.create(code='dr-noprod', name='不可生产',
+                                   permissions={'exec': 'read'},
+                                   can_execute=True, can_exec_prod=False)
+        self.reviewer.role = role
+        self.reviewer.save(update_fields=['role'])
+        _, _, review = self._reach_review()
+        resp, runner = self._run(self._as('b', {'act': cards.ACT_REVIEW, 'token': review}))
+        runner.assert_not_called()
+        self.assertIn('不允许对生产环境', ''.join(_texts(resp['card']['data'])))
+
+    def test_unbound_reviewer_rejected(self):
+        _, _, review = self._reach_review()
+        payload = _card_payload({'act': cards.ACT_REVIEW, 'token': review},
+                                open_id='ou_x', union_id='on_x')
+        resp, runner = self._run(payload)
+        runner.assert_not_called()
+        self.assertIn('尚未绑定', ''.join(_texts(resp['card']['data'])))
+
+    def test_review_token_is_single_use(self):
+        _, _, review = self._reach_review()
+        self._run(self._as('b', {'act': cards.ACT_REVIEW, 'token': review}))
+        resp, runner = self._run(self._as('b', {'act': cards.ACT_REVIEW, 'token': review}))
+        runner.assert_not_called()
+        self.assertIn('已处理过', ''.join(_texts(resp['card']['data'])))
+
+    def test_review_expires(self):
+        from django.utils import timezone
+
+        _, _, review = self._reach_review()
+        FeishuConfirmToken.objects.filter(token=review).update(
+            expires_at=timezone.now() - timedelta(seconds=1))
+        resp, runner = self._run(self._as('b', {'act': cards.ACT_REVIEW, 'token': review}))
+        runner.assert_not_called()
+        self.assertIn('超时', ''.join(_texts(resp['card']['data'])))
+
+    def test_p2p_cannot_start_reviewed_execution(self):
+        """单聊里那张卡只有发起人看得见，没有第二个人能点。"""
+        FeishuApp.objects.filter(pk=FeishuApp.SINGLETON_PK).update(allow_p2p_execute=True)
+        self._run(self._as('a', {'act': cards.ACT_RUN, 'task': self.task.id}, chat_id=''))
+        confirm = FeishuConfirmToken.objects.get(stage='confirm').token
+        payload = _card_payload({'act': cards.ACT_CONFIRM_PROD, 'token': confirm, 'p2p': True},
+                                open_id='ou_a', union_id='on_a', chat_id='')
+        resp, runner = self._run(payload)
+        runner.assert_not_called()
+        text = ''.join(_texts(resp['card']['data']))
+        self.assertIn('单聊里只有你能看到卡片', text)

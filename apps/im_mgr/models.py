@@ -74,6 +74,18 @@ class FeishuApp(models.Model):
     # 但「只许从运维群发起、不许私聊发起」是合理诉求，所以仍要管理员点头
     allow_p2p_execute = models.BooleanField('允许单聊发起执行', default=False)
 
+    REVIEW_CHOICES = [
+        ('off', '关闭'),
+        ('prod', '仅生产环境'),
+        ('all', '所有任务'),
+    ]
+    # 双人复核：发起人确认之后，还要**另一个**有生产执行权限的人点一次才真的跑。
+    # 默认关——它拦的是「一个人在错误的时间对着错误的环境点了确认」，收益真实但
+    # 代价也真实（多一个人在线才能发版），开不开是团队自己的取舍。
+    # **只在群会话里可用**：单聊里那张卡只有发起人看得见，没有第二个人能点。
+    dual_review = models.CharField('双人复核', max_length=20,
+                                   choices=REVIEW_CHOICES, default='off')
+
     SUDO_CHOICES = [
         ('off', '关闭'),
         ('fallback', '仅未绑定验证器的用户'),
@@ -370,6 +382,18 @@ class FeishuConfirmToken(models.Model):
         settings.AUTH_USER_MODEL, verbose_name='发起人', on_delete=models.CASCADE,
         related_name='feishu_confirm_tokens',
     )
+    STAGE_CHOICES = [
+        ('confirm', '发起人确认'),
+        ('review', '等待他人复核'),
+    ]
+
+    # 两段式：发起人先确认（限本人、短过期），需要复核时再发一张等人复核的票据
+    #（不限人——谁够格谁点，但**不能是发起人自己**，否则复核就是走个过场）
+    stage = models.CharField('阶段', max_length=20, choices=STAGE_CHOICES, default='confirm')
+    reviewer = models.ForeignKey(
+        settings.AUTH_USER_MODEL, verbose_name='复核人', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='feishu_reviewed_tokens',
+    )
     open_id = models.CharField('发起人 OpenID', max_length=128)
     chat_id = models.CharField('会话 ID', max_length=128, blank=True)
     # 本次要执行的主机 id（空 = 全部匹配主机）。**存服务端不放卡片**：卡片上的
@@ -389,7 +413,8 @@ class FeishuConfirmToken(models.Model):
         return f'{self.token[:8]}…({self.task_id})'
 
     @classmethod
-    def issue(cls, task, user, open_id, chat_id, ttl_seconds, server_ids=None):
+    def issue(cls, task, user, open_id, chat_id, ttl_seconds, server_ids=None,
+              stage='confirm'):
         """签发一张票据，顺手清掉过期一天以上的旧票据。"""
         from django.utils import timezone
 
@@ -397,7 +422,10 @@ class FeishuConfirmToken(models.Model):
         cls.objects.filter(expires_at__lt=now - timedelta(days=1)).delete()
         return cls.objects.create(
             token=secrets.token_urlsafe(24), task=task, user=user,
-            open_id=open_id or '', chat_id=chat_id or '',
+            # 复核票据不限 open_id：谁够格谁点。「不能是发起人自己」在消费时判，
+            # 因为那要比的是平台用户而不是飞书身份（换个飞书号绕不过去）
+            open_id='' if stage == 'review' else (open_id or ''),
+            chat_id=chat_id or '', stage=stage,
             server_ids=list(server_ids or []),
             expires_at=now + timedelta(seconds=ttl_seconds),
         )
