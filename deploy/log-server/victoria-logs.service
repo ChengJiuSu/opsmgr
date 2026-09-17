@@ -12,8 +12,10 @@
 # 认证：内网环境，已决定不做（无 nginx 鉴权层、无 basic auth）。
 #   VictoriaLogs 自身没有任何认证机制，所以访问控制完全落在网络边界上：
 #   能连到这个端口的人即可读全部日志，也可往 /insert/* 写任意内容。
-#   因此 -httpListenAddr 写成具体的内网地址而不是 :9428（等价于 0.0.0.0）——
-#   这台机若有公网网卡，:9428 就是直接对公网开的。按本机实际内网 IP 改下面一行。
+#   现配置 -httpListenAddr=0.0.0.0:9428，即监听本机【所有】网卡。这台机若有
+#   公网网卡，9428 就是直接对公网开的：任何人可读全部日志、可往 /insert/* 写
+#   任意内容（伪造日志淹没真实记录）。安全边界因此完全落在云安全组 / iptables
+#   上——部署后务必确认 9428 只对内网网段放行，这是目前唯一的防线。
 
 [Unit]
 Description=VictoriaLogs
@@ -36,7 +38,7 @@ Group=vlogs
 #   在时间轴远端堆出永远不过期的数据。
 ExecStart=/usr/local/bin/victoria-logs \
     -storageDataPath=/home/homelab/data/victoria-logs \
-    -httpListenAddr=10.0.0.10:9428 \
+    -httpListenAddr=0.0.0.0:9428 \
     -retentionPeriod=30d \
     -retention.maxDiskSpaceUsagePercent=80 \
     -futureRetention=2d \

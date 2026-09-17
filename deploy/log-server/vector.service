@@ -4,7 +4,9 @@
 #   useradd --system --no-create-home --shell /usr/sbin/nologin vector
 #   # nginx 日志属 adm 组，Vector 要能读；应用日志目录见 README 的权限一节
 #   usermod -aG adm vector
-#   install -o vector -g vector -d /var/lib/vector
+#   install -o vector -g vector -d /home/homelab/apps/vector/data
+#   # data_dir 在 /home/homelab 下，vector 要能穿过这一层
+#   usermod -aG homelab vector && chmod g+x /home/homelab
 #   install -m 0755 vector /usr/local/bin/vector
 #   install -d /etc/vector
 #   cp vector.yaml /etc/vector/
@@ -30,7 +32,10 @@ EnvironmentFile=/etc/vector/vector.env
 # 启动前先校验配置。不校验的话，写错一个字段 = 服务起不来且采集静默中断，
 # 而日志中断这件事本身没有日志会告诉你。validate 失败则 systemd 直接报错退出，
 # 老进程（reload 场景）还在跑，不影响正在采集的数据。
-ExecStartPre=/usr/local/bin/vector validate --config /etc/vector/vector.yaml
+# ⚠ validate 子命令的配置路径是【位置参数】。--config 是 vector 主命令的写法，
+#   用在这里会报 unexpected argument；它给的 tip 指向 --config-dir 更是歧路——
+#   那个要的是目录，传文件会报 Not a directory (os error 20)。
+ExecStartPre=/usr/local/bin/vector validate /etc/vector/vector.yaml
 ExecStart=/usr/local/bin/vector --config /etc/vector/vector.yaml
 ExecReload=/bin/kill -HUP $MAINPID
 
@@ -50,8 +55,9 @@ ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
-# 检查点（读到哪一行）与磁盘 buffer 都落在这里，丢了会重复采集一批
-ReadWritePaths=/var/lib/vector
+# 检查点（读到哪一行）与磁盘 buffer 都落在这里，丢了会重复采集一批。
+# 这个路径在 /home 下，所以上面的 ProtectHome 不能开。
+ReadWritePaths=/home/homelab/apps/vector/data
 
 [Install]
 WantedBy=multi-user.target

@@ -11,11 +11,13 @@
 # =============================================================================
 
 # 检查点（每个文件读到哪一行）与磁盘 buffer 都落这里。
-# 这个值正好也是 Vector 的默认值，写出来是为了和 systemd 的 ReadWritePaths
-# 对得上——删掉不会关掉任何功能，但目录不存在或 vector 用户没有写权限时，
-# vector validate 会直接失败（磁盘 buffer 需要在这里建文件）。
-# ⚠ 删掉它 = 所有文件从头重采一遍（重复数据），别在排障时随手 rm 这个目录。
-data_dir: /var/lib/vector
+# ⚠ 必须是【运行 vector 的那个用户】可写：Vector 会在下面为每个 source 建一个
+#   同名子目录，权限不对就是启动即报
+#     Could not create subdirectory "app" inside of data dir ...: Permission denied
+#   而且是每个 source 各报一条，看着像五个问题，其实是同一个。
+#   手动跑 validate 要用 sudo -u vector，否则验的是你自己的权限，不是服务的。
+# ⚠ 删掉这个目录 = 所有文件从头重采一遍（重复数据），别在排障时随手 rm。
+data_dir: /home/homelab/apps/vector/data
 
 # nginx error log 的时间戳不带时区（`2026/09/17 15:49:35`），
 # 解析时按这个时区当本地时间处理。不设的话 VRL 按 UTC 解析，直接差 8 小时。
@@ -189,12 +191,19 @@ transforms:
       if err != null {
         . = { "msg": .message, "parse_error": true }
       } else {
-        # 时间戳不带时区，靠全局 timezone 选项按本地时间解析
-        ts_raw = to_string(parsed.ts_raw) ?? ""
+        # parse_regex 的捕获组类型是 `string or undefined`，这决定了这里只能用
+        # string() 而不是 to_string()，两者差别正好卡在 VRL 的两条硬错误上：
+        #   to_string(x) 收任意类型 → 对捕获组永不失败 → ?? 成了多余
+        #                              → E651 unnecessary error coalescing operation
+        #   string(x)    只收 string → 对 `string or undefined` 可能失败 → ?? 正当
+        # 而 upcase() 要求参数确定是 string，直接喂捕获组会报
+        #   E103 unhandled fallible assignment，所以先用 string() ?? 把类型钉死。
+        # 时间戳不带时区，靠全局 timezone 选项按本地时间解析。
+        ts_raw = string(parsed.ts_raw) ?? ""
         .ts = parse_timestamp(ts_raw, "%Y/%m/%d %H:%M:%S") ?? now()
-        level = to_string(parsed.level) ?? "error"
+        level = string(parsed.level) ?? "error"
         .level = upcase(level)
-        .msg = to_string(parsed.body) ?? ""
+        .msg = string(parsed.body) ?? ""
       }
       .service = "nginx-error"
       .host = get_hostname!()
@@ -214,7 +223,7 @@ sinks:
       - nginx_access_parsed
       - nginx_error_parsed
     endpoints:
-      - "${VLOGS_ENDPOINT}/insert/elasticsearch/"
+      - "http://localhost:9428/insert/elasticsearch/"
     mode: bulk
     api_version: "v8"
     compression: gzip

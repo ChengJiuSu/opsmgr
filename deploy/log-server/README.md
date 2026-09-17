@@ -41,10 +41,13 @@ systemctl status victoria-logs
 写任意内容。所以这一条要核：
 
 ```bash
-ss -lntp | grep 9428      # 应只绑在内网 IP，不是 0.0.0.0 / :::9428
+ss -lntp | grep 9428                 # 现配置 0.0.0.0，即监听所有网卡
+sudo iptables -L -n | grep 9428      # 或查云控制台的安全组规则
 ```
 
-这台机若有公网网卡，绑 `0.0.0.0` 就是把日志库直接开到公网上。
+当前 `-httpListenAddr=0.0.0.0:9428`，监听所有网卡。这台机若有公网网卡，
+9428 就是直接对公网开的，**安全边界完全落在云安全组 / iptables 上**——
+确认 9428 只对内网网段放行，这是目前唯一的防线。
 
 ### 2. 每台应用机
 
@@ -53,13 +56,14 @@ ss -lntp | grep 9428      # 应只绑在内网 IP，不是 0.0.0.0 / :::9428
 useradd --system --no-create-home --shell /usr/sbin/nologin vector
 usermod -aG homelab vector                      # nginx 日志属 adm 组
 install -m 0755 vector /usr/local/bin/vector
-install -o vector -g vector -d /var/lib/vector
+usermod -aG homelab vector          # data_dir 在 /home/homelab 下，要能穿过这层
+install -o vector -g vector -d /home/homelab/apps/vector/data
 install -d /etc/vector
 cp vector.yaml /etc/vector/
 cp vector.env.example /etc/vector/vector.env         # 按本机改
 chown root:vector /etc/vector/vector.env && chmod 640 /etc/vector/vector.env
 
-vector validate --config /etc/vector/vector.yaml     # 先校验再启
+sudo -u vector vector validate /etc/vector/vector.yaml   # 路径是位置参数；须以服务用户跑
 cp vector.service /etc/systemd/system/
 systemctl daemon-reload && systemctl enable --now vector
 ```
@@ -79,9 +83,11 @@ Vector 以 `vector` 用户跑，要能读：
   `logreader` 组，把应用用户与 `vector` 都放进去，目录 `chgrp logreader` + `g+rx`。
 - `${OPS_LOG_DIR}/*.log` —— 同上。
 - `/var/log/nginx/*` —— 属 `adm` 组，`usermod -aG adm vector` 即可。
-- `/var/lib/vector` —— 必须存在且 `vector` 用户可写（检查点 + 磁盘 buffer 都在这里）。
-  缺了这个 `vector validate` 直接失败，systemd 的 `ExecStartPre` 会挡住启动，
-  报错信息指向 data_dir 而不是配置本身，第一次装很容易看岔。
+- `/home/homelab/apps/vector/data` —— 必须存在且 `vector` 用户可写（检查点 + 磁盘 buffer 都在这里）。
+  Vector 会在下面给每个 source 建同名子目录，权限不对就是
+  `Could not create subdirectory "app" ... Permission denied`，
+  **五个 source 各报一条**，看着像五个问题其实是同一个。
+  手动校验必须 `sudo -u vector`，用自己的账号跑验的是错的权限。
 
 > 别图省事把 Vector 跑成 root。它读的文件里有请求路径、用户名，
 > 配置里有写入口令；跑成 root 意味着一个配置解析漏洞就是整机。
