@@ -278,9 +278,20 @@ docker compose --profile mysql up -d --build
 | 事件配置 → 订阅方式 | 请求地址（事件订阅 / 卡片回调） | 群里 @机器人没反应 |
 | 安全设置 → **重定向 URL** | `https://<域名>/login/feishu` | 飞书登录跳转后报 `20029 Invalid redirect URL` |
 
-**权限**（申请后需管理员审批）：`im:message`、`im:message:send_as_bot`、
-`im:chat:readonly`、`contact:user.base:readonly`、`contact:user.email:readonly`，
-以及网页免登（`authen`）。
+**权限**（申请后需管理员审批）：
+
+| 权限 | 用途 | 缺了会怎样 |
+|------|------|-----------|
+| `im:message:send_as_bot` | 发卡片、改卡片 | 一张卡都发不出去 |
+| `im:message.p2p_msg:readonly` | 收**单聊**消息 | 私聊机器人没反应 |
+| `im:message.group_at_msg:readonly` | 收群里**@机器人**的消息 | **群里 @机器人 没反应**，且服务端日志一片空白 |
+| `im:chat:readonly` | 列出机器人所在的群 | `feishu_check --chats` 报 232025 |
+| `contact:user.base:readonly` | 通讯录反查姓名 / ID | 手工绑定查不到人 |
+| `contact:user.email:readonly` | 读企业邮箱 | 飞书登录无法按邮箱自动绑定用户 |
+| 网页免登（`authen`） | 飞书登录 | 登录流程走不通 |
+
+单聊与群聊的消息事件是**两个独立权限**，只申请了单聊那个的话，私聊和机器人菜单
+都正常、唯独群里 @机器人 毫无反应——因为飞书压根不会把那个事件推过来。
 
 ### 配置顺序（有硬依赖）
 
@@ -446,6 +457,8 @@ grep -i "飞书回调" logs/*.log | tail -20
 | 单聊/菜单里点执行报「当前会话未被授权发起任务执行」 | 那是**群聊**分支的文案。平台侧要打开「允许单聊发起执行」（单聊没有 chat_id 可登记，走总开关）。旧版本还有个 bug：单聊的 chat_id 同样是 `oc_` 开头，被误判成群聊——升级到含该修复的版本 |
 | 点卡片按钮报 `code: 200673` / 点了没反应 | 卡片版本混用了。一条消息的卡片版本不能中途切换——回调返回的卡片必须与原消息同版本（本项目整套 2.0） |
 | 发卡失败带 `ErrPath: ROOT -> body -> …` | 卡片结构被严格校验拒了，**不是权限问题**。按 `ErrPath`/`ErrorValue` 改模板；飞书逐个报错，改一条再试 |
+| 群里 @机器人 没反应，日志里**什么都没有** | 缺 `im:message.group_at_msg:readonly`（群 @ 消息是独立权限，与单聊那个分开）；或事件订阅里没勾 `im.message.receive_v1`。日志空白 = 事件没推过来，问题在飞书后台不在代码 |
+| 群里 @机器人 没反应，但日志有「飞书回调受理」 | 事件到了。看紧随其后的日志：会话未登记 / 未绑定账号 / 无可执行任务，都会回一张说明卡 |
 | 点了机器人菜单没反应 | ① 飞书后台没订阅 `application.bot.menu_v6`（菜单与事件订阅是两处配置）；② 菜单类型选成了「跳转链接」；③ 平台侧没开「允许单聊发起执行」——这种会收到一张说明卡，不是没反应 |
 | 日志里**什么都没有** | 请求没到 Django。查 nginx：`grep feishu deploy/nginx/logs/ops-manager.api.access.log`，403 = IP 白名单挡住（**空的白名单文件 = 拒绝所有回调**） |
 | 浏览器 `20029 Invalid redirect URL` | 飞书后台「安全设置 → 重定向 URL」里没有我们传的那个地址。以**浏览器地址栏里的 `redirect_uri` 参数**为准去对，不要用 `feishu_check` 打印的那行（命令行没有 request，它按 `SITE_BASE_URL` 推导） |

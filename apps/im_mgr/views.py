@@ -220,6 +220,10 @@ class FeishuCallbackView(APIView):
         if not self._first_delivery(payload):
             return self._ack()
 
+        # 成功受理也记一条：排查「群里 @机器人 没反应」时，第一个要回答的问题是
+        # 「事件到底有没有推过来」。只在失败时记日志的话，这个问题只能靠猜——
+        # 而它通常指向飞书后台的权限/订阅，不是代码
+        logger.info('飞书回调受理：%s（path=%s）', self._summarize(payload), request.path)
         try:
             extra = self.dispatch_payload(app, payload)
         except Exception:  # noqa: BLE001 - 业务异常不能改变回包形态
@@ -240,6 +244,20 @@ class FeishuCallbackView(APIView):
         if not fresh:
             logger.info('飞书回调重复投递，已忽略：event_id=%s', event_id)
         return fresh
+
+    @staticmethod
+    def _summarize(payload):
+        """一行说清这次回调是什么，别把整个 payload 打进日志。"""
+        from . import handlers
+
+        parts = [handlers.event_type(payload) or '(未知类型)']
+        chat_id, _ = handlers.context_ids(payload)
+        if chat_id:
+            parts.append(f'chat={chat_id}')
+        open_id, _ = handlers.operator_ids(payload)
+        if open_id:
+            parts.append(f'operator={open_id}')
+        return ' '.join(parts)
 
     def dispatch_payload(self, app, payload):
         raise NotImplementedError
