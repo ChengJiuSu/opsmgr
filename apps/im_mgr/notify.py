@@ -22,7 +22,7 @@ from django.conf import settings
 from django.core.cache import cache
 
 from . import cards, tasks
-from .models import FeishuApp, FeishuBinding, FeishuCardMessage
+from .models import FeishuApp, FeishuBinding, FeishuCardMessage, FeishuChannel
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +62,10 @@ def _schedule(task_id, log_id):
         return
     status = (TaskExecutionLog.objects.filter(pk=log_id)
               .values_list('status', flat=True).first())
+    # 播报与卡片刷新互不依赖：页面发起的执行没有卡片，但它的失败同样该让值班的人
+    # 看见——这正是播报存在的理由
+    if status in ('success', 'failed'):
+        tasks.dispatch_broadcast(log_id)
     if not FeishuCardMessage.objects.filter(log_id=log_id).exists():
         # 没绑卡片的执行（页面发起的）平时不打扰：只有转「等待处理」时才私聊
         # 推给发起人——需要人处理是唯一值得主动打断的时刻
@@ -158,6 +162,52 @@ def push_pause(log_id):
     message_id = tasks.send_card(binding.open_id, render(log), receive_id_type='open_id')
     if message_id:
         bind(log, binding.open_id, message_id)
+
+
+BROADCAST_PREFIX = 'feishu:broadcast:'
+
+
+def broadcast(log_id):
+    """把终态播报给订阅了的会话。
+
+    三条规矩：
+
+    - **只播一次**。终态可能被重复广播（状态推送 + 模块表写入各来一次），
+      缓存标记挡住重复；缓存不可用时宁可多播一条，也不吞掉失败通知——漏播的
+      代价是没人知道生产挂了。
+    - **跳过已经有卡片的那个会话**。从飞书发起的执行，那张卡已经在群里刷成终态了，
+      再播一条一模一样的是纯噪声。
+    - **默认只播失败**（`notify_scope`）。成功的执行每天几十上百次，全播等于把群
+      变成噪声源，而噪声一多，真正该被看见的失败就被划过去了。
+    """
+    from apps.task_exec.models import TaskExecutionLog
+
+    log = (TaskExecutionLog.objects
+           .select_related('task', 'task__project_group', 'task__channel',
+                           'task__environment')
+           .filter(pk=log_id).first())
+    if log is None or log.status not in ('success', 'failed'):
+        return
+    if not FeishuApp.load().is_ready():
+        return
+
+    targets = FeishuChannel.broadcast_targets(log.task, log.status)
+    if not targets:
+        return
+    try:
+        if not cache.add(BROADCAST_PREFIX + str(log_id), 1, timeout=3600):
+            return
+    except Exception:  # noqa: BLE001 - 缓存不可用时宁可多播一条也不漏播
+        logger.warning('播报去重缓存不可用，按未播报处理', exc_info=True)
+
+    # 那张已经刷成终态的卡片所在的会话不必再收一条
+    bound = (FeishuCardMessage.objects.filter(log_id=log_id)
+             .values_list('chat_id', flat=True).first())
+    card = render(log)
+    for channel in targets:
+        if channel.chat_id == bound:
+            continue
+        tasks.send_card(channel.chat_id, card)
 
 
 def refresh(log_id):

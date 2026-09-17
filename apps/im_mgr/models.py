@@ -207,11 +207,30 @@ class FeishuChannel(models.Model):
         ('p2p', '单聊'),
     ]
 
+    SCOPE_CHOICES = [
+        ('failed', '仅失败'),
+        ('all', '全部结果'),
+    ]
+
     chat_id = models.CharField('会话 ID', max_length=128, unique=True)
     name = models.CharField('会话名称', max_length=100)
     chat_type = models.CharField('会话类型', max_length=20, choices=TYPE_CHOICES, default='group')
     allow_execute = models.BooleanField('允许发起任务执行', default=False)
     notify_enabled = models.BooleanField('接收通知播报', default=True)
+    # 播报范围。默认只播失败：成功的执行每天几十上百次，全播等于把群变成噪声源，
+    # 而噪声一多，真正该被看见的失败就被划过去了
+    notify_scope = models.CharField('播报范围', max_length=20,
+                                    choices=SCOPE_CHOICES, default='failed')
+    # 订阅维度（空 = 不限）。与平台其余地方同一套「维度」口径，不引入新概念：
+    # 一个群只关心自己那摊事，别的项目组的失败播过来只会被当噪声
+    notify_project_group = models.ForeignKey(
+        'asset_mgr.ProjectGroup', verbose_name='仅播报该项目组', on_delete=models.PROTECT,
+        null=True, blank=True, related_name='feishu_channels',
+    )
+    notify_environment = models.ForeignKey(
+        'asset_mgr.Environment', verbose_name='仅播报该环境', on_delete=models.PROTECT,
+        null=True, blank=True, related_name='feishu_channels',
+    )
     enabled = models.BooleanField('启用', default=True)
     remark = models.CharField('备注', max_length=200, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -225,6 +244,22 @@ class FeishuChannel(models.Model):
 
     def __str__(self):
         return f'{self.name}({self.chat_id})'
+
+    @classmethod
+    def broadcast_targets(cls, task, status):
+        """该播报给哪些会话。
+
+        三道过滤：开着播报开关、范围涵盖这次结果（失败一律播，成功只播给
+        `notify_scope='all'` 的）、订阅维度与任务维度相容（空 = 不限）。
+        """
+        qs = cls.objects.filter(enabled=True, notify_enabled=True)
+        if status != 'failed':
+            qs = qs.filter(notify_scope='all')
+        return [
+            row for row in qs
+            if (row.notify_project_group_id in (None, task.project_group_id)
+                and row.notify_environment_id in (None, task.environment_id))
+        ]
 
     @classmethod
     def executable(cls, chat_id):

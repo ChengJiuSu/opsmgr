@@ -2828,3 +2828,129 @@ class FeishuServiceTypeScopeTests(TestCase):
             environment=self.env)
         self.assertIsNone(access.selectable_servers(self.task))
         _ = TaskStep
+
+
+@override_settings(TASK_EXEC_BACKEND='sync', SITE_BASE_URL='https://ops.example.com')
+class FeishuBroadcastTests(TestCase):
+    """群订阅播报：失败自动播到订阅了的会话。"""
+
+    def setUp(self):
+        from apps.asset_mgr.models import Channel, Environment, ProjectGroup
+        from apps.task_exec.models import ExecutionTask, TaskExecutionLog
+
+        cache.clear()
+        self.app = FeishuApp.load()
+        for key, value in FULL_CONFIG.items():
+            setattr(self.app, key, value)
+        self.app.enabled = True
+        self.app.save()
+        self.pg = ProjectGroup.objects.create(name='主项目', code='bc-proj')
+        self.other_pg = ProjectGroup.objects.create(name='别的项目', code='bc-other')
+        self.ch = Channel.objects.create(name='官服', code='bc-ch')
+        self.env = Environment.objects.create(name='测试环境', code='bc-env')
+        self.prod = Environment.objects.create(name='生产环境', code='bc-prod', is_prod=True)
+        self.task = ExecutionTask.objects.create(
+            name='重启网关', project_group=self.pg, channel=self.ch, environment=self.env,
+            im_enabled=True)
+        self.log = TaskExecutionLog.objects.create(
+            task=self.task, status='failed', trigger_type='execute',
+            output='fatal: 连接超时',
+            steps_result=[{'order': 1, 'name': '重启', 'status': 'failed'}])
+        self.group = FeishuChannel.objects.create(
+            chat_id='oc_ops', name='运维群', notify_enabled=True)
+
+    def _broadcast(self):
+        with patch('apps.im_mgr.client.send_card') as send:
+            notify.broadcast(self.log.id)
+        return send
+
+    # ── 基本行为 ──────────────────────────────────────────
+    def test_failure_is_broadcast(self):
+        send = self._broadcast()
+        chat_id, card = send.call_args[0][:2]
+        self.assertEqual(chat_id, 'oc_ops')
+        text = ''.join(_texts(card))
+        self.assertIn('重启网关', text)
+        self.assertIn('连接超时', text)   # 失败附日志尾段，不用开页面就能判断
+
+    def test_success_not_broadcast_by_default(self):
+        """成功的执行每天几十上百次，全播等于把群变成噪声源。"""
+        self.log.status = 'success'
+        self.log.save(update_fields=['status'])
+        self._broadcast().assert_not_called()
+
+    def test_success_broadcast_when_scope_is_all(self):
+        FeishuChannel.objects.filter(pk=self.group.pk).update(notify_scope='all')
+        self.log.status = 'success'
+        self.log.save(update_fields=['status'])
+        self._broadcast().assert_called_once()
+
+    def test_notify_disabled_channel_skipped(self):
+        FeishuChannel.objects.filter(pk=self.group.pk).update(notify_enabled=False)
+        self._broadcast().assert_not_called()
+
+    def test_disabled_channel_skipped(self):
+        FeishuChannel.objects.filter(pk=self.group.pk).update(enabled=False)
+        self._broadcast().assert_not_called()
+
+    def test_running_log_not_broadcast(self):
+        self.log.status = 'running'
+        self.log.save(update_fields=['status'])
+        self._broadcast().assert_not_called()
+
+    # ── 维度订阅 ──────────────────────────────────────────
+    def test_dimension_filter_excludes_other_projects(self):
+        """一个群只关心自己那摊事，别的项目组的失败播过来只会被当噪声。"""
+        FeishuChannel.objects.filter(pk=self.group.pk).update(
+            notify_project_group=self.other_pg)
+        self._broadcast().assert_not_called()
+
+    def test_dimension_filter_matches(self):
+        FeishuChannel.objects.filter(pk=self.group.pk).update(
+            notify_project_group=self.pg, notify_environment=self.env)
+        self._broadcast().assert_called_once()
+
+    def test_blank_dimension_means_all(self):
+        self.assertIsNone(self.group.notify_project_group_id)
+        self._broadcast().assert_called_once()
+
+    # ── 去重与免重复 ──────────────────────────────────────
+    def test_broadcast_only_once(self):
+        """终态可能被重复广播（状态推送 + 模块表写入各来一次）。"""
+        with patch('apps.im_mgr.client.send_card') as send:
+            notify.broadcast(self.log.id)
+            notify.broadcast(self.log.id)
+        self.assertEqual(send.call_count, 1)
+
+    def test_skips_the_chat_that_already_has_the_card(self):
+        """从飞书发起的执行，那张卡已经在群里刷成终态了，再播一条是纯噪声。"""
+        notify.bind(self.log, 'oc_ops', 'om_1')
+        self._broadcast().assert_not_called()
+
+    def test_still_broadcasts_to_other_chats(self):
+        FeishuChannel.objects.create(chat_id='oc_other', name='值班群', notify_enabled=True)
+        notify.bind(self.log, 'oc_ops', 'om_1')
+        send = self._broadcast()
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(send.call_args[0][0], 'oc_other')
+
+    def test_cache_failure_still_broadcasts(self):
+        """漏播的代价是没人知道生产挂了——宁可多播一条。"""
+        with patch('apps.im_mgr.notify.cache.add', side_effect=RuntimeError('down')), \
+                patch('apps.im_mgr.client.send_card') as send:
+            notify.broadcast(self.log.id)
+        send.assert_called_once()
+
+    # ── 与执行链路对接 ────────────────────────────────────
+    def test_terminal_status_triggers_broadcast_without_card(self):
+        """页面发起的执行没有卡片，但它的失败同样该让值班的人看见。"""
+        with patch('apps.im_mgr.tasks.dispatch_broadcast') as job:
+            notify.on_execution_updated(None, task_id=self.task.id, log_id=self.log.id)
+        job.assert_called_once_with(self.log.id)
+
+    def test_feishu_failure_does_not_escape(self):
+        with patch('apps.im_mgr.client.send_card',
+                   side_effect=client.FeishuError('bot not in chat')):
+            tasks.broadcast(self.log.id)
+        self.log.refresh_from_db()
+        self.assertEqual(self.log.status, 'failed')

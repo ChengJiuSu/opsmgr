@@ -148,11 +148,18 @@
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="通知" width="90">
+      <el-table-column label="播报" min-width="180">
         <template #default="{ row }">
-          <el-tag :type="row.notify_enabled ? 'success' : 'info'" size="small">
-            {{ row.notify_enabled ? '接收' : '关闭' }}
-          </el-tag>
+          <template v-if="row.notify_enabled">
+            <el-tag :type="row.notify_scope === 'all' ? 'warning' : 'success'" size="small">
+              {{ row.notify_scope_display }}
+            </el-tag>
+            <span class="tip" style="margin-left:6px">
+              {{ [row.notify_project_group_name, row.notify_environment_name]
+                   .filter(Boolean).join(' / ') || '不限维度' }}
+            </span>
+          </template>
+          <el-tag v-else type="info" size="small">关闭</el-tag>
         </template>
       </el-table-column>
       <el-table-column label="状态" width="90">
@@ -204,6 +211,32 @@
       <el-form-item label="接收通知">
         <el-switch v-model="channelForm.notify_enabled" />
       </el-form-item>
+      <template v-if="channelForm.notify_enabled">
+        <el-form-item label="播报范围">
+          <el-radio-group v-model="channelForm.notify_scope">
+            <el-radio value="failed">仅失败</el-radio>
+            <el-radio value="all">全部结果</el-radio>
+          </el-radio-group>
+          <div class="tip">
+            默认只播失败：成功的执行每天几十上百次，全播会把群变成噪声源，
+            真正该被看见的失败反而被划过去。
+          </div>
+        </el-form-item>
+        <el-form-item label="仅播报项目组">
+          <el-select v-model="channelForm.notify_project_group" clearable
+                     placeholder="不限" style="width:100%">
+            <el-option v-for="d in dictOptions.projects" :key="d.id"
+                       :label="d.name" :value="d.id" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="仅播报环境">
+          <el-select v-model="channelForm.notify_environment" clearable
+                     placeholder="不限" style="width:100%">
+            <el-option v-for="d in dictOptions.envs" :key="d.id"
+                       :label="d.name" :value="d.id" />
+          </el-select>
+        </el-form-item>
+      </template>
       <el-form-item label="允许发起执行">
         <el-switch v-model="channelForm.allow_execute" />
         <span class="tip inline danger" v-if="channelForm.allow_execute">
@@ -234,6 +267,7 @@ import {
   createChannel, deleteChannel, getApp, getChannels,
   rotateCallbackSlug, updateApp, updateChannel,
 } from '../../api/feishu'
+import { environmentApi, fetchDictOptions, projectGroupApi } from '../../api/assets'
 
 const secretFields = [
   { key: 'app_secret', has: 'has_app_secret', label: 'App Secret', placeholder: '飞书应用凭证' },
@@ -343,7 +377,9 @@ const editRow = ref(null)
 const channelForm = reactive({
   chat_id: '', name: '', chat_type: 'group',
   allow_execute: false, notify_enabled: true, enabled: true, remark: '',
+  notify_scope: 'failed', notify_project_group: null, notify_environment: null,
 })
+const dictOptions = reactive({ projects: [], envs: [] })
 const channelRules = {
   chat_id: [{ required: true, message: '请输入会话 ID', trigger: 'blur' }],
   name: [{ required: true, message: '请输入会话名称', trigger: 'blur' }],
@@ -370,9 +406,13 @@ function openChannel(row = null) {
     chat_id: row.chat_id, name: row.name, chat_type: row.chat_type,
     allow_execute: row.allow_execute, notify_enabled: row.notify_enabled,
     enabled: row.enabled, remark: row.remark || '',
+    notify_scope: row.notify_scope || 'failed',
+    notify_project_group: row.notify_project_group || null,
+    notify_environment: row.notify_environment || null,
   } : {
     chat_id: '', name: '', chat_type: 'group',
     allow_execute: false, notify_enabled: true, enabled: true, remark: '',
+    notify_scope: 'failed', notify_project_group: null, notify_environment: null,
   })
   channelVisible.value = true
 }
@@ -404,9 +444,19 @@ async function removeChannel(row) {
   loadChannels()
 }
 
+async function loadDicts() {
+  const [projects, envs] = await Promise.all([
+    fetchDictOptions(projectGroupApi),
+    fetchDictOptions(environmentApi),
+  ])
+  dictOptions.projects = projects.data.results
+  dictOptions.envs = envs.data.results
+}
+
 onMounted(() => {
   loadApp()
   loadChannels()
+  loadDicts()
 })
 </script>
 
