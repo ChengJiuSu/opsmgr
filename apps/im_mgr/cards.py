@@ -73,50 +73,94 @@ def esc(text):
 
 
 def md(content):
-    """一段 lark_md 文本。"""
-    return {'tag': 'div', 'text': {'tag': 'lark_md', 'content': content}}
+    """一段 markdown 文本。
+
+    2.0 用 `markdown` 标签，1.0 的 `div` + `lark_md` 嵌套没了。
+    """
+    return {'tag': 'markdown', 'content': content}
 
 
 def note(content):
-    """底部小字说明。"""
-    return {'tag': 'note', 'elements': [{'tag': 'plain_text', 'content': content}]}
+    """小字说明。
+
+    **2.0 删掉了 `note` 标签**（`cards of schema V2 no longer support this
+    capability`），只能退回普通 markdown。保留这个函数是为了让调用处仍能表达
+    「这是附注」的意图。
+    """
+    return {'tag': 'markdown', 'content': content}
 
 
 def hr():
     return {'tag': 'hr'}
 
 
-def button(text, value, style='default', confirm=None):
-    """一个按钮。`style`：default / primary / danger。"""
-    element = {
+def button(text, value, style='default'):
+    """一个按钮。`style`：default / primary / danger。
+
+    2.0 的回调值放在 `behaviors`，1.0 的顶层 `value` 不再被接受——飞书的卡片
+    JSON 是严格校验，多一个未知属性整张卡都发不出去，所以不能两个都写。
+    """
+    return {
         'tag': 'button',
         'text': {'tag': 'plain_text', 'content': text},
         'type': style,
-        'value': value,
+        'behaviors': [{'type': 'callback', 'value': value}],
     }
-    if confirm:
-        # 飞书原生的点击确认弹窗。生产那道**不靠它**：它只是客户端弹窗，
-        # 拦不住重放，真正的确认是带一次性 token 的第二张卡片
-        element['confirm'] = {
-            'title': {'tag': 'plain_text', 'content': confirm[0]},
-            'text': {'tag': 'plain_text', 'content': confirm[1]},
-        }
+
+
+def submit_button(text, value, style='primary', name='submit'):
+    """表单提交按钮（必须放在 `form` 容器里）。
+
+    比普通按钮多 `form_action_type` 与 `name`：提交时飞书会把表单内所有组件的值
+    一起带回（`action.form_value`），这正是 1.0 做不到、非升 2.0 不可的那件事。
+    """
+    element = button(text, value, style=style)
+    element['name'] = name
+    element['form_action_type'] = 'submit'
     return element
 
 
-def actions(*buttons):
-    return {'tag': 'action', 'actions': [b for b in buttons if b]}
+def form(name, elements):
+    """表单容器。"""
+    return {'tag': 'form', 'name': name, 'elements': [e for e in elements if e]}
+
+
+def actions(*elements):
+    """把若干交互组件横向排成一行。
+
+    2.0 没有 1.0 的 `action` 容器，横排靠 `column_set`。单个组件时不套容器——
+    少一层嵌套，出错时 ErrPath 也短一截。
+    """
+    kept = [e for e in elements if e]
+    if not kept:
+        return None
+    if len(kept) == 1:
+        return kept[0]
+    return {
+        'tag': 'column_set',
+        'horizontal_spacing': '8px',
+        'columns': [{'tag': 'column', 'width': 'auto', 'elements': [e]} for e in kept],
+    }
 
 
 def card(title, elements, template='blue'):
-    """组装一张卡片。"""
+    """组装一张卡片（**schema 2.0**）。
+
+    **一条消息的卡片版本不能中途切换**：在 1.0 消息的回调里返回 2.0 卡片（反之
+    亦然）会被飞书拒掉，客户端上表现为「出错了，请稍后重试 code: 200673」或者
+    干脆点了没反应。所以整套统一 2.0，没有混用的余地。
+    """
     return {
-        'config': {'wide_screen_mode': True, 'update_multi': True},
+        'schema': '2.0',
+        'config': {'width_mode': 'fill', 'update_multi': True},
         'header': {
             'title': {'tag': 'plain_text', 'content': title},
             'template': template,
         },
-        'elements': elements,
+        'body': {
+            'direction': 'vertical',
+            'elements': [e for e in elements if e],
+        },
     }
 
 
@@ -175,15 +219,16 @@ def task_picker(tasks, *, tip=None, p2p=False):
             'text': {'tag': 'plain_text', 'content': f'{t.name}（{scope_line(t)}）'[:100]},
             'value': str(t.id),
         } for t in tasks]
-        elements.append(actions({
+        elements.append({
             'tag': 'select_static',
             'placeholder': {'tag': 'plain_text', 'content': '请选择任务'},
             'options': options,
-            # 场景随按钮一路带下去：卡片回调的 context 里**没有 chat_type**，而
+            # 场景随组件一路带下去：卡片回调的 context 里**没有 chat_type**，而
             # 单聊的 chat_id 同样是 oc_ 开头，从 id 上分不出群聊还是单聊
             #（照前缀猜的后果是单聊卡片全被当成未授权的群）
-            'value': {'act': ACT_PICK_TASK, 'p2p': p2p},
-        }))
+            'behaviors': [{'type': 'callback',
+                           'value': {'act': ACT_PICK_TASK, 'p2p': p2p}}],
+        })
     else:
         elements = [md('**当前没有可从飞书发起的任务。**')]
         elements.append(note('任务需在平台上开启「允许从飞书发起执行」，'
@@ -357,109 +402,18 @@ def notice(title, content, *, template='grey', tip=None):
     return card(title, elements, template=template)
 
 
-# ── 组件探针 ──────────────────────────────────────────────
-
-def probe_multi_select(options, *, preselect=None):
-    """探针卡（**卡片 2.0**）：表单容器 + 多选 + 提交按钮。
-
-    1.0 的交互组件各自独立回调，点「提交」时拿不到之前选了什么——要么服务端暂存
-    选择状态，要么升 2.0 用表单容器一次性带回。选了后者，所以先用这张卡确认两件
-    事：2.0 在这个企业的客户端渲染正常，以及提交时 `form_value` 的实际结构
-    （文档对字段名讲得不清楚，照着猜写一版再返工不划算）。
-
-    实测结论：**只认 `selected_values`**，`initial_options` 会被拒；**2.0 不支持
-    `note` 标签**（`cards of schema V2 no longer support this capability`），
-    小字说明只能用 `markdown`。飞书的卡片 JSON 是严格校验，逐个报错、逐个改。
-
-    原始报错：
-
-        unknown property, property: initial_options, path: ROOT -> body ->
-        elements -> [1](tag: form) -> elements -> [0](tag: multi_select_static)
-
-    顺带确认了飞书的卡片 JSON 是**严格校验**——多一个属性整张卡都发不出去，
-    所以别为了「兼容」往里塞备选字段。
-    """
-    preselect = list(preselect if preselect is not None else [o['value'] for o in options])
-    choices = [{'text': {'tag': 'plain_text', 'content': o['label']}, 'value': o['value']}
-               for o in options]
-    return {
-        'schema': '2.0',
-        'config': {'width_mode': 'fill', 'update_multi': True},
-        'header': {'title': {'tag': 'plain_text', 'content': '组件探针（多选 · 卡片 2.0）'},
-                   'template': 'grey'},
-        'body': {
-            'direction': 'vertical',
-            'elements': [
-                {'tag': 'markdown', 'content': '先在下拉里改几项，再点「提交」。'},
-                {
-                    'tag': 'form',
-                    'name': 'probe_form',
-                    'elements': [
-                        {
-                            'tag': 'multi_select_static',
-                            'name': 'hosts',
-                            'placeholder': {'tag': 'plain_text',
-                                            'content': '选择主机（默认全选）'},
-                            'options': choices,
-                            'selected_values': preselect,
-                        },
-                        {
-                            'tag': 'button',
-                            'text': {'tag': 'plain_text', 'content': '提交'},
-                            'type': 'primary',
-                            'name': 'submit',
-                            'form_action_type': 'submit',
-                            'behaviors': [{'type': 'callback',
-                                           'value': {'act': ACT_PROBE, 'from': 'form'}}],
-                        },
-                    ],
-                },
-                # 2.0 **不支持 note 标签**（「cards of schema V2 no longer support
-                # this capability」），小字说明只能退回 markdown
-                {'tag': 'markdown', 'content': '这张卡只用于确认飞书回传的数据结构，'
-                                               '不会执行任何任务。'},
-            ],
-        },
-    }
-
-
-def probe_result(action):
-    """把飞书回传的 action 原样展示出来。
-
-    **必须是 2.0**：这张卡是用来替换那张 2.0 探针卡的，而一条消息的卡片版本不能
-    中途换——回调里塞一张 1.0 卡去更新 2.0 消息，飞书会直接报错（客户端上表现为
-    「出错了，请稍后重试 code: 200673」或干脆点了没反应）。
-    """
-    import json as _json
-
-    body = _json.dumps(action, ensure_ascii=False, indent=2)[:1500].replace('`', "'")
-    return {
-        'schema': '2.0',
-        'config': {'width_mode': 'fill', 'update_multi': True},
-        'header': {'title': {'tag': 'plain_text', 'content': '探针回传'},
-                   'template': 'grey'},
-        'body': {
-            'direction': 'vertical',
-            'elements': [
-                {'tag': 'markdown', 'content': '飞书这次回传的 action：'},
-                {'tag': 'markdown', 'content': f'```\n{body}\n```'},
-            ],
-        },
-    }
-
-
-# ── 主机勾选（卡片 2.0 表单）──────────────────────────────
+# ── 主机勾选（表单）──────────────────────────────────────
 
 def host_select(task, servers, *, p2p=False, selected=None):
-    """主机多选卡（**卡片 2.0**）：表单容器一次把勾选结果带回来。
+    """主机多选卡：表单容器一次把勾选结果带回来。
 
-    用 2.0 而不是 1.0：1.0 的交互组件各自独立回调，点「执行」时拿不到之前选了
-    什么，只能在服务端暂存选择状态——多一份会过期、会串会话的状态，不如让表单
-    一次带回。
+    用表单而不是让多选自己回调：1.0 时代的交互组件各自独立回调，点「执行」时拿不到
+    之前选了什么，只能在服务端暂存选择状态——多一份会过期、会串会话的状态。这是
+    整套升 2.0 的直接动因。
 
-    默认**全部勾上**：默认路径（不点「选择主机」）与这里的默认值一致，改动才是
-    例外。`selected_values` 是唯一被飞书接受的默认选中写法（`initial_options`
-    会被严格校验直接拒掉）。
+    默认**全部勾上**：默认路径（不点「选择主机」）与这里的默认值一致，改动才是例外。
+    `selected_values` 是唯一被接受的默认选中写法，`initial_options` 会被严格校验
+    直接拒掉。
     """
     servers = list(servers)[:MAX_HOSTS_SELECTABLE]
     values = [str(s.id) for s in servers]
@@ -469,48 +423,70 @@ def host_select(task, servers, *, p2p=False, selected=None):
                  'content': f'{s.name} · {getattr(s, "conn_ip", "") or ""}'[:100]},
         'value': str(s.id),
     } for s in servers]
-    return {
-        'schema': '2.0',
-        'config': {'width_mode': 'fill', 'update_multi': True},
-        'header': {
-            'title': {'tag': 'plain_text',
-                      'content': '选择执行主机' + ('（生产）' if is_prod(task) else '')},
-            'template': 'red' if is_prod(task) else 'blue',
-        },
-        'body': {
-            'direction': 'vertical',
-            'elements': [
-                {'tag': 'markdown',
-                 'content': f'**{esc(task.name)}**\n{scope_line(task)}　{env_tag(task)}'},
+    return card(
+        '选择执行主机' + ('（生产）' if is_prod(task) else ''),
+        [
+            md(f'**{esc(task.name)}**\n{scope_line(task)}　{env_tag(task)}'),
+            form('host_form', [
                 {
-                    'tag': 'form',
-                    'name': 'host_form',
-                    'elements': [
-                        {
-                            'tag': 'multi_select_static',
-                            'name': HOSTS_FIELD,
-                            'placeholder': {'tag': 'plain_text', 'content': '选择要执行的主机'},
-                            'options': options,
-                            'selected_values': chosen,
-                        },
-                        {
-                            'tag': 'button',
-                            'text': {'tag': 'plain_text',
-                                     'content': '执行所选主机'},
-                            'type': 'danger' if is_prod(task) else 'primary',
-                            'name': 'submit',
-                            'form_action_type': 'submit',
-                            'behaviors': [{
-                                'type': 'callback',
-                                'value': {'act': ACT_RUN_SELECTED, 'task': task.id, 'p2p': p2p},
-                            }],
-                        },
-                    ],
+                    'tag': 'multi_select_static',
+                    'name': HOSTS_FIELD,
+                    'placeholder': {'tag': 'plain_text', 'content': '选择要执行的主机'},
+                    'options': options,
+                    'selected_values': chosen,
                 },
-                # 2.0 不支持 note，小字说明用 markdown 代替
-                {'tag': 'markdown',
-                 'content': '默认全选；取消勾选即可只跑部分主机。'
-                            + ('生产环境仍需再确认一次。' if is_prod(task) else '')},
-            ],
-        },
-    }
+                submit_button(
+                    '执行所选主机',
+                    {'act': ACT_RUN_SELECTED, 'task': task.id, 'p2p': p2p},
+                    style='danger' if is_prod(task) else 'primary',
+                ),
+            ]),
+            note('默认全选；取消勾选即可只跑部分主机。'
+                 + ('生产环境仍需再确认一次。' if is_prod(task) else '')),
+        ],
+        template='red' if is_prod(task) else 'blue',
+    )
+
+
+# ── 组件探针 ──────────────────────────────────────────────
+
+def probe_multi_select(options, *, preselect=None):
+    """探针卡：表单 + 多选 + 提交按钮，用来问清飞书实际怎么回传选中值。
+
+    真机问出来的三条 2.0 规则（都写进了对应的构件）：
+
+    - 默认选中只认 `selected_values`，`initial_options` 报 `unknown property`；
+    - **没有 `note` 标签**：`cards of schema V2 no longer support this capability`；
+    - 一条消息的卡片版本**不能中途切换**，回调返回的卡片必须同版本。
+
+    飞书的卡片 JSON 是严格校验且**逐个报错**，每次只告诉你第一个问题，所以别为了
+    「兼容」往里塞备选字段——塞了就是下一次报错。
+    """
+    preselect = list(preselect if preselect is not None else [o['value'] for o in options])
+    choices = [{'text': {'tag': 'plain_text', 'content': o['label']}, 'value': o['value']}
+               for o in options]
+    return card('组件探针（多选 · 卡片 2.0）', [
+        md('先在下拉里改几项，再点「提交」。'),
+        form('probe_form', [
+            {
+                'tag': 'multi_select_static',
+                'name': HOSTS_FIELD,
+                'placeholder': {'tag': 'plain_text', 'content': '选择主机（默认全选）'},
+                'options': choices,
+                'selected_values': preselect,
+            },
+            submit_button('提交', {'act': ACT_PROBE, 'from': 'form'}),
+        ]),
+        note('这张卡只用于确认飞书回传的数据结构，不会执行任何任务。'),
+    ], template='grey')
+
+
+def probe_result(action):
+    """把飞书回传的 action 原样展示出来。"""
+    import json as _json
+
+    body = _json.dumps(action, ensure_ascii=False, indent=2)[:1500].replace('`', "'")
+    return card('探针回传', [
+        md('飞书这次回传的 action：'),
+        md(f'```\n{body}\n```'),
+    ], template='grey')

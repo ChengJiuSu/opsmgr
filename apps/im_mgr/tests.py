@@ -1086,6 +1086,18 @@ def _texts(payload):
     return found
 
 
+def _bval(element):
+    """取交互组件的回调值。
+
+    卡片 2.0 把它挪到了 `behaviors[].value`，1.0 的顶层 `value` 不再被接受
+    （飞书严格校验，两个都写整张卡都发不出去）。
+    """
+    for behavior in (element.get('behaviors') or []):
+        if isinstance(behavior, dict) and 'value' in behavior:
+            return behavior['value']
+    return element.get('value')
+
+
 def _buttons(payload):
     """收集卡片里的所有按钮。"""
     found = []
@@ -1115,20 +1127,20 @@ class FeishuCardHelperTests(TestCase):
     def test_log_block_strips_backticks(self):
         """日志里自带 ``` 会让代码块围栏提前闭合，后面的内容当 markdown 渲染。"""
         block = cards.log_block('前面\n```\nrm -rf /\n```\n后面')
-        content = block['text']['content']
+        content = block['content']
         self.assertEqual(content.count('```'), 2)   # 只有外层围栏
         self.assertIn("'''", content)               # 内层被替换成单引号
 
     def test_log_block_truncates(self):
         block = cards.log_block('\n'.join(f'line{i}' for i in range(100)))
-        body = block['text']['content']
+        body = block['content']
         self.assertEqual(body.count('line'), cards.LOG_TAIL_LINES)
         self.assertIn('line99', body)               # 留的是尾段
         self.assertNotIn('line0\n', body)
 
     def test_log_block_truncates_long_line(self):
         block = cards.log_block('x' * 5000)
-        self.assertLess(len(block['text']['content']), cards.LOG_LINE_LIMIT + 50)
+        self.assertLess(len(block['content']), cards.LOG_LINE_LIMIT + 50)
 
     def test_log_block_empty(self):
         self.assertIsNone(cards.log_block(''))
@@ -1170,7 +1182,7 @@ class FeishuCardTests(TestCase):
     # ── 任务选择 ──────────────────────────────────────────
     def test_picker_lists_tasks(self):
         payload = cards.task_picker([self.task])
-        options = payload['elements'][1]['actions'][0]['options']
+        options = payload['body']['elements'][1]['options']
         self.assertEqual(options[0]['value'], str(self.task.id))
         self.assertIn('重启网关', options[0]['text']['content'])
 
@@ -1185,7 +1197,7 @@ class FeishuCardTests(TestCase):
         payload = cards.task_detail(self.task, server_count=3, step_count=2)
         self.assertEqual(payload['header']['template'], 'blue')
         run = _buttons(payload)[0]
-        self.assertEqual(run['value']['act'], cards.ACT_RUN)
+        self.assertEqual(_bval(run)['act'], cards.ACT_RUN)
         self.assertEqual(run['type'], 'primary')
 
     def test_detail_prod_is_red_and_danger(self):
@@ -1197,7 +1209,7 @@ class FeishuCardTests(TestCase):
     def test_detail_without_hosts_offers_no_run(self):
         """让人点下去再看到「没有主机」的报错，不如现在就说清楚。"""
         payload = cards.task_detail(self.task, server_count=0, step_count=2)
-        acts = [b['value']['act'] for b in _buttons(payload)]
+        acts = [_bval(b)['act'] for b in _buttons(payload)]
         self.assertEqual(acts, [cards.ACT_CANCEL])
         self.assertIn('未匹配到可执行主机', ''.join(_texts(payload)))
 
@@ -1210,7 +1222,7 @@ class FeishuCardTests(TestCase):
         self.assertIn('4 个模块 × 12 台主机', text)
         self.assertIn('60 秒内有效', text)
         confirm = _buttons(payload)[0]
-        self.assertEqual(confirm['value'],
+        self.assertEqual(_bval(confirm),
                          {'act': cards.ACT_CONFIRM_PROD, 'task': self.task.id,
                           'token': 'tk1', 'p2p': False})
 
@@ -1251,26 +1263,26 @@ class FeishuCardTests(TestCase):
     # ── 暂停处理 ──────────────────────────────────────────
     def test_pause_confirm_buttons(self):
         payload = cards.pause(self.task, self.log, 'confirm', current_step='重启')
-        dos = [b['value']['do'] for b in _buttons(payload)]
+        dos = [_bval(b)['do'] for b in _buttons(payload)]
         self.assertEqual(dos, ['continue', 'abort'])
 
     def test_pause_failed_buttons_with_log(self):
         payload = cards.pause(self.task, self.log, 'failed',
                               current_step='重启', tail='Traceback...')
-        dos = [b['value']['do'] for b in _buttons(payload)]
+        dos = [_bval(b)['do'] for b in _buttons(payload)]
         self.assertEqual(dos, ['retry', 'skip', 'abort'])
         self.assertIn('Traceback...', ''.join(_texts(payload)))
 
     def test_pause_unknown_type_falls_back_to_confirm(self):
         payload = cards.pause(self.task, self.log, '', current_step=None)
-        dos = [b['value']['do'] for b in _buttons(payload)]
+        dos = [_bval(b)['do'] for b in _buttons(payload)]
         self.assertEqual(dos, ['continue', 'abort'])
 
     def test_pause_buttons_carry_log_id(self):
         """处理动作要落到具体这次执行上，不能只带任务 id。"""
         payload = cards.pause(self.task, self.log, 'failed')
         for btn in _buttons(payload):
-            self.assertEqual(btn['value']['log'], self.log.id)
+            self.assertEqual(_bval(btn)['log'], self.log.id)
 
     # ── 定格与提示 ────────────────────────────────────────
     def test_handled_has_no_buttons(self):
@@ -1785,7 +1797,7 @@ class FeishuPauseTests(TestCase):
     # ── 渲染 ──────────────────────────────────────────────
     def test_render_confirm_pause(self):
         card = notify.render(self.log)
-        dos = [b['value']['do'] for b in _buttons(card)]
+        dos = [_bval(b)['do'] for b in _buttons(card)]
         self.assertEqual(dos, ['continue', 'abort'])
         self.assertIn('人工确认', ''.join(_texts(card)))
 
@@ -1797,7 +1809,7 @@ class FeishuPauseTests(TestCase):
         self.log.steps_result = [{'order': 1, 'name': '重启', 'status': 'failed'}]
         self.log.save()
         card = notify.render(self.log)
-        dos = [b['value']['do'] for b in _buttons(card)]
+        dos = [_bval(b)['do'] for b in _buttons(card)]
         self.assertEqual(dos, ['retry', 'skip', 'abort'])
         text = ''.join(_texts(card))
         self.assertIn('连接超时', text)
@@ -1935,7 +1947,7 @@ class FeishuPauseTests(TestCase):
                 patch('apps.im_mgr.client.send_card') as send:
             notify.on_execution_updated(None, task_id=self.task.id, log_id=self.log.id)
         send.assert_not_called()
-        dos = [b['value']['do'] for b in _buttons(update.call_args[0][1])]
+        dos = [_bval(b)['do'] for b in _buttons(update.call_args[0][1])]
         self.assertEqual(dos, ['continue', 'abort'])
 
 
@@ -2487,12 +2499,12 @@ class FeishuP2pScopeTests(TestCase):
 
     def test_picker_carries_scope(self):
         card = cards.task_picker([self.task], p2p=True)
-        select = card['elements'][1]['actions'][0]
-        self.assertTrue(select['value']['p2p'])
+        select = card['body']['elements'][1]
+        self.assertTrue(_bval(select)['p2p'])
 
     def test_run_button_carries_scope(self):
         card = cards.task_detail(self.task, server_count=1, step_count=1, p2p=True)
-        self.assertTrue(_buttons(card)[0]['value']['p2p'])
+        self.assertTrue(_bval(_buttons(card)[0])['p2p'])
 
     def test_p2p_run_works_with_oc_chat_id(self):
         """单聊的 chat_id 也是 oc_ 开头：靠 value 里的标记，不靠前缀猜。"""
@@ -2516,7 +2528,7 @@ class FeishuP2pScopeTests(TestCase):
                                 chat_id='oc_p2p_looks_like_group',
                                 option=str(self.task.id))
         resp = handlers.handle_card_action(self.app, payload)
-        self.assertTrue(_buttons(resp['card']['data'])[0]['value']['p2p'])
+        self.assertTrue(_bval(_buttons(resp['card']['data'])[0])['p2p'])
 
 
 @override_settings(TASK_EXEC_BACKEND='sync')
@@ -2594,13 +2606,13 @@ class FeishuHostSelectTests(TestCase):
     # ── 确认卡上的入口 ────────────────────────────────────
     def test_detail_offers_host_picker(self):
         card = cards.task_detail(self.task, server_count=3, step_count=1)
-        acts = [b['value']['act'] for b in _buttons(card)]
+        acts = [_bval(b)['act'] for b in _buttons(card)]
         self.assertIn(cards.ACT_PICK_HOSTS, acts)
         self.assertIn('全部 3 台', ''.join(_texts(card)))
 
     def test_detail_hides_picker_for_single_host(self):
         card = cards.task_detail(self.task, server_count=1, step_count=1)
-        acts = [b['value']['act'] for b in _buttons(card)]
+        acts = [_bval(b)['act'] for b in _buttons(card)]
         self.assertNotIn(cards.ACT_PICK_HOSTS, acts)
 
     def test_detail_warns_when_too_many_hosts(self):
