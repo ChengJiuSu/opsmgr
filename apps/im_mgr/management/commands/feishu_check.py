@@ -269,9 +269,15 @@ class Command(BaseCommand):
             self.stdout.write(BAD + f'发送失败：{exc}')
             # 卡片 JSON 被拒时，「机器人不在群里」这类提示纯属误导——飞书自己
             # 已经把出错的属性和路径指出来了，照着改就行
-            if 'card json' in str(exc).lower() or 'unknown property' in str(exc).lower():
-                self.stdout.write(INFO + '卡片结构被飞书拒了（严格校验，多一个属性都不行）：'
-                                         '按上面的 property / path 改卡片模板')
+            # 飞书的卡片结构错误统一以 Failed to create card content 开头，且带
+            # ErrPath 指出具体位置。只匹配 unknown property 的话，这次的
+            # 「unsupported tag note」就漏了，又去提示权限——而权限明明是好的
+            text = str(exc).lower()
+            if any(k in text for k in ('card content', 'card json', 'errpath',
+                                       'unknown property', 'unsupported tag')):
+                self.stdout.write(INFO + '卡片结构被飞书拒了（严格校验，逐个报错）：'
+                                         '按上面的 ErrPath / ErrorValue 改卡片模板，'
+                                         '**不是权限问题**')
             else:
                 self.stdout.write(INFO + '常见原因：机器人不在该群 / 对方没跟机器人建立过会话、'
                                          '或缺 im:message:send_as_bot 权限')

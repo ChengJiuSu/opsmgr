@@ -367,7 +367,11 @@ def probe_multi_select(options, *, preselect=None):
     事：2.0 在这个企业的客户端渲染正常，以及提交时 `form_value` 的实际结构
     （文档对字段名讲得不清楚，照着猜写一版再返工不划算）。
 
-    实测结论（2026-09-16）：**只认 `selected_values`**，`initial_options` 会被拒：
+    实测结论：**只认 `selected_values`**，`initial_options` 会被拒；**2.0 不支持
+    `note` 标签**（`cards of schema V2 no longer support this capability`），
+    小字说明只能用 `markdown`。飞书的卡片 JSON 是严格校验，逐个报错、逐个改。
+
+    原始报错：
 
         unknown property, property: initial_options, path: ROOT -> body ->
         elements -> [1](tag: form) -> elements -> [0](tag: multi_select_static)
@@ -410,10 +414,10 @@ def probe_multi_select(options, *, preselect=None):
                         },
                     ],
                 },
-                {'tag': 'note',
-                 'elements': [{'tag': 'plain_text',
-                               'content': '这张卡只用于确认飞书回传的数据结构，'
-                                          '不会执行任何任务。'}]},
+                # 2.0 **不支持 note 标签**（「cards of schema V2 no longer support
+                # this capability」），小字说明只能退回 markdown
+                {'tag': 'markdown', 'content': '这张卡只用于确认飞书回传的数据结构，'
+                                               '不会执行任何任务。'},
             ],
         },
     }
@@ -489,11 +493,10 @@ def host_select(task, servers, *, p2p=False, selected=None):
                         },
                     ],
                 },
-                {'tag': 'note',
-                 'elements': [{'tag': 'plain_text',
-                               'content': '默认全选；取消勾选即可只跑部分主机。'
-                                          + ('生产环境仍需再确认一次。'
-                                             if is_prod(task) else '')}]},
+                # 2.0 不支持 note，小字说明用 markdown 代替
+                {'tag': 'markdown',
+                 'content': '默认全选；取消勾选即可只跑部分主机。'
+                            + ('生产环境仍需再确认一次。' if is_prod(task) else '')},
             ],
         },
     }
