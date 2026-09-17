@@ -38,6 +38,7 @@ class FeishuAppSerializer(serializers.ModelSerializer):
         fields = [
             'app_id', 'app_secret', 'encrypt_key', 'verification_token',
             'has_app_secret', 'has_encrypt_key', 'has_verification_token',
+            'event_mode',
             'callback_slug', 'event_url', 'card_url', 'missing_fields',
             'ip_unrestricted', 'ip_whitelist',
             'enabled', 'sso_enabled', 'sso_redirect_uri', 'auto_create_user',

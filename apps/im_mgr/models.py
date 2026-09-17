@@ -56,6 +56,20 @@ class FeishuApp(models.Model):
     # 回调路径随机串：/api/feishu/<slug>/event/ 与 /api/feishu/<slug>/card/
     callback_slug = models.CharField('回调标识', max_length=64, default=new_callback_slug)
 
+    MODE_CALLBACK = 'callback'
+    MODE_WEBSOCKET = 'websocket'
+    MODE_CHOICES = [
+        (MODE_CALLBACK, '回调（飞书推到公网地址）'),
+        (MODE_WEBSOCKET, '长连接（平台主动外连）'),
+    ]
+    # 事件接收方式。两者**互斥**：都开着会让同一个事件被处理两次（飞书两条路都推）。
+    #
+    # - callback：零依赖、无常驻进程，但要把两条地址暴露在公网上；
+    # - websocket：平台主动外连飞书，**入站零暴露**，代价是引 lark-oapi
+    #   与一个常驻进程。想把服务收回内网、只对指定 IP 开放时选它。
+    event_mode = models.CharField('事件接收方式', max_length=20,
+                                  choices=MODE_CHOICES, default=MODE_CALLBACK)
+
     ip_unrestricted = models.BooleanField('不限制来源 IP', default=False)
     ip_whitelist = models.TextField(
         '回调来源 IP 白名单', blank=True,
@@ -164,14 +178,17 @@ class FeishuApp(models.Model):
     def missing_fields(self):
         """启用前缺失的必填项（中文名列表，空 = 齐全）。
 
-        `encrypt_key` 与 `verification_token` 在飞书侧是可选的，这里当必填：
-        方案要求回调强制验签，缺了就只能裸收——那条入口在公网上。
+        回调模式下 `encrypt_key` / `verification_token` / IP 白名单都是必填：
+        那条入口在公网上，缺了就只能裸收。**长连接模式下这三项不要求**——
+        事件走平台主动外连的加密通道，没有公网入口可打，再要求它们只是徒增配置。
         """
         missing = []
         if not self.app_id:
             missing.append('App ID')
         if not self.has_app_secret:
             missing.append('App Secret')
+        if self.use_websocket:
+            return missing
         if not self.has_encrypt_key:
             missing.append('Encrypt Key')
         if not self.has_verification_token:
@@ -183,6 +200,10 @@ class FeishuApp(models.Model):
     def is_ready(self):
         """能否对外提供飞书能力（回调 / 发卡片）。"""
         return self.enabled and not self.missing_fields()
+
+    @property
+    def use_websocket(self):
+        return self.event_mode == self.MODE_WEBSOCKET
 
     def ip_allowed(self, ip):
         """回调来源 IP 是否放行。白名单留空且未显式勾选不限制 → 拒。

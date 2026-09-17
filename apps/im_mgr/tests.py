@@ -15,7 +15,7 @@ from rest_framework.test import APIClient
 
 from common.testing import grant_sudo
 
-from apps.im_mgr import access, cards, client, crypto, handlers, notify, sso, tasks
+from apps.im_mgr import access, cards, client, crypto, handlers, notify, sso, tasks, ws
 from apps.im_mgr.models import (
     FeishuApp, FeishuBinding, FeishuCardMessage, FeishuChannel, FeishuConfirmToken,
 )
@@ -3294,3 +3294,179 @@ class FeishuDualReviewTests(TestCase):
         runner.assert_not_called()
         text = ''.join(_texts(resp['card']['data']))
         self.assertIn('单聊里只有你能看到卡片', text)
+
+
+# ══════════════════════════════════════════════════════════
+# 长连接接收事件（入站零暴露）
+# ══════════════════════════════════════════════════════════
+
+class _Obj:
+    """把 dict 变成属性访问的对象，模拟 SDK 的事件模型。"""
+
+    def __init__(self, **kw):
+        for key, value in kw.items():
+            setattr(self, key, value)
+
+
+@override_settings(TASK_EXEC_BACKEND='sync')
+class FeishuWebsocketTests(TestCase):
+    """长连接与回调**只有入口不同**，进来之后完全共用。
+
+    所以这里只压两件事：payload 转换不丢字段、以及两种模式互斥。
+    """
+
+    def setUp(self):
+        from apps.asset_mgr.models import Channel, Environment, ProjectGroup, ServerService, ServiceType
+        from apps.asset_mgr.models import Server
+        from apps.task_exec.models import ExecutionTask, TaskStep
+
+        cache.clear()
+        self.app = FeishuApp.load()
+        for key, value in FULL_CONFIG.items():
+            setattr(self.app, key, value)
+        self.app.enabled = True
+        self.app.event_mode = FeishuApp.MODE_WEBSOCKET
+        self.app.save()
+        pg = ProjectGroup.objects.create(name='主项目', code='ws-proj')
+        ch = Channel.objects.create(name='官服', code='ws-ch')
+        env = Environment.objects.create(name='测试环境', code='ws-env')
+        service = ServiceType.objects.create(name='网关', code='ws-gw')
+        server = Server.objects.create(name='web1', private_ip='10.0.0.1',
+                                       project_group=pg, channel=ch, environment=env)
+        ServerService.objects.create(server=server, service_type=service, status='planned')
+        self.task = ExecutionTask.objects.create(
+            name='重启网关', project_group=pg, channel=ch, environment=env,
+            im_enabled=True, default_select_all=True)
+        TaskStep.objects.create(task=self.task, order=1, name='重启',
+                                command='echo hi', service_type=service)
+        FeishuChannel.objects.create(chat_id='oc_ops', name='运维群', allow_execute=True)
+        self.user = get_user_model().objects.create(username='ws_ops', is_staff=True)
+        FeishuBinding.objects.create(user=self.user, union_id='on_1', open_id='ou_1')
+
+    # ── payload 转换 ──────────────────────────────────────
+    def test_event_payload_roundtrip(self):
+        sdk_event = _Obj(
+            schema='2.0',
+            header=_Obj(event_id='ev-1', event_type='im.message.receive_v1',
+                        token='tk'),
+            event={'sender': {'sender_id': {'open_id': 'ou_1', 'union_id': 'on_1'}},
+                   'message': {'chat_id': 'oc_ops', 'chat_type': 'group',
+                               'content': json.dumps({'text': '执行'})}},
+        )
+        payload = ws.event_payload(sdk_event)
+        # 转换之后，handlers 的取值函数一个都不用改
+        self.assertEqual(handlers.event_type(payload), 'im.message.receive_v1')
+        self.assertEqual(handlers.event_id(payload), 'ev-1')
+        self.assertEqual(handlers.operator_ids(payload), ('ou_1', 'on_1'))
+        self.assertEqual(handlers.context_ids(payload)[0], 'oc_ops')
+        self.assertFalse(handlers.is_p2p(payload))
+
+    def test_card_payload_roundtrip(self):
+        """卡片这条 SDK 把整棵树转成了对象，漏一个字段的表现是「点了没反应」。"""
+        trigger = _Obj(
+            schema='2.0',
+            header=_Obj(event_id='ca-1', event_type='card.action.trigger', token='tk'),
+            event=_Obj(
+                operator=_Obj(open_id='ou_1', union_id='on_1', user_id='u1'),
+                context=_Obj(open_chat_id='oc_ops', open_message_id='om_1'),
+                action=_Obj(tag='button', value={'act': 'run', 'task': 7},
+                            option='', name='submit',
+                            form_value={'hosts': ['1', '2']}, input_value=''),
+            ),
+        )
+        payload = ws.card_payload(trigger)
+        value, option = handlers.action_payload(payload)
+        self.assertEqual(value, {'act': 'run', 'task': 7})
+        self.assertEqual(handlers.operator_ids(payload), ('ou_1', 'on_1'))
+        self.assertEqual(handlers.context_ids(payload), ('oc_ops', 'om_1'))
+        self.assertEqual(handlers.selected_host_ids(payload), ['1', '2'])
+        self.assertEqual(option, '')
+
+    def test_select_option_survives(self):
+        trigger = _Obj(
+            schema='2.0', header=_Obj(event_id='ca-2', event_type='card.action.trigger'),
+            event=_Obj(operator=_Obj(open_id='ou_1', union_id='on_1'),
+                       context=_Obj(open_chat_id='oc_ops', open_message_id='om_1'),
+                       action=_Obj(tag='select_static', value={'act': 'pick_task'},
+                                   option='42', form_value=None)),
+        )
+        _, option = handlers.action_payload(ws.card_payload(trigger))
+        self.assertEqual(option, '42')
+
+    # ── 端到端（不连真飞书）────────────────────────────────
+    def test_event_reaches_handlers(self):
+        sdk_event = _Obj(
+            schema='2.0',
+            header=_Obj(event_id='ev-run', event_type='im.message.receive_v1'),
+            event={'sender': {'sender_id': {'open_id': 'ou_1', 'union_id': 'on_1'}},
+                   'message': {'chat_id': 'oc_ops', 'chat_type': 'group',
+                               'content': json.dumps({'text': '执行'})}},
+        )
+        with patch('apps.im_mgr.tasks.dispatch_send_card') as send:
+            ws.on_event(sdk_event)
+        self.assertIn('重启网关', ''.join(_texts(send.call_args[0][1])))
+
+    def test_event_deduped(self):
+        """飞书的投递重试在长连接上同样存在。"""
+        sdk_event = _Obj(
+            schema='2.0',
+            header=_Obj(event_id='ev-dup', event_type='im.message.receive_v1'),
+            event={'sender': {'sender_id': {'open_id': 'ou_1', 'union_id': 'on_1'}},
+                   'message': {'chat_id': 'oc_ops', 'chat_type': 'group',
+                               'content': json.dumps({'text': '执行'})}},
+        )
+        with patch('apps.im_mgr.tasks.dispatch_send_card') as send:
+            ws.on_event(sdk_event)
+            ws.on_event(sdk_event)
+        self.assertEqual(send.call_count, 1)
+
+    def test_handler_exception_does_not_escape(self):
+        """一次业务异常不该影响后续事件。"""
+        sdk_event = _Obj(schema='2.0',
+                         header=_Obj(event_id='ev-boom',
+                                     event_type='im.message.receive_v1'),
+                         event={})
+        with patch('apps.im_mgr.handlers.handle_event', side_effect=RuntimeError('boom')):
+            ws.on_event(sdk_event)   # 不抛
+
+    def test_card_action_returns_sdk_response(self):
+        trigger = _Obj(
+            schema='2.0', header=_Obj(event_id='ca-run', event_type='card.action.trigger'),
+            event=_Obj(operator=_Obj(open_id='ou_1', union_id='on_1'),
+                       context=_Obj(open_chat_id='oc_ops', open_message_id='om_1'),
+                       action=_Obj(tag='button', value={'act': cards.ACT_CANCEL},
+                                   option='', form_value=None)),
+        )
+        resp = ws.on_card_action(trigger)
+        # SDK 的响应模型能直接吃 handlers 返回的那个 dict
+        self.assertIsNotNone(resp)
+        self.assertEqual(resp.card.type, 'raw')
+        self.assertIn('已取消', ''.join(_texts(resp.card.data)))
+
+    # ── 两种模式互斥 ──────────────────────────────────────
+    def test_callback_entry_disabled_in_ws_mode(self):
+        """回调地址没从飞书后台清掉的话，同一个事件会被处理两次。"""
+        body = _callback_body('encrypt-value', {'type': 'url_verification',
+                                                'token': 'token-value',
+                                                'challenge': 'c'})
+        ts, nonce = str(int(time.time())), 'n-ws'
+        FeishuApp.objects.filter(pk=FeishuApp.SINGLETON_PK).update(ip_whitelist='127.0.0.1')
+        resp = APIClient().post(
+            FeishuApp.load().event_path, data=body, content_type='application/json',
+            HTTP_X_LARK_REQUEST_TIMESTAMP=ts, HTTP_X_LARK_REQUEST_NONCE=nonce,
+            HTTP_X_LARK_SIGNATURE=_sign('encrypt-value', ts, nonce, body))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {'code': 0})      # 恒定回包，没回显 challenge
+
+    def test_ws_mode_does_not_require_callback_secrets(self):
+        """长连接没有公网入口可打，再要求 Encrypt Key 与 IP 白名单只是徒增配置。"""
+        FeishuApp.objects.filter(pk=FeishuApp.SINGLETON_PK).update(
+            encrypt_key='', verification_token='', ip_whitelist='', ip_unrestricted=False)
+        self.assertEqual(FeishuApp.load().missing_fields(), [])
+
+    def test_callback_mode_still_requires_them(self):
+        FeishuApp.objects.filter(pk=FeishuApp.SINGLETON_PK).update(
+            event_mode=FeishuApp.MODE_CALLBACK,
+            encrypt_key='', verification_token='', ip_whitelist='', ip_unrestricted=False)
+        missing = FeishuApp.load().missing_fields()
+        self.assertIn('Encrypt Key', missing)

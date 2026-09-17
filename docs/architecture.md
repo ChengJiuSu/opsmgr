@@ -91,10 +91,12 @@ flowchart TB
 - **写请求不在 web 进程里干活**：web 只落库 + 置状态 + 投 Redis，真正的 ansible/acme 在 celery worker 里跑。worker 没起 = 任务永远排队且页面无报错。
 - **两个 celery worker 不共队列**：`task_exec` 队列跑任务执行，默认队列跑证书，互不抢占；同机运行必须给不同 `-n` node 名。
 - **连接方向恒为 agent → manager**，manager 从不主动连 agent，NAT 内网主机零改造。
-- **飞书是第四类接入方**：入站只有 `/api/feishu/callback/<slug>/{event,card}/` 两条，
-  nginx 侧独立 IP 白名单 + 限速，应用层再验签名/时间戳/nonce；出站（发卡、改卡、
-  通讯录、换 token）走默认 celery 队列异步发，**绝不在执行线程里发**。飞书发不出去
-  不影响任何一次任务执行。
+- **飞书是第四类接入方**，入站两种方式二选一（互斥）：**回调**——
+  `/api/feishu/callback/<slug>/{event,card}/` 两条公网入口，nginx 侧独立 IP 白名单
+  + 限速，应用层再验签名/时间戳/nonce；**长连接**——多一个常驻进程
+  （`manage.py feishu_ws`）主动外连飞书，**入站零暴露**，服务可以收回内网、
+  只对指定 IP 开放。出站（发卡、改卡、通讯录、换 token）两种方式都一样，走异步
+  后端发，**绝不在执行线程里发**。飞书发不出去不影响任何一次任务执行。
 
 ---
 
@@ -108,6 +110,7 @@ flowchart TB
 | celery worker (exec) | `deploy/ops-manager-celery-exec.conf` | — | `-Q task_exec`，跑任务流 | 任务卡在 pending |
 | celery worker (默认) | `deploy/ops-manager-celery.conf` | — | 证书签发/续签/分发 | 证书永远「申请中」 |
 | celery beat | `deploy/ops-manager-celery-beat.conf` | — | 24h 扫临期证书 | 不自动续签（可手动） |
+| feishu-ws（可选） | `deploy/ops-manager-feishu-ws.conf` | — | 飞书长连接收事件（仅长连接模式） | 群里 @机器人 无反应 |
 | Redis | 系统服务 | 6379 | broker / result / channel layer / 缓存 | celery 与 WebSocket 均不可用 |
 | MySQL | 系统服务 | 3306 | 主数据 | 全挂 |
 

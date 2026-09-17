@@ -45,3 +45,7 @@ gunicorn>=22.0
 
 # API 文档（可选）
 drf-spectacular>=0.28.0
+
+# 飞书长连接接收事件（apps/im_mgr/ws.py）。回调模式不需要它，但装上无害；
+# 想把服务收回内网、入站零暴露时必须有。自带 protobuf 副本，不引编译依赖
+lark-oapi>=1.7,<2

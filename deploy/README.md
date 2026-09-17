@@ -269,6 +269,7 @@ docker compose --profile mysql up -d --build
 
 | 小节 | 什么时候看 |
 |------|-----------|
+| [事件接收方式：回调 vs 长连接](#事件接收方式回调-vs-长连接) | **不想把服务暴露到公网时先看这条** |
 | [飞书后台要配的四处](#飞书后台要配的四处) | 第一次接入 |
 | [配置顺序](#配置顺序有硬依赖) | 第一次接入（顺序错了会卡住） |
 | [怎么拿 chat_id / open_id](#怎么拿-chat_id--open_id) | 登记会话、手工绑定、个人订阅 |
@@ -277,6 +278,51 @@ docker compose --profile mysql up -d --build
 | [双人复核](#双人复核可选) | 生产执行要两个人点 |
 | [排错：日志怎么看](#排错日志怎么看) | **任何一步卡住** |
 | [上线前收紧](#上线前收紧) | 测通之后、正式启用之前 |
+
+### 事件接收方式：回调 vs 长连接
+
+先定这个，它决定后面要不要配回调地址、要不要开公网。
+
+| | 回调（默认） | 长连接 |
+|---|---|---|
+| 方向 | 飞书 → 平台公网地址 | 平台 → 飞书（主动外连） |
+| **入站暴露** | 两条公网入口（需 IP 白名单 + 验签） | **零**，服务可只对指定 IP 开放 |
+| 依赖 | 无 | `lark-oapi`（要重新 `make lock` + 重建 wheelhouse） |
+| 常驻进程 | 无 | 一个（supervisor 托管） |
+| 必填配置 | Encrypt Key + Verification Token + IP 白名单 | 只要 App ID / Secret |
+| 执行后端 | 任意 | **必须 `TASK_EXEC_BACKEND=celery`** |
+
+**两者互斥**：都开着同一个事件会被处理两次（执行跑两遍）。
+
+#### 切换到长连接
+
+```bash
+# ① 依赖：requirements.txt 已含 lark-oapi，但 lock 要在 builder 容器里重新生成
+make lock USE_DOCKER=true      # 生成 requirements.lock
+make wheels                    # 重建离线 wheelhouse，随制品发到目标机
+
+# ② 平台侧：「系统管理 → 飞书接入」把事件接收方式改成「长连接」并保存
+
+# ③ 飞书后台：事件配置 → 订阅方式改成「使用长连接接收事件」，
+#    把原来的「请求地址」清掉（留着的话事件会走两条路）
+
+# ④ 起进程
+sudo cp deploy/ops-manager-feishu-ws.conf /etc/supervisor/conf.d/
+sudo supervisorctl reread && sudo supervisorctl update
+sudo supervisorctl start ops-manager-feishu-ws
+tail -f logs/feishu-ws.log      # 应看到「飞书长连接启动」
+
+# ⑤ 验证：群里 @机器人，能出任务列表即通
+```
+
+切完之后 nginx 里那条 `/api/feishu/callback/` 的 location 可以整个删掉，平台不再
+需要为飞书开放任何入站端口。**出站仍然需要**（发卡片、改卡片、通讯录、换 token）。
+
+飞书登录（SSO）也不受影响：授权码由用户浏览器带回，飞书服务器不访问平台地址，
+所以内网访问后台照样能用飞书登录。
+
+进程没起来时的现象：群里 @机器人 毫无反应，且服务端**没有任何回调日志**——因为
+根本没有入站请求。先看 `logs/feishu-ws.log`。
 
 ### 飞书后台要配的四处
 

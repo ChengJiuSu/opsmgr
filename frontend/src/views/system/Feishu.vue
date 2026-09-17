@@ -33,7 +33,33 @@
         />
       </el-form-item>
 
+      <el-divider content-position="left">事件接收方式</el-divider>
+      <el-form-item label="接收方式">
+        <el-radio-group v-model="form.event_mode">
+          <el-radio value="callback">回调（飞书推到公网地址）</el-radio>
+          <el-radio value="websocket">长连接（平台主动外连）</el-radio>
+        </el-radio-group>
+        <div class="tip">
+          <b>长连接入站零暴露</b>：平台主动外连飞书，下面那两条回调地址不再需要，
+          服务可以收回内网、只对指定 IP 开放。代价是多一个常驻进程
+          （<code>manage.py feishu_ws</code>，supervisor 配置见
+          <code>deploy/ops-manager-feishu-ws.conf</code>），且执行后端必须是 celery。
+          <br />
+          两种方式<b>互斥</b>：切到长连接后请把飞书后台的「请求地址」清掉，
+          否则同一个事件会被处理两次。
+        </div>
+      </el-form-item>
+
       <el-divider content-position="left">回调入口</el-divider>
+      <el-alert
+        v-if="form.event_mode === 'websocket'"
+        type="info"
+        :closable="false"
+        show-icon
+        style="margin:-4px 0 14px"
+      >
+        当前为长连接模式，下面的回调地址与来源 IP 白名单都不生效（回调入口已停用）。
+      </el-alert>
       <el-form-item label="事件订阅地址">
         <div class="url-row">
           <el-input :model-value="app.event_url" readonly />
@@ -309,6 +335,7 @@ const app = ref({})
 const form = reactive({
   app_id: '', app_secret: '', encrypt_key: '', verification_token: '',
   ip_unrestricted: false, ip_whitelist: '',
+  event_mode: 'callback',
   enabled: false, sso_enabled: false, sso_redirect_uri: '',
   allow_p2p_execute: false, auto_create_user: false, remark: '',
   sudo_confirm: 'fallback', dual_review: 'off',
@@ -324,6 +351,7 @@ async function loadApp() {
     // 秘密字段一律回填空串：后端把留空视为「不修改」
     Object.assign(form, {
       app_id: res.data.app_id || '',
+      event_mode: res.data.event_mode || 'callback',
       app_secret: '', encrypt_key: '', verification_token: '',
       ip_unrestricted: res.data.ip_unrestricted,
       ip_whitelist: res.data.ip_whitelist || '',

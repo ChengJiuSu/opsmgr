@@ -176,6 +176,10 @@ class FeishuCallbackView(APIView):
         if not app.is_ready():
             missing = app.missing_fields()
             return f'飞书接入未就绪（{"、".join(missing) if missing else "未启用"}）'
+        if app.use_websocket:
+            # 改用长连接后这两条入口就该是死的。留着不拒的话，万一飞书后台的回调
+            # 地址没清掉，同一个事件会被处理两次——执行会跑两遍
+            return '当前事件接收方式为长连接，回调入口已停用'
         if not app.ip_allowed(auth_client_ip(request)):
             return '来源 IP 不在白名单内'
         return None

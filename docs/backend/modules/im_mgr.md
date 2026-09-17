@@ -15,7 +15,8 @@
 |--------|------|
 | 这个模块管什么、边界在哪 | [职责](#职责) |
 | 六张表分别存什么 | [数据模型](#数据模型) |
-| 回调怎么验、为什么回包恒定 | [入站：回调](#入站回调) |
+| 事件怎么进来（回调 / 长连接） | [入站：两种接收方式](#入站两种接收方式) |
+| 想把服务收回内网 | [长连接](#长连接wspy) |
 | token 怎么缓存、卡片为什么是 2.0 | [出站：客户端与卡片](#出站客户端与卡片) |
 | 飞书登录与 MFA 的关系 | [飞书登录（SSO）](#飞书登录ssopy) |
 | 谁能从哪发起执行 | [执行准入](#执行准入accesspy) |
@@ -61,6 +62,7 @@ apps/im_mgr/
 ├── tasks.py         # 出站异步调度（thread/celery/sync，失败只记日志）
 ├── handlers.py      # 回调的业务路由（事件 / 卡片动作）
 ├── sso.py           # 飞书网页免登：state、换 token、身份落到平台 User
+├── ws.py            # 长连接接收事件：SDK 事件对象 → 回调那套 payload
 ├── client.py        # 出站客户端：token 缓存 + 统一请求封装 + 消息接口
 ├── serializers.py   # 秘密 write_only + has_xxx 回显、启用前置校验
 ├── views.py         # 配置单例 APIView + 会话 ViewSet
@@ -154,11 +156,31 @@ apps/im_mgr/
 ---
 
 
-## 入站：回调
+## 入站：两种接收方式
 
-回调是本平台唯一「任何人都能直接 POST」的公网入口，这一段的每一行都直接影响它的安全性。
+`FeishuApp.event_mode` 二选一，**互斥**——两边都开着，同一个事件会被处理两次
+（执行跑两遍）：
 
-### 回调校验（crypto.py）
+| | 回调（默认） | 长连接 |
+|---|---|---|
+| 方向 | 飞书 → 平台公网地址 | 平台 → 飞书（主动外连） |
+| 入站暴露 | 两条公网入口 | **零** |
+| 依赖 | 无 | `lark-oapi` |
+| 常驻进程 | 无 | 一个（`manage.py feishu_ws`） |
+| 必填配置 | Encrypt Key + Verification Token + IP 白名单 | 只要 App ID / Secret |
+| 执行后端 | 任意 | **必须 celery** |
+
+选回调：不想引依赖、不想多一个进程。选长连接：**要把服务收回内网、只对指定 IP
+开放**——入站没有可打的入口，nginx 那条 location 可以整个去掉。
+
+两种方式**只有「事件怎么进来」不同**，进来之后的一切（鉴权、准入、卡片、执行、
+播报）完全共用，见[长连接](#长连接wspy)。
+
+### 回调
+
+回调是「任何人都能直接 POST」的公网入口，这一段的每一行都直接影响它的安全性。
+
+#### 回调校验（crypto.py）
 
 任何人都能直接 POST 那两条公网地址，路径随机串只是让扫描器打不到入口，**真正
 的门是验签**。`verify_callback(app, timestamp, nonce, signature, body)` 一次做完，
@@ -173,7 +195,7 @@ apps/im_mgr/
 | 4 | 解密 | AES-256-CBC，key = `sha256(encrypt_key)`，IV 取密文前 16 字节 |
 | 5 | Verification Token | 兼容 `header.token`（v2 事件）与顶层 `token`（url_verification / 旧版卡片回调） |
 
-#### 地址验证是例外（联调踩到的）
+##### 地址验证是例外（联调踩到的）
 
 **飞书不给事件订阅的地址验证请求带签名头**——那一步它只想确认你能解密并回显
 challenge。实现最初把签名放在最前面、对验证请求也强制要求，结果飞书后台永远显示
@@ -209,7 +231,7 @@ challenge。实现最初把签名放在最前面、对验证请求也强制要�
 
 ---
 
-### 回调入口（views.py）
+#### 回调入口（views.py）
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
@@ -245,7 +267,7 @@ card 回 `{}`），失败原因只进日志。回包有差异本身就是一份�
 
 ---
 
-### nginx
+#### nginx
 
 ```
 conf/templates/ops_manager.conf.template   # limit_req_zone + 回调 location
@@ -259,6 +281,45 @@ conf/snippets/feishu_callback_ips.conf     # 来源 IP 白名单
 - 正则里的 `{32}` **必须放在引号内**，否则 nginx 把裸的 `{ }` 当配置块边界。
 - `feishu_callback_ips.conf` **为空 = 拒绝所有回调**（后面紧跟 `deny all;`）。
   顺序上先填白名单再让配置生效，反了会把已经跑通的回调全部挡死。
+
+### 长连接（ws.py）
+
+平台主动外连飞书，入站零暴露。启动：
+
+```bash
+./venv/bin/python manage.py feishu_ws --settings=ops_manager.settings.prod
+```
+
+常驻，supervisor 配置见 `deploy/ops-manager-feishu-ws.conf`。命令启动前会检查
+「事件接收方式」是否为长连接——不是就直接退出而不是默默连上去，否则两条路同时收
+事件，执行会跑两遍。
+
+**`ws.py` 只做一件事**：把 SDK 的事件对象翻回 `handlers` 一直在用的 payload 形状。
+不把 handlers 改成吃 SDK 对象，是为了让两种模式共用同一套代码路径与同一批测试——
+否则「回调能跑、长连接不能跑」这类问题会重复出现两遍。
+
+| SDK 对象 | 转换 |
+|----------|------|
+| `CustomizedEvent`（消息 / 菜单） | `event` 本来就是原始 dict，把 header 拼回去即可 |
+| `P2CardActionTrigger`（卡片） | 整棵树都是对象（operator / context / action），逐个摊回 dict |
+
+卡片动作的响应由 `P2CardActionTriggerResponse(body)` 直接吃 `handlers` 返回的那个
+dict——与回调模式的响应体同构，所以卡片交互一行都不用改。
+
+三个必须注意的地方：
+
+- **handler 跑在 asyncio 事件循环里**（SDK 在 `_handle_data_frame` 里同步调用），
+  Django ORM 在异步上下文中会抛 `SynchronousOnlyOperation`，命令入口因此设了
+  `DJANGO_ALLOW_ASYNC_UNSAFE`。由此推出一条硬约束：**执行后端必须是 celery**，
+  `sync` 会把 ansible 跑在事件循环里、把整条长连接卡死（命令启动时直接拒绝）。
+- **数据库连接要回收**：长期运行的进程，连接放久了会被数据库端断掉而 Django 不会
+  自己发现。每次处理前后 `close_old_connections()`。
+- **幂等照旧**：飞书的投递重试在长连接上同样存在，仍按 `event_id` 判重。
+
+切到长连接后，回调入口会**主动拒绝**（`_reject_reason` 里判 `use_websocket`）：
+万一飞书后台的请求地址没清掉，也不会出现一个事件被处理两次。
+
+---
 
 ## 出站：客户端与卡片
 
