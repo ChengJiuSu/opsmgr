@@ -11,6 +11,7 @@
 | [API 接口文档](api-reference.md) | 所有接口的请求/响应格式 |
 | [数据模型](models.md) | 数据库表结构、字段说明、ER 关系 |
 | [配置说明](configuration.md) | 环境变量、多环境配置、.env 示例 |
+| [日志采集设计](../log-collection-design.md) | 结构化日志格式、request_id 串联、Vector → VictoriaLogs 方案 |
 | [认证模块](modules/auth.md) | 自定义用户模型、JWT 登录流程 |
 | [资产管理模块](modules/assets.md) | 服务器 CRUD 与 CMDB 字典（项目组/渠道/环境/云厂商） |
 | [配置管理模块](modules/config.md) | 服务器归属批量分配、分配概览 |
