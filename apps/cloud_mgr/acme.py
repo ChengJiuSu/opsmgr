@@ -5,6 +5,8 @@
 - AK/SK 从 CloudAccount 注入子进程环境变量，不落盘不入日志；
 - 签发成功用 --install-cert 导出到临时目录读取 PEM 入库，过期时间用
   openssl 解析（失败回退签发时间 + 90 天，Let's Encrypt 口径）。
+- 写完 TXT 记录用 --dnssleep 硬等传播，失败若是 DNS 传播类错误再自动重试一次
+  （见 ACME_DNS_SLEEP / ACME_DNS_RETRY_WAIT）；
 
 同步阻塞（数分钟），调用方负责放后台线程/celery，见 tasks.py。
 """
@@ -14,6 +16,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone as dt_timezone
 
 from django.conf import settings
@@ -23,6 +26,19 @@ logger = logging.getLogger(__name__)
 
 class AcmeError(Exception):
     """acme.sh 调用失败，message 面向用户展示（不含密钥）。"""
+
+
+# CA 侧查不到 TXT 记录的报错特征：DNS 传播没跟上，等负缓存过期重试一次即可
+DNS_PROPAGATION_MARKERS = (
+    'DNS problem',
+    'NXDOMAIN',
+    'no TXT record',
+    'incorrect TXT record',
+)
+
+
+def _is_dns_propagation_error(message):
+    return any(m.lower() in message.lower() for m in DNS_PROPAGATION_MARKERS)
 
 
 # CloudProvider.code → (acme.sh dns hook, 凭据环境变量名)
@@ -127,9 +143,23 @@ def issue_certificate(certificate, force=False):
     issue_args = ['--issue', '--dns', dns_hook, '--server', settings.ACME_SERVER]
     for d in domains:
         issue_args += ['-d', d]
+    # 写完 TXT 记录先干等传播：acme.sh 自带的公共 DNS 探测查的是 DoH 解析器，
+    # 查得到不代表 CA 的解析器查得到——CA 那边一次 NXDOMAIN 会被负缓存住
+    issue_args += ['--dnssleep', str(settings.ACME_DNS_SLEEP)]
     if force:
         issue_args.append('--force')
-    _run_acme(issue_args, env)
+    try:
+        _run_acme(issue_args, env)
+    except AcmeError as e:
+        wait = settings.ACME_DNS_RETRY_WAIT
+        if not wait or not _is_dns_propagation_error(str(e)):
+            raise
+        # 传播类失败重试一次：等过 CA 侧负缓存 TTL（权威 SOA minimum）再签。
+        # 重试必须带 --force，否则 acme.sh 可能因订单未过期直接跳过
+        logger.warning('证书签发疑似 DNS 传播失败，%ss 后重试一次：%s', wait, e)
+        time.sleep(wait)
+        retry_args = issue_args if force else issue_args + ['--force']
+        _run_acme(retry_args, env)
 
     # --install-cert 导出到临时目录读取（不猜 acme home 内部目录布局）
     workdir = tempfile.mkdtemp(prefix='ops_cert_')

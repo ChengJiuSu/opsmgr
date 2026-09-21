@@ -527,6 +527,14 @@ ACME_EMAIL = config('ACME_EMAIL', default='')
 ACME_SERVER = config('ACME_SERVER', default='letsencrypt')
 # 签发/续签子进程超时秒数（DNS 验证含传播等待，耗时数分钟）
 ACME_TIMEOUT = config('ACME_TIMEOUT', default=900, cast=int)
+# TXT 记录写入后等待 DNS 传播的秒数（acme.sh --dnssleep）。
+# 免费版 DNSPod/阿里云新子域传播到全部权威节点要几十秒，等不够 CA 会查到
+# NXDOMAIN，并按 SOA minimum 负缓存数分钟——表现就是"第一次必失败、第二次才成功"。
+# 给了 --dnssleep 后 acme.sh 不再做自己的公共 DNS 探测（那个探测查不到 CA 侧缓存）。
+ACME_DNS_SLEEP = config('ACME_DNS_SLEEP', default=180, cast=int)
+# 命中 DNS 传播类错误后自动重试一次前的等待秒数，要盖过 CA 侧负缓存 TTL
+# （= 权威 SOA minimum，DNSPod 免费版 180s）。置 0 关闭自动重试。
+ACME_DNS_RETRY_WAIT = config('ACME_DNS_RETRY_WAIT', default=200, cast=int)
 # 距过期不足 N 天时 beat 自动续签（renew_expiring_certificates）
 CERT_RENEW_BEFORE_DAYS = config('CERT_RENEW_BEFORE_DAYS', default=30, cast=int)
 

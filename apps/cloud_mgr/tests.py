@@ -18,6 +18,7 @@ from apps.cloud_mgr.models import (
     Domain,
 )
 from apps.cloud_mgr.providers.base import BaseDnsProvider, DnsProviderError, DnsRecordData
+from apps.cloud_mgr.acme import AcmeError, issue_certificate
 
 
 class FakeDnsProvider(BaseDnsProvider):
@@ -1282,3 +1283,73 @@ class DnsApprovalTests(BaseApiTest):
         admin = self._client()
         data = admin.get(f'/api/cloud/dns-records/{self.record.id}/').json()
         self.assertIn('修改/删除已生效的线上解析', data['risk_reasons'])
+
+
+class AcmeDnsPropagationTests(TestCase):
+    """DNS 传播类失败自动重试：CA 侧负缓存导致「第一次必失败」的补救。"""
+
+    def setUp(self):
+        from apps.cloud_mgr.models import Certificate
+        provider, _ = CloudProvider.objects.get_or_create(code='aliyun', defaults={'name': '阿里云'})
+        account = CloudAccount.objects.create(
+            name='ali-acme', provider=provider, access_key='AK', secret_key='SK',
+        )
+        self.cert = Certificate.objects.create(
+            name='c', domains=['vlogs.example.com'], cloud_account=account,
+        )
+
+    def _fake_run(self, fail_times):
+        """替身 _run_acme：前 fail_times 次 --issue 报 DNS 传播错，--install-cert 写出 PEM。"""
+        calls = []
+
+        def run(args, env, timeout=None):
+            calls.append(args)
+            if args[0] == '--issue':
+                if len([a for a in calls if a[0] == '--issue']) <= fail_times:
+                    raise AcmeError(
+                        'acme.sh 退出码 1：\nvlogs.example.com: Invalid status. Verification error '
+                        'details: DNS problem: NXDOMAIN looking up TXT for _acme-challenge.vlogs.example.com',
+                    )
+            elif args[0] == '--install-cert':
+                for i, flag in enumerate(args):
+                    if flag in ('--cert-file', '--key-file', '--fullchain-file'):
+                        with open(args[i + 1], 'w') as f:
+                            f.write('PEM')
+            return ''
+
+        return run, calls
+
+    @override_settings(ACME_DNS_SLEEP=7, ACME_DNS_RETRY_WAIT=3, ACME_EMAIL='')
+    def test_issue_retries_once_on_dns_propagation_error(self):
+        run, calls = self._fake_run(fail_times=1)
+        with patch('apps.cloud_mgr.acme._run_acme', side_effect=run), \
+                patch('apps.cloud_mgr.acme.time.sleep') as slept:
+            cert_pem, _, _, _ = issue_certificate(self.cert)
+        self.assertEqual(cert_pem, 'PEM')
+        issues = [a for a in calls if a[0] == '--issue']
+        self.assertEqual(len(issues), 2)
+        self.assertIn('--dnssleep', issues[0])
+        self.assertEqual(issues[0][issues[0].index('--dnssleep') + 1], '7')
+        # 重试必须带 --force，否则 acme.sh 会以「证书还没到续期时间」跳过
+        self.assertNotIn('--force', issues[0])
+        self.assertIn('--force', issues[1])
+        slept.assert_called_once_with(3)
+
+    @override_settings(ACME_DNS_SLEEP=7, ACME_DNS_RETRY_WAIT=3, ACME_EMAIL='')
+    def test_issue_gives_up_after_one_retry(self):
+        run, calls = self._fake_run(fail_times=2)
+        with patch('apps.cloud_mgr.acme._run_acme', side_effect=run), \
+                patch('apps.cloud_mgr.acme.time.sleep'):
+            with self.assertRaises(AcmeError):
+                issue_certificate(self.cert)
+        self.assertEqual(len([a for a in calls if a[0] == '--issue']), 2)
+
+    @override_settings(ACME_DNS_SLEEP=7, ACME_DNS_RETRY_WAIT=3, ACME_EMAIL='')
+    def test_non_dns_error_not_retried(self):
+        def run(args, env, timeout=None):
+            raise AcmeError('acme.sh 退出码 1：\nrate limit exceeded')
+
+        with patch('apps.cloud_mgr.acme._run_acme', side_effect=run) as mock_run:
+            with self.assertRaises(AcmeError):
+                issue_certificate(self.cert)
+        self.assertEqual(mock_run.call_count, 1)
