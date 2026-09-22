@@ -3,8 +3,15 @@ from django.urls import include, path
 from django.views.generic import RedirectView
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
 
+from ops_manager.health import healthz, readyz
+
 urlpatterns = [
     path('', RedirectView.as_view(url='/api/docs/', permanent=False)),
+    # 容器探针（无需认证）。healthz 不碰数据库，readyz 才探依赖，理由见 health.py。
+    # ⚠ 走的是 Django 的 ALLOWED_HOSTS 校验：容器部署时 ALLOWED_HOSTS 必须含
+    #   127.0.0.1，否则 healthcheck 恒得 400 Bad Request，容器一直是 unhealthy。
+    path('healthz/', healthz, name='healthz'),
+    path('readyz/', readyz, name='readyz'),
     path('admin/', admin.site.urls),
     path('api/schema/', SpectacularAPIView.as_view(), name='schema'),
     path('api/docs/', SpectacularSwaggerView.as_view(url_name='schema'), name='swagger-ui'),

@@ -274,6 +274,21 @@ celery -A ops_manager worker -l info
 
 ---
 
+## 部署
+
+两条路径并存，选一条：
+
+| 方式 | 入口 | 适用 |
+|---|---|---|
+| 宿主 supervisor（现状） | `deploy/README.md`、`deploy/*.conf` | 已在跑的生产 |
+| docker-compose（Cython 编译镜像） | [deploy/docker/README.md](deploy/docker/README.md) | 新机部署 / 需要源码不可读 |
+
+容器方式一条命令起全栈（web、ws、两个 celery worker、beat、MySQL 8.0、Redis 7.0、
+前置 nginx），业务代码在镜像构建期由 Cython 编成 `.so`，运行时镜像里没有 `.py` 源码。
+日志系统（Vector / VictoriaLogs）不在 compose 内，仍由宿主 systemd 托管。
+
+---
+
 ## 文档
 
 - [全局架构图](docs/architecture.md)

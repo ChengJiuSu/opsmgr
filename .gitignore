@@ -48,3 +48,14 @@ wheelhouse/
 deploy/nginx/certs/
 deploy/nginx/logs/
 deploy/nginx/**/.backup/
+
+# Cython 编译产物：deploy/cython/build.py 在本地验证（make cython-check）时
+# 会就地生成 .so / .c 与 setuptools 的 build/。镜像里的那份由 Dockerfile 的
+# builder 阶段产出，两边都不该入库。
+*.so
+*.c
+/build/
+
+# 内置 MySQL 的 root 密码等（deploy/docker/mysql.env.example 是模板）。
+# 上面的 .env / .env.* 规则匹配不到这个文件名，必须单列。
+deploy/docker/mysql.env

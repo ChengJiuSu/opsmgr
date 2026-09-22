@@ -195,6 +195,59 @@ smoke:
 	    '$(BUILD_TS)' '$(GIT_COMMIT)' '$(DEPLOY_ENV)' > $(OUTPUT_DIR)/BUILD_INFO
 	echo "冒烟产物已就绪（不含 wheelhouse/staticfiles/frontend，不可用于部署）: $(OUTPUT_DIR)"
 
+# ── 容器镜像（Cython 编译 + 多阶段构建）────────────────────────────────────
+# 编译与运行共用 deploy/docker/Dockerfile 的 base 阶段，Python/libc 基线由
+# Dockerfile 自身保证一致（.so 带 ABI tag，跨基线放过去只在 import 时才炸）。
+IMAGE_NAME ?= ops-manager-backend
+# CI 会注入 GIT_COMMIT；本地直接 make image 时退回当前 HEAD 的短 hash，
+# 别打出一堆 :unknown —— 回滚时靠的就是这个 tag
+IMAGE_TAG  ?= $(if $(filter unknown,$(GIT_COMMIT)),$(shell git rev-parse --short HEAD 2>/dev/null || echo dev),$(GIT_COMMIT))
+# 容器内 app 用户的 uid/gid，**必须等于目标机上 logs/ media/ 目录的属主**
+# （deploy/docker/init-dirs.sh 用的也是这两个值），否则 bind mount 写不进去。
+APP_UID ?= 1000
+APP_GID ?= 1000
+
+.PHONY: image image-save cython-check compose-config
+
+image:
+	$(DOCKER) build -f deploy/docker/Dockerfile \
+	    --build-arg UBUNTU_VERSION=$(UBUNTU_VERSION) \
+	    --build-arg PYTHON_VERSION=$(PYTHON_VERSION) \
+	    --build-arg APP_UID=$(APP_UID) \
+	    --build-arg APP_GID=$(APP_GID) \
+	    --build-arg BUILD_TS=$(BUILD_TS) \
+	    --build-arg GIT_COMMIT=$(GIT_COMMIT) \
+	    -t $(IMAGE_NAME):$(IMAGE_TAG) \
+	    -t $(IMAGE_NAME):latest .
+	echo "镜像已就绪：$(IMAGE_NAME):$(IMAGE_TAG)（同时打了 latest）"
+	echo "部署机拉不到 registry 时用 make image-save 导出 tar"
+
+# 离线交付：导出镜像 tar（目标机 docker load -i）
+image-save: image
+	mkdir -p $(OUTPUT_DIR)
+	$(DOCKER) save $(IMAGE_NAME):$(IMAGE_TAG) | gzip > $(OUTPUT_DIR)/$(IMAGE_NAME)-$(IMAGE_TAG).tar.gz
+	ls -lh $(OUTPUT_DIR)/$(IMAGE_NAME)-$(IMAGE_TAG).tar.gz
+
+# 只验证 Cython 能编过（不删源码、不打镜像）。改了 build.py 的排除规则、
+# 或想抬 Cython 版本上界时，先跑这个。
+# ⚠ 编译产物必须当场清掉：容器与宿主共用同一个挂载点，留下的 .so 会被本机
+#   开发用的解释器优先加载（importlib 里扩展模块排在源码之前），改了 .py 却
+#   不生效，排查起来毫无线索。
+cython-check: builder
+	$(DOCKER_RUN) $(BUILDER_IMAGE) bash -c '
+	    set -eu -o pipefail
+	    python -m venv /tmp/cyv
+	    /tmp/cyv/bin/pip install -q -r requirements.lock -r deploy/docker/requirements-build.txt
+	    /tmp/cyv/bin/python deploy/cython/build.py --list | tail -1
+	    /tmp/cyv/bin/python deploy/cython/build.py' \
+	  && ret=0 || ret=$$?
+	find apps common \( -name '*.so' -o -name '*.c' \) -delete
+	rm -rf build
+	[ "$$ret" = 0 ] && echo "编译通过（产物已清理）" || { echo "编译失败" >&2; exit "$$ret"; }
+
+compose-config:
+	$(DOCKER) compose config -q && echo "compose 配置校验通过"
+
 # ── 测试 / 代码风格 ───────────────────────────────────────────────────────
 # 用 dev settings（sqlite）跑，不依赖 CI 上有 MySQL
 test: ci-venv

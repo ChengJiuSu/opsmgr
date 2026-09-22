@@ -1,0 +1,11 @@
+# 仅构建期依赖（Cython 编译），不进 requirements.lock、不进运行时镜像。
+#
+# ⚠ 版本锁在 3.2.x，不是随手写的上界：
+#   Cython 3.3.0 的代码生成器在「`**` 解包一个键是 f-string 的字典字面量」上崩，
+#       qs.filter(**{f'{field}__in': values})
+#   报 `TypeError: sequence item 0: expected str instance, NoneType found`，
+#   且报错里不带文件名——本仓库有 8 个文件命中（各 views.py 与 common/dimscope.py）。
+#   3.2.9 与 3.0.11 都正常；3.0.x 不支持 Python 3.14，所以锁 3.2.x。
+#   升级前先跑 `make cython-check`，通过了再抬上界。
+cython>=3.2,<3.3
+setuptools>=69

@@ -1,0 +1,34 @@
+# OpsManager 内置 MySQL 8.0 配置（挂载到 /etc/mysql/conf.d/）
+#
+# 这台机 4C/3.7G，与 gunicorn(4×8 线程) + 两个 celery worker 共享内存，
+# 参数按「够用且不抢」定，别照抄大内存机器的模板。
+[mysqld]
+character-set-server      = utf8mb4
+collation-server          = utf8mb4_0900_ai_ci
+
+# max_connections ≥ 200 是硬要求，不是余量：
+# prod.py 开了 CONN_MAX_AGE=60，gunicorn 4 worker × 8 线程各持一条常驻连接
+# = 最多 32 条，再加 daphne、两个 celery worker、beat 与运维手连。
+max_connections           = 300
+
+# 3.7G 机器上的 buffer pool：不显式给会按默认 128M 跑（太小，全表扫盘），
+# 给大了又和应用抢。512M 是这个数据量级的平衡点。
+innodb_buffer_pool_size   = 512M
+innodb_flush_log_at_trx_commit = 1
+innodb_flush_method       = O_DIRECT
+
+# 日志落 /var/log/mysql（宿主 bind mount），不走容器 stdout：
+# ⚠ 代价是 `docker compose logs mysql` 看不到错误，排障请看宿主日志目录。
+log_error                 = /var/log/mysql/error.log
+slow_query_log            = ON
+slow_query_log_file       = /var/log/mysql/slow.log
+long_query_time           = 1
+
+# binlog 默认开着（8.0），单实例用不上复制但留着可做时间点恢复。
+# 不设过期就会一直涨到把磁盘吃满——这是容器化后最容易踩的一个。
+binlog_expire_logs_seconds = 604800
+
+# 连接空闲回收时间要大于 Django 的 CONN_MAX_AGE（60s），否则复用的连接
+# 会被服务端单方面掐掉；prod.py 开了 CONN_HEALTH_CHECKS 兜底，但没必要制造它。
+wait_timeout              = 28800
+interactive_timeout       = 28800

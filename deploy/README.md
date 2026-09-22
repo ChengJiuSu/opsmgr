@@ -1,5 +1,9 @@
 # 部署指南
 
+> 本文讲**宿主 supervisor** 部署（现状生产）。容器化部署（Cython 编译镜像 +
+> docker-compose，一条命令起全栈）见 [docker/README.md](docker/README.md)；
+> 两条路径共存，同一台机上不要同时起（会抢 80/443 与 8000/8001）。
+
 生产架构：nginx（前端静态 + 反向代理）+ gunicorn（Django API）+ MySQL + Redis。
 任务执行走 celery 独立 worker（`TASK_EXEC_BACKEND=celery`）：ansible 不在 web
 进程里跑，执行多久都不影响后台响应。代码默认值是 thread（本地开发免 Redis），

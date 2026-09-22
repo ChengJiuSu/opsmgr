@@ -1,50 +1,366 @@
-# OpsManager 后端 docker-compose 部署（前端构建产物仍由宿主机 nginx 提供）
+# =============================================================================
+# OpsManager 全栈 docker-compose 部署
 #
-# 使用外部 MySQL（.env 的 DB_HOST 指向外部库）：
-#   docker compose up -d --build
-# 使用内置 MySQL（.env 设 DB_HOST=mysql，并配置 MYSQL_ROOT_PASSWORD）：
-#   docker compose --profile mysql up -d --build
+# 首次部署（顺序不能颠倒）：
+#   1. cp deploy/env.example .env                     && vim .env
+#   2. cp deploy/docker/mysql.env.example deploy/docker/mysql.env && vim 它
+#   3. sudo bash deploy/docker/init-dirs.sh           # 建宿主目录并设属主
+#   4. make image                                     # 本地 Cython 编译 + 打镜像
+#   5. make frontend                                  # 前端产物给 nginx 发
+#   6. docker compose up -d
 #
-# 说明：backend 入口自带数据库重试等待，无需 depends_on；
-# ~/.ssh 只读挂载供 Ansible 免密连接目标主机。
+# 日常更新：make image && docker compose up -d
+# 回滚：改 .env 的 APP_IMAGE_TAG 指回上一个 commit，再 up -d
+#
+# ── 进程与 supervisor 的对应关系 ─────────────────────────────────────────────
+#   init          （原先混在 entrypoint 里的 migrate，现在独立成一次性任务）
+#   web           deploy/ops-manager.conf
+#   ws            deploy/ops-manager-ws.conf
+#   celery        deploy/ops-manager-celery.conf
+#   celery-exec   deploy/ops-manager-celery-exec.conf
+#   beat          deploy/ops-manager-celery-beat.conf
+#   feishu-ws     deploy/ops-manager-feishu-ws.conf   （profile: feishu）
+# 参数在 deploy/docker/entrypoint.sh 里，与上述 .conf 逐项对齐。
+#
+# ── 日志采集不在本文件内 ─────────────────────────────────────────────────────
+# Vector / VictoriaLogs 仍由宿主 systemd 托管（deploy/log-server/）。
+# 应用日志、nginx 日志、MySQL/Redis 日志全部 bind mount 到宿主目录，
+# Vector 照旧按文件路径采集，采集端零改动。
+# =============================================================================
 name: ops-manager
 
-services:
-  backend:
-    build:
-      context: .
-      dockerfile: deploy/docker/Dockerfile
-    image: ops-manager-backend:latest
-    restart: unless-stopped
-    env_file: .env
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./media:/app/media          # 制品落盘
-      - ./logs:/app/logs            # 应用日志
-      - ./ansible:/app/ansible      # Ansible 剧本项目目录
-      - ~/.ssh:/root/.ssh:ro        # Ansible SSH 私钥（免密）
+# ── 公共片段 ────────────────────────────────────────────────────────────────
+x-app-image: &app-image
+  image: ${APP_IMAGE:-ops-manager-backend}:${APP_IMAGE_TAG:-latest}
+  # 生产用 `make image` 预先构建好；这里留着 build 只为本地 `docker compose build` 方便。
+  # up 时不会自动重建（除非显式 --build）。
+  build:
+    context: .
+    dockerfile: deploy/docker/Dockerfile
+    args:
+      APP_UID: ${APP_UID:-1000}
+      APP_GID: ${APP_GID:-1000}
 
-  # 可选内置 MySQL：--profile mysql 启用；不启用时用外部库
+x-app-logging: &app-logging
+  # 与 supervisor 的 stdout_logfile_maxbytes=50MB / backups=5 等价。
+  # 这里只剩进程自身的启动与崩溃输出（prod settings 去掉了 console handler），
+  # 应用日志走 /app/logs 的 file handler。
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+x-app-common: &app-common
+  <<: *app-image
+  restart: unless-stopped
+  # init: true 不是可选项：ansible / acme.sh 都是子进程，
+  # PID 1 不收割就攒僵尸进程，跑一周后 fork 失败。
+  init: true
+  user: "${APP_UID:-1000}:${APP_GID:-1000}"
+  env_file: [.env]
+  environment:
+    TZ: ${TZ:-Asia/Shanghai}
+  networks: [ops]
+  logging: *app-logging
+  volumes:
+    # 应用日志：Django file handler、gunicorn access、任务日志（TASK_LOG_DIR）
+    - ${OPS_LOG_ROOT:-/home/homelab/logs/ops-manager}/app:/app/logs
+    # 制品落盘 + ACME 私钥（MEDIA_ROOT）
+    - ${OPS_DATA_ROOT:-/home/homelab/data/ops-manager}/media:/app/media
+    # Ansible 项目目录：留 bind mount，运维加剧本不必重新打镜像
+    - ${OPS_ANSIBLE_DIR:-./ansible}:/app/ansible
+    # Ansible 免密连目标机的私钥。降权后 HOME=/home/app，不再是 /root
+    - ${OPS_SSH_DIR:-/home/homelab/.ssh}:/home/app/.ssh:ro
+    - /etc/localtime:/etc/localtime:ro
+  depends_on:
+    init:
+      condition: service_completed_successfully
+
+services:
+
+  # ── 一次性初始化：迁移 + 导出静态文件 ────────────────────────────────────
+  # 独立成一个 job 而不是塞进每个服务的入口：六个容器同时 migrate 会撞锁，
+  # 表现为随机一两个容器启动失败，且报错信息与真实原因无关。
+  init:
+    <<: *app-image
+    init: true
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+    command: ["init"]
+    env_file: [.env]
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      LOG_SERVICE: init
+    networks: [ops]
+    logging: *app-logging
+    restart: "no"
+    volumes:
+      - ${OPS_LOG_ROOT:-/home/homelab/logs/ops-manager}/app:/app/logs
+      - ${OPS_DATA_ROOT:-/home/homelab/data/ops-manager}/media:/app/media
+      # 静态文件导出目录：nginx 以只读挂同一个宿主目录。
+      # 注意挂的是 /app/static-export 而不是 /app/staticfiles——
+      # 后者是镜像构建期 collectstatic 的产物，被空目录挂上去就没了。
+      - ${OPS_DATA_ROOT:-/home/homelab/data/ops-manager}/staticfiles:/app/static-export
+      - /etc/localtime:/etc/localtime:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+        required: false
+      redis:
+        condition: service_healthy
+
+  # ── Web（gunicorn）────────────────────────────────────────────────────────
+  web:
+    <<: *app-common
+    command: ["web"]
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      LOG_SERVICE: django
+    ports:
+      # 只绑回环：公网入口是 host 网络下的 nginx，容器端口不对外。
+      - "127.0.0.1:${WEB_PORT:-8000}:8000"
+    healthcheck:
+      # /healthz/ 不打库不打 Redis，只证明 wsgi 还在应答。
+      # ⚠ Django 的 ALLOWED_HOSTS 必须包含 127.0.0.1，否则健康检查恒为 400。
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    mem_limit: ${WEB_MEM_LIMIT:-1g}
+
+  # ── WebSocket（daphne）───────────────────────────────────────────────────
+  # 不部署它 /ws/ 就是 502，前端退回每秒一次的日志轮询接口——
+  # 恰好在任务执行期间给后端加压，正是要避免的方向。
+  ws:
+    <<: *app-common
+    command: ["ws"]
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      LOG_SERVICE: ws
+    ports:
+      - "127.0.0.1:${WS_PORT:-8001}:8001"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8001/healthz/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    mem_limit: ${WS_MEM_LIMIT:-384m}
+
+  # ── Celery：默认队列（证书签发 / 分发）──────────────────────────────────
+  celery:
+    <<: *app-common
+    command: ["celery"]
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      LOG_SERVICE: celery
+      # ACME_BIN 默认按 ~/.acme.sh/acme.sh 解析，HOME 必须落在挂了 acme.sh 的那个家目录
+      HOME: /home/app
+    volumes:
+      - ${OPS_LOG_ROOT:-/home/homelab/logs/ops-manager}/app:/app/logs
+      - ${OPS_DATA_ROOT:-/home/homelab/data/ops-manager}/media:/app/media
+      - ${OPS_ANSIBLE_DIR:-./ansible}:/app/ansible
+      - ${OPS_SSH_DIR:-/home/homelab/.ssh}:/home/app/.ssh:ro
+      # acme.sh 本体与账号目录（宿主已有的那份，别在镜像里再装一套）
+      - ${OPS_ACME_SH_DIR:-/home/homelab/.acme.sh}:/home/app/.acme.sh
+      - /etc/localtime:/etc/localtime:ro
+    # ⚠ 对齐 supervisor 的 stopwaitsecs=930：acme.sh 的 DNS 验证上限是
+    # ACME_TIMEOUT=900s。默认 10s 会把签发砍在中途——任务凭空消失、
+    # 状态永远留在 issuing（celery 取出即 ack，不会重投）。
+    stop_grace_period: 930s
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A ops_manager inspect ping -d celery@$$(hostname) >/dev/null 2>&1"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 60s
+    mem_limit: ${CELERY_MEM_LIMIT:-512m}
+
+  # ── Celery：任务执行队列（ansible）──────────────────────────────────────
+  # 独立 worker 的理由见 deploy/ops-manager-celery-exec.conf：
+  # 与证书签发挤同一队列时，一个 900s 的签发能把后面的 ansible 堵十几分钟，
+  # 而页面上只是一条「执行中」且无报错的任务。
+  celery-exec:
+    <<: *app-common
+    command: ["celery-exec"]
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      LOG_SERVICE: celery-exec
+    # ⚠ 对齐 supervisor 的 stopwaitsecs=600（= TASK_FAILURE_WAIT_TIMEOUT）：
+    # 砍在中途的任务状态会永远留在 running。代价是有任务正暂停等人处理时，
+    # 重启最长要等 600s。
+    stop_grace_period: 600s
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A ops_manager inspect ping -d exec@$$(hostname) >/dev/null 2>&1"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 60s
+    mem_limit: ${CELERY_EXEC_MEM_LIMIT:-768m}
+
+  # ── Celery beat（只调度不干活，只能一个实例）────────────────────────────
+  beat:
+    <<: *app-common
+    command: ["beat"]
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      LOG_SERVICE: celery-beat
+    # ⚠ 不要 `docker compose up -d --scale beat=2`：多个 beat 会把同一个任务重复投递。
+    scale: 1
+    volumes:
+      - ${OPS_LOG_ROOT:-/home/homelab/logs/ops-manager}/app:/app/logs
+      - ${OPS_DATA_ROOT:-/home/homelab/data/ops-manager}/media:/app/media
+      - ${OPS_ANSIBLE_DIR:-./ansible}:/app/ansible
+      - ${OPS_SSH_DIR:-/home/homelab/.ssh}:/home/app/.ssh:ro
+      # celerybeat-schedule（上次调度时间戳）。落在容器可写层的话，
+      # 每次换镜像都会「忘记」上次调度时间，重启当刻把到期任务全打一遍。
+      - ${OPS_DATA_ROOT:-/home/homelab/data/ops-manager}/beat:/app/run
+      - /etc/localtime:/etc/localtime:ro
+    mem_limit: ${BEAT_MEM_LIMIT:-256m}
+
+  # ── 飞书长连接（可选，profile: feishu）──────────────────────────────────
+  # ⚠ 仅在「系统管理 → 飞书接入」设为长连接时启用。
+  # 与回调模式同时开着 = 同一个事件被处理两次（执行跑两遍）。
+  feishu-ws:
+    <<: *app-common
+    command: ["feishu-ws"]
+    profiles: ["feishu"]
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      LOG_SERVICE: feishu-ws
+    stop_signal: SIGINT
+    stop_grace_period: 15s
+    mem_limit: ${FEISHU_WS_MEM_LIMIT:-384m}
+
+  # ── MySQL 8.0 ───────────────────────────────────────────────────────────
+  # 外部数据库时不要启用：不带 --profile mysql 即可，.env 的 DB_HOST 指向外部库。
   mysql:
-    image: mysql:8.4
+    image: mysql:8.0
     profiles: ["mysql"]
     restart: unless-stopped
+    env_file:
+      # required: false —— 用外部数据库时这个文件根本不该存在，
+      # 不这么写的话 `docker compose config` 会在没启用 mysql profile 时也报缺文件
+      - path: deploy/docker/mysql.env
+        required: false
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?使用内置 MySQL 需在 .env 配置 MYSQL_ROOT_PASSWORD}
-      MYSQL_DATABASE: ${DB_NAME:-ops_manager}
-      MYSQL_USER: ${DB_USER:-ops}
-      MYSQL_PASSWORD: ${DB_PASSWORD:?使用内置 MySQL 需在 .env 配置 DB_PASSWORD}
-    command:
-      - --character-set-server=utf8mb4
-      - --collation-server=utf8mb4_0900_ai_ci
+      TZ: ${TZ:-Asia/Shanghai}
+    networks: [ops]
     volumes:
-      - mysql-data:/var/lib/mysql
+      - ${OPS_DATA_ROOT:-/home/homelab/data/ops-manager}/mysql:/var/lib/mysql
+      - ${OPS_LOG_ROOT:-/home/homelab/logs/ops-manager}/mysql:/var/log/mysql
+      - ./deploy/docker/mysql/conf.d:/etc/mysql/conf.d:ro
+      - /etc/localtime:/etc/localtime:ro
     healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD"]
-      interval: 5s
-      timeout: 3s
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
       retries: 30
+      start_period: 60s
+    # 关库要等 InnoDB 把脏页刷完，默认 10s 会被 SIGKILL 打断 → 下次启动做崩溃恢复
+    stop_grace_period: 120s
+    mem_limit: ${MYSQL_MEM_LIMIT:-1g}
+    logging: *app-logging
 
-volumes:
-  mysql-data:
+  # ── Redis 7.0 ───────────────────────────────────────────────────────────
+  redis:
+    image: redis:7.0-alpine
+    restart: unless-stopped
+    # ⚠ 密码经命令行传入，在宿主 `ps` 里可见。容器内已是降权用户，
+    # 但同机其他用户能看到——介意就改用 ACL 文件（deploy/docker/redis/）。
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf",
+              "--requirepass", "${REDIS_PASSWORD:?REDIS_PASSWORD 必须在 .env 中设置}"]
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      # healthcheck 的 redis-cli 要用它认证
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    networks: [ops]
+    volumes:
+      - ${OPS_DATA_ROOT:-/home/homelab/data/ops-manager}/redis:/data
+      - ${OPS_LOG_ROOT:-/home/homelab/logs/ops-manager}/redis:/var/log/redis
+      - ./deploy/docker/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - /etc/localtime:/etc/localtime:ro
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    # AOF 刷盘 + RDB 落盘要时间，别砍
+    stop_grace_period: 60s
+    mem_limit: ${REDIS_MEM_LIMIT:-320m}
+    logging: *app-logging
+
+  # ── 前置 nginx ──────────────────────────────────────────────────────────
+  # ⚠ network_mode: host 是刻意保留的，不要改成 bridge + ports 发布：
+  #   bridge 下 docker 的 userland proxy 会把客户端源 IP 换成 172.x 网关地址，
+  #   而这套系统有三处依赖真实客户端 IP —— API 凭证的 per-key IP 白名单、
+  #   飞书回调的来源 IP 校验、TRUSTED_PROXIES 的可信代理链。
+  #   丢了源 IP 的表现是「所有白名单一律 403，报错里带一个内网网关地址」。
+  # host 网络下 nginx 通过 127.0.0.1:8000 / 8001 连到上面发布的端口。
+  nginx:
+    image: ${OPS_NGINX_IMAGE:-nginx:1.27-alpine}
+    container_name: ${OPS_CONTAINER_NAME:-ops_manager_nginx}
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      web:
+        condition: service_started
+      ws:
+        condition: service_started
+    environment:
+      # 仅替换 OPS_ 前缀变量，保护 $host / $uri 等 nginx 内置变量
+      NGINX_ENVSUBST_FILTER: "^OPS_"
+      OPS_HTTP_PORT: ${OPS_HTTP_PORT}
+      OPS_HTTPS_PORT: ${OPS_HTTPS_PORT}
+      OPS_SERVER_NAME: ${OPS_SERVER_NAME}
+      OPS_UPSTREAM_ADDR: ${OPS_UPSTREAM_ADDR:-127.0.0.1:8000}
+      OPS_CLIENT_MAX_BODY_SIZE: ${OPS_CLIENT_MAX_BODY_SIZE}
+      OPS_PROXY_TIMEOUT: ${OPS_PROXY_TIMEOUT}
+      OPS_APP_ROOT: ${OPS_APP_ROOT}
+      OPS_TLS_CERT: ${OPS_TLS_CERT}
+      OPS_TLS_KEY: ${OPS_TLS_KEY}
+      OPS_TLS_CHAIN: ${OPS_TLS_CHAIN}
+      OPS_BEIAN_SERVER_NAME: ${OPS_BEIAN_SERVER_NAME}
+      OPS_BEIAN_INDEX: ${OPS_BEIAN_INDEX}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - ./deploy/nginx/conf/templates:/etc/nginx/templates:ro
+      - ./deploy/nginx/conf/snippets:/etc/nginx/snippets:ro
+      - ./deploy/nginx/html:/etc/nginx/html-sites:ro
+      - ./deploy/nginx/certs:/etc/nginx/certs:ro
+      - ./deploy/nginx/acme_webroot:/var/www/acme:ro
+      # 静态资源：容器内路径与模板里的 ${OPS_APP_ROOT}/... 保持一致，模板无需改。
+      # 前端 dist 仍由宿主 `make frontend` 产出；staticfiles 由 init 容器导出。
+      - ${OPS_FRONTEND_DIST:-./frontend/dist}:${OPS_APP_ROOT}/frontend/dist:ro
+      - ${OPS_DATA_ROOT:-/home/homelab/data/ops-manager}/staticfiles:${OPS_APP_ROOT}/staticfiles:ro
+      # 只挂 media/artifacts，不挂整个 media：制品下载走 X-Accel-Redirect 需要它，
+      # 而 media/acme 下是 TLS 私钥和 ACME 账号私钥，nginx 容器里根本不该看得见。
+      - ${OPS_DATA_ROOT:-/home/homelab/data/ops-manager}/media/artifacts:${OPS_APP_ROOT}/media/artifacts:ro
+      - ${OPS_LOG_ROOT:-/home/homelab/logs/ops-manager}/nginx:/var/log/nginx
+      - /etc/localtime:/etc/localtime:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "${OPS_HEALTHCHECK_URL:-http://127.0.0.1/nginx-health}"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID, NET_BIND_SERVICE, DAC_OVERRIDE]
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      com.opsmanager.service: "nginx"
+      com.opsmanager.role: "edge-proxy"
+
+networks:
+  ops:
+    driver: bridge
+
+# 数据与日志一律 bind mount 到宿主（见 .env 的 OPS_DATA_ROOT / OPS_LOG_ROOT），
+# 不用具名 volume：备份、排障、Vector 采集都要求路径是可直接看见的。

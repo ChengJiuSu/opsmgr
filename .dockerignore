@@ -1,15 +1,33 @@
 # 构建上下文瘦身：仅后端代码进镜像
 .git
+.idea
 venv
-frontend/node_modules
-frontend/dist
+.venv
+frontend
 media
 logs
 db.sqlite3*
 *.pyc
 __pycache__
 .env
+.env.*
 wheelhouse
 .ci-venv
 output
 staticfiles
+docs
+
+# 测试代码不进生产镜像（也不参与 Cython 编译，见 deploy/cython/build.py）
+**/tests.py
+**/tests/
+**/conftest.py
+
+# nginx 的宿主侧运行产物（日志、证书、备份），镜像用不到
+deploy/nginx/logs
+deploy/nginx/certs
+deploy/nginx/acme_webroot
+deploy/nginx/conf/**/.backup
+deploy/docker/mysql.env
+
+# ansible 运行期日志
+ansible/*.log
