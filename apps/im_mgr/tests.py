@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
+from django.core.management.base import CommandError
 from django.db import connection
 from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
@@ -3470,3 +3471,102 @@ class FeishuWebsocketTests(TestCase):
             encrypt_key='', verification_token='', ip_whitelist='', ip_unrestricted=False)
         missing = FeishuApp.load().missing_fields()
         self.assertIn('Encrypt Key', missing)
+
+
+class FeishuWsCommandTests(TestCase):
+    """`manage.py feishu_ws` 的启动前置。
+
+    重点是区分两类不就绪：数据库里的配置（运维随时会改，必须原地等）
+    与 settings 里的静态错配（重启多少次都一样，必须退出）。
+    """
+
+    def _run(self, **opts):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        out = StringIO()
+        call_command('feishu_ws', stdout=out, stderr=out, **opts)
+        return out.getvalue()
+
+    def _configure(self, event_mode):
+        # 必须走 load()：单例行由它按需创建，行还不存在时 .update() 影响 0 行
+        app = FeishuApp.load()
+        for field, value in FULL_CONFIG.items():
+            setattr(app, field, value)
+        app.enabled = True
+        app.event_mode = event_mode
+        app.save()
+        return app
+
+    def _enable_ws(self):
+        return self._configure(FeishuApp.MODE_WEBSOCKET)
+
+    @override_settings(TASK_EXEC_BACKEND='sync')
+    def test_sync_backend_exits_instead_of_waiting(self):
+        """静态错配：重启救不了，必须硬失败，否则进程管理器会无限重启。"""
+        self._enable_ws()
+        with self.assertRaises(CommandError) as ctx:
+            self._run()
+        self.assertIn('sync', str(ctx.exception))
+
+    @override_settings(TASK_EXEC_BACKEND='celery')
+    def test_no_wait_keeps_fail_fast(self):
+        """交互调试要的是立刻知道缺什么，不是挂在那儿等。"""
+        with self.assertRaises(CommandError) as ctx:
+            self._run(no_wait=True)
+        self.assertIn('飞书接入未就绪', str(ctx.exception))
+
+    @override_settings(TASK_EXEC_BACKEND='celery')
+    def test_waits_for_config_then_connects(self):
+        """未配置时不退出：原地轮询，配置在页面上改好后自己连上去。
+
+        这正是修掉的回归——早先这里直接 CommandError，配上
+        `restart: unless-stopped` 就是每几秒重启一次刷同一条报错。
+        """
+        started = []
+
+        def _fake_sleep(_seconds):
+            # 第一轮睡眠期间把配置补齐，模拟运维在页面上改完
+            self._enable_ws()
+
+        with patch('apps.im_mgr.ws.build_client') as build_client, \
+                patch('time.sleep', side_effect=_fake_sleep):
+            build_client.return_value.start.side_effect = lambda: started.append(True)
+            out = self._run()
+
+        self.assertEqual(started, [True])
+        self.assertIn('飞书接入未就绪', out)      # 等待原因打了一次
+        self.assertIn('配置已就绪', out)          # 自愈后明确说连上了
+        self.assertIn(FULL_CONFIG['app_id'], out)
+
+    @override_settings(TASK_EXEC_BACKEND='celery')
+    def test_callback_mode_waits_and_force_bypasses(self):
+        """回调模式下同样是等待（两边都开 = 同一事件处理两次），--force 才绕过。"""
+        self._configure(FeishuApp.MODE_CALLBACK)
+
+        with self.assertRaises(CommandError) as ctx:
+            self._run(no_wait=True)
+        self.assertIn('回调', str(ctx.exception))
+
+        with patch('apps.im_mgr.ws.build_client') as build_client:
+            out = self._run(force=True, no_wait=True)
+        self.assertTrue(build_client.return_value.start.called)
+        self.assertIn(FULL_CONFIG['app_id'], out)
+
+    @override_settings(TASK_EXEC_BACKEND='celery')
+    def test_repeated_reason_is_throttled(self):
+        """原因没变就别每 30s 刷一条，否则一夜几千行同样的话。"""
+        rounds = []
+
+        def _fake_sleep(_seconds):
+            rounds.append(1)
+            if len(rounds) >= 3:
+                self._enable_ws()
+
+        with patch('apps.im_mgr.ws.build_client'), \
+                patch('time.sleep', side_effect=_fake_sleep):
+            out = self._run()
+
+        self.assertEqual(len(rounds), 3)
+        self.assertEqual(out.count('飞书接入未就绪'), 1)

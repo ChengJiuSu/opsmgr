@@ -221,6 +221,10 @@ services:
   # ── 飞书长连接（可选，profile: feishu）──────────────────────────────────
   # ⚠ 仅在「系统管理 → 飞书接入」设为长连接时启用。
   # 与回调模式同时开着 = 同一个事件被处理两次（执行跑两遍）。
+  #
+  # 飞书还没配好就开了这个 profile 也没关系：进程会原地等配置，不会退出，
+  # 因此不会在 restart: unless-stopped 下变成每几秒重启一次刷同一条报错。
+  # 唯一仍会退出的是 TASK_EXEC_BACKEND=sync —— 那是重启救不了的静态错配。
   feishu-ws:
     <<: *app-common
     command: ["feishu-ws"]
