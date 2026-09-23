@@ -328,6 +328,10 @@ services:
       - ./deploy/nginx/conf/templates:/etc/nginx/templates:ro
       - ./deploy/nginx/conf/snippets:/etc/nginx/snippets:ro
       - ./deploy/nginx/html:/etc/nginx/html-sites:ro
+      # 官方镜像自带的 conf.d/default.conf（server_name localhost，指向
+      # /usr/share/nginx/html）必须盖掉：它按字母序排在 ops_manager.conf 之前，
+      # OPS_SERVER_NAME=localhost 时会把本站请求全吃掉并回 404。
+      - /dev/null:/etc/nginx/conf.d/default.conf:ro
       - ./deploy/nginx/certs:/etc/nginx/certs:ro
       - ./deploy/nginx/acme_webroot:/var/www/acme:ro
       # 静态资源：容器内路径与模板里的 ${OPS_APP_ROOT}/... 保持一致，模板无需改。
@@ -340,7 +344,11 @@ services:
       - ${OPS_LOG_ROOT:-/home/homelab/logs/ops-manager}/nginx:/var/log/nginx
       - /etc/localtime:/etc/localtime:ro
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "${OPS_HEALTHCHECK_URL:-http://127.0.0.1/nginx-health}"]
+      # ⚠ 必须显式带 Host：/nginx-health 只存在于 `server_name ${OPS_SERVER_NAME}`
+      # 那个 server 里，裸 IP 的请求会落到 00-default-server 的 `return 444`，
+      # 表现是 `wget: error getting response` 且容器恒为 unhealthy。
+      test: ["CMD", "wget", "-qO-", "--header=Host: ${OPS_SERVER_NAME}",
+             "${OPS_HEALTHCHECK_URL:-http://127.0.0.1/nginx-health}"]
       interval: 30s
       timeout: 5s
       retries: 3

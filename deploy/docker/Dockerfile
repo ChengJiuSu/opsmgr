@@ -27,7 +27,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     VENV=/opt/venv \
-    PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin
+    PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # 运行时系统依赖：
 #   libmysqlclient21  mysqlclient 的运行时库（唯一需要编译的依赖链接它）
