@@ -1,10 +1,26 @@
 from django.db import transaction
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 from rest_framework.validators import UniqueValidator
 
 from apps.agent_mgr.channel import SOURCE_DIRECT, SOURCE_LABELS, resolve_channels
 
 from .models import Channel, CloudProvider, Environment, ProjectGroup, Server, ServerService, ServiceType
+
+class ServerServiceBriefSerializer(serializers.Serializer):
+    """只为 schema 存在：ServerSerializer.get_services 是手拼的 dict 列表，
+    没有这个描述的话 spectacular 猜不出类型、整个字段按 string 写进文档。
+    字段与 get_services 的返回逐项对应，改一边要改两边。
+    """
+
+    id = serializers.IntegerField(help_text='ServerService 记录 ID')
+    service_type = serializers.IntegerField(help_text='服务类型 ID')
+    service_type_name = serializers.CharField()
+    service_type_code = serializers.CharField()
+    status = serializers.CharField(help_text='规划 / 部署 / 运行 三态')
+    process_name = serializers.CharField()
+    process_count = serializers.IntegerField()
+
 
 # 服务器录入必填的归属维度：字段 → 展示名（云厂商/地域仍可留空）
 REQUIRED_DIMS = (
@@ -133,20 +149,21 @@ class ServerSerializer(serializers.ModelSerializer):
             cache.update(resolve_channels(batch if batch is not None else [obj]))
         return cache.get(obj.pk, (None, SOURCE_DIRECT))
 
-    def get_effective_agent(self, obj):
+    def get_effective_agent(self, obj) -> int | None:
         agent = self._channel(obj)[0]
         return agent.pk if agent else None
 
-    def get_effective_agent_name(self, obj):
+    def get_effective_agent_name(self, obj) -> str | None:
         agent = self._channel(obj)[0]
         return agent.name if agent else None
 
-    def get_channel_source(self, obj):
+    def get_channel_source(self, obj) -> str:
         return self._channel(obj)[1]
 
-    def get_channel_source_label(self, obj):
+    def get_channel_source_label(self, obj) -> str:
         return SOURCE_LABELS[self._channel(obj)[1]]
 
+    @extend_schema_field(ServerServiceBriefSerializer(many=True))
     def get_services(self, obj):
         return [
             {

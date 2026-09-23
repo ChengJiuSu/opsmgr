@@ -76,10 +76,10 @@ class PortalNoticeSerializer(serializers.ModelSerializer):
         model = PortalNotice
         fields = '__all__'
 
-    def get_system_names(self, obj):
+    def get_system_names(self, obj) -> list[str]:
         return [s.name for s in obj.systems.all()]
 
-    def get_is_active(self, obj):
+    def get_is_active(self, obj) -> bool:
         now = timezone.now()
         return bool(obj.enabled and obj.start_at <= now <= obj.end_at)
 

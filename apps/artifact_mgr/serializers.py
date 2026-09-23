@@ -24,7 +24,7 @@ class ArtifactSerializer(serializers.ModelSerializer):
             'download_url',
         ]
 
-    def get_download_url(self, obj):
+    def get_download_url(self, obj) -> str:
         return obj.download_url()
 
 

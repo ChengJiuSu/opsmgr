@@ -3,6 +3,7 @@ import re
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.utils import timezone
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
@@ -10,6 +11,20 @@ from common.request import parse_ip_rules
 
 from . import roles
 from .apikey import HIGH_RISK_SCOPES, SCOPES
+
+
+class PermissionSnapshotSerializer(serializers.Serializer):
+    """只为 schema 存在：roles.permission_snapshot() 的返回结构。
+    改那个函数要同步改这里。
+    """
+
+    role = serializers.CharField(help_text='角色 code，无角色为空串')
+    role_name = serializers.CharField()
+    modules = serializers.DictField(
+        child=serializers.CharField(),
+        help_text='模块 → 权限档（none / read / read_create / write）')
+    can_execute = serializers.BooleanField(help_text='是否可执行任务')
+    can_exec_prod = serializers.BooleanField(help_text='是否可在生产环境执行')
 from .models import ApiCredential, Role
 from .services import AMR_PASSWORD
 
@@ -67,11 +82,12 @@ class UserSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'last_login', 'date_joined', 'is_ldap', 'is_service',
                             'mfa_enabled']
 
+    @extend_schema_field(PermissionSnapshotSerializer)
     def get_permissions(self, obj):
         """该用户的实际权限快照（含无角色时的回退结果）。"""
         return roles.permission_snapshot(obj)
 
-    def get_mfa_enabled(self, obj):
+    def get_mfa_enabled(self, obj) -> bool:
         mfa = getattr(obj, 'mfa', None)
         return bool(mfa and mfa.enabled)
 
@@ -233,7 +249,7 @@ class ApiCredentialSerializer(serializers.ModelSerializer):
             'bound_user': {'required': False},
         }
 
-    def get_expired(self, obj):
+    def get_expired(self, obj) -> bool:
         return obj.is_expired()
 
     def validate_name(self, value):

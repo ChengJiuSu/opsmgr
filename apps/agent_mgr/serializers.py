@@ -15,7 +15,7 @@ class AgentNodeSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['status', 'last_heartbeat', 'version', 'meta']
 
-    def get_running_jobs(self, obj):
+    def get_running_jobs(self, obj) -> int:
         return obj.jobs.filter(status__in=('sent', 'running')).count()
 
     def validate_name(self, value):
