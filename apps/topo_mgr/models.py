@@ -199,9 +199,12 @@ class TopoNode(models.Model):
         constraints = [
             # 同一张画布里同一个平台实体只允许出现一次：出现两次的图会让「影响面
             # 反查」数出两条链路，而实际只有一条
+            # 不写 condition=Q(ref_id__isnull=False)：外部节点的 ref_id 为 NULL，
+            # 而 SQL 里 NULL != NULL，普通唯一索引本就不约束这些行——语义一致。
+            # 带 condition 的写法在 MySQL 上会被 Django 跳过不建（models.W036），
+            # 反倒等于没有约束。
             models.UniqueConstraint(
                 fields=['canvas', 'kind', 'ref_id'],
-                condition=models.Q(ref_id__isnull=False),
                 name='uniq_topo_node_ref',
             ),
             # source 与 ref_id 必须自洽：外部节点带着 ref_id 会被当成引用型去查

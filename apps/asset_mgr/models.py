@@ -152,10 +152,13 @@ class Server(models.Model):
         verbose_name_plural = '服务器'
         db_table = 'asset_server'
         constraints = [
-            # 公网 IP 有值时全局唯一（NAT 主机留空不受限）
+            # 公网 IP 有值时全局唯一（NAT 主机留空不受限）。
+            # 不写 condition=Q(public_ip__isnull=False)：条件恰好是「约束字段自己
+            # 非空」，而 SQL 里 NULL != NULL，普通唯一索引本就把 NULL 行两两视为
+            # 不同、不参与比较——两者语义完全一致。而带 condition 的写法在 MySQL 上
+            # 会被 Django 直接跳过不建（只留一条 models.W036），反倒等于没有约束。
             models.UniqueConstraint(
                 fields=['public_ip'],
-                condition=models.Q(public_ip__isnull=False),
                 name='uniq_server_public_ip',
             ),
         ]

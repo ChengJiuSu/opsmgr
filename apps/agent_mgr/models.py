@@ -14,6 +14,8 @@ import uuid
 from datetime import timedelta
 
 from django.db import models
+from django.db.models import Value
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 
 from common.secrets import generate_secret, hash_secret
@@ -157,15 +159,17 @@ class AgentRoute(models.Model):
         db_table = 'agent_route'
         ordering = ['project_group_id', 'environment_id', 'id']
         constraints = [
+            # 同一项目组下：精确环境的规则唯一，environment 留空的默认规则也只能有一条。
+            # ⚠ 不要改回 condition=... 的条件唯一约束：MySQL 不支持，
+            # Django 在该后端**直接跳过不建**（makemigrations/migrate 都不报错，
+            # 只在 check 里留一条 models.W036），生产上等于没有这条约束，
+            # 唯一性只剩应用层校验，并发下挡不住重复行。
+            # 改用把 NULL 折叠成 0 的表达式唯一：自增主键从 1 起，0 不会与真实
+            # ID 相撞；MySQL 8.0.13+ 的函数索引支持它，SQLite 也支持表达式索引。
             models.UniqueConstraint(
-                fields=['project_group', 'environment'],
-                condition=models.Q(environment__isnull=False),
+                'project_group',
+                Coalesce('environment', Value(0), output_field=models.BigIntegerField()),
                 name='uniq_agent_route_pg_env',
-            ),
-            models.UniqueConstraint(
-                fields=['project_group'],
-                condition=models.Q(environment__isnull=True),
-                name='uniq_agent_route_pg_default',
             ),
         ]
 

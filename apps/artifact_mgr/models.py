@@ -19,7 +19,8 @@ from urllib.parse import quote
 
 from django.conf import settings
 from django.db import models
-from django.db.models import Q
+from django.db.models import Q, Value
+from django.db.models.functions import Coalesce
 
 # 版本号与文件名白名单：仅字母数字 . _ -，从源头排除路径穿越
 VERSION_RE = re.compile(r'^[A-Za-z0-9._-]{1,100}$')
@@ -73,20 +74,20 @@ class Artifact(models.Model):
         db_table = 'artifact'
         ordering = ['-id']
         constraints = [
+            # 同 项目组/渠道/环境/服务类型 下版本唯一。service_type 可空（0002 之前的
+            # 存量制品），而 SQL 里 NULL != NULL，普通唯一索引会把每个 NULL 当成不同
+            # 值，存量行之间就不再受约束。
+            # ⚠ 不要改回 condition=... 的条件唯一约束：MySQL 不支持，
+            # Django 在该后端**直接跳过不建**（makemigrations/migrate 都不报错，
+            # 只在 check 里留一条 models.W036），生产上等于没有这条约束，
+            # 唯一性只剩应用层校验，并发下挡不住重复行。
+            # 改用把 NULL 折叠成 0 的表达式唯一：自增主键从 1 起，0 不会与真实
+            # ID 相撞；MySQL 8.0.13+ 的函数索引支持它，SQLite 也支持表达式索引。
             models.UniqueConstraint(
-                fields=['project_group', 'channel', 'environment', 'service_type', 'version'],
+                'project_group', 'channel', 'environment',
+                Coalesce('service_type', Value(0), output_field=models.BigIntegerField()),
+                'version',
                 name='uniq_artifact_dims_version',
-            ),
-            # 上面那条对存量（service_type 为空）的记录不生效：SQL 里 NULL != NULL，
-            # 唯一索引把每个 NULL 当成不同值。存量记录仍需保证「同三维度同版本只有
-            # 一条」，故另加一条 NULL 专用的条件唯一约束。
-            # 注意：MySQL 不支持条件唯一约束，Django 在该后端直接跳过不建——生产
-            # （MySQL）上这条只是声明。可接受：上报必填服务类型，不会再产生新的
-            # NULL 行，而已有的 NULL 行在旧约束下本就是唯一的
-            models.UniqueConstraint(
-                fields=['project_group', 'channel', 'environment', 'version'],
-                condition=Q(service_type__isnull=True),
-                name='uniq_artifact_dims_version_legacy',
             ),
         ]
 
