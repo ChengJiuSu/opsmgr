@@ -3570,3 +3570,144 @@ class FeishuWsCommandTests(TestCase):
 
         self.assertEqual(len(rounds), 3)
         self.assertEqual(out.count('飞书接入未就绪'), 1)
+
+
+class _FakeClock:
+    """让 patch 掉的 time.sleep 也推进 time.monotonic。
+
+    _wait_before_retry 是按 wait_interval 分步睡到 deadline 的，光把 sleep
+    换成 no-op 会让它在同一毫秒里空转几万圈，断言也就看不出退避的节奏。
+    """
+
+    def __init__(self):
+        self.now = 0.0
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+    def monotonic(self):
+        return self.now
+
+
+class FeishuWsCredentialRejectionTests(TestCase):
+    """凭据被飞书拒掉后的行为。
+
+    这类错误配置校验拦不住——app_id 打错一个字，要连上去才知道。SDK 的
+    start() 对 ClientException 直接抛出而不重连，进程若就此退出就会撞上
+    进程管理器的自动重启，变成带堆栈的刷屏循环。
+    """
+
+    def setUp(self):
+        app = FeishuApp.load()
+        for field, value in FULL_CONFIG.items():
+            setattr(app, field, value)
+        app.enabled = True
+        app.event_mode = FeishuApp.MODE_WEBSOCKET
+        app.save()
+
+    def _run(self, **opts):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        out = StringIO()
+        call_command('feishu_ws', stdout=out, stderr=out, **opts)
+        return out.getvalue()
+
+    @staticmethod
+    def _client_exception(code=1000040346, msg='app_id is invalid'):
+        from lark_oapi.ws.exception import ClientException
+
+        return ClientException(code, msg)
+
+    @override_settings(TASK_EXEC_BACKEND='celery')
+    def test_rejection_does_not_exit_and_retries_after_credential_change(self):
+        """凭据错不退出：等运维改好 app_id，立刻重试并连上。"""
+        attempts = []
+
+        def _start():
+            attempts.append(FeishuApp.load().app_id)
+            if len(attempts) == 1:
+                raise self._client_exception()
+            # 第二次（改过凭据）正常返回 = 连上了
+
+        def _fake_sleep(_seconds):
+            # 退避睡眠期间运维在页面上把 app_id 改对
+            app = FeishuApp.load()
+            app.app_id = 'cli_corrected'
+            app.save()
+
+        with patch('apps.im_mgr.ws.build_client') as build_client, \
+                patch('time.sleep', side_effect=_fake_sleep):
+            build_client.return_value.start.side_effect = _start
+            out = self._run()
+
+        self.assertEqual(attempts, [FULL_CONFIG['app_id'], 'cli_corrected'])
+        self.assertIn('飞书拒绝了当前凭据', out)
+        self.assertIn('app_id is invalid', out)
+        self.assertIn('凭据已更新，立刻重试', out)
+
+    @override_settings(TASK_EXEC_BACKEND='celery')
+    def test_rejection_retries_with_backoff_when_nothing_changes(self):
+        """凭据没变也要再试：EXCEED_CONN_LIMIT 这类同样是 ClientException，
+        过一阵自己会好，死等就永远好不了。退避逐次翻倍。"""
+        from apps.im_mgr.management.commands import feishu_ws as cmd
+
+        clock = _FakeClock()
+        at = []
+
+        def _start():
+            at.append(clock.now)
+            if len(at) <= 4:
+                raise self._client_exception(1000040350, 'exceed connection limit')
+
+        with patch('apps.im_mgr.ws.build_client') as build_client, \
+                patch('time.sleep', side_effect=clock.sleep), \
+                patch('time.monotonic', side_effect=clock.monotonic):
+            build_client.return_value.start.side_effect = _start
+            out = self._run()
+
+        gaps = [round(b - a) for a, b in zip(at, at[1:])]
+        self.assertEqual(gaps, [30, 60, 120, 240])          # 每次翻倍
+        self.assertEqual(cmd.RETRY_BACKOFF_START, 30)
+        self.assertIn('exceed connection limit', out)
+
+    @override_settings(TASK_EXEC_BACKEND='celery')
+    def test_backoff_is_capped(self):
+        """封顶 300s：再错下去也不会退避到几小时才试一次。"""
+        from apps.im_mgr.management.commands import feishu_ws as cmd
+
+        clock = _FakeClock()
+        at = []
+
+        def _start():
+            at.append(clock.now)
+            if len(at) <= 7:
+                raise self._client_exception()
+
+        with patch('apps.im_mgr.ws.build_client') as build_client, \
+                patch('time.sleep', side_effect=clock.sleep), \
+                patch('time.monotonic', side_effect=clock.monotonic):
+            build_client.return_value.start.side_effect = _start
+            self._run()
+
+        gaps = [round(b - a) for a, b in zip(at, at[1:])]
+        self.assertEqual(gaps[-1], cmd.RETRY_BACKOFF_MAX)
+        self.assertTrue(all(g <= cmd.RETRY_BACKOFF_MAX for g in gaps))
+
+    @override_settings(TASK_EXEC_BACKEND='celery')
+    def test_no_wait_still_fails_fast_on_rejection(self):
+        with patch('apps.im_mgr.ws.build_client') as build_client:
+            build_client.return_value.start.side_effect = self._client_exception()
+            with self.assertRaises(CommandError) as ctx:
+                self._run(no_wait=True)
+        self.assertIn('app_id is invalid', str(ctx.exception))
+
+    @override_settings(TASK_EXEC_BACKEND='celery')
+    def test_other_exceptions_still_propagate(self):
+        """只接 ClientException：别的异常照旧抛出去，
+        进程级崩溃由进程管理器重启兜底，这层不能吃掉。"""
+        with patch('apps.im_mgr.ws.build_client') as build_client:
+            build_client.return_value.start.side_effect = RuntimeError('boom')
+            with self.assertRaises(RuntimeError):
+                self._run()

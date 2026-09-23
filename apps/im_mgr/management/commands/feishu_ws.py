@@ -19,7 +19,17 @@
 现在改成原地轮询等待：配置一旦在页面上改好，进程自己就连上去，不需要人再去
 重启它。**只有重启也救不了的静态错配**（TASK_EXEC_BACKEND=sync）才硬失败退出。
 交互调试想要旧的快速失败语义，加 --no-wait。
+
+凭据本身错（app_id 打错一个字）是同一类问题的另一半：它要连上飞书才知道，
+配置校验拦不住。SDK 的 start() 对 ClientException 直接抛出而不重连——这是
+它有意的分类：凭据/配置错重试无用，网络抖动才归它自己的重连逻辑管。所以这里
+接住 ClientException 回到等待，其余异常照旧往上抛，进程级崩溃的兜底不受影响。
+
+等待不是死等：EXCEED_CONN_LIMIT 这类 ClientException 过一阵会自己好，所以
+按指数退避重试（30s 起，封顶 300s）；同时盯着配置指纹，运维一改凭据就立刻
+重试并把退避清零。
 """
+import hashlib
 import os
 import time
 
@@ -28,6 +38,11 @@ from django.core.management.base import BaseCommand, CommandError
 # 等待期间重复打同一条原因的间隔（秒）。首次以及原因变化时立即打，
 # 其余靠这个节流——否则 30s 一条，一夜就是几千行同样的话。
 REASON_REPEAT_INTERVAL = 600
+
+# 凭据被飞书拒掉后的重试退避：首次等 30s，每次翻倍，封顶 300s。
+# 配置一变就清零立刻重试，所以运维改完不会白等一个长退避。
+RETRY_BACKOFF_START = 30
+RETRY_BACKOFF_MAX = 300
 
 
 class Command(BaseCommand):
@@ -63,17 +78,88 @@ class Command(BaseCommand):
             self.stdout.write(self.style.WARNING(
                 f'  [!!] TASK_EXEC_BACKEND={backend}，生产建议用 celery'))
 
-        app = self._await_ready(options)
-        if app is None:
+        self._serve_forever(ws, options)
+
+    def _serve_forever(self, ws, options):
+        """等配置 → 连接 → 被拒就回去等，循环往复。
+
+        正常返回（start() 自己退出）与 SIGINT 都结束进程；只有
+        ClientException 会被接住转回等待。
+        """
+        from lark_oapi.ws.exception import ClientException
+
+        backoff = RETRY_BACKOFF_START
+
+        while True:
+            app = self._await_ready(options)
+            if app is None:
+                return
+
+            self.stdout.write(f'飞书长连接启动：app_id={app.app_id}')
+            try:
+                ws.build_client(app).start()
+            except KeyboardInterrupt:
+                self.stdout.write('已停止。')
+                return
+            except ClientException as exc:
+                # SDK 对 ClientException 不做重连——凭据/配置错，重试无用。
+                # 但退出会撞上进程管理器的自动重启，又变成刷屏循环，所以回去等。
+                if options['no_wait']:
+                    raise CommandError(f'飞书拒绝了当前凭据：{exc}')
+                self.stderr.write(self.style.ERROR(
+                    f'飞书拒绝了当前凭据：{exc}。请到「系统管理 → 飞书接入」核对 '
+                    f'App ID / App Secret；{backoff}s 后重试，改好配置会立刻重试。'))
+                changed = self._wait_before_retry(app, backoff, options)
+                if changed is None:
+                    return                          # SIGINT
+                # 运维改了凭据就清零立刻重试；没改则退避加倍后再试一次——
+                # 不能就此死等：EXCEED_CONN_LIMIT 这类也是 ClientException，
+                # 它过一阵自己会好，只有再连一次才知道。
+                backoff = (RETRY_BACKOFF_START if changed
+                           else min(backoff * 2, RETRY_BACKOFF_MAX))
+                continue
             return
 
-        self.stdout.write(f'飞书长连接启动：app_id={app.app_id}')
-        try:
-            ws.build_client(app).start()
-        except KeyboardInterrupt:
-            self.stdout.write('已停止。')
-
     # ── 配置就绪判定 ────────────────────────────────────────────────────────
+    @staticmethod
+    def _fingerprint(app):
+        """凭据指纹：只用来判断「运维改过了没有」，取摘要而非明文，
+        免得哪天进了日志或 traceback。"""
+        raw = f'{app.app_id}:{app.app_secret}'.encode()
+        return hashlib.sha256(raw).hexdigest()
+
+    @staticmethod
+    def _reload():
+        from django.db import close_old_connections
+
+        from apps.im_mgr.models import FeishuApp
+
+        close_old_connections()
+        return FeishuApp.load()
+
+    def _wait_before_retry(self, rejected_app, delay, options):
+        """凭据被拒后的退避等待：睡够 delay，中途发现凭据变了就提前返回。
+
+        返回 True  = 运维改了凭据，立刻重试（退避清零）
+        返回 False = 退避到点，按原样再试一次
+        返回 None  = 收到 SIGINT，应当结束进程
+        """
+        rejected_fp = self._fingerprint(rejected_app)
+        step = max(1, min(options['wait_interval'], delay))
+        deadline = time.monotonic() + delay
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                time.sleep(min(step, remaining))
+            except KeyboardInterrupt:
+                self.stdout.write('已停止。')
+                return None
+            if self._fingerprint(self._reload()) != rejected_fp:
+                self.stdout.write(self.style.SUCCESS('凭据已更新，立刻重试。'))
+                return True
+
     def _blocking_reason(self, app, force):
         """返回阻塞启动的原因（字符串），齐全则返回 None。"""
         if not app.is_ready():
