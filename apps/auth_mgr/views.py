@@ -278,6 +278,11 @@ class MfaStatusView(APIView):
 
     permission_classes = [IsAuthenticated]
 
+    # APIView 没有 serializer_class，不显式声明的话 spectacular 猜不出响应体，
+    # 会跳过整个视图（drf_spectacular.W002），接口就从 schema 里消失了
+    @extend_schema(responses=OpenApiResponse(
+        description='enabled / pending / activated_at / last_used_at / '
+                    'recovery_codes_left / enforced / enforce_scope / sudo_ttl'))
     def get(self, request):
         return ok(services.status(request.user))
 
@@ -287,7 +292,10 @@ class MfaSetupView(APIView):
 
     permission_classes = [IsAuthenticated]
 
-    @extend_schema(responses=OpenApiResponse(description='secret / uri / recovery_codes'))
+    # request=None 是必须的：这个 POST 不收请求体，不声明的话 spectacular 会去猜
+    # 请求序列化器、猜不出来就跳过整个视图（drf_spectacular.W002）
+    @extend_schema(request=None,
+                   responses=OpenApiResponse(description='secret / uri / recovery_codes'))
     def post(self, request):
         try:
             return ok(services.start_enrollment(request.user))
