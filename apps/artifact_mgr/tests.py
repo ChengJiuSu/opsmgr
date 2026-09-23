@@ -175,6 +175,13 @@ class ArtifactReportTests(ArtifactTestBase):
         self.assertIn('渠道已停用', r.json()['msg'])
 
 
+# 下载分两条路：配了 ARTIFACT_XACCEL_PREFIX 就只回 header 交给 nginx，
+# 没配才由 Django 直接把文件流出去。这里把前缀钉成空，测的是后一条路——
+# 不钉的话，settings 的 config() 会读项目根的 .env，而部署用的 .env 里
+# ARTIFACT_XACCEL_PREFIX=/_artifacts/，于是开发机上跑走的是 X-Accel 分支、
+# CI 上（没有 .env）走直发分支，同一份代码两种结果。
+# X-Accel 那条路由下面带 @override_settings 的用例单独覆盖。
+@override_settings(ARTIFACT_XACCEL_PREFIX='')
 class ArtifactDownloadTests(ArtifactTestBase):
     def _make_artifact(self, content=b'data', version='2.0.0'):
         self._report(content=content, version=version)

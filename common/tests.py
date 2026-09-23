@@ -90,7 +90,11 @@ class CryptoTests(SimpleTestCase):
 
     def test_key_change_breaks_decrypt(self):
         token = crypto.encrypt('s3cret')
-        with override_settings(MFA_SECRET_KEY='another-key'):
+        # 必须覆盖优先级最高的 SECRET_ENC_KEY：密钥按
+        # SECRET_ENC_KEY → MFA_SECRET_KEY → SECRET_KEY 回退，只改 MFA_SECRET_KEY
+        # 的话，凡是配了 SECRET_ENC_KEY 的环境（部署用的 .env 里就有，而
+        # settings 的 config() 会读它）根本没换到密钥，解密照样成功。
+        with override_settings(SECRET_ENC_KEY='another-key-entirely'):
             with self.assertRaises(crypto.DecryptError):
                 crypto.decrypt(token)
 
