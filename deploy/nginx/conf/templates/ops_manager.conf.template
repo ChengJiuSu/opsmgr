@@ -173,6 +173,29 @@ server {
         return 200 "ok\n";
     }
 
+    # ---- 后端存活/就绪探针（ops_manager/urls.py 的 healthz / readyz）----------
+    # ⚠ 必须显式写出来。不写的话它们落进下面 `location /` 的 SPA 回退，
+    # try_files 兜底吐 index.html —— 探针恒得 200 + 一坨 HTML，后端整个挂掉也
+    # 照样「健康」。外部拨测与 LB 拿到的是彻头彻尾的假信号。
+    #
+    # 正则而非 `= /healthz/`：Django 的路由带尾斜杠，但拨测常写成 /healthz，
+    # 少了斜杠就又掉回 SPA 回退，且这次的假阳性更隐蔽。两种写法一并接住。
+    #
+    # 分工：/nginx-health 只证明 nginx 活着（它自己 return 200，不碰后端）；
+    # 这两条才穿透到 gunicorn。healthz 不碰数据库，readyz 才探 DB 与 Redis。
+    location ~ ^/(healthz|readyz)/?$ {
+        access_log off;            # 拨测按秒级打，进 access log 只是噪音
+
+        include /etc/nginx/snippets/proxy_backend.conf;
+        proxy_pass http://ops_manager_backend;
+
+        # 探针要快失败：后端卡住时应当立刻报不健康，而不是陪着等
+        # ${OPS_PROXY_TIMEOUT}（任务执行那种长请求才需要的超时）。
+        proxy_read_timeout 5s;
+        proxy_send_timeout 5s;
+        proxy_next_upstream off;   # 别把探针的失败重试到别的 upstream 上
+    }
+
     # ---- 前端静态资源（vite 构建产物），SPA 回退 index.html --------------------
     location / {
         root ${OPS_APP_ROOT}/frontend/dist;
