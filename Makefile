@@ -202,6 +202,13 @@ IMAGE_NAME ?= ops-manager-backend
 # CI 会注入 GIT_COMMIT；本地直接 make image 时退回当前 HEAD 的短 hash，
 # 别打出一堆 :unknown —— 回滚时靠的就是这个 tag
 IMAGE_TAG  ?= $(if $(filter unknown,$(GIT_COMMIT)),$(shell git rev-parse --short HEAD 2>/dev/null || echo dev),$(GIT_COMMIT))
+# 是否额外打 :latest。本地开发留 true 方便 docker run 不带 tag；
+# CI 上传 IMAGE_LATEST=false —— 不同分支的构建会互相覆盖构建节点上的 latest，
+# 且 IMAGE_NAME 带 registry 前缀时那个 latest 永远不会被推，只占节点磁盘。
+IMAGE_LATEST ?= true
+LATEST_TAG := $(if $(filter true,$(IMAGE_LATEST)),-t $(IMAGE_NAME):latest,)
+# 文件名用的镜像名：IMAGE_NAME 带 registry 前缀时含 /，直接拼进路径会指向不存在的目录
+IMAGE_SLUG := $(subst /,-,$(IMAGE_NAME))
 # 容器内 app 用户的 uid/gid，**必须等于目标机上 logs/ media/ 目录的属主**
 # （deploy/docker/init-dirs.sh 用的也是这两个值），否则 bind mount 写不进去。
 APP_UID ?= 1000
@@ -218,15 +225,15 @@ image:
 	    --build-arg BUILD_TS=$(BUILD_TS) \
 	    --build-arg GIT_COMMIT=$(GIT_COMMIT) \
 	    -t $(IMAGE_NAME):$(IMAGE_TAG) \
-	    -t $(IMAGE_NAME):latest .
-	echo "镜像已就绪：$(IMAGE_NAME):$(IMAGE_TAG)（同时打了 latest）"
+	    $(LATEST_TAG) .
+	echo "镜像已就绪：$(IMAGE_NAME):$(IMAGE_TAG)$(if $(LATEST_TAG),（同时打了 latest）,)"
 	echo "部署机拉不到 registry 时用 make image-save 导出 tar"
 
 # 离线交付：导出镜像 tar（目标机 docker load -i）
 image-save: image
 	mkdir -p $(OUTPUT_DIR)
-	$(DOCKER) save $(IMAGE_NAME):$(IMAGE_TAG) | gzip > $(OUTPUT_DIR)/$(IMAGE_NAME)-$(IMAGE_TAG).tar.gz
-	ls -lh $(OUTPUT_DIR)/$(IMAGE_NAME)-$(IMAGE_TAG).tar.gz
+	$(DOCKER) save $(IMAGE_NAME):$(IMAGE_TAG) | gzip > $(OUTPUT_DIR)/$(IMAGE_SLUG)-$(IMAGE_TAG).tar.gz
+	ls -lh $(OUTPUT_DIR)/$(IMAGE_SLUG)-$(IMAGE_TAG).tar.gz
 
 # 只验证 Cython 能编过（不删源码、不打镜像）。改了 build.py 的排除规则、
 # 或想抬 Cython 版本上界时，先跑这个。
