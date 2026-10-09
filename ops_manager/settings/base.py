@@ -297,6 +297,11 @@ CELERY_RESULT_BACKEND = REDIS_URL
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_TIMEZONE = 'Asia/Shanghai'
+# 每个 worker 子进程只预取 1 条。默认 4 时空闲 worker 会把排队消息扣在自己手里：
+# `redis-cli llen task_exec` 看不到真实积压，重启时这批已预取未执行的消息也要
+# 等 broker 的可见性超时才回到队列。任务执行和证书签发都是分钟级长任务，预取省下
+# 的那点往返毫无意义。
+CELERY_WORKER_PREFETCH_MULTIPLIER = config('CELERY_WORKER_PREFETCH_MULTIPLIER', default=1, cast=int)
 
 # ── Channels（执行日志推送 / ops-agent WebSocket 接入）────
 # CHANNEL_LAYER_BACKEND 选层：

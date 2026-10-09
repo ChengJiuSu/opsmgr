@@ -96,12 +96,15 @@ celery-exec)
     # 与 ansible 挤同一队列时页面上是一条「执行中」且无报错的任务。
     #   nice 10   ansible 与 web 抢同一 4 个核时让 web 优先
     #   -n exec@%h 显式 node 名，否则与 celery 容器 node name 撞车，inspect/revoke 认错对象
-    #   --concurrency=1  ansible 内部已按 --forks 并行，worker 再并发只是抢 CPU
+    #   --concurrency=2  执行位不再全局唯一：失败等人处理/暂停确认/等 Jenkins 的任务
+    #                    占位不干活，只有 1 个位置时会堵住全部后续任务。同主机同服务
+    #                    由主机锁串行（apps/task_exec/host_lock.py）。理由与内存账见
+    #                    deploy/ops-manager-celery-exec.conf
     exec nice -n 10 celery -A ops_manager worker \
         -l "${CELERY_LOG_LEVEL:-info}" \
         -Q task_exec \
         -n 'exec@%h' \
-        --concurrency="${CELERY_EXEC_CONCURRENCY:-1}" \
+        --concurrency="${CELERY_EXEC_CONCURRENCY:-2}" \
         "$@"
     ;;
 

@@ -22,7 +22,7 @@ flowchart TB
     subgraph APP["ops-manager 应用层（同一份代码，四类进程）"]
         WSGI["gunicorn (WSGI) :8000<br/>gthread 4×8 preload<br/>全部 REST API"]
         WS["daphne (ASGI) :8001<br/>Channels：/ws/agent/ 接入<br/>/ws/task-logs/&lt;id&gt;/ 日志推送"]
-        CEXEC["celery worker -Q task_exec<br/>concurrency=1<br/>任务流执行"]
+        CEXEC["celery worker -Q task_exec<br/>concurrency=2<br/>任务流执行（主机锁串行同主机同服务）"]
         CDEF["celery worker (默认队列)<br/>concurrency=2<br/>证书签发/续签/分发"]
         BEAT["celery beat<br/>每 24h 扫临期证书续签"]
     end

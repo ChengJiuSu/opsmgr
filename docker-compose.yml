@@ -196,7 +196,7 @@ services:
       timeout: 15s
       retries: 3
       start_period: 60s
-    mem_limit: ${CELERY_EXEC_MEM_LIMIT:-768m}
+    mem_limit: ${CELERY_EXEC_MEM_LIMIT:-1g}
 
   # ── Celery beat（只调度不干活，只能一个实例）────────────────────────────
   beat:

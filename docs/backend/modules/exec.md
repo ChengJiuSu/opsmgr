@@ -181,6 +181,7 @@ apps/task_exec/
 ├── consumers.py     # TaskLogConsumer：/ws/task-logs/<task_id>/ 日志推送（子协议 JWT 鉴权）
 ├── routing.py       # WebSocket 路由（ops_manager/asgi.py 挂载）
 ├── tasks.py         # dispatch：thread/celery/sync 三种后端（日志落主机快照与模块结果）
+├── host_lock.py     # 主机锁：「主机 × 服务类型」跨任务互斥，撞锁排队重试
 └── management/      # clean_task_logs 日志清理命令
 ```
 
@@ -466,6 +467,27 @@ Ansible 项目目录内执行剧本：
   failed 态仅收 retry/skip/abort（`pause_type` 空值兼容存量，视为 confirm）。
 - `output` 轮询接口与任务序列化器均返回 `pause_type`，前端据此切换
   暂停操作条（继续/中止 vs 重试/跳过/中止）。
+
+## 执行并发与主机锁
+
+- 生产 celery 后端由专用 worker 消费 `task_exec` 队列，**并发 = worker
+  `--concurrency`**（supervisor conf / compose `CELERY_EXEC_CONCURRENCY`，默认 2）。
+  曾为 1：失败等人处理（最长 600s）、暂停确认、等 Jenkins 构建的任务占着唯一执行位
+  却不耗 CPU，后续任务全部排队。`CELERY_WORKER_PREFETCH_MULTIPLIER=1` 防空闲子进程
+  扣住排队消息。同一任务 running/paused 时 `trigger.preflight` 拒绝再发起；
+  pending（排队/等锁）不拦，重复发起的两次执行会被主机锁串行。
+- **主机锁**（`host_lock.py`）：开跑前一次性算出整条任务流的锁键
+  `<server_id>:<service_type_id>`，模块未选服务类型时为 `<server_id>:*`（整机，
+  与该主机任何键冲突）；暂停模块不加锁。持锁 = 执行记录 `status=running` 且
+  `lock_keys` 含该键，终态即释放，无需显式解锁；判冲突 + 置 running 用缓存互斥
+  （生产 Redis）保证原子。
+- 撞锁：执行记录保持 `pending`，任务快照 `output` 写排队提示（持锁任务名 + 执行
+  记录号）并推送面板；celery 带 `countdown=TASK_HOST_LOCK_RETRY`（默认 10s）重新
+  投递，**等锁不占执行位**；thread/sync 在原线程 sleep 重试。从首次撞锁起累计超过
+  `TASK_HOST_LOCK_WAIT_TIMEOUT`（默认 3600s）记失败（return_code -1）。
+- 锁按整条任务流加而非逐模块加放：逐模块会让两条任务流交错执行。代价是偏保守。
+- 边界：worker 被 kill -9 时持锁记录停在 running，后来者等满超时失败，失败信息
+  里有持锁任务名，按名处理那条卡死记录。
 
 ## 接口
 
