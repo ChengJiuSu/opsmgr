@@ -4,7 +4,7 @@
 
 平台主动外连飞书，**入站零暴露**——服务可以收回内网、只对指定 IP 开放，
 `/api/feishu/callback/` 那两条公网入口不再需要。代价是多一个常驻进程
-（supervisor 配置见 deploy/ops-manager-feishu-ws.conf）。
+（supervisor 配置见 deploy/opsmgr-feishu-ws.conf）。
 
 与回调模式**互斥**：两边都开着，同一个事件会被处理两次。所以本命令会先检查
 「系统管理 → 飞书接入」里的事件接收方式，不是长连接就不连上去。

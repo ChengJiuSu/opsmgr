@@ -274,7 +274,7 @@ _time:24h parse_error:true | stats count() by (host, service)
 | `ops_manager/settings/prod.py` | 默认 json 格式、剥掉 console handler |
 | `deploy/nginx/conf/templates/ops_manager.conf.template` | `ops_timing` → `ops_json`（`escape=json` + `rid`） |
 | `deploy/nginx/conf/snippets/proxy_backend.conf` | 下发 `X-Request-ID: $request_id` |
-| `deploy/ops-manager.conf` | gunicorn access log 改 JSON + `rid`；`LOG_SERVICE=django` |
+| `deploy/opsmgr.conf` | gunicorn access log 改 JSON + `rid`；`LOG_SERVICE=django` |
 | `deploy/ops-manager-{ws,celery,celery-beat,celery-exec,feishu-ws}.conf` | 各自的 `LOG_SERVICE` |
 | `deploy/env.example` | `LOG_FORMAT` / `LOG_SERVICE` 说明 |
 | `common/tests.py` | `JSONFormatterTests`、`RequestIdTests` |

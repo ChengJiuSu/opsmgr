@@ -17,11 +17,11 @@
 | `install.sh` | **CD 主路径**：装 Jenkins 制品包，离线装依赖、迁移、重启 |
 | `deploy.sh` | 无 CI 场景，首次从源码树部署：venv、联网装依赖、迁移、collectstatic、前端构建 |
 | `update.sh` | 无 CI 场景，日常更新：拉代码、迁移、构建、重启服务 |
-| `ops-manager.conf` | gunicorn supervisor 配置 |
-| `ops-manager-ws.conf` | daphne supervisor 配置（`/ws/` 执行日志推送 + ops-agent 接入） |
-| `ops-manager-celery.conf` | celery worker supervisor 配置（默认队列：证书签发/分发） |
-| `ops-manager-celery-exec.conf` | **任务执行专用** celery worker（队列 `task_exec`，`TASK_EXEC_BACKEND=celery` 时必须） |
-| `ops-manager-celery-beat.conf` | celery beat supervisor 配置（证书自动续签调度，只起一个实例） |
+| `opsmgr.conf` | gunicorn supervisor 配置 |
+| `opsmgr-ws.conf` | daphne supervisor 配置（`/ws/` 执行日志推送 + ops-agent 接入） |
+| `opsmgr-celery.conf` | celery worker supervisor 配置（默认队列：证书签发/分发） |
+| `opsmgr-celery-exec.conf` | **任务执行专用** celery worker（队列 `task_exec`，`TASK_EXEC_BACKEND=celery` 时必须） |
+| `opsmgr-celery-beat.conf` | celery beat supervisor 配置（证书自动续签调度，只起一个实例） |
 | `docker/` | 后端容器化：Dockerfile + entrypoint（compose 文件在仓库根） |
 | `docker/Dockerfile.builder` | CI 依赖构建镜像（预编 wheelhouse / 生成 lock），不进生产 |
 | `nginx/` | 前置 nginx（容器化）：docker compose + envsubst 模板 + 安全头片段 + logrotate |
@@ -147,10 +147,10 @@ cp deploy/env.example .env && vim .env       # SECRET_KEY / ALLOWED_HOSTS / DB /
 bash deploy/deploy.sh
 
 # 后端托管（supervisor，改路径/用户/程序名后安装）
-sudo cp deploy/ops-manager.conf /etc/supervisor/conf.d/            # gunicorn
-sudo cp deploy/ops-manager-ws.conf /etc/supervisor/conf.d/        # daphne（/ws/ 日志推送）
-sudo cp deploy/ops-manager-celery.conf /etc/supervisor/conf.d/     # 证书签发/分发
-sudo cp deploy/ops-manager-celery-exec.conf /etc/supervisor/conf.d/  # 任务执行（必须）
+sudo cp deploy/opsmgr.conf /etc/supervisor/conf.d/            # gunicorn
+sudo cp deploy/opsmgr-ws.conf /etc/supervisor/conf.d/        # daphne（/ws/ 日志推送）
+sudo cp deploy/opsmgr-celery.conf /etc/supervisor/conf.d/     # 证书签发/分发
+sudo cp deploy/opsmgr-celery-exec.conf /etc/supervisor/conf.d/  # 任务执行（必须）
 sudo supervisorctl reread && sudo supervisorctl update
 
 # 前置 nginx（容器化，见 deploy/nginx/）
@@ -164,7 +164,7 @@ sudo cp deploy/nginx/logrotate/ops_manager_nginx /etc/logrotate.d/   # 改日志
 
 ### daphne（`/ws/`）不是可选项
 
-`ops-manager-ws.conf` 承载两件事：执行日志的 WebSocket 实时推送、ops-agent 接入。
+`opsmgr-ws.conf` 承载两件事：执行日志的 WebSocket 实时推送、ops-agent 接入。
 不部署它，`/ws/` 是 502，前端会退回**每秒一次**的日志轮询接口 —— 恰好在任务执行
 期间给后端加压，正是要避免的方向。nginx 侧的 `/ws/` → `127.0.0.1:8001` 分流已内置在
 `nginx/conf/templates/ops_manager.conf.template`。
@@ -189,7 +189,7 @@ worker 进程里，生产上会有三个后果：
 （默认 `celery` 队列，acme.sh DNS 验证上限 900s）共用，否则一个正在签发的证书能把
 后面排队的 ansible 任务堵十几分钟。
 
-部署路径与配置内路径不一致时，同步修改 `ops-manager.conf`、`ops-manager-ws.conf`、
+部署路径与配置内路径不一致时，同步修改 `opsmgr.conf`、`opsmgr-ws.conf`、
 两个 celery 配置，以及 `nginx/.env` 的 `OPS_APP_ROOT`。
 
 ## Docker Compose 部署（后端，可选内置 MySQL）
@@ -311,7 +311,7 @@ make wheels                    # 重建离线 wheelhouse，随制品发到目标
 #    把原来的「请求地址」清掉（留着的话事件会走两条路）
 
 # ④ 起进程
-sudo cp deploy/ops-manager-feishu-ws.conf /etc/supervisor/conf.d/
+sudo cp deploy/opsmgr-feishu-ws.conf /etc/supervisor/conf.d/
 sudo supervisorctl reread && sudo supervisorctl update
 sudo supervisorctl start ops-manager-feishu-ws
 tail -f logs/feishu-ws.log      # 应看到「飞书长连接启动」
@@ -639,9 +639,9 @@ Docker 部署无需手工执行：backend 入口每次启动都会跑 `migrate`�
    或永远「申请中」的证书，且没有任何报错）：
 
    ```bash
-   sudo cp deploy/ops-manager-celery.conf /etc/supervisor/conf.d/        # 默认队列：证书签发/分发
-   sudo cp deploy/ops-manager-celery-exec.conf /etc/supervisor/conf.d/   # 队列 task_exec：任务执行
-   sudo cp deploy/ops-manager-celery-beat.conf /etc/supervisor/conf.d/   # 自动续签调度，可选
+   sudo cp deploy/opsmgr-celery.conf /etc/supervisor/conf.d/        # 默认队列：证书签发/分发
+   sudo cp deploy/opsmgr-celery-exec.conf /etc/supervisor/conf.d/   # 队列 task_exec：任务执行
+   sudo cp deploy/opsmgr-celery-beat.conf /etc/supervisor/conf.d/   # 自动续签调度，可选
    sudo supervisorctl reread && sudo supervisorctl update
    sudo supervisorctl status | grep celery
    ```
@@ -673,11 +673,11 @@ Docker 部署无需手工执行：backend 入口每次启动都会跑 `migrate`�
      gunicorn 侧 `--access-logformat` 带了 `pid=`，可看出是否只有某个 worker 慢；
   4. ansible 自己把机器打满：`runner.py` 并发模式默认 `--forks 10`，并行组还会
      同时起多个 playbook。核少的机器上给执行 worker 加 `nice -n 10`（已在
-     `ops-manager-celery-exec.conf` 里），让 web 在 CPU 争抢中优先。
+     `opsmgr-celery-exec.conf` 里），让 web 在 CPU 争抢中优先。
 - **证书一直「申请中」/ 任务点了没反应**（celery 模式）：worker 没跑。
   `venv/bin/celery -A ops_manager inspect ping` 报 `No nodes replied` +
   `redis-cli -n 0 llen celery` 不为 0 即可确认（任务执行看 `llen task_exec`）。
-  装上 `ops-manager-celery.conf` / `ops-manager-celery-exec.conf`（见上节）。残留状态用
+  装上 `opsmgr-celery.conf` / `opsmgr-celery-exec.conf`（见上节）。残留状态用
   `manage.py reap_stuck_cert_tasks` 收成失败；队列里的陈旧任务先
   `redis-cli -n 0 del celery` 清掉，否则 worker 一起来就把过期任务全跑一遍。
 - **制品下载地址错误**：`.env` 的 `SITE_BASE_URL` 未配置为对外可达地址。

@@ -1,6 +1,6 @@
 """主机锁：不同任务同时动同一台主机的同一服务时，后来者排队。
 
-任务执行 worker 开了并发（deploy/ops-manager-celery-exec.conf）之后，两个任务
+任务执行 worker 开了并发（deploy/opsmgr-celery-exec.conf）之后，两个任务
 可能同时落到同一台主机上——部署和重启撞在一起，结果取决于谁先跑到哪一步。
 同一任务不会并发（trigger.preflight 拦住了），这里管的是不同任务之间。
 

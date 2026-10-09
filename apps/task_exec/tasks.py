@@ -5,7 +5,7 @@
     注意 ansible 子进程与 O(n) 的日志汇聚都跑在 web 进程里，会和 API 抢 GIL 与
     CPU —— 生产用它会让后台响应随任务输出量一起变慢，故生产应选 celery。
   - 'celery'：投递到独立队列 TASK_EXEC_QUEUE，由专用 worker 消费（部署见
-    deploy/ops-manager-celery-exec.conf），执行与 web 进程彻底分家。
+    deploy/opsmgr-celery-exec.conf），执行与 web 进程彻底分家。
   - 'sync'：当前请求线程内同步执行，便于测试。
 
 每次执行（含重跑）在 TaskExecutionLog 落一条日志记录：dispatch 时创建（pending），

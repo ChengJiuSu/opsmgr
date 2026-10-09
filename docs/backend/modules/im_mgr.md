@@ -290,7 +290,7 @@ conf/snippets/feishu_callback_ips.conf     # 来源 IP 白名单
 ./venv/bin/python manage.py feishu_ws --settings=ops_manager.settings.prod
 ```
 
-常驻，supervisor 配置见 `deploy/ops-manager-feishu-ws.conf`。命令启动前会检查
+常驻，supervisor 配置见 `deploy/opsmgr-feishu-ws.conf`。命令启动前会检查
 「事件接收方式」是否为长连接——不是就直接退出而不是默默连上去，否则两条路同时收
 事件，执行会跑两遍。
 

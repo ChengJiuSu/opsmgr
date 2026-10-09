@@ -14,12 +14,12 @@
 #
 # ── 进程与 supervisor 的对应关系 ─────────────────────────────────────────────
 #   init          （原先混在 entrypoint 里的 migrate，现在独立成一次性任务）
-#   web           deploy/ops-manager.conf
-#   ws            deploy/ops-manager-ws.conf
-#   celery        deploy/ops-manager-celery.conf
-#   celery-exec   deploy/ops-manager-celery-exec.conf
-#   beat          deploy/ops-manager-celery-beat.conf
-#   feishu-ws     deploy/ops-manager-feishu-ws.conf   （profile: feishu）
+#   web           deploy/opsmgr.conf
+#   ws            deploy/opsmgr-ws.conf
+#   celery        deploy/opsmgr-celery.conf
+#   celery-exec   deploy/opsmgr-celery-exec.conf
+#   beat          deploy/opsmgr-celery-beat.conf
+#   feishu-ws     deploy/opsmgr-feishu-ws.conf   （profile: feishu）
 # 参数在 deploy/docker/entrypoint.sh 里，与上述 .conf 逐项对齐。
 #
 # ── 日志采集不在本文件内 ─────────────────────────────────────────────────────
@@ -177,7 +177,7 @@ services:
     mem_limit: ${CELERY_MEM_LIMIT:-512m}
 
   # ── Celery：任务执行队列（ansible）──────────────────────────────────────
-  # 独立 worker 的理由见 deploy/ops-manager-celery-exec.conf：
+  # 独立 worker 的理由见 deploy/opsmgr-celery-exec.conf：
   # 与证书签发挤同一队列时，一个 900s 的签发能把后面的 ansible 堵十几分钟，
   # 而页面上只是一条「执行中」且无报错的任务。
   celery-exec:

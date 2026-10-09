@@ -45,9 +45,9 @@ venv/bin/python manage.py createsuperuser || true
 cat <<'EOF'
 
 部署完成。剩余手工步骤：
-  1. sudo cp deploy/ops-manager.conf /home/ubuntu/apps/supervisor/conf.d
+  1. sudo cp deploy/opsmgr.conf /home/ubuntu/apps/supervisor/conf.d
      （改路径/用户/程序名）/home/ubuntu/scripts/manager.sh update devops-manager-01
-     另需 ops-manager-ws.conf（daphne）与两个 celery worker，见 deploy/README.md
+     另需 opsmgr-ws.conf（daphne）与两个 celery worker，见 deploy/README.md
   2. cp deploy/nginx/.env.example deploy/nginx/.env && vim deploy/nginx/.env
      （域名 / 证书路径 / OPS_APP_ROOT）cd deploy/nginx && docker compose up -d
   3. 浏览器登录，「系统配置」页维护 jenkins.url / jenkins.user / jenkins.api_token

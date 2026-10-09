@@ -2,7 +2,7 @@
 
 pending 有两种来由，页面上要分开说：
   - 在队列里等执行位：celery worker 的子进程都被占着（并发见
-    deploy/ops-manager-celery-exec.conf）；
+    deploy/opsmgr-celery-exec.conf）；
   - 已被取出但撞了主机锁（host_lock.py）：等占用方跑完，tasks._wait_for_lock
     把原因写进任务快照 output，以 LOCK_WAIT_PREFIX 开头。
 

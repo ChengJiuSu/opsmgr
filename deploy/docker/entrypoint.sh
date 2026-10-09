@@ -55,7 +55,7 @@ init)
     ;;
 
 web)
-    # 参数与 deploy/ops-manager.conf 逐项对齐，改一边要改两边：
+    # 参数与 deploy/opsmgr.conf 逐项对齐，改一边要改两边：
     #   gthread 4×8 + --preload：4C/3.7G 上单进程 RSS ≈ 116MB，不 preload 时
     #     16 个 worker 直接换页；preload 后 fork 前加载一次，靠 COW 共享。
     #     代价是不能 HUP 热重载，改代码必须重启容器（本来就是换镜像）。
@@ -99,7 +99,7 @@ celery-exec)
     #   --concurrency=2  执行位不再全局唯一：失败等人处理/暂停确认/等 Jenkins 的任务
     #                    占位不干活，只有 1 个位置时会堵住全部后续任务。同主机同服务
     #                    由主机锁串行（apps/task_exec/host_lock.py）。理由与内存账见
-    #                    deploy/ops-manager-celery-exec.conf
+    #                    deploy/opsmgr-celery-exec.conf
     exec nice -n 10 celery -A ops_manager worker \
         -l "${CELERY_LOG_LEVEL:-info}" \
         -Q task_exec \

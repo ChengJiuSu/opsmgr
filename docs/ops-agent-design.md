@@ -603,4 +603,4 @@ steps_result / 失败处理（retry/skip/abort）流程。
 2. 出口主机到内网主机 **SSH 已免密**（密钥驻留 agent 主机，符合 3.4 设计）。
 3. 生产 **nginx 前置**：`deploy/nginx/conf/templates/ops_manager.conf.template`
    已加 `/ws/` → daphne(8001) 分流，
-   daphne 托管配置 `deploy/ops-manager-ws.conf`（supervisor）。
+   daphne 托管配置 `deploy/opsmgr-ws.conf`（supervisor）。

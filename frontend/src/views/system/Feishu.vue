@@ -43,7 +43,7 @@
           <b>长连接入站零暴露</b>：平台主动外连飞书，下面那两条回调地址不再需要，
           服务可以收回内网、只对指定 IP 开放。代价是多一个常驻进程
           （<code>manage.py feishu_ws</code>，supervisor 配置见
-          <code>deploy/ops-manager-feishu-ws.conf</code>），且执行后端必须是 celery。
+          <code>deploy/opsmgr-feishu-ws.conf</code>），且执行后端必须是 celery。
           <br />
           两种方式<b>互斥</b>：切到长连接后请把飞书后台的「请求地址」清掉，
           否则同一个事件会被处理两次。

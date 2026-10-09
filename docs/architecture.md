@@ -105,12 +105,12 @@ flowchart TB
 | 进程 | 启动方式 | 端口 | 职责 | 不部署的后果 |
 |------|----------|------|------|--------------|
 | nginx | 系统服务 / docker | 80, 443 | TLS、静态资源、反代、`X-Accel-Redirect` 发制品 | 无入口 |
-| gunicorn | `deploy/ops-manager.conf` | 127.0.0.1:8000 | 全部 REST API、Django Admin | API 全挂 |
-| daphne | `deploy/ops-manager-ws.conf` | 127.0.0.1:8001 | `/ws/agent/`、`/ws/task-logs/<id>/` | agent 掉线；日志退回轮询 |
-| celery worker (exec) | `deploy/ops-manager-celery-exec.conf` | — | `-Q task_exec`，跑任务流 | 任务卡在 pending |
-| celery worker (默认) | `deploy/ops-manager-celery.conf` | — | 证书签发/续签/分发 | 证书永远「申请中」 |
-| celery beat | `deploy/ops-manager-celery-beat.conf` | — | 24h 扫临期证书 | 不自动续签（可手动） |
-| feishu-ws（可选） | `deploy/ops-manager-feishu-ws.conf` | — | 飞书长连接收事件（仅长连接模式） | 群里 @机器人 无反应 |
+| gunicorn | `deploy/opsmgr.conf` | 127.0.0.1:8000 | 全部 REST API、Django Admin | API 全挂 |
+| daphne | `deploy/opsmgr-ws.conf` | 127.0.0.1:8001 | `/ws/agent/`、`/ws/task-logs/<id>/` | agent 掉线；日志退回轮询 |
+| celery worker (exec) | `deploy/opsmgr-celery-exec.conf` | — | `-Q task_exec`，跑任务流 | 任务卡在 pending |
+| celery worker (默认) | `deploy/opsmgr-celery.conf` | — | 证书签发/续签/分发 | 证书永远「申请中」 |
+| celery beat | `deploy/opsmgr-celery-beat.conf` | — | 24h 扫临期证书 | 不自动续签（可手动） |
+| feishu-ws（可选） | `deploy/opsmgr-feishu-ws.conf` | — | 飞书长连接收事件（仅长连接模式） | 群里 @机器人 无反应 |
 | Redis | 系统服务 | 6379 | broker / result / channel layer / 缓存 | celery 与 WebSocket 均不可用 |
 | MySQL | 系统服务 | 3306 | 主数据 | 全挂 |
 

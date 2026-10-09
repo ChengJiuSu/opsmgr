@@ -20,7 +20,7 @@ export DJANGO_SETTINGS_MODULE=ops_manager.settings.prod
 
 VENV=${VENV:-venv}
 WHEELHOUSE=${WHEELHOUSE:-wheelhouse}
-# 程序名与 deploy/ops-manager.conf 的 [program:xxx] 一致；多实例部署时覆盖
+# 程序名与 deploy/opsmgr.conf 的 [program:xxx] 一致；多实例部署时覆盖
 SUPERVISOR_PROGRAM=${SUPERVISOR_PROGRAM:-ops-manager-01}
 # 现网用的是自封装的 supervisor 包装脚本，不是 systemd（见 deploy/README.md）
 MANAGER_BIN=${MANAGER_BIN:-/home/ubuntu/scripts/manager.sh}
