@@ -560,7 +560,7 @@ grep -i "飞书回调" logs/*.log | tail -20
 | 群里 @机器人 没反应，日志里**什么都没有** | 缺 `im:message.group_at_msg:readonly`（群 @ 消息是独立权限，与单聊那个分开）；或事件订阅里没勾 `im.message.receive_v1`。日志空白 = 事件没推过来，问题在飞书后台不在代码 |
 | 群里 @机器人 没反应，但日志有「飞书回调受理」 | 事件到了。看紧随其后的日志：会话未登记 / 未绑定账号 / 无可执行任务，都会回一张说明卡 |
 | 点了机器人菜单没反应 | ① 飞书后台没订阅 `application.bot.menu_v6`（菜单与事件订阅是两处配置）；② 菜单类型选成了「跳转链接」；③ 平台侧没开「允许单聊发起执行」——这种会收到一张说明卡，不是没反应 |
-| 日志里**什么都没有** | 请求没到 Django。查 nginx：`grep feishu deploy/nginx/logs/ops-manager.api.access.log`，403 = IP 白名单挡住（**空的白名单文件 = 拒绝所有回调**） |
+| 日志里**什么都没有** | 请求没到 Django。查 nginx：`grep feishu deploy/nginx/logs/opsmgr.api.access.log`，403 = IP 白名单挡住（**空的白名单文件 = 拒绝所有回调**） |
 | 浏览器 `20029 Invalid redirect URL` | 飞书后台「安全设置 → 重定向 URL」里没有我们传的那个地址。以**浏览器地址栏里的 `redirect_uri` 参数**为准去对，不要用 `feishu_check` 打印的那行（命令行没有 request，它按 `SITE_BASE_URL` 推导） |
 | `The authorization code ... does not match the provided application credential`（20024） | 授权码与换 token 用的凭证不是同一个应用。换过自建应用（如个人版 → 企业版）时最常见；token 缓存已按 App ID 隔离、且保存配置会自动清缓存，若仍报错，检查**浏览器里那个授权链接是不是旧页面留下的**（带旧 `app_id`），从登录页重新发起一次 |
 | 登录日志 `oidc/access_token 调用失败（其他 20024）` | ① 授权码被用过（刷新了带 `code` 的回调页，码是一次性的）；② 登录的飞书账号不属于该自建应用所在的企业租户；③ 应用改过能力后没重新发布 / 还在审核中。错误描述见日志里 `code=` 前面那句 |

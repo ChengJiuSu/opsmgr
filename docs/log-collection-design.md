@@ -16,8 +16,8 @@
 | gunicorn stdout/stderr | `~/logs/opsmgr.log`、`-error.log` | 同 Django（console handler） | **与 file handler 内容重复，采集后存两份** |
 | celery ×3 | `~/logs/opsmgr-celery*.log` | celery 前缀 + Django 格式混排 | 同一文件两种格式 |
 | daphne / feishu-ws | `~/logs/opsmgr-ws.log`、`logs/feishu-ws.log` | 同上 | 同上 |
-| nginx access | `/var/log/nginx/ops-manager*.access.log` | 自定义 `ops_timing` | 引号嵌套，UA 里带引号即解析失败 |
-| nginx error | `/var/log/nginx/ops-manager.error.log` | nginx 内置 | 多行，无法 JSON 化 |
+| nginx access | `/var/log/nginx/opsmgr*.access.log` | 自定义 `ops_timing` | 引号嵌套，UA 里带引号即解析失败 |
+| nginx error | `/var/log/nginx/opsmgr.error.log` | nginx 内置 | 多行，无法 JSON 化 |
 | 任务执行 | `logs/tasks/<task_id>/<exec_id>.log` | ansible 原始输出 | 含 ANSI 颜色码、多行、**可能含下发的凭据** |
 | 审计 | DB 表 `audit_auditlog` | 结构化但在库里 | 不在文件流上 |
 | ops-agent | 独立仓库，NAT 出口机 | 另行确认 | 跨网络边界 |

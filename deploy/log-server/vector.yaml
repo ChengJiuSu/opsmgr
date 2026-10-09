@@ -74,7 +74,7 @@ sources:
   nginx_access:
     type: file
     include:
-      - /var/log/nginx/ops-manager*.access.log
+      - /var/log/nginx/opsmgr*.access.log
     read_from: beginning
 
   # ---------------------------------------------------------------------------
@@ -85,7 +85,7 @@ sources:
   nginx_error:
     type: file
     include:
-      - /var/log/nginx/ops-manager*.error.log
+      - /var/log/nginx/opsmgr*.error.log
     read_from: beginning
     # upstream 超时等错误会跟着多行上下文，按「下一条以 YYYY/MM/DD 开头」切分。
     # halt_before：遇到匹配 condition_pattern 的行就结束当前这条。

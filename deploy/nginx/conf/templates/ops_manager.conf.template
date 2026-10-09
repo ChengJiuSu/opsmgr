@@ -111,8 +111,8 @@ server {
     server_name ${OPS_SERVER_NAME};
     server_tokens off;
 
-    access_log /var/log/nginx/ops-manager.access.log ops_json;
-    error_log  /var/log/nginx/ops-manager.error.log warn;
+    access_log /var/log/nginx/opsmgr.access.log ops_json;
+    error_log  /var/log/nginx/opsmgr.error.log warn;
 
     # 容器健康检查端点，不参与跳转（避免 healthcheck 拿到 301）
     location = /nginx-health {
@@ -164,8 +164,8 @@ server {
     # CI 制品压缩包上报走 /api，放宽上传限制
     client_max_body_size ${OPS_CLIENT_MAX_BODY_SIZE};
 
-    access_log /var/log/nginx/ops-manager.access.log ops_json;
-    error_log  /var/log/nginx/ops-manager.error.log warn;
+    access_log /var/log/nginx/opsmgr.access.log ops_json;
+    error_log  /var/log/nginx/opsmgr.error.log warn;
 
     location = /nginx-health {
         access_log off;
@@ -219,7 +219,7 @@ server {
     # client_body_temp 再转发，多一轮磁盘读写；这里关掉让它边收边转。
     # 精确匹配（=）优先级高于下面的正则，必须写在前面才生效。
     location = /api/artifacts/report/ {
-        access_log /var/log/nginx/ops-manager.api.access.log ops_json;
+        access_log /var/log/nginx/opsmgr.api.access.log ops_json;
 
         include /etc/nginx/snippets/proxy_backend.conf;
         proxy_pass http://ops_manager_backend;
@@ -245,7 +245,7 @@ server {
         limit_req zone=feishu_callback burst=20 nodelay;
         limit_req_status 429;
 
-        access_log /var/log/nginx/ops-manager.api.access.log ops_json;
+        access_log /var/log/nginx/opsmgr.api.access.log ops_json;
 
         include /etc/nginx/snippets/proxy_backend.conf;
         proxy_pass http://ops_manager_backend;
@@ -258,7 +258,7 @@ server {
 
     # ---- 后端 API / Django admin ---------------------------------------------
     location ~ ^/(api|admin)/ {
-        access_log /var/log/nginx/ops-manager.api.access.log ops_json;
+        access_log /var/log/nginx/opsmgr.api.access.log ops_json;
 
         include /etc/nginx/snippets/proxy_backend.conf;
         proxy_pass http://ops_manager_backend;
@@ -284,7 +284,7 @@ server {
     #     allow 203.0.113.9;       # CI 出口
     #     deny all;
     #
-    #     access_log /var/log/nginx/ops-manager.api.access.log ops_json;
+    #     access_log /var/log/nginx/opsmgr.api.access.log ops_json;
     #     proxy_pass http://ops_manager_backend;
     #     proxy_http_version 1.1;
     #     proxy_set_header Connection "";
