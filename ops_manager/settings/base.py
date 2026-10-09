@@ -463,6 +463,12 @@ TASK_FAILURE_WAIT_TIMEOUT = config('TASK_FAILURE_WAIT_TIMEOUT', default=600, cas
 # ansible 进程，每个再按 task.forks（默认 10）派生 —— 5 个模块就是 50 个进程，
 # 小机器上足以把 CPU 打满，连带拖慢 web。超出上限的模块排队等前面的跑完。
 TASK_PARALLEL_MAX = config('TASK_PARALLEL_MAX', default=5, cast=int)
+# 主机锁（apps/task_exec/host_lock.py）：任务执行 worker 开了并发之后，不同任务
+# 可能同时动同一台主机的同一服务。开跑前按「主机 × 服务类型」加锁，撞锁的任务
+# 不占执行位，每 TASK_HOST_LOCK_RETRY 秒重新尝试；从首次撞锁起累计等待超过
+# TASK_HOST_LOCK_WAIT_TIMEOUT 秒仍未拿到即记失败（持锁任务卡死时不至于无限排队）。
+TASK_HOST_LOCK_RETRY = config('TASK_HOST_LOCK_RETRY', default=10, cast=int)
+TASK_HOST_LOCK_WAIT_TIMEOUT = config('TASK_HOST_LOCK_WAIT_TIMEOUT', default=3600, cast=int)
 
 # ── 任务执行日志 ──────────────────────────────────────────
 # 每次执行的完整日志流式落盘目录（输出可能含敏感回显，禁止暴露到静态文件路径）

@@ -3261,3 +3261,104 @@ class FeishuExecFlagTests(TestCase):
     def test_feishu_trigger_type_registered(self):
         choices = dict(TaskExecutionLog.TRIGGER_CHOICES)
         self.assertEqual(choices['feishu'], '飞书触发')
+
+
+class HostLockTests(TestCase):
+    """主机锁：不同任务撞同一「主机 × 服务」时后来者排队，等锁超时记失败。"""
+
+    def setUp(self):
+        from . import host_lock
+        self.host_lock = host_lock
+        cache.clear()
+        self.user = User.objects.create(username='lock_admin', is_staff=True, is_superuser=True)
+        self.srv = Server.objects.create(name='lock-01', private_ip='10.0.9.1')
+        self.holder_task = ExecutionTask.objects.create(name='正在部署', created_by=self.user)
+        self.holder = TaskExecutionLog.objects.create(
+            task=self.holder_task, status='running', lock_keys=[f'{self.srv.id}:3'])
+        self.task = ExecutionTask.objects.create(name='后来者', created_by=self.user, status='pending')
+        self.log = TaskExecutionLog.objects.create(task=self.task)
+
+    def test_conflicts(self):
+        c = self.host_lock.conflicts
+        self.assertEqual(c(['1:3'], ['1:3']), ['1:3'])
+        self.assertEqual(c(['1:*'], ['1:3']), ['1:*'])   # 整机锁撞任何服务
+        self.assertEqual(c(['1:3'], ['1:*']), ['1:3'])
+        self.assertEqual(c(['1:4'], ['1:3']), [])        # 同机不同服务并行
+        self.assertEqual(c(['2:3'], ['1:3']), [])
+        self.assertEqual(c(['1:3'], []), [])
+
+    def test_lock_keys_skip_pause_and_wildcard_without_service_type(self):
+        step = TaskStep.objects.create(task=self.task, order=1, name='重启', task_type='command',
+                                       command='uptime')
+        TaskStep.objects.create(task=self.task, order=2, name='确认', task_type='pause')
+        step.servers.set([self.srv])
+        self.assertEqual(self.host_lock.lock_keys(self.task), [f'{self.srv.id}:*'])
+
+    def test_try_acquire(self):
+        blocker = self.host_lock.try_acquire(self.log, [f'{self.srv.id}:3'])
+        self.assertEqual(blocker['task_name'], '正在部署')
+        self.assertIn('lock-01', self.host_lock.describe(blocker))
+        self.log.refresh_from_db()
+        self.assertEqual(self.log.status, 'pending')
+
+        # 同机不同服务：拿到锁，原子置 running 并记下锁键
+        self.assertIsNone(self.host_lock.try_acquire(self.log, [f'{self.srv.id}:4']))
+        self.log.refresh_from_db()
+        self.assertEqual((self.log.status, self.log.lock_keys), ('running', [f'{self.srv.id}:4']))
+
+    def test_finished_holder_releases(self):
+        self.holder.status = 'success'
+        self.holder.save()
+        self.assertIsNone(self.host_lock.try_acquire(self.log, [f'{self.srv.id}:*']))
+
+    def _patch_keys(self):
+        return mock.patch.object(self.host_lock, 'lock_keys', return_value=[f'{self.srv.id}:*'])
+
+    def test_execute_defers_then_times_out(self):
+        from .tasks import execute_task
+        with self._patch_keys(), mock.patch.object(runner, 'run') as run:
+            wait_since = execute_task(self.task.id, self.log.id)
+            self.assertIsInstance(wait_since, float)
+            run.assert_not_called()
+            self.task.refresh_from_db()
+            self.log.refresh_from_db()
+            self.assertEqual((self.task.status, self.log.status), ('pending', 'pending'))
+            self.assertIn('排队等待主机锁', self.task.output)
+            self.assertIn('正在部署', self.task.output)
+
+            with override_settings(TASK_HOST_LOCK_WAIT_TIMEOUT=60):
+                self.assertIsNone(execute_task(self.task.id, self.log.id, time.time() - 61))
+            run.assert_not_called()
+        self.task.refresh_from_db()
+        self.log.refresh_from_db()
+        self.assertEqual((self.task.status, self.log.status), ('failed', 'failed'))
+        self.assertIn('等待主机锁超时', self.log.output)
+
+    @override_settings(TASK_EXEC_BACKEND='sync')
+    def test_sync_retries_until_holder_finishes(self):
+        from .tasks import _run_until_done
+        holder = self.holder
+
+        def _finish_holder(_seconds):
+            TaskExecutionLog.objects.filter(pk=holder.pk).update(status='success')
+
+        log_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, log_dir, True)
+        with override_settings(TASK_LOG_DIR=log_dir), self._patch_keys(), \
+                mock.patch('apps.task_exec.tasks.time.sleep', side_effect=_finish_holder) as sleep, \
+                mock.patch.object(runner, 'run', return_value=(0, 'ok', [])):
+            _run_until_done(self.task.id, self.log.id)
+        sleep.assert_called_once()
+        self.log.refresh_from_db()
+        self.assertEqual((self.log.status, self.log.lock_keys), ('success', [f'{self.srv.id}:*']))
+
+    def test_celery_requeues_with_countdown(self):
+        from . import tasks
+        if not hasattr(tasks.run_execution_task, 'delay'):
+            self.skipTest('celery 未安装')
+        with self._patch_keys(), \
+                mock.patch.object(tasks.run_execution_task, 'apply_async') as requeue:
+            tasks.run_execution_task.run(self.task.id, self.log.id)
+        kwargs = requeue.call_args.kwargs
+        self.assertEqual(kwargs['queue'], tasks.TASK_EXEC_QUEUE)
+        self.assertIsInstance(kwargs['kwargs']['wait_since'], float)

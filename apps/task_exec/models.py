@@ -481,6 +481,9 @@ class TaskExecutionLog(models.Model):
     # 执行期间就按 pending → running → 终态逐步更新（不是跑完才落一次），面板的
     # 模块列表读的就是它
     steps_result = models.JSONField('模块执行结果', default=list, blank=True)
+    # 本次执行持有的主机锁 ["<server_id>:<service_type_id|*>"]，开跑时写入
+    # （见 host_lock.py）。只有 status=running 的记录算持锁，终态后留作历史
+    lock_keys = models.JSONField('主机锁', default=list, blank=True)
     triggered_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
         related_name='exec_task_logs', verbose_name='触发人',

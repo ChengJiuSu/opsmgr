@@ -13,15 +13,20 @@
 
 执行期间输出由 live.LiveSink 边跑边写：数据库存尾部预览（前端轮询实时刷新），
 完整日志流式落盘到 TASK_LOG_DIR/<task_id>/<log_id>.log（按保留期定期清理）。
+
+开跑前先拿主机锁（host_lock.py）：撞上别的任务正在动的「主机 × 服务」时不执行，
+保持 pending 并按后端重新排队——celery 带 countdown 重新投递（不占执行位），
+thread/sync 在原线程里 sleep 重试。
 """
 import logging
+import time
 from pathlib import Path
 
 from django.conf import settings
 from django.db import connection
 from django.utils import timezone
 
-from . import runner
+from . import host_lock, runner
 from .live import DB_PREVIEW_LIMIT, PREVIEW_LIMIT, LiveSink, log_rel_path, preview_of, push, push_status
 
 logger = logging.getLogger('apps.task_exec')
@@ -35,8 +40,12 @@ OUTPUT_PREVIEW_LIMIT = DB_PREVIEW_LIMIT
 TASK_EXEC_QUEUE = 'task_exec'
 
 
-def execute_task(task_id, log_id=None):
-    """加载任务并执行，同时更新任务快照与执行日志。可在线程/celery/同步上下文中调用。"""
+def execute_task(task_id, log_id=None, wait_since=None):
+    """加载任务并执行，同时更新任务快照与执行日志。可在线程/celery/同步上下文中调用。
+
+    撞主机锁时不执行，返回首次撞锁的时间戳（调用方据此稍后重试并原样传回
+    wait_since）；其余情况（执行完毕、任务不存在、等锁超时记失败）返回 None。
+    """
     from .models import ExecutionTask, TaskExecutionLog
 
     task = ExecutionTask.objects.filter(pk=task_id).select_related('credential').first()
@@ -49,6 +58,15 @@ def execute_task(task_id, log_id=None):
         # 兜底：直接调用（未经 dispatch）时也保证有日志记录
         log = TaskExecutionLog.objects.create(task=task, triggered_by=task.created_by)
 
+    try:
+        keys = host_lock.lock_keys(task)
+    except Exception:  # noqa: BLE001 - 算不出锁键宁可不加锁，也不能让任务卡在 pending
+        logger.exception('任务 %s 计算主机锁失败，本次不加锁', task_id)
+        keys = []
+    blocker = host_lock.try_acquire(log, keys)
+    if blocker:
+        return _wait_for_lock(task, log, blocker, wait_since)
+
     started_at = timezone.now()
     task.status = log.status = 'running'
     task.started_at = log.started_at = started_at
@@ -57,7 +75,9 @@ def execute_task(task_id, log_id=None):
     task.output, task.output_offset = '', 0
     task.save(update_fields=['status', 'started_at', 'output', 'output_offset'])
     log.save(update_fields=['status', 'started_at'])
-    push_status(task.pk)  # 开跑：推送 running（WebSocket 客户端已在等）
+    # 开跑：清掉面板上的排队提示（或上次执行残留），再推送 running
+    push(task.pk, {'kind': 'full', 'output': '', 'start': 0, 'offset': 0})
+    push_status(task.pk)
 
     rel_path = log_rel_path(task.pk, log.pk)
     abs_path = Path(settings.TASK_LOG_DIR) / rel_path
@@ -102,12 +122,53 @@ def execute_task(task_id, log_id=None):
         push_status(task.pk)
 
 
+def _wait_for_lock(task, log, blocker, wait_since):
+    """撞锁：未超时则在面板上给出排队提示并返回 wait_since；超时记失败返回 None。"""
+    from .models import ExecutionTask, TaskExecutionLog
+
+    now = time.time()
+    wait_since = wait_since or now
+    waited = int(now - wait_since)
+    timeout = settings.TASK_HOST_LOCK_WAIT_TIMEOUT
+    reason = host_lock.describe(blocker)
+
+    if waited >= timeout:
+        note = f'等待主机锁超时（已等 {waited}s，上限 {timeout}s），本次未执行：{reason}'
+        logger.warning('任务 %s 执行记录 %s %s', task.pk, log.pk, note)
+        finished_at = timezone.now()
+        ExecutionTask.objects.filter(pk=task.pk).update(
+            status='failed', return_code=-1, output=note, output_offset=len(note), finished_at=finished_at)
+        TaskExecutionLog.objects.filter(pk=log.pk).update(
+            status='failed', return_code=-1, output=note, finished_at=finished_at)
+        push(task.pk, {'kind': 'full', 'output': note, 'start': 0, 'offset': len(note)})
+        push_status(task.pk)
+        return None
+
+    note = (f'⏳ 排队等待主机锁：{reason}。已等 {waited}s，每 '
+            f'{settings.TASK_HOST_LOCK_RETRY}s 重试，超过 {timeout}s 记失败。')
+    # 只写任务快照（面板/轮询读它），执行记录的 output 留给真正的执行输出
+    ExecutionTask.objects.filter(pk=task.pk).update(output=note, output_offset=len(note))
+    push(task.pk, {'kind': 'full', 'output': note, 'start': 0, 'offset': len(note)})
+    return wait_since
+
+
+def _run_until_done(task_id, log_id):
+    """thread/sync 后端：撞锁就在当前线程 sleep 后重试，直至执行完毕或等锁超时。"""
+    wait_since = None
+    while True:
+        wait_since = execute_task(task_id, log_id, wait_since)
+        # 只认 float：测试里 execute_task 常被 mock 掉，返回的 MagicMock 不能当成撞锁
+        if not isinstance(wait_since, float):
+            return
+        time.sleep(settings.TASK_HOST_LOCK_RETRY)
+
+
 def _run_in_thread(task_id, log_id):
     import threading
 
     def _worker():
         try:
-            execute_task(task_id, log_id)
+            _run_until_done(task_id, log_id)
         finally:
             connection.close()  # 线程退出前释放数据库连接
 
@@ -127,7 +188,7 @@ def dispatch(task, triggered_by=None, trigger_type='execute'):
     )
     backend = getattr(settings, 'TASK_EXEC_BACKEND', 'thread')
     if backend == 'sync':
-        execute_task(task.id, log.id)
+        _run_until_done(task.id, log.id)
     elif backend == 'celery':
         run_execution_task.apply_async(args=[task.id, log.id], queue=TASK_EXEC_QUEUE)
     else:
@@ -140,11 +201,16 @@ try:
     from celery import shared_task
 
     @shared_task(name='task_exec.run_execution_task')
-    def run_execution_task(task_id, log_id=None):
-        execute_task(task_id, log_id)
+    def run_execution_task(task_id, log_id=None, wait_since=None):
+        wait_since = execute_task(task_id, log_id, wait_since)
+        if isinstance(wait_since, float):
+            # 撞锁：重新投递而不是在 worker 里 sleep，等锁期间不占执行位
+            run_execution_task.apply_async(
+                args=[task_id, log_id], kwargs={'wait_since': wait_since},
+                countdown=settings.TASK_HOST_LOCK_RETRY, queue=TASK_EXEC_QUEUE)
 
 except ImportError:  # celery 未安装时提供占位，避免导入错误
-    def run_execution_task(task_id, log_id=None):  # type: ignore
+    def run_execution_task(task_id, log_id=None, wait_since=None):  # type: ignore
         raise RuntimeError('Celery 未安装，无法使用 celery 后端。请改用 thread/sync。')
 
     # dispatch 走 apply_async 投队列，占位函数也得有这个属性，否则抛的是
