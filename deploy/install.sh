@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # OpsManager 制品安装脚本（在目标服务器上、解包后的发布目录里执行）
 #
-#   tar -xzf ops-manager-<BUILD_TS>.tar.gz -C /home/ubuntu/apps/devops-manager-01
+#   tar -xzf opsmgr-<BUILD_TS>.tar.gz -C /home/ubuntu/apps/devops-manager-01
 #   cd /home/ubuntu/apps/devops-manager-01
 #   bash deploy/install.sh
 #

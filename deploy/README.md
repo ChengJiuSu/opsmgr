@@ -112,7 +112,7 @@ sudo apt-get install -y python3.14 python3.14-venv libmysqlclient21
 
 ```bash
 cd /home/ubuntu/apps/devops-manager-01
-tar -xzf /path/to/ops-manager-<BUILD_TS>.tar.gz -C .
+tar -xzf /path/to/opsmgr-<BUILD_TS>.tar.gz -C .
 cp deploy/env.example .env && vim .env      # 首次；后续 .env 不随包覆盖
 bash deploy/install.sh
 ```
