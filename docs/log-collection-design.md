@@ -13,9 +13,9 @@
 |---|---|---|---|
 | Django 应用 | `logs/ops_manager.log`、`logs/error.log` | `{levelname} {asctime} {name} {module}:{lineno} {message}` | 无时区；traceback 多行；无请求关联；**同机多进程写同一文件** |
 | gunicorn access | `~/logs/gunicorn-access.log` | `%(t)s %(m)s %(U)s?%(q)s %(s)s %(M)sms pid=` | 空格分隔，URI 里带空格即错位 |
-| gunicorn stdout/stderr | `~/logs/ops-manager.log`、`-error.log` | 同 Django（console handler） | **与 file handler 内容重复，采集后存两份** |
-| celery ×3 | `~/logs/ops-manager-celery*.log` | celery 前缀 + Django 格式混排 | 同一文件两种格式 |
-| daphne / feishu-ws | `~/logs/ops-manager-ws.log`、`logs/feishu-ws.log` | 同上 | 同上 |
+| gunicorn stdout/stderr | `~/logs/opsmgr.log`、`-error.log` | 同 Django（console handler） | **与 file handler 内容重复，采集后存两份** |
+| celery ×3 | `~/logs/opsmgr-celery*.log` | celery 前缀 + Django 格式混排 | 同一文件两种格式 |
+| daphne / feishu-ws | `~/logs/opsmgr-ws.log`、`logs/feishu-ws.log` | 同上 | 同上 |
 | nginx access | `/var/log/nginx/ops-manager*.access.log` | 自定义 `ops_timing` | 引号嵌套，UA 里带引号即解析失败 |
 | nginx error | `/var/log/nginx/ops-manager.error.log` | nginx 内置 | 多行，无法 JSON 化 |
 | 任务执行 | `logs/tasks/<task_id>/<exec_id>.log` | ansible 原始输出 | 含 ANSI 颜色码、多行、**可能含下发的凭据** |
@@ -87,7 +87,7 @@ VictoriaLogs 按 stream 组织存储，组合数应控制在几百以内。
 > 是必然丢数据。这是采集之前必须先解决的，否则采到的本身就是残缺的。
 
 **去掉 prod 的 console handler**：supervisor 已把进程 stdout 落到
-`~/logs/ops-manager.log`，file handler 又把同样内容写进 `logs/ops_manager-django.log`，
+`~/logs/opsmgr.log`，file handler 又把同样内容写进 `logs/ops_manager-django.log`，
 两个文件都采 = 每条日志在 VictoriaLogs 里存两份。保留 file handler（JSON、自带轮转），
 去掉 console 后 supervisor 那份只剩 gunicorn/celery 自身的启动与崩溃输出——低频，
 且正是 file handler 覆盖不到的部分，仍然要采。
@@ -290,7 +290,7 @@ _time:24h parse_error:true | stats count() by (host, service)
    - `logs/` 下每个进程一个文件，无同名互相覆盖；
    - 请求任意接口，响应头有 `X-Request-ID`，其值同时出现在 nginx access log 的 `rid`、
      gunicorn access log 的 `rid`、应用日志的 `request_id`；
-   - `~/logs/ops-manager.log` 不再有应用日志的重复行。
+   - `~/logs/opsmgr.log` 不再有应用日志的重复行。
 
 **回滚**：设 `LOG_FORMAT=verbose` 重启即可退回文本格式（文件名拆分与 request_id 不受
 影响，两者都是纯增强）。nginx 侧回滚需要改回模板并 reload。

@@ -58,7 +58,7 @@ for _handler in ('file', 'error_file'):
     LOGGING['handlers'][_handler]['formatter'] = LOG_FORMAT
 
 # ── 去掉 console handler：同一行日志不要写两遍 ──────────────────
-# 生产由 supervisor 接管进程的 stdout/stderr 落到 ~/logs/ops-manager.log，
+# 生产由 supervisor 接管进程的 stdout/stderr 落到 ~/logs/opsmgr.log，
 # 而 file handler 同时把同样的内容写进 logs/ops_manager-<service>.log。两个文件都被
 # Vector 采集 = 每条日志在 VictoriaLogs 里存两份，磁盘与查询结果双倍噪声。
 # 保留 file handler（JSON、自带轮转）、去掉 console，supervisor 的那份就只剩

@@ -48,7 +48,7 @@ sources:
   proc:
     type: file
     include:
-      - "${OPS_LOG_DIR}/ops-manager*.log"
+      - "${OPS_LOG_DIR}/opsmgr*.log"
     read_from: beginning
     # 纯文本，且崩溃栈是多行。按「下一行以时间戳/日志级别开头」切分不可靠
     # （gunicorn、celery、Python traceback 三种前缀各不相同），这里按空闲超时
@@ -122,7 +122,7 @@ transforms:
     source: |
       .msg = del(.message)
       .service = "supervisor"
-      # 文件名里带进程名（ops-manager-celery-error.log），保留它才能区分是哪个进程。
+      # 文件名里带进程名（opsmgr-celery-error.log），保留它才能区分是哪个进程。
       # 用局部变量而不是直接对 . 上的路径取值再判断：路径取值在 VRL 里是 any 类型，
       # contains/upcase 这类函数会因此变成可失败的，写起来要处处 ?? 兜底。
       logfile = to_string(.file) ?? ""

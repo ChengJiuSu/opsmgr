@@ -67,7 +67,7 @@ docker compose run --rm web python manage.py <cmd>   # 一次性管理命令
 `${OPS_LOG_ROOT}/app`（原先是项目目录与 `~/logs`）。
 
 ⚠ 进程 stdout/stderr 走 docker 的 json-file driver（50m × 5），**不再落在
-`${OPS_LOG_DIR}/ops-manager*.log`**，所以 vector.yaml 的 `proc` source 在容器化后采不到东西。
+`${OPS_LOG_DIR}/opsmgr*.log`**，所以 vector.yaml 的 `proc` source 在容器化后采不到东西。
 里面本来就只剩 gunicorn/celery 自身的启动与崩溃输出；要继续采得给 Vector 加
 `docker_logs` source ——那会改变 stream 维度，按既定红线属于不可逆变更，单独评估再动。
 
