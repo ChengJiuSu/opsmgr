@@ -118,7 +118,7 @@ bash deploy/install.sh
 ```
 
 `install.sh` 的开关：`--deps-only`（只装依赖）、`--no-migrate`、`--no-restart`。
-多实例部署用 `SUPERVISOR_PROGRAM=ops-manager-02 bash deploy/install.sh`。
+多实例部署用 `SUPERVISOR_PROGRAM=opsmgr-02 bash deploy/install.sh`。
 
 ### 本地/CI 常用 make 目标
 
