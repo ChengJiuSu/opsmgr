@@ -4,12 +4,12 @@
 # 一个镜像六个角色，与 deploy/*.conf 里的 supervisor program 一一对应：
 #
 #   init          迁移 + 导出静态文件（一次性，其余服务 depends_on 它成功）
-#   web           ops-manager           gunicorn  :8000
-#   ws            ops-manager-ws        daphne    :8001
-#   celery        ops-manager-celery        默认队列（证书签发/分发）
-#   celery-exec   ops-manager-celery-exec   task_exec 队列（任务执行）
-#   beat          ops-manager-celery-beat   定时调度，只能起一个实例
-#   feishu-ws     ops-manager-feishu-ws     飞书长连接（与回调模式互斥）
+#   web           opsmgr           gunicorn  :8000
+#   ws            opsmgr-ws        daphne    :8001
+#   celery        opsmgr-celery        默认队列（证书签发/分发）
+#   celery-exec   opsmgr-celery-exec   task_exec 队列（任务执行）
+#   beat          opsmgr-celery-beat   定时调度，只能起一个实例
+#   feishu-ws     opsmgr-feishu-ws     飞书长连接（与回调模式互斥）
 #
 # 其它参数原样执行，便于 `docker compose run --rm web python manage.py xxx`。
 # =============================================================================

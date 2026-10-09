@@ -185,7 +185,7 @@ worker 进程里，生产上会有三个后果：
 3. **内存翻倍**：ansible 从 web worker fork 出来，worker 越多越吃内存。
 
 切 celery 后 web 进程只建 `TaskExecutionLog` + 投递 Redis，执行全在
-`ops-manager-celery-exec` 里。它用**独立队列 `task_exec`**，不与证书签发
+`opsmgr-celery-exec` 里。它用**独立队列 `task_exec`**，不与证书签发
 （默认 `celery` 队列，acme.sh DNS 验证上限 900s）共用，否则一个正在签发的证书能把
 后面排队的 ansible 任务堵十几分钟。
 
@@ -313,7 +313,7 @@ make wheels                    # 重建离线 wheelhouse，随制品发到目标
 # ④ 起进程
 sudo cp deploy/opsmgr-feishu-ws.conf /etc/supervisor/conf.d/
 sudo supervisorctl reread && sudo supervisorctl update
-sudo supervisorctl start ops-manager-feishu-ws
+sudo supervisorctl start opsmgr-feishu-ws
 tail -f logs/feishu-ws.log      # 应看到「飞书长连接启动」
 
 # ⑤ 验证：群里 @机器人，能出任务列表即通
@@ -650,7 +650,7 @@ Docker 部署无需手工执行：backend 入口每次启动都会跑 `migrate`�
    worker 与 web 用同一个运行用户，否则找不到 acme.sh、签出的文件属主也错。
    两个坑：supervisor 的续行是**缩进**不是反斜杠（写 `\` 会当字面参数传给 celery）；
    `stopwaitsecs` 默认 10s 会把正在跑的 acme.sh 砍掉，配置里已给到 930s。
-3. 重启 `ops-manager` 服务。
+3. 重启 `opsmgr` 服务。
 4. 自检：`venv/bin/celery -A ops_manager inspect ping` 有回应，
    `redis-cli -n 0 llen celery` 稳定为 0。
 
