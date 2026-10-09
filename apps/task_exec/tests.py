@@ -550,7 +550,7 @@ class ExecutionAPITests(TestCase):
         self.assertIn('模块「部署」', str(r.json()))
 
         ServerService.objects.create(server=self.server, service_type=game, status='planned')
-        with mock.patch('apps.task_exec.trigger.dispatch', return_value=mock.Mock(id=1)):
+        with mock.patch('apps.task_exec.trigger.schedule'):
             r = c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
         self.assertEqual(r.status_code, 200)
 
@@ -2861,10 +2861,10 @@ class TaskTriggerApiTests(TestCase):
                                 body or {}, format='json', **headers)
 
     def test_trigger_creates_execution(self):
-        with mock.patch('apps.task_exec.trigger.dispatch', return_value=mock.Mock(id=7)):
+        with mock.patch('apps.task_exec.trigger.schedule'):
             r = self._trigger()
         self.assertEqual(r.status_code, 200, r.content)
-        self.assertEqual(r.json()['data']['log_id'], 7)
+        self.assertEqual(r.json()['data']['log_id'], self.task.logs.get().id)
         self.assertEqual(r.json()['data']['server_count'], 1)
         self.task.refresh_from_db()
         self.assertEqual(list(self.task.servers.values_list('id', flat=True)), [self.server.id])
@@ -2896,7 +2896,7 @@ class TaskTriggerApiTests(TestCase):
         self.assertEqual(r.status_code, 400)
         self.assertIn('confirm_production', r.json()['msg'])
 
-        with mock.patch('apps.task_exec.trigger.dispatch', return_value=mock.Mock(id=8)):
+        with mock.patch('apps.task_exec.trigger.schedule'):
             r = self._trigger(body={'confirm_production': True})
         self.assertEqual(r.status_code, 200, r.content)
 
@@ -3362,3 +3362,88 @@ class HostLockTests(TestCase):
         kwargs = requeue.call_args.kwargs
         self.assertEqual(kwargs['queue'], tasks.TASK_EXEC_QUEUE)
         self.assertIsInstance(kwargs['kwargs']['wait_since'], float)
+
+
+class ExecQueueTests(TestCase):
+    """排队可见性 + 发起抢占：pending 任务给出位次/前方任务，排队中不允许重复发起。"""
+
+    def setUp(self):
+        self.user = User.objects.create(username='queue_admin', is_staff=True, is_superuser=True)
+
+    def _pending(self, name):
+        task = ExecutionTask.objects.create(name=name, created_by=self.user, status='pending')
+        TaskExecutionLog.objects.create(task=task)
+        return task
+
+    def test_queue_info(self):
+        from .exec_queue import LOCK_WAIT_PREFIX, queue_info
+        running = ExecutionTask.objects.create(name='执行中', created_by=self.user, status='running')
+        TaskExecutionLog.objects.create(task=running, status='running')
+        first, second = self._pending('A'), self._pending('B')
+
+        self.assertIsNone(queue_info(running))
+        q = queue_info(second)
+        self.assertEqual((q['position'], q['ahead'], q['running']), (2, ['A'], ['执行中']))
+        self.assertEqual(queue_info(first)['position'], 1)
+        self.assertEqual(q['lock_wait'], '')
+
+        second.output = f'{LOCK_WAIT_PREFIX}：主机 x 正被任务「执行中」占用'
+        self.assertTrue(queue_info(second)['lock_wait'].startswith(LOCK_WAIT_PREFIX))
+
+    def test_stale_pending_ignored(self):
+        from .exec_queue import queue_info
+        stale = self._pending('僵尸')
+        TaskExecutionLog.objects.filter(task=stale).update(created_at=timezone.now() - timedelta(days=2))
+        self.assertIsNone(queue_info(stale))
+        self.assertEqual(queue_info(self._pending('新'))['position'], 1)
+
+    def test_list_serializes_queue(self):
+        self._pending('A')
+        c = APIClient()
+        c.force_authenticate(self.user)
+        rows = c.get('/api/exec/tasks/').json()
+        rows = rows.get('data', rows)
+        rows = rows.get('results', rows)
+        self.assertEqual(rows[0]['queue']['position'], 1)
+
+    def test_never_run_pending_is_not_queued(self):
+        """从没执行过的任务默认也是 pending，不能当成排队中拦掉。"""
+        from . import trigger
+        from .exec_queue import queue_info
+        task = ExecutionTask.objects.create(name='新任务', created_by=self.user)
+        self.assertEqual(task.status, 'pending')
+        self.assertFalse(trigger.is_active(task))
+        self.assertIsNone(queue_info(task))
+
+    def test_preflight_and_launch_reject_queued(self):
+        from . import trigger
+        task = self._pending('A')
+        self.assertTrue(trigger.is_active(task))
+        self.assertIn('排队', trigger.preflight(task))
+        # preflight 读到的是旧状态（并发两次点击）：launch 在互斥内复查兜住
+        task.status = 'success'
+        with mock.patch.object(trigger, 'validate_steps', return_value=None), \
+                mock.patch.object(trigger, 'schedule') as schedule:
+            log, error = trigger.launch(task, [], [], {}, self.user)
+        self.assertIsNone(log)
+        self.assertIn('排队或执行中', error)
+        schedule.assert_not_called()
+        self.assertEqual(task.logs.count(), 1)
+
+    def test_launch_creates_log_then_schedules(self):
+        from . import trigger
+        task = ExecutionTask.objects.create(name='新任务', created_by=self.user)
+        with mock.patch.object(trigger, 'validate_steps', return_value=None), \
+                mock.patch.object(trigger, 'schedule') as schedule:
+            log, error = trigger.launch(task, [], [], {}, self.user)
+        self.assertIsNone(error)
+        schedule.assert_called_once_with(task, log)
+        self.assertEqual(log.status, 'pending')
+        self.assertTrue(trigger.is_active(task))
+
+    def test_edit_blocked_while_queued(self):
+        task = self._pending('A')
+        c = APIClient()
+        c.force_authenticate(self.user)
+        r = c.patch(f'/api/exec/tasks/{task.id}/', {'name': 'B'}, format='json')
+        self.assertIn('排队或执行中', r.content.decode())

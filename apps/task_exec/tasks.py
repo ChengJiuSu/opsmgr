@@ -27,6 +27,7 @@ from django.db import connection
 from django.utils import timezone
 
 from . import host_lock, runner
+from .exec_queue import LOCK_WAIT_PREFIX
 from .live import DB_PREVIEW_LIMIT, PREVIEW_LIMIT, LiveSink, log_rel_path, preview_of, push, push_status
 
 logger = logging.getLogger('apps.task_exec')
@@ -144,7 +145,7 @@ def _wait_for_lock(task, log, blocker, wait_since):
         push_status(task.pk)
         return None
 
-    note = (f'⏳ 排队等待主机锁：{reason}。已等 {waited}s，每 '
+    note = (f'{LOCK_WAIT_PREFIX}：{reason}。已等 {waited}s，每 '
             f'{settings.TASK_HOST_LOCK_RETRY}s 重试，超过 {timeout}s 记失败。')
     # 只写任务快照（面板/轮询读它），执行记录的 output 留给真正的执行输出
     ExecutionTask.objects.filter(pk=task.pk).update(output=note, output_offset=len(note))
@@ -177,15 +178,26 @@ def _run_in_thread(task_id, log_id):
 
 def dispatch(task, triggered_by=None, trigger_type='execute'):
     """创建本次执行的日志记录（含执行范围快照），并按配置的后端调度执行。"""
+    log = create_log(task, triggered_by=triggered_by, trigger_type=trigger_type)
+    schedule(task, log)
+    return log
+
+
+def create_log(task, triggered_by=None, trigger_type='execute'):
+    """建出本次执行的 pending 日志记录（含执行范围快照），不调度。"""
     from .models import TaskExecutionLog
 
-    log = TaskExecutionLog.objects.create(
+    return TaskExecutionLog.objects.create(
         task=task,
         trigger_type=trigger_type,
         triggered_by=triggered_by or task.created_by,
         exec_mode=task.exec_mode,
         servers_snapshot=[{'id': s.id, 'name': s.name, 'ip': s.conn_ip} for s in task.servers.all()],
     )
+
+
+def schedule(task, log):
+    """按配置的后端调度一条已建好的执行记录。"""
     backend = getattr(settings, 'TASK_EXEC_BACKEND', 'thread')
     if backend == 'sync':
         _run_until_done(task.id, log.id)
@@ -193,7 +205,6 @@ def dispatch(task, triggered_by=None, trigger_type='execute'):
         run_execution_task.apply_async(args=[task.id, log.id], queue=TASK_EXEC_QUEUE)
     else:
         _run_in_thread(task.id, log.id)
-    return log
 
 
 # ── Celery 任务（仅在已安装 celery 时可用）─────────────────

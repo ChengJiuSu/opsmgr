@@ -285,6 +285,8 @@ class ExecutionTaskSerializer(serializers.ModelSerializer):
     exec_mode_display = serializers.CharField(source='get_exec_mode_display', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     duration = serializers.FloatField(read_only=True, allow_null=True)
+    # 仅 pending 时有值：排第几、前面是谁、是否在等主机锁（见 exec_queue.py）
+    queue = serializers.SerializerMethodField()
 
     class Meta:
         model = ExecutionTask
@@ -294,7 +296,7 @@ class ExecutionTaskSerializer(serializers.ModelSerializer):
             'environment', 'environment_name', 'environment_is_prod',
             'exec_mode', 'exec_mode_display', 'forks', 'default_select_all', 'im_enabled', 'servers',
             'credential', 'credential_name',
-            'status', 'status_display', 'pause_type', 'return_code', 'output',
+            'status', 'status_display', 'pause_type', 'return_code', 'output', 'queue',
             'created_by_name', 'created_at', 'started_at', 'finished_at', 'duration',
         ]
         read_only_fields = [
@@ -305,6 +307,11 @@ class ExecutionTaskSerializer(serializers.ModelSerializer):
     @extend_schema_field(OpenApiTypes.OBJECT)
     def get_servers(self, obj):
         return [{'id': s.id, 'name': s.name, 'ip': s.conn_ip} for s in obj.servers.all()]
+
+    @extend_schema_field(OpenApiTypes.OBJECT)
+    def get_queue(self, obj):
+        from .exec_queue import queue_info
+        return queue_info(obj)
 
     def validate_steps(self, value):
         if not value:

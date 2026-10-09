@@ -401,8 +401,8 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
         serializer.save(created_by=self.request.user)
 
     def update(self, request, *args, **kwargs):
-        if self.get_object().status in ('running', 'paused'):
-            return fail('任务正在执行中，无法编辑')
+        if trigger.is_active(self.get_object()):
+            return fail('任务正在排队或执行中，无法编辑')
         return super().update(request, *args, **kwargs)
 
     @action(detail=True, methods=['get'])

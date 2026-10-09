@@ -10,8 +10,10 @@
 """
 from apps.auth_mgr import roles
 
+from .exec_queue import queued_log
+from .host_lock import mutex
 from .serializers import validate_service_planned
-from .tasks import dispatch
+from .tasks import create_log, schedule
 
 
 def permission_error(user, task):
@@ -37,6 +39,20 @@ def permission_error(user, task):
 
 
 #: 暂停类型 -> 允许的处理动作（'' 兼容存量：视为暂停确认）
+RUNNING_STATUSES = ('running', 'paused')
+
+
+def is_active(task):
+    """任务是否处在一次执行的发起到终态之间（期间不允许再发起/编辑）。
+
+    排队中也算：排队或等主机锁期间再点一次，会给同一任务投出第二条执行，两条共用
+    同一份任务快照字段（状态/输出），面板上就分不清谁是谁。但 status=pending 本身
+    不能当排队——从没执行过的任务默认也是 pending，要看有没有未开跑的执行记录。
+    """
+    if task.status in RUNNING_STATUSES:
+        return True
+    return task.status == 'pending' and queued_log(task) is not None
+
 PAUSE_ACTIONS = {
     'confirm': ('continue', 'abort'),
     'failed': ('retry', 'skip', 'abort'),
@@ -71,8 +87,10 @@ def apply_pause_action(task_id, action):
 
 def preflight(task):
     """发起前的任务级校验，返回中文错误消息；None 表示可以继续。"""
-    if task.status in ('running', 'paused'):
+    if task.status in RUNNING_STATUSES:
         return '任务正在执行中，请等待完成后再发起'
+    if is_active(task):
+        return '任务正在排队等待执行，请等待完成后再发起'
     if not task.steps.exists():
         return '任务未配置任何模块，请先编辑任务添加模块'
     # 兜底存量任务：主机范围三维度必选，未选齐不予执行
@@ -89,7 +107,23 @@ def launch(task, steps, selected_global, picked, triggered_by, trigger_type='exe
     error = validate_steps(steps, selected_global, picked)
     if error:
         return None, error
+    # 抢占发起权：preflight 是先查后写，两个人同时点（或连点两下）都能过。
+    # 「是否在执行」要看执行记录（见 is_active），一条条件 UPDATE 表达不了，
+    # 所以用按任务的互斥把「复查 + 写快照 + 建执行记录」串起来；投递放在锁外——
+    # sync 后端的投递就是整个执行过程
+    with mutex(f'task_exec:launch:{task.pk}') as got:
+        if not got:
+            return None, '任务正在发起中，请稍后再试'
+        task.refresh_from_db()
+        if is_active(task):
+            return None, '任务正在排队或执行中，请等待完成后再发起'
+        log = _snapshot_and_log(task, steps, selected_global, picked, triggered_by, trigger_type)
+    schedule(task, log)
+    return log, None
 
+
+def _snapshot_and_log(task, steps, selected_global, picked, triggered_by, trigger_type):
+    """固化本次执行范围、重置任务快照，并建出 pending 的执行记录。"""
     # 固化主机快照：模块级勾选落到各模块，任务级存并集（日志/兜底口径）
     for step in steps:
         if step.use_custom_scope or step.task_type == 'pause':
@@ -113,7 +147,7 @@ def launch(task, steps, selected_global, picked, triggered_by, trigger_type='exe
         'status', 'return_code', 'output', 'pause_action', 'pause_type',
         'started_at', 'finished_at',
     ])
-    return dispatch(task, triggered_by=triggered_by, trigger_type=trigger_type), None
+    return create_log(task, triggered_by=triggered_by, trigger_type=trigger_type)
 
 
 def validate_steps(steps, selected_global, picked):

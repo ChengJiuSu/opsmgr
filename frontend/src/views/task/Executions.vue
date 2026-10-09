@@ -59,9 +59,12 @@
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="最近状态" width="100">
+      <el-table-column label="最近状态" width="110">
         <template #default="{ row }">
-          <el-tag size="small" :type="statusType(row.status)">
+          <el-tooltip v-if="row.status === 'pending' && row.queue" :content="queueTip(row.queue)" placement="top">
+            <el-tag size="small" :type="statusType(row.status)">{{ queueText(row.queue) }}</el-tag>
+          </el-tooltip>
+          <el-tag v-else size="small" :type="statusType(row.status)">
             <el-icon v-if="row.status === 'running'" class="is-loading"><Loading /></el-icon>
             {{ row.status_display }}
           </el-tag>
@@ -76,8 +79,8 @@
       </el-table-column>
       <el-table-column label="操作" width="330" fixed="right">
         <template #default="{ row }">
-          <el-button v-if="canRunTask" size="small" type="primary" :icon="CaretRight" :disabled="['running', 'paused'].includes(row.status)" @click="openExec(row)">执行</el-button>
-          <el-button v-if="canWrite" size="small" :icon="EditPen" :disabled="['running', 'paused'].includes(row.status)" @click="openForm(row)">编辑</el-button>
+          <el-button v-if="canRunTask" size="small" type="primary" :icon="CaretRight" :disabled="isActive(row)" @click="openExec(row)">执行</el-button>
+          <el-button v-if="canWrite" size="small" :icon="EditPen" :disabled="isActive(row)" @click="openForm(row)">编辑</el-button>
           <el-button v-if="canWrite" size="small" :icon="CopyDocument" @click="handleCopy(row)">复制</el-button>
           <el-button size="small" :icon="View" @click="openLogs(row)">日志</el-button>
           <el-button v-if="canWrite" size="small" type="danger" :icon="Delete" @click="handleDelete(row)" />
@@ -106,6 +109,7 @@
             <el-icon v-if="logPanel.task.status === 'running'" class="is-loading"><Loading /></el-icon>
             {{ logPanel.task.status_display || logPanel.task.status }}
           </el-tag>
+          <span v-if="panelQueue" class="queue-hint">{{ queueText(panelQueue) }} · {{ queueTip(panelQueue) }}</span>
         </span>
         <el-button size="small" text :icon="Close" @click="closeLogs">关闭</el-button>
       </div>
@@ -759,6 +763,20 @@ const methodOptions = ref([])
 const dictOptions = reactive({ projects: [], channels: [], envs: [], serviceTypes: [] })
 
 const statusType = (s) => ({ pending: 'info', running: 'warning', paused: 'primary', success: 'success', failed: 'danger' }[s] || 'info')
+// 发起到终态之间：期间不能再执行/编辑（与后端 trigger.is_active 一致）。
+// 不能直接认 pending——从没执行过的任务默认也是 pending，排队中才带 queue
+const isActive = (row) => ['running', 'paused'].includes(row.status) || (row.status === 'pending' && !!row.queue)
+
+// 排队信息（仅 pending 有，见后端 exec_queue.queue_info）。位次按发起顺序近似：
+// 撞主机锁的任务重新排队会排到队尾
+const queueText = (q) => (q.lock_wait ? '等待主机锁' : `排队第 ${q.position} 位`)
+function queueTip(q) {
+  if (q.lock_wait) return q.lock_wait
+  const list = (names, count) => (names.length ? `：${names.join('、')}${count > names.length ? ' 等' : ''}` : '')
+  const parts = [`前方排队 ${q.ahead_count} 个${list(q.ahead, q.ahead_count)}`]
+  if (q.running_count) parts.push(`执行中 ${q.running_count} 个${list(q.running, q.running_count)}`)
+  return parts.join('；')
+}
 const typeTagType = (t) => ({ command: 'info', playbook: 'success', method: 'warning', pause: 'danger' }[t] || 'info')
 const formatTime = (t) => (t ? t.slice(0, 19).replace('T', ' ') : '')
 
@@ -1364,6 +1382,11 @@ async function doExecute() {
 // ── 执行日志面板 ─────────────────────────────────────────
 const logPanel = reactive({ task: null, logs: [], current: null, output: '', polling: false })
 const logPanelRef = ref()
+// 日志面板里的任务对象会被推送/轮询覆盖成副本，排队信息取列表行上随 5s 刷新的那份
+const panelQueue = computed(() => {
+  if (logPanel.task?.status !== 'pending') return null
+  return tableData.value.find((t) => t.id === logPanel.task.id)?.queue || null
+})
 const logTableRef = ref()
 const outputFullVisible = ref(false)
 let pollTimer = null
@@ -1682,6 +1705,11 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+.queue-hint {
+  margin-left: 8px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
 .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .toolbar-left { display: flex; gap: 8px; flex-wrap: wrap; }
 .muted { color: #909399; }

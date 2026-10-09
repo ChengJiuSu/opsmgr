@@ -182,6 +182,7 @@ apps/task_exec/
 ├── routing.py       # WebSocket 路由（ops_manager/asgi.py 挂载）
 ├── tasks.py         # dispatch：thread/celery/sync 三种后端（日志落主机快照与模块结果）
 ├── host_lock.py     # 主机锁：「主机 × 服务类型」跨任务互斥，撞锁排队重试
+├── exec_queue.py    # 排队可见性：pending 任务的位次/前方任务/等锁原因
 └── management/      # clean_task_logs 日志清理命令
 ```
 
@@ -474,8 +475,12 @@ Ansible 项目目录内执行剧本：
   `--concurrency`**（supervisor conf / compose `CELERY_EXEC_CONCURRENCY`，默认 2）。
   曾为 1：失败等人处理（最长 600s）、暂停确认、等 Jenkins 构建的任务占着唯一执行位
   却不耗 CPU，后续任务全部排队。`CELERY_WORKER_PREFETCH_MULTIPLIER=1` 防空闲子进程
-  扣住排队消息。同一任务 running/paused 时 `trigger.preflight` 拒绝再发起；
-  pending（排队/等锁）不拦，重复发起的两次执行会被主机锁串行。
+  扣住排队消息。同一任务 `trigger.is_active` 时不能再发起或编辑：running/paused，
+  或 **pending 且有未开跑的执行记录**（`exec_queue.queued_log`，1 天窗口）——任务
+  本体 status=pending 不等于排队，从没执行过的任务默认也是 pending。`preflight`
+  先拦；`launch` 再用按任务的缓存互斥 `task_exec:launch:<id>` 串起「复查 + 写快照 +
+  建执行记录」，投递（`tasks.schedule`）放锁外，并发两次点击只有一次成功。
+  测试要拦真实执行请 patch `apps.task_exec.trigger.schedule`。
 - **主机锁**（`host_lock.py`）：开跑前一次性算出整条任务流的锁键
   `<server_id>:<service_type_id>`，模块未选服务类型时为 `<server_id>:*`（整机，
   与该主机任何键冲突）；暂停模块不加锁。持锁 = 执行记录 `status=running` 且
@@ -486,6 +491,12 @@ Ansible 项目目录内执行剧本：
   投递，**等锁不占执行位**；thread/sync 在原线程 sleep 重试。从首次撞锁起累计超过
   `TASK_HOST_LOCK_WAIT_TIMEOUT`（默认 3600s）记失败（return_code -1）。
 - 锁按整条任务流加而非逐模块加放：逐模块会让两条任务流交错执行。代价是偏保守。
+- **排队可见性**（`exec_queue.py`）：任务序列化器的 `queue` 字段，仅 pending 有值
+  `{position, ahead_count, ahead, running_count, running, lock_wait}`。位次按执行
+  记录 id（发起顺序）近似——web 不连 broker，撞锁重投会排到队尾；只看 1 天内的
+  记录，避免僵尸 pending/running 永久抬高位次。`lock_wait` 非空 = 已被取出但在等
+  主机锁（任务快照 output 以 `LOCK_WAIT_PREFIX` 开头）。前端列表状态标签显示
+  「排队第 N 位 / 等待主机锁」，悬停看前方与执行中任务；日志面板标题旁同步显示。
 - 边界：worker 被 kill -9 时持锁记录停在 running，后来者等满超时失败，失败信息
   里有持锁任务名，按名处理那条卡死记录。
 

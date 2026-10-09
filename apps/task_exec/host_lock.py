@@ -23,6 +23,7 @@ running 必须原子，用缓存互斥（生产 Redis，跨 web/worker 进程）
 import logging
 import time
 import uuid
+from contextlib import contextmanager
 
 from django.core.cache import cache
 
@@ -69,20 +70,27 @@ def conflicts(mine, theirs):
     return hit
 
 
-def _acquire_mutex():
+@contextmanager
+def mutex(key, wait=MUTEX_WAIT, ttl=MUTEX_TTL):
+    """缓存互斥（生产 Redis，跨 web/worker 进程）。yield 是否拿到；拿不到不抛错，
+    由调用方决定是重试还是回错误。只包「查 + 写」这种毫秒级临界区，TTL 只防
+    持有者崩溃后死锁。"""
     token = uuid.uuid4().hex
-    deadline = time.monotonic() + MUTEX_WAIT
-    while time.monotonic() < deadline:
-        if cache.add(MUTEX_KEY, token, MUTEX_TTL):
-            return token
+    deadline = time.monotonic() + wait
+    got = False
+    while True:
+        if cache.add(key, token, ttl):
+            got = True
+            break
+        if time.monotonic() >= deadline:
+            break
         time.sleep(0.05)
-    return None
-
-
-def _release_mutex(token):
-    # 只删自己的：持有超过 TTL 后键可能已被别人拿走
-    if cache.get(MUTEX_KEY) == token:
-        cache.delete(MUTEX_KEY)
+    try:
+        yield got
+    finally:
+        # 只删自己的：持有超过 TTL 后键可能已被别人拿走
+        if got and cache.get(key) == token:
+            cache.delete(key)
 
 
 def try_acquire(log, keys):
@@ -93,11 +101,10 @@ def try_acquire(log, keys):
     """
     from .models import TaskExecutionLog
 
-    token = _acquire_mutex()
-    if token is None:
-        logger.warning('主机锁互斥等待超时，执行记录 %s 稍后重试', log.pk)
-        return {'task_id': None, 'task_name': '', 'log_id': None, 'keys': []}
-    try:
+    with mutex(MUTEX_KEY) as got:
+        if not got:
+            logger.warning('主机锁互斥等待超时，执行记录 %s 稍后重试', log.pk)
+            return {'task_id': None, 'task_name': '', 'log_id': None, 'keys': []}
         if keys:
             holders = (TaskExecutionLog.objects.filter(status='running')
                        .exclude(pk=log.pk)
@@ -110,8 +117,6 @@ def try_acquire(log, keys):
         TaskExecutionLog.objects.filter(pk=log.pk).update(status='running', lock_keys=keys)
         log.status, log.lock_keys = 'running', keys
         return None
-    finally:
-        _release_mutex(token)
 
 
 def describe(blocker):

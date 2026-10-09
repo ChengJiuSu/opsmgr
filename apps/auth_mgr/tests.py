@@ -1743,7 +1743,7 @@ class ExecCapabilityTests(TestCase):
     def test_member_can_execute_but_not_edit(self):
         """「能跑不能改」：execute 是 POST，但不该按 read_create 档拦。"""
         client = self._client('ec_member', role=self.member_role)
-        with mock.patch('apps.task_exec.trigger.dispatch', return_value=mock.Mock(id=1)):
+        with mock.patch('apps.task_exec.trigger.schedule'):
             r = client.post(f'/api/exec/tasks/{self.task_test.id}/execute/', {}, format='json')
         self.assertEqual(r.status_code, 200, r.content)
 
@@ -1769,7 +1769,7 @@ class ExecCapabilityTests(TestCase):
 
     def test_data_scope_blocks_other_project(self):
         client = self._client('ec_scoped', role=self.member_role, groups=[self.pg])
-        with mock.patch('apps.task_exec.trigger.dispatch', return_value=mock.Mock(id=2)):
+        with mock.patch('apps.task_exec.trigger.schedule'):
             r = client.post(f'/api/exec/tasks/{self.task_test.id}/execute/', {}, format='json')
         self.assertEqual(r.status_code, 200, r.content)
 
