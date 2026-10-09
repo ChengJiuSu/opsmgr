@@ -244,7 +244,7 @@ systemd unit 在 [`deploy/log-server/victoria-logs.service`](../deploy/log-serve
 request_id:"9f2c8a1e..." | sort by (_time)
 
 # 最近 1 小时的应用报错，按 logger 聚合看热点
-_time:1h _stream:{app="ops-manager"} level:ERROR | stats count() by (logger)
+_time:1h _stream:{app="opsmgr"} level:ERROR | stats count() by (logger)
 
 # 5xx 请求
 _time:1h _stream:{service="nginx"} status:>=500

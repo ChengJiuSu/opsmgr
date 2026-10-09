@@ -112,7 +112,7 @@ transforms:
         . = object!(parsed)
       }
       .host = get_hostname!()
-      .app  = "ops-manager"
+      .app  = "opsmgr"
       .env  = "${OPS_ENV}"
 
   proc_parsed:
@@ -129,7 +129,7 @@ transforms:
       .logfile = logfile
       .level = if contains(logfile, "-error") { "ERROR" } else { "INFO" }
       .host = get_hostname!()
-      .app  = "ops-manager"
+      .app  = "opsmgr"
       .env  = "${OPS_ENV}"
 
   gunicorn_parsed:
@@ -157,7 +157,7 @@ transforms:
         if rid != null { .request_id = rid }
       }
       .host = get_hostname!()
-      .app  = "ops-manager"
+      .app  = "opsmgr"
       .env  = "${OPS_ENV}"
 
   nginx_access_parsed:
@@ -179,7 +179,7 @@ transforms:
       }
       .service = "nginx"
       .host = get_hostname!()
-      .app  = "ops-manager"
+      .app  = "opsmgr"
       .env  = "${OPS_ENV}"
 
   nginx_error_parsed:
@@ -207,7 +207,7 @@ transforms:
       }
       .service = "nginx-error"
       .host = get_hostname!()
-      .app  = "ops-manager"
+      .app  = "opsmgr"
       .env  = "${OPS_ENV}"
 
 sinks:
