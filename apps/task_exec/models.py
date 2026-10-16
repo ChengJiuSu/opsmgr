@@ -288,6 +288,10 @@ class ExecutionTask(models.Model):
     # 一次有意识的选择。仅 default_select_all=True 的任务可开——飞书里没法像
     # 执行弹窗那样逐模块勾主机，关掉默认全选的任务本就是要求人工确认
     im_enabled = models.BooleanField('允许从飞书发起执行', default=False)
+    # 执行结果的消息通知（apps/notify_mgr 订阅规则发群）。默认开；测试任务一天跑
+    # 几十次，关掉免得把群刷成噪声源。只管播报，不管飞书交互卡片与暂停私聊——
+    # 那些是发起人自己要处理的事
+    notify_enabled = models.BooleanField('消息通知', default=True)
 
     # ── 目标主机与连接：servers 为「最近一次执行的全局范围主机」快照 ──
     servers = models.ManyToManyField(

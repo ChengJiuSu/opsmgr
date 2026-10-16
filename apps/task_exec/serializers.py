@@ -294,7 +294,7 @@ class ExecutionTaskSerializer(serializers.ModelSerializer):
             'id', 'name', 'steps',
             'project_group', 'project_group_name', 'channel', 'channel_name',
             'environment', 'environment_name', 'environment_is_prod',
-            'exec_mode', 'exec_mode_display', 'forks', 'default_select_all', 'im_enabled', 'servers',
+            'exec_mode', 'exec_mode_display', 'forks', 'default_select_all', 'im_enabled', 'notify_enabled', 'servers',
             'credential', 'credential_name',
             'status', 'status_display', 'pause_type', 'resume_deadline', 'return_code', 'output', 'queue',
             'created_by_name', 'created_at', 'started_at', 'finished_at', 'duration',

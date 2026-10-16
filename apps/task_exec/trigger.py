@@ -10,6 +10,7 @@
 """
 from apps.auth_mgr import roles
 
+from . import signals
 from .exec_queue import queued_log
 from .host_lock import mutex
 from .serializers import validate_service_planned
@@ -155,6 +156,7 @@ def finish_failure(task, log, reason):
     append_note(task.pk, log, note)
     push(task.pk, {'kind': 'steps', 'steps': steps})
     push_status(task.pk)
+    signals.notify(task.pk, log.pk, kind='failure_closed', reason=reason)
 
 
 def discard_resume(task):

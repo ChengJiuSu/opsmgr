@@ -28,5 +28,6 @@ urlpatterns = [
     path('api/portal/', include('apps.portal_mgr.urls')),
     path('api/topo/', include('apps.topo_mgr.urls')),
     path('api/feishu/', include('apps.im_mgr.urls')),
+    path('api/notify/', include('apps.notify_mgr.urls')),
     path('api/', include('apps.agent_mgr.urls')),
 ]

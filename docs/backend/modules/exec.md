@@ -45,6 +45,11 @@
 [飞书接入模块](im_mgr.md)的 `access.py`，其中「人的权限」那道直接复用本模块的
 `trigger.permission_error`。
 
+**消息通知开关**（`ExecutionTask.notify_enabled`，默认 **True**）：执行成功、失败、
+失败待处理收尾（最终失败）按「消息通知」的订阅规则发送；测试任务关掉即不发。
+失败待处理终止 / 超时时 `trigger.finish_failure` 额外广播 `kind='failure_closed'`
+（带 `reason`），见 [notify_mgr](notify_mgr.md)。
+
 **模块服务类型**（`TaskStep.service_type`，非暂停模块**必选**）：与 `use_custom_scope`
 **正交**，对「跟随全局」与「自定义」两种范围都生效——在该范围解析出的主机上
 再收窄到**已规划/已部署该服务类型**的主机。同一任务流据此对不同服务类型跑
@@ -571,6 +576,7 @@ GET                 /api/exec/log-files/download/ 日志原文件下载（exec r
 | 执行方式 | `exec_mode` 默认 parallel |
 | 默认全选主机 | `default_select_all` 默认 True；False 时执行必须显式传 `server_ids` |
 | 飞书执行 | `im_enabled` 默认 False；开启要求 `default_select_all=True`（飞书无法逐模块勾主机） |
+| 消息通知 | `notify_enabled` 默认 True；关闭后执行成功 / 失败 / 最终失败都不发订阅通知（见 notify_mgr），测试任务建议关闭 |
 | 变量 | `key` 须为合法 ansible 变量名；`value` 须为合法 YAML；生效条件三维度必选 |
 | 超时 | 模块级 `timeout` 秒，默认 300 |
 

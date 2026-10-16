@@ -140,6 +140,7 @@ LOCAL_APPS = [
     'apps.portal_mgr',
     'apps.topo_mgr',
     'apps.im_mgr',
+    'apps.notify_mgr',
 ]
 
 # daphne 必须排在 staticfiles 之前：接管 runserver 为 ASGI（含 WebSocket）
@@ -486,6 +487,10 @@ TASK_LOG_FILE_RETENTION_DAYS = config('TASK_LOG_FILE_RETENTION_DAYS', default=30
 # ansible 彩色输出：开启则日志内保留 ANSI 颜色码（前端渲染着色），关闭为纯文本
 TASK_LOG_COLOR = config('TASK_LOG_COLOR', default=True, cast=bool)
 
+# ── 消息通知（apps/notify_mgr）────────────────────────────
+# 通知事件与发送记录的保留天数（clean_notify_records / beat 每天清理）
+NOTIFY_RECORD_RETENTION_DAYS = config('NOTIFY_RECORD_RETENTION_DAYS', default=30, cast=int)
+
 # ── 构建制品（Jenkins CI 上报）───────────────────────────
 # CI 上报的代码压缩包落盘根目录，按 项目组/渠道/环境/版本 分层
 ARTIFACT_ROOT = config('ARTIFACT_ROOT', default=str(MEDIA_ROOT / 'artifacts'))
@@ -562,5 +567,10 @@ CELERY_BEAT_SCHEDULE = {
     'expire-task-failure-waits': {
         'task': 'task_exec.expire_failure_waits',
         'schedule': 300,
+    },
+    # 过期的通知事件与发送记录（保留期 NOTIFY_RECORD_RETENTION_DAYS）
+    'clean-notify-records': {
+        'task': 'notify_mgr.clean_records',
+        'schedule': 3600 * 24,
     },
 }

@@ -87,27 +87,6 @@ def dispatch_refresh_card(log_id):
         _in_thread(refresh_card, log_id)
 
 
-def broadcast(log_id):
-    """把终态播报给订阅会话；失败只记日志。"""
-    from . import notify
-
-    try:
-        notify.broadcast(log_id)
-    except Exception:  # noqa: BLE001 - 通知链路不该外溢
-        logger.warning('飞书播报失败：log=%s', log_id, exc_info=True)
-
-
-def dispatch_broadcast(log_id):
-    """按配置后端异步播报。"""
-    backend = getattr(settings, 'TASK_EXEC_BACKEND', 'thread')
-    if backend == 'sync':
-        broadcast(log_id)
-    elif backend == 'celery':
-        broadcast_task.delay(log_id)
-    else:
-        _in_thread(broadcast, log_id)
-
-
 def pause_push(log_id):
     """私聊推送暂停处理卡；失败只记日志。"""
     from . import notify
@@ -164,10 +143,6 @@ try:  # pragma: no cover - 未装 celery 的环境（开发机）照常工作
     @shared_task(ignore_result=True)
     def pause_push_task(log_id):
         pause_push(log_id)
-
-    @shared_task(ignore_result=True)
-    def broadcast_task(log_id):
-        broadcast(log_id)
 except ImportError:  # pragma: no cover
     send_card_task = update_card_task = refresh_card_task = None
-    pause_push_task = broadcast_task = None
+    pause_push_task = None

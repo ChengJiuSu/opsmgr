@@ -243,18 +243,15 @@ class FeishuChannel(models.Model):
     handlers），但「哪些会话能把执行入口摆出来」是另一道闸，必须显式登记。
     未登记的会话一律只读：收不到通知、也渲染不出按钮。
 
-    `allow_execute` 与 `notify_enabled` 分开：多数群只需要收发布播报，不需要
-    也不该能从群里直接推生产。
+    执行结果的播报不在这里配：发什么、发给谁统一由消息通知的订阅规则
+    （apps/notify_mgr.NotifyRule）决定，本表只是「应用机器人」这种发送方式的
+    目标清单。多数群只需要收发布播报，不需要也不该能从群里直接推生产，所以
+    `allow_execute` 默认关。
     """
 
     TYPE_CHOICES = [
         ('group', '群聊'),
         ('p2p', '单聊'),
-    ]
-
-    SCOPE_CHOICES = [
-        ('failed', '仅失败'),
-        ('all', '全部结果'),
     ]
 
     # 群用 chat_id（oc_…），也接受个人 open_id（ou_…）——只用单聊的人同样需要
@@ -263,21 +260,6 @@ class FeishuChannel(models.Model):
     name = models.CharField('会话名称', max_length=100)
     chat_type = models.CharField('会话类型', max_length=20, choices=TYPE_CHOICES, default='group')
     allow_execute = models.BooleanField('允许发起任务执行', default=False)
-    notify_enabled = models.BooleanField('接收通知播报', default=True)
-    # 播报范围。默认只播失败：成功的执行每天几十上百次，全播等于把群变成噪声源，
-    # 而噪声一多，真正该被看见的失败就被划过去了
-    notify_scope = models.CharField('播报范围', max_length=20,
-                                    choices=SCOPE_CHOICES, default='failed')
-    # 订阅维度（空 = 不限）。与平台其余地方同一套「维度」口径，不引入新概念：
-    # 一个群只关心自己那摊事，别的项目组的失败播过来只会被当噪声
-    notify_project_group = models.ForeignKey(
-        'asset_mgr.ProjectGroup', verbose_name='仅播报该项目组', on_delete=models.PROTECT,
-        null=True, blank=True, related_name='feishu_channels',
-    )
-    notify_environment = models.ForeignKey(
-        'asset_mgr.Environment', verbose_name='仅播报该环境', on_delete=models.PROTECT,
-        null=True, blank=True, related_name='feishu_channels',
-    )
     enabled = models.BooleanField('启用', default=True)
     remark = models.CharField('备注', max_length=200, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -296,22 +278,6 @@ class FeishuChannel(models.Model):
     def receive_id_type(self):
         """发消息时的收件人类型。飞书的 open_id 固定 `ou_` 前缀，群是 `oc_`。"""
         return 'open_id' if str(self.chat_id).startswith('ou_') else 'chat_id'
-
-    @classmethod
-    def broadcast_targets(cls, task, status):
-        """该播报给哪些会话。
-
-        三道过滤：开着播报开关、范围涵盖这次结果（失败一律播，成功只播给
-        `notify_scope='all'` 的）、订阅维度与任务维度相容（空 = 不限）。
-        """
-        qs = cls.objects.filter(enabled=True, notify_enabled=True)
-        if status != 'failed':
-            qs = qs.filter(notify_scope='all')
-        return [
-            row for row in qs
-            if (row.notify_project_group_id in (None, task.project_group_id)
-                and row.notify_environment_id in (None, task.environment_id))
-        ]
 
     @classmethod
     def executable(cls, chat_id):

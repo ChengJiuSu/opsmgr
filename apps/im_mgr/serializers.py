@@ -110,22 +110,20 @@ class FeishuChannelSerializer(serializers.ModelSerializer):
     """飞书会话白名单。"""
 
     chat_type_display = serializers.CharField(source='get_chat_type_display', read_only=True)
-    notify_scope_display = serializers.CharField(source='get_notify_scope_display', read_only=True)
-    notify_project_group_name = serializers.CharField(
-        source='notify_project_group.name', read_only=True, default=None)
-    notify_environment_name = serializers.CharField(
-        source='notify_environment.name', read_only=True, default=None)
+    # 有几条订阅规则发到这个会话（播报在「消息通知」里配）
+    notify_rule_count = serializers.SerializerMethodField()
 
     class Meta:
         model = FeishuChannel
         fields = [
             'id', 'chat_id', 'name', 'chat_type', 'chat_type_display',
-            'allow_execute', 'notify_enabled', 'enabled', 'remark',
-            'notify_scope', 'notify_scope_display',
-            'notify_project_group', 'notify_project_group_name',
-            'notify_environment', 'notify_environment_name',
+            'allow_execute', 'enabled', 'remark', 'notify_rule_count',
             'created_at', 'updated_at',
         ]
+
+    @extend_schema_field(OpenApiTypes.INT)
+    def get_notify_rule_count(self, obj):
+        return obj.notify_rules.count()
 
     def validate_chat_id(self, value):
         value = str(value or '').strip()

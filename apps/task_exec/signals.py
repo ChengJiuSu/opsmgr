@@ -15,17 +15,20 @@ task_exec 不该知道 im_mgr 的存在——那会让「装不装飞书」变�
 from django.dispatch import Signal
 
 #: 一次执行的状态或模块表发生了变化。
-#: kwargs：task_id、log_id（可能为 None，接收方按任务取最近一条）、kind（steps/status）
+#: kwargs：task_id、log_id（可能为 None，接收方按任务取最近一条）、kind：
+#:   steps / status —— 模块表 / 执行状态变化；
+#:   failure_closed —— 失败待处理被终止或超时收尾（另带 reason）。执行状态本来
+#:   就是 failed、收尾不改状态，订阅方只看状态分不出「刚失败」与「最终失败」
 execution_updated = Signal()
 
 
-def notify(task_id, log_id=None, kind=''):
+def notify(task_id, log_id=None, kind='', **extra):
     """广播一次执行更新；任何订阅者异常都不得影响执行本身。"""
     import logging
 
     logger = logging.getLogger(__name__)
     try:
-        execution_updated.send(sender=None, task_id=task_id, log_id=log_id, kind=kind)
+        execution_updated.send(sender=None, task_id=task_id, log_id=log_id, kind=kind, **extra)
     except Exception:  # noqa: BLE001 - 订阅者出问题不该把任务执行带停
         logger.warning('执行更新通知失败：task=%s log=%s kind=%s',
                        task_id, log_id, kind, exc_info=True)
