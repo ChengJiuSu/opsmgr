@@ -17,8 +17,8 @@
 | `method` | 平台方法（仅承载运维后台能力：剧本+平台管理的 tags、云主机管理等） | 委托 `method_mgr` 对应 provider 执行器 |
 | `pause` | 暂停确认：任务流停在该模块等待人工继续/中止，timeout 为等待上限（超时自动中止） | runner 置任务 `paused` 并轮询 `pause_action`，确认接口写 continue/abort |
 
-**执行语义**：模块间按 order 顺序执行，任一模块失败即中止后续（标记
-skipped）；模块内主机按任务级 exec_mode 并发/串行（串行 = `--forks 1`）。
+**执行语义**：模块间按 order 顺序执行，任一模块失败即落 failed 并释放执行位，
+可在时限内人工重试/跳过（断点续跑）或终止（后续标记 skipped），见「模块失败处理」；模块内主机按任务级 exec_mode 并发/串行（串行 = `--forks 1`）。
 
 **主机范围**：任务级项目组/渠道/环境为全局默认，**三维度必选**（不支持
 留空=不限，未选齐不予保存与执行）；模块可 `use_custom_scope` 自定义三维度
@@ -174,7 +174,7 @@ apps/task_exec/
 │                    #   （页面执行 / 接口触发 / 飞书卡片共用同一段）
 ├── webhook.py       # TaskTriggerView：API 凭证鉴权的机读触发入口
 ├── log_files.py     # 日志文件浏览：TASK_LOG_DIR 只读目录树 / 文本分段读 / 原文件下载（exec read）
-├── runner.py        # 任务流执行：逐模块解析主机 + 动态 inventory + 变量注入 + ansible 调用，失败中止
+├── runner.py        # 任务流执行：逐模块解析主机 + 动态 inventory + 变量注入 + ansible 调用，失败出断点/续跑
 ├── signals.py       # execution_updated：给模块外的订阅者（飞书卡片刷新）广播状态变化
 ├── live.py          # 实时输出汇聚 + 敏感变量打码（mask_secrets / LiveSink.add_secrets）
 ├── live.py          # LiveSink：流式日志汇聚（节流写库预览 + 落盘 + WebSocket 推送）
@@ -449,31 +449,47 @@ Ansible 项目目录内执行剧本：
   pause 模块的中止/超时直接终止任务流，**不进入失败处理**。
 - paused 状态下任务禁止编辑与重复发起。
 
-## 模块失败处理（重试 / 跳过 / 中止）
+## 模块失败处理（重试 / 跳过 / 终止）
 
-- 模块失败（rc != 0）后任务流不再立即中止：任务状态置 `paused`
-  （`pause_type=failed`），等待人工经 confirm 接口处理
-  `{"action": "retry"|"skip"|"abort"}`（仅管理员）：
-  - `retry`：重跑当前阶段的失败模块（并行组只重跑失败成员，序号沿用），
-    可反复重试；模块头追加 ` · 重试#N` 标记，steps_result 该模块
-    `attempts` 递增（日志树右侧显示已重试次数）。
-  - `skip`：跳过失败模块继续后续阶段；该模块 steps_result 标记
-    `skipped_over: true`（前端显示「失败·已跳过」），任务最终仍记失败
-    （return_code = 首个失败模块 rc）。
-  - `abort`：中止，后续模块标记 skipped。
-- 等待超时按中止处理。超时时长：系统配置 `task.failure_wait_timeout` 优先，
-  其次 settings `TASK_FAILURE_WAIT_TIMEOUT`（环境变量，默认 600s）；
-  **配置为 0 = 不等待，恢复「失败即中止」旧行为**。
-- confirm 接口按 `pause_type` 校验动作：confirm 态仅收 continue/abort，
-  failed 态仅收 retry/skip/abort（`pause_type` 空值兼容存量，视为 confirm）。
-- `output` 轮询接口与任务序列化器均返回 `pause_type`，前端据此切换
-  暂停操作条（继续/中止 vs 重试/跳过/中止）。
+**失败即落终态，等人处理不占执行资源**。旧实现在 worker 里轮询等人（任务停在
+`paused`，最长 600s），等待期间既占 celery-exec 执行位、又因执行记录仍是 running
+而占着主机锁。现改为「断点 + 续跑」：
+
+- 模块失败（rc != 0）：`runner.run` 记断点立即返回 `checkpoint`，
+  `tasks.execute_task` 照常收尾——任务与执行记录**立即落 `failed`**（执行位、
+  主机锁随之释放），并：
+  - 执行记录 `resume_state` = 断点 `{stage, failed, names, rc, flow_rc, step_ids, remaining}`；
+  - 任务 `pause_type=failed`、`resume_deadline` = 失败时刻 + 可处理时限。
+  - 日志末尾追加「已释放执行资源，N 内可重试 / 跳过 / 终止」。
+- 处理：`POST /api/exec/tasks/{id}/confirm/` `{"action": "retry"|"skip"|"abort"}`
+  （与发起执行同一道权限，飞书卡片同口径，见 `trigger.resolve_failure`）：
+  - `retry`：断点写入 action，执行记录与任务回到 `pending` 并重新投递，**沿用同一条
+    执行记录**续跑——重新抢主机锁（撞锁照常排队）、只重跑断点阶段的失败模块（并行组
+    只重跑失败成员，序号沿用），落盘日志接着追加（`LiveSink.resume_from`），模块头
+    追加 ` · 重试#N`、`attempts` 递增；再失败就再出一个断点，可反复。
+  - `skip`：同样续跑，跳过失败模块继续后续阶段；该模块标记 `skipped_over: true`，
+    任务最终仍记失败（return_code = 首个失败模块 rc）。
+  - `abort`：**不投递**，web 进程里直接收尾（`trigger.finish_failure`）：后续模块
+    标记 skipped、追加中止说明、清断点，状态保持 failed。
+- 时限：系统配置 `task.failure_wait_timeout` 优先，其次 settings
+  `TASK_FAILURE_WAIT_TIMEOUT`（环境变量，默认 **3600s**）；**配置为 0 = 不出断点，
+  保持「失败即中止」**。逾期：celery beat `task_exec.expire_failure_waits`（每 5 分钟）
+  按终止收尾；未跑 beat 时，逾期后点处理会被拒并就地收尾。
+- 断点作废：重新发起执行（`_snapshot_and_log`）、编辑任务（模块会重建）时清除。
+- 续跑等主机锁超时：退回失败待处理（断点保留、截止时间重新起算），可再次处理。
+- 并发：处理动作与 launch 共用 `task_exec:launch:<id>` 互斥 + 条件判定，「重试」
+  与「重新执行」同时点只有一个生效。
+- confirm 接口按状态校验动作：`paused`（暂停确认）仅收 continue/abort，失败待处理
+  仅收 retry/skip/abort。
+- 可见性：任务序列化器、`output` 轮询接口、WebSocket 状态帧都带 `pause_type` 与
+  `resume_deadline`；列表 `?status=paused`（「等待处理」）与概览页待处理都包含未逾期
+  的失败待处理；飞书对失败待处理推处理卡（重试/跳过/中止 + 截止时间）。
 
 ## 执行并发与主机锁
 
 - 生产 celery 后端由专用 worker 消费 `task_exec` 队列，**并发 = worker
   `--concurrency`**（supervisor conf / compose `CELERY_EXEC_CONCURRENCY`，默认 2）。
-  曾为 1：失败等人处理（最长 600s）、暂停确认、等 Jenkins 构建的任务占着唯一执行位
+  曾为 1：暂停确认、等 Jenkins 构建的任务（以及改造前的失败等人处理）占着唯一执行位
   却不耗 CPU，后续任务全部排队。`CELERY_WORKER_PREFETCH_MULTIPLIER=1` 防空闲子进程
   扣住排队消息。同一任务 `trigger.is_active` 时不能再发起或编辑：running/paused，
   或 **pending 且有未开跑的执行记录**（`exec_queue.queued_log`，1 天窗口）——任务
@@ -518,7 +534,7 @@ POST                /api/exec/tasks/{id}/trigger/ 接口/Webhook 触发（API �
                                                   仅接受 default_select_all=True 的任务（接口无法逐模块勾选主机）；
                                                   生产环境任务须带 body {confirm_production:true}；
                                                   主机范围恒为「维度匹配到的全部主机」，日志 trigger_type='api'
-POST                /api/exec/tasks/{id}/confirm/ 人工处理暂停：确认模块 continue/abort；失败等待 retry/skip/abort（仅管理员）
+POST                /api/exec/tasks/{id}/confirm/ 人工处理暂停：确认模块 continue/abort；失败待处理 retry/skip/abort（续跑/收尾）
 GET                 /api/exec/tasks/{id}/output/  轻量轮询（WebSocket 回退）：状态、模块表与输出；?offset=N 为完整输出里的绝对偏移，窗口覆盖时只回增量（delta=true），否则以落盘文件重建可见日志并给出 head/start
 GET                 /api/exec/tasks/{id}/logs/    执行历史列表（含主机数/执行方式/逐模块结果 steps_result）
 GET                 /api/exec/tasks/{id}/logs/{log_id}/  单条日志详情（完整输出 + 主机快照）

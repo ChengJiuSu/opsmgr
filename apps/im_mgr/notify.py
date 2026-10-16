@@ -67,14 +67,36 @@ def _schedule(task_id, log_id):
     if status in ('success', 'failed'):
         tasks.dispatch_broadcast(log_id)
     if not FeishuCardMessage.objects.filter(log_id=log_id).exists():
-        # 没绑卡片的执行（页面发起的）平时不打扰：只有转「等待处理」时才私聊
-        # 推给发起人——需要人处理是唯一值得主动打断的时刻
-        if status == 'paused':
+        # 没绑卡片的执行（页面发起的）平时不打扰：只有转「等待处理」/「失败待处理」
+        # 时才私聊推给发起人——需要人处理是唯一值得主动打断的时刻
+        if status == 'paused' or (status == 'failed' and _awaiting_failure(log_id)):
             tasks.dispatch_pause_push(log_id)
         return
     if not _should_push(log_id, status):
         return
     tasks.dispatch_refresh_card(log_id)
+
+
+def _awaiting_failure(log_id):
+    """这次执行是否停在「失败待处理」（失败已落终态，但还能重试/跳过/终止）。"""
+    from apps.task_exec.models import TaskExecutionLog
+
+    return TaskExecutionLog.objects.filter(
+        pk=log_id, status='failed', resume_state__isnull=False,
+        task__pause_type='failed').exists()
+
+
+def pending_pause_type(log):
+    """这次执行等人处理的类型：'confirm' / 'failed'；不需要处理时为 None。
+
+    暂停确认时执行还在跑（status=paused）；失败待处理时执行已落 failed、断点
+    挂在执行记录上——后者看着是终态，但卡片上还得摆出重试/跳过/终止。
+    """
+    if log.status == 'failed' and log.resume_state and log.task.pause_type == 'failed':
+        return 'failed'
+    if log.status == 'paused':
+        return log.task.pause_type or 'confirm'
+    return None
 
 
 def _should_push(log_id, status):
@@ -110,12 +132,12 @@ def render(log):
     """按当前状态渲染卡片。"""
     task = log.task
     url = log_url(log)
-    if log.status in ('success', 'failed'):
+    # 暂停类型在任务本体上（处理后即清），日志里没有
+    pause_type = pending_pause_type(log)
+    if pause_type is None and log.status in ('success', 'failed'):
         # tail 用库里的输出预览：它就是完整日志的尾部，够判断成败原因
         return cards.result(task, log, url=url, tail=log.output)
-    if log.status == 'paused':
-        # 暂停类型在任务本体上（runner 消费 pause_action 时清），日志里没有
-        pause_type = task.pause_type or 'confirm'
+    if pause_type:
         return cards.pause(
             task, log, pause_type,
             current_step=current_step_name(log, pause_type),
@@ -134,7 +156,7 @@ def push_pause(log_id):
     推完就把这条消息绑到本次执行上：后续的进度与终态照常就地刷新，于是私聊里
     也始终是同一条消息在变，不会因为一次暂停而多出一串消息。
 
-    **只推一次**：runner 可能反复广播同一个 paused 状态（失败重试后再次失败），
+    **只推一次**：同一次执行可能反复进入等待处理（失败重试后再次失败），
     缓存标记挡住重复推送；真正的去重是绑定关系——绑上之后就走刷新那条路了。
     """
     from apps.task_exec.models import TaskExecutionLog
@@ -143,7 +165,7 @@ def push_pause(log_id):
            .select_related('task', 'task__project_group', 'task__channel',
                            'task__environment', 'triggered_by')
            .filter(pk=log_id).first())
-    if log is None or log.status != 'paused' or log.triggered_by is None:
+    if log is None or pending_pause_type(log) is None or log.triggered_by is None:
         return
     if FeishuCardMessage.objects.filter(log_id=log_id).exists():
         return

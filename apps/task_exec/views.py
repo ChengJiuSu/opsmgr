@@ -5,8 +5,10 @@ from pathlib import Path
 import yaml
 
 from django.conf import settings
+from django.db.models import Q
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import viewsets
@@ -390,7 +392,11 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
         if task_type:
             # 类型下沉到模块后，筛选语义 = 包含该类型模块的任务
             qs = qs.filter(steps__task_type=task_type).distinct()
-        if status:
+        if status == 'paused':
+            # 「等待处理」= 暂停确认 + 失败待处理（后者状态是 failed，但同样等人点）
+            qs = qs.filter(Q(status='paused') | Q(
+                status='failed', pause_type='failed', resume_deadline__gt=timezone.now()))
+        elif status:
             qs = qs.filter(status=status)
         if keyword:
             qs = qs.filter(name__icontains=keyword)
@@ -403,7 +409,10 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
     def update(self, request, *args, **kwargs):
         if trigger.is_active(self.get_object()):
             return fail('任务正在排队或执行中，无法编辑')
-        return super().update(request, *args, **kwargs)
+        resp = super().update(request, *args, **kwargs)
+        # 模块会被重建（id 全换），失败断点续不上了
+        trigger.discard_resume(self.get_object())
+        return resp
 
     @action(detail=True, methods=['get'])
     def matched_servers(self, request, pk=None):
@@ -525,10 +534,10 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
         与发起执行同一道能力位与范围校验：continue / retry / skip 都会让剩余模块
         真的跑起来，只在 execute 上拦等于留了个后门。
 
-        暂停确认模块（pause_type=confirm）：continue 继续 / abort 中止；
-        模块失败等待（pause_type=failed）：retry 重试失败模块 / skip 跳过
-        继续后续模块 / abort 中止。仅 paused 状态可操作；动作写入
-        pause_action 由 runner 轮询消费。
+        暂停确认模块（status=paused）：continue 继续 / abort 中止，动作写入
+        pause_action 由 runner 轮询消费；失败待处理（status=failed 且
+        pause_type=failed，未逾期）：retry 重试失败模块 / skip 跳过继续后续模块
+        （均投递续跑，沿用同一条执行记录）/ abort 终止（就地收尾）。
         """
         task = self.get_object()
         error = trigger.permission_error(request.user, task)
@@ -549,7 +558,7 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
         （delta=true）；否则重建可见日志（delta=false，含 head/start），由前端按
         绝对偏移把这段盖回本地那份更长的日志上。
         """
-        from .live import read_live_output, split_note
+        from .live import read_live_output, resume_deadline_of, split_note
 
         task = self.get_object()
         try:
@@ -571,6 +580,7 @@ class ExecutionTaskViewSet(viewsets.ModelViewSet):
             'id': task.id,
             'status': task.status,
             'pause_type': task.pause_type,
+            'resume_deadline': resume_deadline_of(task),
             'return_code': task.return_code,
             'steps_result': self._latest_steps(task),
             'delta': delta,

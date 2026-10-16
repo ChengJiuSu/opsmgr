@@ -59,17 +59,17 @@
           </el-button>
         </div>
         <!-- 暂停处理操作条：暂停确认模块（继续/中止）或模块失败等待（重试/跳过/中止） -->
-        <el-alert v-if="task?.status === 'paused'" :type="pausedFailed ? 'error' : 'warning'" :closable="false" show-icon class="pause-bar">
+        <el-alert v-if="showPauseBar" :type="pausedFailed ? 'error' : 'warning'" :closable="false" show-icon class="pause-bar">
           <template #title>
             <span class="pause-line">
-              {{ pausedFailed ? '模块执行失败，任务流已暂停，等待人工处理' : '任务流已暂停，等待人工确认后继续' }}
+              {{ pauseTitle(task) }}
               <span v-if="canExec" class="pause-actions">
                 <template v-if="pausedFailed">
                   <el-button size="small" type="primary" :loading="confirming" @click="handleConfirm('retry')">重试失败模块</el-button>
                   <el-button size="small" type="warning" :loading="confirming" @click="handleConfirm('skip')">跳过并继续</el-button>
                 </template>
                 <el-button v-else size="small" type="primary" :loading="confirming" @click="handleConfirm('continue')">继续执行</el-button>
-                <el-button size="small" type="danger" :loading="confirming" @click="handleConfirm('abort')">中止任务流</el-button>
+                <el-button size="small" type="danger" :loading="confirming" @click="handleConfirm('abort')">{{ pausedFailed ? '终止' : '中止任务流' }}</el-button>
               </span>
             </span>
           </template>
@@ -122,6 +122,7 @@ import { getTask, getTaskLogs, getTaskLogDetail, getTaskLogScene, getTaskOutput,
 import { useAuthStore } from '../../stores/auth'
 import { openTaskLogStream } from '../../utils/taskLogStream'
 import { createLogBuffer, applyFull, applyDelta, resetBuffer } from '../../utils/taskLogBuffer'
+import { awaitingFailure, pauseTitle, CONFIRM_DONE_MSG } from '../../utils/taskPause'
 import StepOutput from '../../components/StepOutput.vue'
 
 const route = useRoute()
@@ -277,6 +278,7 @@ function applyStatus(data) {
     ...task.value,
     status: data.status,
     pause_type: data.pause_type,
+    resume_deadline: data.resume_deadline,
     return_code: data.return_code,
     duration: data.duration,
   }
@@ -371,25 +373,37 @@ function stopPolling() {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
 }
 
-// 暂停处理：确认模块（继续/中止）或失败等待（重试/跳过/中止），状态由轮询自动刷新
+// 暂停处理：确认模块（继续/中止）或失败待处理（重试/跳过/终止）
 const confirming = ref(false)
-const pausedFailed = computed(() => task.value?.pause_type === 'failed')
-const CONFIRM_DONE_MSG = {
-  continue: '已确认，任务流继续执行',
-  abort: '已发送中止指令',
-  retry: '已发送重试指令，失败模块将重新执行',
-  skip: '已发送跳过指令，任务流继续执行后续模块',
-}
+const pausedFailed = computed(() => awaitingFailure(task.value))
+const showPauseBar = computed(() => task.value?.status === 'paused' || pausedFailed.value)
 async function handleConfirm(action) {
   if (action === 'abort') {
     await ElMessageBox.confirm('确定中止任务流吗？后续模块将不再执行。', '警告', { type: 'warning' })
   } else if (action === 'skip') {
     await ElMessageBox.confirm('确定跳过失败模块吗？任务流将继续执行后续模块（本次执行仍记为失败）。', '提示', { type: 'warning' })
   }
+  const wasFailed = pausedFailed.value
   confirming.value = true
   try {
     await confirmTask(taskId, action)
     ElMessage.success(CONFIRM_DONE_MSG[action])
+    // 暂停确认的状态由实时通道刷新；失败待处理时执行早已收尾、通道已断，要自己接上
+    if (wasFailed) {
+      const resumed = action !== 'abort'
+      task.value = {
+        ...task.value, pause_type: '', resume_deadline: null,
+        ...(resumed ? { status: 'pending' } : {}),
+      }
+      if (resumed) {
+        // 续跑沿用同一条执行记录：重新跟随实时输出（日志接着上次往后写）
+        liveTail.value = true
+        startFollow()
+        startListTimer()
+      } else {
+        finish()   // 终止：换成追加了中止说明的完整日志，模块表里后续模块记跳过
+      }
+    }
   } finally {
     confirming.value = false
   }

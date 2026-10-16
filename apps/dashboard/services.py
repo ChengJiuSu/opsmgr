@@ -24,7 +24,7 @@
 import logging
 from datetime import timedelta
 
-from django.db.models import Count, Max
+from django.db.models import Count, Max, Q
 from django.utils import timezone
 
 from apps.agent_mgr.models import AgentNode
@@ -230,17 +230,18 @@ def agent_alerts():
 def paused_todos():
     """卡在暂停确认 / 失败待处理的任务。
 
-    平台里唯一「不点就永远停在那」的东西：runner 在轮询 pause_action，没人处理
-    就一直挂着占着执行线程。必须上首页。
+    平台里「不点就不会往下走」的东西，必须上首页：暂停确认模块还占着执行位在等；
+    失败待处理已经释放了执行位，但过了 resume_deadline 就只能重新发起。
     """
     now = timezone.now()
+    waiting = ExecutionTask.objects.filter(
+        Q(status='paused') | Q(status='failed', pause_type='failed', resume_deadline__gt=now))
     tasks = list(
-        ExecutionTask.objects.filter(status='paused')
-        .select_related('created_by').order_by('-started_at')[:ITEM_LIMIT]
+        waiting.select_related('created_by').order_by('-started_at')[:ITEM_LIMIT]
     )
     if not tasks:
         return []
-    total = ExecutionTask.objects.filter(status='paused').count()
+    total = waiting.count()
     # 只为这几条取最近一条日志 id（执行页要靠它定位到具体那次执行的日志）
     log_map = {}
     for log in TaskExecutionLog.objects.filter(
@@ -253,8 +254,9 @@ def paused_todos():
         'pause_type_label': t.get_pause_type_display() if t.pause_type else '',
         'log_id': log_map.get(t.id),
         'triggered_by': getattr(t.created_by, 'username', ''),
-        # 已经等了多久：等待时间越长越可能是没人看见，前端按它排序高亮
-        'waiting_seconds': int((now - t.started_at).total_seconds()) if t.started_at else None,
+        # 已经等了多久：等待时间越长越可能是没人看见，前端按它排序高亮。失败待处理
+        # 从失败那刻（finished_at）算，开跑时间早就过去很久了
+        'waiting_seconds': _waiting_seconds(t, now),
         'link': ({'path': f'/task/executions/{t.id}/logs/{log_map[t.id]}'}
                  if log_map.get(t.id) else {'path': '/task/executions',
                                             'query': {'status': 'paused'}}),
@@ -263,6 +265,11 @@ def paused_todos():
         'task_paused', 'warning', f'{total} 个任务等待处理',
         items, {'path': '/task/executions', 'query': {'status': 'paused'}}, total=total,
     )]
+
+
+def _waiting_seconds(task, now):
+    since = task.finished_at if task.status == 'failed' else task.started_at
+    return int((now - since).total_seconds()) if since else None
 
 
 def dns_approval_todos(user):

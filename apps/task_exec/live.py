@@ -280,6 +280,11 @@ def push(task_id, payload):
         return False
 
 
+def resume_deadline_of(task):
+    """失败可处理截止时间（ISO 串，供推送帧/轮询接口；channel layer 不收 datetime）。"""
+    return task.resume_deadline.isoformat() if task.resume_deadline else None
+
+
 def push_status(task_id):
     """推送任务状态变化（执行中/暂停/终态），供前端切换操作条与收尾。"""
     from .models import ExecutionTask
@@ -291,6 +296,7 @@ def push_status(task_id):
         'kind': 'status',
         'status': task.status,
         'pause_type': task.pause_type,
+        'resume_deadline': resume_deadline_of(task),
         'return_code': task.return_code,
         'duration': task.duration,
     })
@@ -331,6 +337,15 @@ class LiveSink:
         self._ticker = None
 
     # ── 生命周期 ────────────────────────────────────────────
+    def resume_from(self, prior):
+        """失败续跑：落盘文件里已有上次的完整输出 prior，后续接着往后追加。
+
+        runner 续跑时把 prior 作为 outputs 的第一段，这里把落盘与推送的基准都
+        挪到它末尾——否则 flush 会把整段 prior 再往文件里写一遍。
+        """
+        with self._lock:
+            self._file_len = self._ws_len = len(prior or '')
+
     def bind(self, outputs):
         """绑定 runner 的已完成模块输出列表（同一对象，后续只读）。"""
         self._outputs = outputs

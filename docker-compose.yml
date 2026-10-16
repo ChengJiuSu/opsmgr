@@ -186,9 +186,9 @@ services:
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       LOG_SERVICE: celery-exec
-    # ⚠ 对齐 supervisor 的 stopwaitsecs=600（= TASK_FAILURE_WAIT_TIMEOUT）：
-    # 砍在中途的任务状态会永远留在 running。代价是有任务正暂停等人处理时，
-    # 重启最长要等 600s。
+    # ⚠ 对齐 supervisor 的 stopwaitsecs=600（暂停确认模块的等待 + 长模块）：
+    # 砍在中途的任务状态会永远留在 running。代价是有任务正停在暂停确认时，
+    # 重启最长要等 600s。（模块失败等人处理已不占 worker，见 runner.run。）
     stop_grace_period: 600s
     healthcheck:
       test: ["CMD-SHELL", "celery -A ops_manager inspect ping -d exec@$$(hostname) >/dev/null 2>&1"]

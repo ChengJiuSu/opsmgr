@@ -244,13 +244,16 @@ class ExecutionTask(models.Model):
     STATUS_CHOICES = [
         ('pending', '等待中'),
         ('running', '执行中'),
-        ('paused', '等待处理'),  # 暂停确认模块等待继续/中止，或模块失败等待重试/跳过/中止
+        # 暂停确认模块等待继续/中止。模块失败不进这个状态：直接落 failed 并释放
+        # 执行位，可处理期内带 pause_type=failed（见 resume_deadline）
+        ('paused', '等待处理'),
         ('success', '成功'),
         ('failed', '失败'),
     ]
     PAUSE_TYPE_CHOICES = [
         ('confirm', '暂停确认'),   # 暂停确认模块：可 continue/abort
-        ('failed', '失败待处理'),  # 模块执行失败：可 retry/skip/abort
+        # 模块执行失败：status=failed 且在 resume_deadline 之前可 retry/skip/abort
+        ('failed', '失败待处理'),
     ]
     EXEC_MODE_CHOICES = [
         ('parallel', '并发'),
@@ -309,6 +312,10 @@ class ExecutionTask(models.Model):
     pause_type = models.CharField(
         '暂停类型', max_length=20, choices=PAUSE_TYPE_CHOICES, blank=True, default='',
     )
+    # 失败待处理的截止时间：模块失败后执行即落 failed、释放执行位与主机锁，断点记在
+    # 最近一次执行记录的 resume_state 上；截止前可重试/跳过（投递续跑）或终止，
+    # 过期按终止处理（trigger.expire_failure_waits）。不在失败待处理时为空
+    resume_deadline = models.DateTimeField('失败可处理截止', null=True, blank=True)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
         related_name='exec_tasks', verbose_name='发起人',
@@ -484,6 +491,10 @@ class TaskExecutionLog(models.Model):
     # 本次执行持有的主机锁 ["<server_id>:<service_type_id|*>"]，开跑时写入
     # （见 host_lock.py）。只有 status=running 的记录算持锁，终态后留作历史
     lock_keys = models.JSONField('主机锁', default=list, blank=True)
+    # 失败断点（runner.run 返回的 checkpoint）：{stage, failed, names, rc, flow_rc,
+    # step_ids}，人工选择重试/跳过时再写入 action 并投递续跑。续跑沿用本记录，
+    # 落盘日志接着追加；为空 = 不可续跑
+    resume_state = models.JSONField('失败断点', null=True, blank=True)
     triggered_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
         related_name='exec_task_logs', verbose_name='触发人',

@@ -461,9 +461,10 @@ LOGIN_FAIL_BLOCK = config('LOGIN_FAIL_BLOCK', default=900, cast=int)
 # ── 任务执行后端 ──────────────────────────────────────────
 # thread（默认，无需 Redis）/ celery（生产，需 worker）/ sync（同步，测试用）
 TASK_EXEC_BACKEND = config('TASK_EXEC_BACKEND', default='thread')
-# 模块失败后等待人工处理（重试/跳过/中止）的超时秒数，超时按中止处理；
-# 0 = 不等待（失败即中止）。系统配置 task.failure_wait_timeout 可运行时覆盖。
-TASK_FAILURE_WAIT_TIMEOUT = config('TASK_FAILURE_WAIT_TIMEOUT', default=600, cast=int)
+# 模块失败后可人工处理（重试/跳过/终止）的时限秒数，逾期按终止处理；
+# 0 = 不提供处理（失败即中止）。系统配置 task.failure_wait_timeout 可运行时覆盖。
+# 失败即落 failed 并释放执行位与主机锁，等待期间不占资源，所以默认给 1 小时。
+TASK_FAILURE_WAIT_TIMEOUT = config('TASK_FAILURE_WAIT_TIMEOUT', default=3600, cast=int)
 # 并行组内同时执行的模块数上限。不设上限时一个 N 模块的并行组会起 N 个
 # ansible 进程，每个再按 task.forks（默认 10）派生 —— 5 个模块就是 50 个进程，
 # 小机器上足以把 CPU 打满，连带拖慢 web。超出上限的模块排队等前面的跑完。
@@ -556,5 +557,10 @@ CELERY_BEAT_SCHEDULE = {
     'renew-expiring-certificates': {
         'task': 'cloud_mgr.renew_expiring_certificates',
         'schedule': 3600 * 24,
+    },
+    # 逾期未处理的失败待处理按终止收尾（不跑 beat 时点击处理也会就地收尾）
+    'expire-task-failure-waits': {
+        'task': 'task_exec.expire_failure_waits',
+        'schedule': 300,
     },
 }

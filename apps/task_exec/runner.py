@@ -31,7 +31,7 @@ from django.conf import settings
 
 from common.ansible import resolve_within, run_stream
 
-from .live import SECRET_MASK_MIN_LEN, LiveSink, mask_secrets, push_status
+from .live import SECRET_MASK_MIN_LEN, SEP, LiveSink, mask_secrets, push_status
 
 logger = logging.getLogger('apps.task_exec')
 
@@ -627,19 +627,29 @@ _STEP_HANDLERS = {
 
 # 暂停确认轮询间隔（秒）
 PAUSE_POLL_INTERVAL = 2
-# 模块失败后等待人工处理（重试/跳过/中止）的默认超时（秒），超时按中止处理
-FAILURE_WAIT_TIMEOUT_DEFAULT = 600
+# 模块失败后可人工处理（重试/跳过/终止）的默认时限（秒），过期按终止处理。
+# 等待期间不占执行位（失败即落终态、断点续跑），所以给得比暂停确认宽
+FAILURE_WAIT_TIMEOUT_DEFAULT = 3600
 
 
-def _failure_wait_timeout():
-    """失败等待超时（秒）：系统配置 task.failure_wait_timeout 优先，其次
-    settings.TASK_FAILURE_WAIT_TIMEOUT，默认 600；0 = 不等待（失败即中止）。"""
+def failure_wait_timeout():
+    """失败可处理时限（秒）：系统配置 task.failure_wait_timeout 优先，其次
+    settings.TASK_FAILURE_WAIT_TIMEOUT，默认 3600；0 = 不提供处理（失败即中止）。"""
     from apps.system_cfg.services import get_config
 
     raw = get_config('task.failure_wait_timeout')
     if str(raw).strip().isdigit():
         return int(raw)
     return getattr(settings, 'TASK_FAILURE_WAIT_TIMEOUT', FAILURE_WAIT_TIMEOUT_DEFAULT)
+
+
+def fmt_seconds(seconds):
+    """时限的中文说法：3600 → 1 小时，90 → 90 秒。"""
+    if seconds % 3600 == 0:
+        return f'{seconds // 3600} 小时'
+    if seconds % 60 == 0:
+        return f'{seconds // 60} 分钟'
+    return f'{seconds} 秒'
 
 
 def _persist_progress(sink, extra=None):
@@ -683,72 +693,68 @@ def _wait_confirmation(step, task):
         push_status(task.pk)  # 恢复执行：推送状态收起操作条
 
 
-def _wait_failure_action(task, timeout):
-    """模块失败等待人工处理：置任务 paused（pause_type=failed），轮询动作。
+def run(task, sink=None, resume=None):
+    """按 order 顺序执行任务流的全部模块，返回 (return_code, output, steps_result, checkpoint)。
 
-    确认接口（views.confirm）向 pause_action 写 retry/skip/abort，本函数
-    消费后清空并把状态恢复为 running；等待超时返回 'timeout'（按中止处理）。
-    """
-    from .models import ExecutionTask
+    模块失败（rc != 0）后**不在这里等人**：记下断点立即返回（checkpoint 非空），
+    由调用方把执行落为 failed、释放执行位与主机锁。人工处理时再带着断点调回来
+    （resume）续跑：
+      - action=retry：重跑断点阶段里的失败模块（并行组只重跑失败成员），再失败
+        就再出一个断点，可反复；
+      - action=skip：跳过失败模块继续后续阶段，任务最终仍记失败。
+    终止不经过这里（trigger.finish_failure 直接收尾）。失败可处理时限配置为 0
+    时不出断点，保持「失败即中止」。暂停确认模块的中止/超时直接终止任务流，
+    不进入失败处理。
 
-    ExecutionTask.objects.filter(pk=task.pk).update(
-        status='paused', pause_action='', pause_type='failed')
-    deadline = time.monotonic() + timeout
-    try:
-        while time.monotonic() < deadline:
-            action = (
-                ExecutionTask.objects.filter(pk=task.pk)
-                .values_list('pause_action', flat=True)
-                .first()
-            )
-            if action in ('retry', 'skip', 'abort'):
-                return action
-            time.sleep(PAUSE_POLL_INTERVAL)
-        return 'timeout'
-    finally:
-        ExecutionTask.objects.filter(pk=task.pk).update(
-            status='running', pause_action='', pause_type='')
-        push_status(task.pk)  # 恢复执行：推送状态收起操作条
-
-
-def run(task, sink=None):
-    """按 order 顺序执行任务流的全部模块，返回 (return_code, output, steps_result)。
-
-    模块失败（rc != 0）后任务流暂停，等待人工处理：重试（重跑当前阶段失败
-    模块，可反复）/ 跳过（继续后续模块，任务最终仍记失败）/ 中止（后续模块
-    标记 skipped）；等待超时按中止处理。暂停确认模块的中止/超时直接终止
-    任务流，不进入失败处理。
+    resume 为 {stage, failed, names, rc, flow_rc, step_ids, action, results, output}：
+    前六项是上次返回的 checkpoint，results/output 是上次的模块表与完整输出
+    （续跑接在后面写）。
 
     sink 为实时输出汇聚器（LiveSink）：ansible 输出边跑边写库/落盘；未传时
     自建一个仅写库的 sink（直接调用 runner.run 的场景，如测试）。
     """
     steps = list(task.steps.all())
     if not steps:
-        return 1, '任务未配置任何模块，请编辑任务后重试。', []
+        return 1, '任务未配置任何模块，请编辑任务后重试。', [], None
 
     sink = sink or LiveSink(task.pk)
     stages = _build_stages(steps)
-    outputs = []
-    # 整张模块表先按 pending 建好（不是跑一个 append 一个）：执行中面板就能画出完整
-    # 任务流，看到后面还有哪些模块要输出；每项按模块序号原地更新（results[idx-1]）
-    results = [
-        {
-            'order': step.order, 'name': step.name, 'task_type': step.task_type,
-            'status': 'pending', 'return_code': None, 'duration': None,
-            'server_count': None, 'parallel': len(stage) > 1, 'attempts': 1,
-        }
-        for stage in stages for step in stage
-    ]
+    if resume:
+        # 续跑沿用上次的输出与模块表：断点之前的阶段不再执行
+        outputs = [resume['output']] if resume.get('output') else []
+        results = resume['results']
+        flow_rc = resume.get('flow_rc')
+        start_stage = resume['stage']
+        if resume.get('step_ids') != [step.id for step in steps]:
+            # 编辑任务会作废断点（trigger.discard_resume），这里只兜直接改库的情况
+            outputs.append('✖ 任务模块在失败后被修改，无法从断点续跑，请重新发起执行。')
+            return resume.get('rc') or 1, SEP.join(outputs), results, None
+    else:
+        outputs = []
+        # 整张模块表先按 pending 建好（不是跑一个 append 一个）：执行中面板就能画出完整
+        # 任务流，看到后面还有哪些模块要输出；每项按模块序号原地更新（results[idx-1]）
+        results = [
+            {
+                'order': step.order, 'name': step.name, 'task_type': step.task_type,
+                'status': 'pending', 'return_code': None, 'duration': None,
+                'server_count': None, 'parallel': len(stage) > 1, 'attempts': 1,
+            }
+            for stage in stages for step in stage
+        ]
+        flow_rc = None  # 首个失败模块的 rc（含被跳过的失败），决定任务流最终状态
+        start_stage = 0
     sink.bind(outputs)
     sink.bind_steps(results)
     total = len(steps)
-    flow_rc = None  # 首个失败模块的 rc（含被跳过的失败），决定任务流最终状态
     aborted = False
     abort_note = ''
     pos = 0  # 已消费的模块数（模块序号 = pos + 组内偏移）
-    for stage in stages:
+    for stage_no, stage in enumerate(stages):
         parallel = len(stage) > 1
         pairs = [(step, pos + offset) for offset, step in enumerate(stage, 1)]
+        if stage_no < start_stage:
+            pos += len(stage)
+            continue
         if aborted:
             for step, idx in pairs:
                 results[idx - 1].update({'status': 'skipped'})
@@ -756,74 +762,75 @@ def run(task, sink=None):
             pos += len(stage)
             continue
 
-        entries = _exec_stage(pairs, task, total, sink, parallel)
-
         idx_by_id = {step.id: idx for step, idx in pairs}
-        result_by_id = {}
-        for step, header, rc, out, duration, server_count in entries:
-            outputs.append(f'{header}\n{out}')
-            item = results[idx_by_id[step.id] - 1]
-            item.update({
-                'status': 'success' if rc == 0 else 'failed', 'return_code': rc,
-                'duration': duration, 'server_count': server_count,
-            })
-            result_by_id[step.id] = item
-        sink.publish_steps()
-        failed_entries = [e for e in entries if e[2] != 0]
 
-        # 暂停确认模块的中止/超时：直接终止任务流，不提供重试/跳过
-        if failed_entries and stage[0].task_type == 'pause':
-            flow_rc = failed_entries[0][2]
-            aborted = True
-            abort_note = f'模块「{stage[0].name}」暂停确认未通过'
-            failed_entries = []
+        def _record(entries, attempt=None):
+            for step, header, rc, out, duration, server_count in entries:
+                outputs.append(f'{header}\n{out}')
+                item = results[idx_by_id[step.id] - 1]
+                item.update({
+                    'status': 'success' if rc == 0 else 'failed', 'return_code': rc,
+                    'duration': duration, 'server_count': server_count,
+                })
+                if attempt:
+                    item['attempts'] = attempt
+            sink.publish_steps()
+            return [e for e in entries if e[2] != 0]
 
-        # 失败处理循环：暂停等待人工选择重试/跳过/中止（超时=中止；
-        # 等待超时配置为 0 时不等待，保持「失败即中止」）
-        while failed_entries:
-            names = '、'.join(e[0].name for e in failed_entries)
-            timeout = _failure_wait_timeout()
-            if timeout > 0:
-                prompt = (f'✖ 模块「{names}」执行失败，任务流已暂停，等待人工处理：'
-                          f'重试失败模块 / 跳过并继续 / 中止（超过 {timeout}s 未处理将自动中止）。')
-                _persist_progress(sink, extra=prompt)
-                action = _wait_failure_action(task, timeout)
-            else:
-                action = 'abort_now'
-            if action == 'retry':
-                attempt = result_by_id[failed_entries[0][0].id]['attempts'] + 1
-                outputs.append(f'↻ 已人工确认重试，第 {attempt} 次执行失败模块：{names}。')
-                _persist_progress(sink)
-                retry_pairs = [(e[0], idx_by_id[e[0].id]) for e in failed_entries]
-                entries = _exec_stage(retry_pairs, task, total, sink, parallel, attempt=attempt)
-                for step, header, rc, out, duration, server_count in entries:
-                    outputs.append(f'{header}\n{out}')
-                    item = result_by_id[step.id]
-                    item.update({
-                        'status': 'success' if rc == 0 else 'failed', 'return_code': rc,
-                        'duration': duration, 'server_count': server_count,
-                        'attempts': attempt,
-                    })
-                sink.publish_steps()
-                failed_entries = [e for e in entries if e[2] != 0]
-            elif action == 'skip':
+        if resume and stage_no == start_stage:
+            failed_ids = set(resume['failed'])
+            failed_pairs = [(step, idx) for step, idx in pairs if step.id in failed_ids]
+            names = '、'.join(step.name for step, _ in failed_pairs)
+            if resume.get('action') == 'skip':
                 if flow_rc is None:
-                    flow_rc = failed_entries[0][2]
-                for e in failed_entries:
-                    result_by_id[e[0].id]['skipped_over'] = True
+                    flow_rc = resume.get('rc') or 1
+                for _, idx in failed_pairs:
+                    results[idx - 1]['skipped_over'] = True
                 sink.publish_steps()
                 outputs.append(f'⤼ 已人工确认跳过失败模块「{names}」，继续执行后续模块（本次执行仍记失败）。')
                 failed_entries = []
-            else:  # abort / timeout / abort_now（未开启失败等待）
-                if flow_rc is None:
-                    flow_rc = failed_entries[0][2]
+            else:
+                attempt = results[failed_pairs[0][1] - 1].get('attempts', 1) + 1
+                outputs.append(f'↻ 已人工确认重试，第 {attempt} 次执行失败模块：{names}。')
+                _persist_progress(sink)
+                failed_entries = _record(
+                    _exec_stage(failed_pairs, task, total, sink, parallel, attempt=attempt),
+                    attempt=attempt)
+        else:
+            failed_entries = _record(_exec_stage(pairs, task, total, sink, parallel))
+            # 暂停确认模块的中止/超时：直接终止任务流，不提供重试/跳过
+            if failed_entries and stage[0].task_type == 'pause':
+                flow_rc = failed_entries[0][2]
                 aborted = True
-                if action == 'abort_now':
-                    abort_note = f'模块「{names}」执行失败'
-                else:
-                    reason = '等待人工处理超时' if action == 'timeout' else '人工确认中止'
-                    abort_note = f'模块「{names}」执行失败（{reason}）'
+                abort_note = f'模块「{stage[0].name}」暂停确认未通过'
                 failed_entries = []
+
+        if failed_entries:
+            names = '、'.join(e[0].name for e in failed_entries)
+            timeout = failure_wait_timeout()
+            if timeout > 0:
+                # 记断点立即返回：执行落 failed、释放执行位与主机锁，人工处理时续跑
+                outputs.append(
+                    f'✖ 模块「{names}」执行失败，本次执行已结束并释放执行资源。'
+                    f'{fmt_seconds(timeout)}内可人工处理：重试失败模块 / 跳过并继续 / 终止'
+                    f'（逾期按终止处理）。')
+                _persist_progress(sink)
+                checkpoint = {
+                    'stage': stage_no,
+                    'failed': [e[0].id for e in failed_entries],
+                    'names': names,
+                    'rc': failed_entries[0][2],
+                    'flow_rc': flow_rc,
+                    'step_ids': [step.id for step in steps],
+                    'remaining': total - pos - len(stage),
+                    'timeout': timeout,  # 调用方据此算截止时间后弹掉，不落库
+                }
+                rc = flow_rc if flow_rc is not None else failed_entries[0][2]
+                return rc, SEP.join(outputs), results, checkpoint
+            if flow_rc is None:
+                flow_rc = failed_entries[0][2]
+            aborted = True
+            abort_note = f'模块「{names}」执行失败'
 
         pos += len(stage)
         if aborted:
@@ -833,7 +840,7 @@ def run(task, sink=None):
         # 每个阶段结束即持久化进度（写库预览 + 补齐落盘）
         _persist_progress(sink)
 
-    return (flow_rc if flow_rc is not None else 0), '\n\n'.join(outputs), results
+    return (flow_rc if flow_rc is not None else 0), SEP.join(outputs), results, None
 
 
 def _build_stages(steps):

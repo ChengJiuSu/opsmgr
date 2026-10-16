@@ -130,7 +130,7 @@ class TaskLogConsumer(AsyncJsonWebsocketConsumer):
         那时预览里往往只剩当前模块，先前模块的日志就「不见了」。live.read_live_output
         以落盘文件补回已完成模块的完整输出，并给出绝对偏移供后续增量落位。
         """
-        from .live import read_live_output
+        from .live import read_live_output, resume_deadline_of
         from .models import ExecutionTask
 
         task = ExecutionTask.objects.filter(pk=self.task_id).first()
@@ -142,6 +142,7 @@ class TaskLogConsumer(AsyncJsonWebsocketConsumer):
             'steps': self._latest_steps(task),
             'status': task.status,
             'pause_type': task.pause_type,
+            'resume_deadline': resume_deadline_of(task),
             'return_code': task.return_code,
             'duration': task.duration,
         }

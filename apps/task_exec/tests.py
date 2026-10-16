@@ -10,7 +10,9 @@ import shutil
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from datetime import timedelta
+from pathlib import Path
 from unittest import mock
 
 import yaml
@@ -402,7 +404,7 @@ class ExecutionAPITests(TestCase):
             self._step(order=2, name='定向', use_custom_scope=True,
                        project_group=pg_b.id, channel=self.ch.id, environment=self.env.id),
         ])
-        with mock.patch('apps.task_exec.runner.run', return_value=(0, 'ok', [])):
+        with mock.patch('apps.task_exec.runner.run', return_value=(0, 'ok', [], None)):
             r = c.post(f'/api/exec/tasks/{task_id}/execute/', {'server_ids': [self.server.id]}, format='json')
         self.assertEqual(r.status_code, 200)
         task = ExecutionTask.objects.get(pk=task_id)
@@ -700,7 +702,7 @@ class ExecutionAPITests(TestCase):
         TaskStep.objects.create(task=task, order=1, name='cmd', task_type='command', command='uptime')
         task.servers.add(self.server)
         ServerService.objects.filter(server=self.server).update(status='offline')
-        code, output, results = runner.run(task)
+        code, output, results, _ = runner.run(task)
         self.assertEqual(code, 1)
         self.assertIn('未规划任何服务类型', output)
         self.assertEqual(results[0]['status'], 'failed')
@@ -758,7 +760,7 @@ class ExecutionAPITests(TestCase):
         """执行落日志：trigger=execute，含全局主机快照、执行方式与模块结果。"""
         c = self._client()
         task_id = self._create_task(c, exec_mode='serial')
-        with mock.patch('apps.task_exec.runner.run', return_value=(0, 'ok', [{'order': 1, 'status': 'success'}])):
+        with mock.patch('apps.task_exec.runner.run', return_value=(0, 'ok', [{'order': 1, 'status': 'success'}], None)):
             r = c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
         self.assertEqual(r.status_code, 200)
         task = ExecutionTask.objects.get(pk=task_id)
@@ -773,7 +775,7 @@ class ExecutionAPITests(TestCase):
         """反复执行追加日志，历史输出不被覆盖。"""
         c = self._client()
         task_id = self._create_task(c)
-        with mock.patch('apps.task_exec.runner.run', side_effect=[(0, 'first run', []), (1, 'second run', [])]):
+        with mock.patch('apps.task_exec.runner.run', side_effect=[(0, 'first run', [], None), (1, 'second run', [], None)]):
             c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
             c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
         logs = TaskExecutionLog.objects.filter(task_id=task_id).order_by('id')
@@ -790,7 +792,7 @@ class ExecutionAPITests(TestCase):
         log_dir = tempfile.mkdtemp(prefix='task_logs_')
         try:
             with override_settings(TASK_LOG_DIR=log_dir):
-                with mock.patch('apps.task_exec.runner.run', return_value=(0, long_output, [])):
+                with mock.patch('apps.task_exec.runner.run', return_value=(0, long_output, [], None)):
                     task = ExecutionTask.objects.create(name='long', created_by=self.admin)
                     TaskStep.objects.create(task=task, order=1, name='cmd', task_type='command', command='echo')
                     task.servers.add(self.server)
@@ -814,7 +816,7 @@ class ExecutionAPITests(TestCase):
         """日志列表接口返回执行历史（含主机数/执行方式/模块结果），不含输出大字段。"""
         c = self._client()
         task_id = self._create_task(c, name='list-test')
-        with mock.patch('apps.task_exec.runner.run', return_value=(0, 'ok', [{'order': 1, 'status': 'success'}])):
+        with mock.patch('apps.task_exec.runner.run', return_value=(0, 'ok', [{'order': 1, 'status': 'success'}], None)):
             c.post(f'/api/exec/tasks/{task_id}/execute/', {}, format='json')
         r = c.get(f'/api/exec/tasks/{task_id}/logs/')
         data = r.json()['data']
@@ -1420,7 +1422,7 @@ class PauseStepTests(TestCase):
             ExecutionTask.objects.filter(pk=task_pk).update(pause_action=action)
 
         with mock.patch.object(runner.time, 'sleep', side_effect=_inject_action):
-            return runner.run(self.task)
+            return runner.run(self.task)[:3]
 
     def test_pause_continue(self):
         rc, output, results = self._run_with_action('continue')
@@ -1444,7 +1446,7 @@ class PauseStepTests(TestCase):
         self.step.save()
         # sleep 置空转忙等，1s 超时后返回 124
         with mock.patch.object(runner.time, 'sleep'):
-            rc, output, results = runner.run(self.task)
+            rc, output, results, _ = runner.run(self.task)
         self.assertEqual(rc, 124)
         self.assertIn('超时', output)
 
@@ -1538,7 +1540,7 @@ class ParallelStageTests(TestCase):
                 mock.patch.object(runner, '_step_servers', return_value=[object()]), \
                 mock.patch.object(runner, '_guard', return_value=None), \
                 mock.patch.object(runner, '_persist_progress'):
-            rc, output, results = runner.run(self.task)
+            rc, output, results, _ = runner.run(self.task)
         self.assertEqual(rc, 0)
         self.assertEqual([r['status'] for r in results], ['success', 'success'])
         self.assertTrue(all(r['parallel'] for r in results))
@@ -1557,7 +1559,7 @@ class ParallelStageTests(TestCase):
                 mock.patch.object(runner, '_step_servers', return_value=[object()]), \
                 mock.patch.object(runner, '_guard', return_value=None), \
                 mock.patch.object(runner, '_persist_progress'):
-            rc, output, results = runner.run(self.task)
+            rc, output, results, _ = runner.run(self.task)
         self.assertEqual(rc, 1)
         self.assertEqual([r['status'] for r in results], ['success', 'failed', 'skipped'])
         self.assertIn('中止后续 1 个模块', output)
@@ -1580,14 +1582,22 @@ class ParallelStageTests(TestCase):
         self.assertIn('不允许标记并行', r.json()['msg'])
 
 
+@override_settings(TASK_EXEC_BACKEND='sync', TASK_FAILURE_WAIT_TIMEOUT=3600,
+                   CHANNEL_LAYERS={'default': {'BACKEND': 'channels.layers.InMemoryChannelLayer'}})
 class FailureHandlingTests(TestCase):
-    """模块失败处理：暂停等待人工重试/跳过/中止，超时中止，confirm 接口按暂停类型校验动作。"""
+    """模块失败处理：失败即落 failed 并释放执行位/主机锁，断点续跑重试/跳过，终止与逾期。"""
 
     def setUp(self):
+        import tempfile
+
+        cache.clear()
         self.user = User.objects.create(username='admin_f', is_staff=True, is_superuser=True)
         self.user.set_password('Pass!2345xyz')
         self.user.save()
         self.task = ExecutionTask.objects.create(name='失败流', created_by=self.user)
+        self.log_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.log_dir, ignore_errors=True)
+        self.calls = []
 
     def _client(self, username='admin_f'):
         c = APIClient()
@@ -1601,125 +1611,296 @@ class FailureHandlingTests(TestCase):
             command='echo hi', run_parallel=parallel, timeout=30,
         )
 
-    def _run(self, handler, actions):
-        """执行任务流：handler 为命令模块假执行器；actions 为失败等待期间
-        依次注入的处理动作（借 mock 的 sleep 单线程写入，规避 SQLite 跨线程锁）。"""
-        queue = list(actions)
-        task_pk = self.task.pk
+    @contextmanager
+    def _env(self, handler):
+        """命令模块换成假执行器；主机解析/校验/锁键都打桩（不碰真实主机）。"""
+        def _record(step, *args, **kwargs):
+            self.calls.append(step.name)
+            return handler(step, *args, **kwargs)
 
-        def _inject(_seconds=None):
-            if queue:
-                ExecutionTask.objects.filter(pk=task_pk).update(pause_action=queue.pop(0))
-
-        with mock.patch.dict(runner._STEP_HANDLERS, {'command': handler}), \
+        with mock.patch.dict(runner._STEP_HANDLERS, {'command': _record}), \
                 mock.patch.object(runner, '_step_servers', return_value=[object()]), \
                 mock.patch.object(runner, '_guard', return_value=None), \
-                mock.patch.object(runner.time, 'sleep', side_effect=_inject):
-            return runner.run(self.task)
+                mock.patch('apps.task_exec.host_lock.lock_keys', return_value=[]), \
+                override_settings(TASK_LOG_DIR=self.log_dir):
+            yield
 
-    def test_retry_until_success(self):
-        """失败后人工重试：当前模块重跑成功，任务流继续且最终成功。"""
-        self._step(1, '会失败')
-        self._step(2, '后续')
-        calls = {'n': 0}
+    def _start(self):
+        from apps.task_exec import tasks
+
+        return tasks.dispatch(self.task, triggered_by=self.user)
+
+    def _act(self, action):
+        from apps.task_exec import trigger
+
+        return trigger.apply_pause_action(self.task.pk, action)
+
+    def _full_log(self, log):
+        from apps.task_exec.live import log_rel_path
+
+        return (Path(self.log_dir) / log_rel_path(self.task.pk, log.pk)).read_text(encoding='utf-8')
+
+    @staticmethod
+    def _fail_first(times=1):
+        state = {'n': 0}
 
         def handler(step, task, servers, on_data=None, **kwargs):
             if step.name == '会失败':
-                calls['n'] += 1
-                return (1, 'boom') if calls['n'] == 1 else (0, 'ok after retry')
-            return 0, 'tail ok'
+                state['n'] += 1
+                return (1, 'boom') if state['n'] <= times else (0, 'ok after retry')
+            return 0, f'{step.name} ok'
+        return handler
 
-        rc, output, results = self._run(handler, ['retry'])
-        self.assertEqual(rc, 0)
-        self.assertEqual([r['status'] for r in results], ['success', 'success'])
-        self.assertEqual(results[0]['attempts'], 2)
-        self.assertEqual(results[1]['attempts'], 1)
-        self.assertIn('重试#1', output)
-        self.assertIn('ok after retry', output)
+    def test_failure_lands_failed_immediately_and_releases(self):
+        """模块失败：执行立即落 failed（不再停在 paused 占执行位），带断点、可处理。"""
+        self._step(1, '会失败')
+        self._step(2, '后续')
+        with self._env(self._fail_first()):
+            log = self._start()
+        log.refresh_from_db()
         self.task.refresh_from_db()
-        self.assertEqual(self.task.pause_action, '')
+        self.assertEqual(log.status, 'failed')
+        self.assertEqual(self.task.status, 'failed')
+        self.assertEqual(self.task.pause_type, 'failed')
+        self.assertIsNotNone(self.task.resume_deadline)
+        self.assertEqual(log.resume_state['stage'], 0)
+        self.assertEqual(log.resume_state['names'], '会失败')
+        self.assertNotIn('timeout', log.resume_state)
+        self.assertEqual([r['status'] for r in log.steps_result], ['failed', 'pending'])
+        self.assertEqual(self.calls, ['会失败'])
+        self.assertIn('释放执行资源', self._full_log(log))
+        # 不是 running = 不持主机锁；也不算 active，可以重新发起
+        from apps.task_exec import trigger
+        self.assertFalse(trigger.is_active(self.task))
+
+    def test_retry_resumes_same_log_until_success(self):
+        """重试：沿用同一条执行记录续跑，只重跑失败模块，日志接着追加，最终成功。"""
+        self._step(1, '会失败')
+        self._step(2, '后续')
+        with self._env(self._fail_first()):
+            log = self._start()
+            first_output = self._full_log(log)
+            self.assertIsNone(self._act('retry'))
+        log.refresh_from_db()
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.logs.count(), 1)
+        self.assertEqual(log.status, 'success')
+        self.assertEqual(log.return_code, 0)
+        self.assertIsNone(log.resume_state)
         self.assertEqual(self.task.pause_type, '')
+        self.assertIsNone(self.task.resume_deadline)
+        self.assertEqual([r['status'] for r in log.steps_result], ['success', 'success'])
+        self.assertEqual([r['attempts'] for r in log.steps_result], [2, 1])
+        self.assertEqual(self.calls, ['会失败', '会失败', '后续'])
+        full = self._full_log(log)
+        self.assertTrue(full.startswith(first_output))  # 追加而不是重写
+        self.assertEqual(full.count('boom'), 1)
+        self.assertIn('重试#1', full)
+        self.assertIn('ok after retry', full)
+        self.assertEqual(self.task.output_offset, len(full))
+
+    def test_retry_fails_again_new_checkpoint(self):
+        """重试仍失败：再出断点，attempts 递增，可继续处理。"""
+        self._step(1, '会失败')
+        with self._env(self._fail_first(times=2)):
+            log = self._start()
+            self.assertIsNone(self._act('retry'))
+            log.refresh_from_db()
+            self.task.refresh_from_db()
+            self.assertEqual(log.status, 'failed')
+            self.assertEqual(self.task.pause_type, 'failed')
+            self.assertEqual(log.steps_result[0]['attempts'], 2)
+            self.assertIsNone(self._act('retry'))
+        log.refresh_from_db()
+        self.assertEqual(log.status, 'success')
+        self.assertEqual(log.steps_result[0]['attempts'], 3)
 
     def test_skip_continues_following_steps(self):
-        """失败后人工跳过：后续模块继续执行，失败模块标记 skipped_over，任务最终记失败。"""
+        """跳过：续跑后续模块，失败模块标记 skipped_over，任务最终仍记失败。"""
         self._step(1, '会失败')
         self._step(2, '后续')
+        with self._env(lambda step, *a, **k: (1, 'boom') if step.name == '会失败' else (0, 'tail ok')):
+            log = self._start()
+            self.assertIsNone(self._act('skip'))
+        log.refresh_from_db()
+        self.task.refresh_from_db()
+        self.assertEqual(log.status, 'failed')
+        self.assertEqual(log.return_code, 1)
+        self.assertEqual(self.task.pause_type, '')
+        self.assertIsNone(log.resume_state)
+        self.assertEqual([r['status'] for r in log.steps_result], ['failed', 'success'])
+        self.assertTrue(log.steps_result[0].get('skipped_over'))
+        self.assertEqual(self.calls, ['会失败', '后续'])
+        full = self._full_log(log)
+        self.assertIn('跳过失败模块', full)
+        self.assertIn('tail ok', full)
 
-        def handler(step, task, servers, on_data=None, **kwargs):
-            return (1, 'boom') if step.name == '会失败' else (0, 'tail ok')
-
-        rc, output, results = self._run(handler, ['skip'])
-        self.assertEqual(rc, 1)
-        self.assertEqual([r['status'] for r in results], ['failed', 'success'])
-        self.assertTrue(results[0].get('skipped_over'))
-        self.assertIn('跳过失败模块', output)
-        self.assertIn('tail ok', output)
-
-    def test_abort_marks_rest_skipped(self):
-        """失败后人工中止：后续模块标记 skipped。"""
+    def test_abort_finishes_without_worker(self):
+        """终止：不投递续跑，后续模块记 skipped，追加中止说明，断点清除。"""
         self._step(1, '会失败')
         self._step(2, '后续')
+        with self._env(self._fail_first()), \
+                mock.patch('apps.task_exec.trigger.schedule') as schedule:
+            log = self._start()
+            self.assertIsNone(self._act('abort'))
+        schedule.assert_not_called()
+        log.refresh_from_db()
+        self.task.refresh_from_db()
+        self.assertEqual(log.status, 'failed')
+        self.assertIsNone(log.resume_state)
+        self.assertEqual(self.task.pause_type, '')
+        self.assertEqual([r['status'] for r in log.steps_result], ['failed', 'skipped'])
+        with override_settings(TASK_LOG_DIR=self.log_dir):
+            full = self._full_log(log)
+        self.assertIn('人工确认终止', full)
+        self.assertIn('中止后续 1 个模块', full)
+        self.assertEqual(self.task.output_offset, len(full))
+        # 已收尾的不能再处理
+        self.assertIn('不在', self._act('retry'))
 
-        def handler(step, task, servers, on_data=None, **kwargs):
-            return (1, 'boom') if step.name == '会失败' else (0, 'tail ok')
+    def test_expired_rejects_and_finishes(self):
+        """逾期：点处理被拒并就地按终止收尾；beat 扫描同样收尾。"""
+        from apps.task_exec import trigger
 
-        rc, output, results = self._run(handler, ['abort'])
-        self.assertEqual(rc, 1)
-        self.assertEqual([r['status'] for r in results], ['failed', 'skipped'])
-        self.assertIn('人工确认中止', output)
-        self.assertNotIn('tail ok', output)
-
-    def test_wait_timeout_aborts(self):
-        """失败等待超时：按中止处理。"""
         self._step(1, '会失败')
         self._step(2, '后续')
+        with self._env(self._fail_first()):
+            log = self._start()
+            ExecutionTask.objects.filter(pk=self.task.pk).update(
+                resume_deadline=timezone.now() - timedelta(seconds=1))
+            error = self._act('retry')
+        self.assertIn('超过失败可处理时限', error)
+        log.refresh_from_db()
+        self.assertIsNone(log.resume_state)
+        self.assertEqual(self.calls, ['会失败'])
 
-        def handler(step, task, servers, on_data=None, **kwargs):
-            return (1, 'boom') if step.name == '会失败' else (0, 'tail ok')
+        # beat 扫描
+        self.calls.clear()
+        with self._env(self._fail_first()):
+            log2 = self._start()
+            ExecutionTask.objects.filter(pk=self.task.pk).update(
+                resume_deadline=timezone.now() - timedelta(seconds=1))
+            self.assertEqual(trigger.expire_failure_waits(), 1)
+            full = self._full_log(log2)
+        log2.refresh_from_db()
+        self.assertIsNone(log2.resume_state)
+        self.assertEqual([r['status'] for r in log2.steps_result], ['failed', 'skipped'])
+        self.assertIn('等待人工处理超时', full)
 
-        with override_settings(TASK_FAILURE_WAIT_TIMEOUT=1):
-            rc, output, results = self._run(handler, [])  # 不注入动作，sleep 空转到超时
-        self.assertEqual(rc, 1)
-        self.assertEqual([r['status'] for r in results], ['failed', 'skipped'])
-        self.assertIn('等待人工处理超时', output)
+    def test_zero_timeout_keeps_fail_fast(self):
+        """时限配置为 0：不出断点，失败即中止。"""
+        self._step(1, '会失败')
+        self._step(2, '后续')
+        with self._env(self._fail_first()), override_settings(TASK_FAILURE_WAIT_TIMEOUT=0):
+            log = self._start()
+        log.refresh_from_db()
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.pause_type, '')
+        self.assertIsNone(log.resume_state)
+        self.assertEqual([r['status'] for r in log.steps_result], ['failed', 'skipped'])
+
+    def test_relaunch_discards_checkpoint(self):
+        """重新发起：旧断点作废，旧执行记录不能再被重试唤醒。"""
+        self._step(1, '会失败')
+        with self._env(self._fail_first(times=5)):
+            first = self._start()
+            self.task.refresh_from_db()
+            self.task.pause_type = ''  # 模拟 launch 的快照重置路径
+            from apps.task_exec import trigger
+            trigger.discard_resume(self.task)
+        first.refresh_from_db()
+        self.task.refresh_from_db()
+        self.assertIsNone(first.resume_state)
+        self.assertEqual(self.task.pause_type, '')
+        self.assertIsNone(self.task.resume_deadline)
+
+    def test_resume_waits_lock_then_restores(self):
+        """续跑撞主机锁等到超时：退回失败待处理，断点保留，可再次处理。"""
+        from apps.task_exec import tasks
+
+        self._step(1, '会失败')
+        with self._env(self._fail_first()):
+            log = self._start()
+            blocker = {'task_id': 99, 'task_name': '别的任务', 'log_id': 1, 'keys': []}
+            with mock.patch('apps.task_exec.host_lock.try_acquire', return_value=blocker), \
+                    mock.patch('apps.task_exec.host_lock.describe', return_value='被占用'), \
+                    override_settings(TASK_HOST_LOCK_WAIT_TIMEOUT=0), \
+                    mock.patch.object(tasks.time, 'sleep'):
+                self.assertIsNone(self._act('retry'))
+            log.refresh_from_db()
+            self.task.refresh_from_db()
+            self.assertEqual(log.status, 'failed')
+            self.assertEqual(self.task.status, 'failed')
+            self.assertEqual(self.task.pause_type, 'failed')
+            self.assertNotIn('action', log.resume_state)
+            self.assertIn('等待主机锁超时', self._full_log(log))
+            self.assertIsNone(self._act('retry'))
+        log.refresh_from_db()
+        self.assertEqual(log.status, 'success')
 
     def test_retry_parallel_group_only_failed_members(self):
         """并行组失败重试：仅重跑失败模块，成功模块不重复执行。"""
         self._step(1, '并A', parallel=True)
         self._step(2, '并B', parallel=True)
-        calls = {'A': 0, 'B': 0}
+        state = {'B': 0}
 
         def handler(step, task, servers, on_data=None, **kwargs):
-            key = 'A' if step.name == '并A' else 'B'
-            calls[key] += 1
-            if key == 'B' and calls['B'] == 1:
-                return 1, 'B boom'
+            if step.name == '并B':
+                state['B'] += 1
+                if state['B'] == 1:
+                    return 1, 'B boom'
             return 0, f'{step.name} ok'
 
-        rc, output, results = self._run(handler, ['retry'])
-        self.assertEqual(rc, 0)
-        self.assertEqual([r['status'] for r in results], ['success', 'success'])
-        self.assertEqual(calls, {'A': 1, 'B': 2})
-        self.assertEqual(results[0]['attempts'], 1)
-        self.assertEqual(results[1]['attempts'], 2)
+        with self._env(handler), mock.patch.object(runner, '_exec_parallel_stage',
+                                                   side_effect=self._serial_parallel):
+            log = self._start()
+            self.assertEqual(log.__class__.objects.get(pk=log.pk).resume_state['failed'],
+                             [TaskStep.objects.get(name='并B').id])
+            self.assertIsNone(self._act('retry'))
+        log.refresh_from_db()
+        self.assertEqual(log.status, 'success')
+        self.assertEqual(sorted(self.calls), ['并A', '并B', '并B'])
+        self.assertEqual([r['attempts'] for r in log.steps_result], [1, 2])
+
+    @staticmethod
+    def _serial_parallel(pairs, task, total, sink, attempt=1):
+        # SQLite 测试库跨线程写会锁，并行组改成顺序跑（语义不变：全组跑完再汇总）
+        return [runner._exec_step(step, task, idx, total, sink, parallel=True, attempt=attempt)
+                for step, idx in pairs]
 
     def test_confirm_api_validates_pause_type(self):
-        """confirm 接口：失败等待仅接受 retry/skip/abort，暂停确认仅接受 continue/abort。"""
+        """confirm 接口：失败待处理仅接受 retry/skip/abort，暂停确认仅接受 continue/abort。"""
+        self._step(1, '会失败')
         c = self._client()
-        ExecutionTask.objects.filter(pk=self.task.pk).update(status='paused', pause_type='failed')
-        r = c.post(f'/api/exec/tasks/{self.task.id}/confirm/', {'action': 'continue'}, format='json')
-        self.assertEqual(r.status_code, 400)
-        self.assertIn('retry/skip/abort', r.json()['msg'])
-        r = c.post(f'/api/exec/tasks/{self.task.id}/confirm/', {'action': 'retry'}, format='json')
-        self.assertEqual(r.status_code, 200)
+        with self._env(self._fail_first()):
+            self._start()
+            r = c.post(f'/api/exec/tasks/{self.task.id}/confirm/', {'action': 'continue'}, format='json')
+            self.assertEqual(r.status_code, 400)
+            self.assertIn('retry/skip/abort', r.json()['msg'])
+            r = c.post(f'/api/exec/tasks/{self.task.id}/confirm/', {'action': 'retry'}, format='json')
+            self.assertEqual(r.status_code, 200)
         self.task.refresh_from_db()
-        self.assertEqual(self.task.pause_action, 'retry')
+        self.assertEqual(self.task.status, 'success')
 
         ExecutionTask.objects.filter(pk=self.task.pk).update(
             status='paused', pause_type='confirm', pause_action='')
         r = c.post(f'/api/exec/tasks/{self.task.id}/confirm/', {'action': 'skip'}, format='json')
         self.assertEqual(r.status_code, 400)
         self.assertIn('continue/abort', r.json()['msg'])
+
+    def test_paused_filter_includes_failure_wait(self):
+        """列表「等待处理」筛选包含未逾期的失败待处理。"""
+        self._step(1, '会失败')
+        with self._env(self._fail_first()):
+            self._start()
+        c = self._client()
+        r = c.get('/api/exec/tasks/', {'status': 'paused'})
+        ids = [t['id'] for t in r.json()['data']['results']]
+        self.assertIn(self.task.id, ids)
+        ExecutionTask.objects.filter(pk=self.task.pk).update(
+            resume_deadline=timezone.now() - timedelta(seconds=1))
+        r = c.get('/api/exec/tasks/', {'status': 'paused'})
+        self.assertNotIn(self.task.id, [t['id'] for t in r.json()['data']['results']])
 
 
 class RunStreamTests(TestCase):
@@ -3346,7 +3527,7 @@ class HostLockTests(TestCase):
         self.addCleanup(shutil.rmtree, log_dir, True)
         with override_settings(TASK_LOG_DIR=log_dir), self._patch_keys(), \
                 mock.patch('apps.task_exec.tasks.time.sleep', side_effect=_finish_holder) as sleep, \
-                mock.patch.object(runner, 'run', return_value=(0, 'ok', [])):
+                mock.patch.object(runner, 'run', return_value=(0, 'ok', [], None)):
             _run_until_done(self.task.id, self.log.id)
         sleep.assert_called_once()
         self.log.refresh_from_db()

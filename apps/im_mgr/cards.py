@@ -16,6 +16,7 @@ handlers 从这里 import，两边不会各写一份字符串。value 会原样�
   剩下的日志直接当 markdown 渲染；
 - **模块列表要截断**：卡片有大小上限，一条 50 个模块的任务流全渲染出来会超。
 """
+from django.utils import timezone
 
 # ── 按钮动作常量（handlers 与本模块共用）──
 ACT_PICK_TASK = 'pick_task'       # 下拉选中一条任务
@@ -379,6 +380,11 @@ def pause(task, log, pause_type, *, current_step=None, tail=None, url=None):
            f'**范围**：{scope_line(task)}　{env_tag(task)}'),
     ]
     if kind == 'failed':
+        deadline = getattr(task, 'resume_deadline', None)
+        if deadline:
+            # 失败已落终态、不占执行资源，但处理窗口有限，过了就只能重新发起
+            elements.append(note(
+                f'{timezone.localtime(deadline):%m-%d %H:%M} 前未处理将按终止处理'))
         block = log_block(tail)
         if block:
             elements.append(block)
