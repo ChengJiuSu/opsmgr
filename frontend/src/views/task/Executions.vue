@@ -279,43 +279,51 @@
             <el-option v-for="d in dictOptions.envs" :key="d.id" :label="d.name" :value="d.id" />
           </el-select>
         </div>
-        <div class="form-tip">
+        <div class="form-tip scope-tip">
           模块默认的主机范围，项目组/渠道/环境<b>必选</b>，当前匹配
           <b :class="{ danger: matchedCount === 0 }">{{ matchedCount ?? '…' }}</b> 台可执行主机；
           模块可单独覆盖范围与服务类型，具体主机在「执行」时确认
         </div>
-        <!-- 关闭后执行表单不预勾选，必须人工挑主机（后端同样拒绝缺省 server_ids） -->
-        <el-checkbox v-model="form.default_select_all" size="small" @change="onSelectAllChange">
-          执行时默认全选范围主机
-        </el-checkbox>
-        <span class="form-tip" style="margin:0 0 0 8px">
-          取消后发起执行时不预勾选，必须人工确认要跑哪些主机
-        </span>
-        <br />
-        <!-- 飞书执行：默认关，且依赖「默认全选」——飞书里没法逐模块勾主机 -->
-        <el-checkbox
-          v-model="form.im_enabled"
-          size="small"
-          :disabled="!form.default_select_all"
-        >
-          允许从飞书发起执行
-        </el-checkbox>
-        <span class="form-tip" style="margin:0 0 0 8px">
-          {{ form.default_select_all
-            ? '开启后该任务会出现在飞书的任务下拉里；生产环境仍需卡片二次确认'
-            : '需先勾选「执行时默认全选范围主机」——飞书里无法逐模块勾选主机' }}
-        </span>
-        <br />
-        <!-- 消息通知：默认开；测试任务跑得频繁，关掉免得把通知群刷屏 -->
-        <span class="notify-switch">
-          <el-switch v-model="form.notify_enabled" size="small" />
-          <span style="margin-left:8px">消息通知</span>
-        </span>
-        <span class="form-tip" style="margin:0 0 0 8px">
-          {{ form.notify_enabled
-            ? '执行成功 / 失败按「系统管理 → 消息通知」的订阅规则发送'
-            : '已关闭：该任务的执行结果不发任何群通知（测试任务建议关闭）' }}
-        </span>
+      </el-form-item>
+
+      <!-- 执行选项：每项一行，左侧开关、右侧说明，避免挤在一行 -->
+      <el-form-item label="执行选项">
+        <div class="exec-options">
+          <!-- 关闭后执行表单不预勾选，必须人工挑主机（后端同样拒绝缺省 server_ids） -->
+          <div class="exec-option">
+            <el-checkbox v-model="form.default_select_all" size="small" @change="onSelectAllChange">
+              执行时默认全选范围主机
+            </el-checkbox>
+            <span class="exec-option-tip">取消后发起执行时不预勾选，必须人工确认要跑哪些主机</span>
+          </div>
+          <!-- 飞书执行：默认关，且依赖「默认全选」——飞书里没法逐模块勾主机 -->
+          <div class="exec-option">
+            <el-checkbox
+              v-model="form.im_enabled"
+              size="small"
+              :disabled="!form.default_select_all"
+            >
+              允许从飞书发起执行
+            </el-checkbox>
+            <span class="exec-option-tip" :class="{ warn: !form.default_select_all }">
+              {{ form.default_select_all
+                ? '开启后该任务会出现在飞书的任务下拉里；生产环境仍需卡片二次确认'
+                : '需先勾选「执行时默认全选范围主机」——飞书里无法逐模块勾选主机' }}
+            </span>
+          </div>
+          <!-- 消息通知：默认开；测试任务跑得频繁，关掉免得把通知群刷屏 -->
+          <div class="exec-option">
+            <span class="notify-switch">
+              <el-switch v-model="form.notify_enabled" size="small" />
+              <span style="margin-left:8px">消息通知</span>
+            </span>
+            <span class="exec-option-tip">
+              {{ form.notify_enabled
+                ? '执行成功 / 失败按「系统管理 → 消息通知」的订阅规则发送'
+                : '已关闭：该任务的执行结果不发任何群通知（测试任务建议关闭）' }}
+            </span>
+          </div>
+        </div>
       </el-form-item>
 
       <!-- 任务流模块列表：流程图 + 左模块树 + 右单模块编辑（与执行弹窗一致） -->
@@ -1746,6 +1754,24 @@ onUnmounted(() => {
   align-items: center;
   font-size: 12px;
 }
+.scope-tip { width: 100%; }
+/* 执行选项：浅底卡片内逐行排列，左列控件定宽对齐、右列说明 */
+.exec-options {
+  width: 100%;
+  padding: 4px 12px;
+  background: var(--el-fill-color-lighter);
+  border-radius: 4px;
+}
+.exec-option {
+  display: grid;
+  grid-template-columns: 180px 1fr;
+  align-items: center;
+  column-gap: 12px;
+  min-height: 30px;
+}
+.exec-option + .exec-option { border-top: 1px dashed var(--el-border-color-lighter); }
+.exec-option-tip { color: #909399; font-size: 12px; line-height: 1.5; }
+.exec-option-tip.warn { color: var(--el-color-warning); }
 .queue-hint {
   margin-left: 8px;
   font-size: 12px;
