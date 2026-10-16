@@ -556,3 +556,114 @@ class RenderTests(NotifyBase):
         event = NotifyEvent.objects.create(code=source.EVENT_FAILED, dedupe_key='gone',
                                            source_type=source.SOURCE_TYPE, source_id='999999')
         self.assertIsNone(source.build(event))
+
+
+# ══════════════════════════════════════════════════════════
+# 角色权限：独立模块 notify（none / read / write）
+# ══════════════════════════════════════════════════════════
+
+class NotifyRolePermissionTests(NotifyBase):
+    def _client_with(self, username, role=None, permissions=None, sudo=True):
+        from apps.auth_mgr.models import Role
+
+        if role is None:
+            role = Role.objects.create(name=username, code=username,
+                                       permissions=permissions or {})
+        user = get_user_model().objects.create(username=username, role=role)
+        user.set_password(PASSWORD)
+        user.save()
+        client = APIClient()
+        resp = client.post('/api/auth/login/',
+                           {'username': username, 'password': PASSWORD}, format='json')
+        client.credentials(HTTP_AUTHORIZATION='Bearer ' + resp.json()['access'])
+        if sudo:
+            grant_sudo(client)
+        return client
+
+    def test_read_level_can_view_only(self):
+        client = self._client_with('nt_reader', permissions={'notify': 'read'})
+        for url in ('/api/notify/events/', '/api/notify/chats/', '/api/notify/rules/',
+                    '/api/notify/robots/', '/api/notify/deliveries/'):
+            self.assertEqual(client.get(url).status_code, 200, url)
+        # 没有 read_create 档：新增按可选档向上取整到 write
+        resp = client.post('/api/notify/robots/', {'name': 'x', 'hook_token': TOKEN},
+                           format='json')
+        self.assertEqual(resp.status_code, 403)
+        with patch('apps.notify_mgr.webhook._post', return_value={'code': 0}) as post:
+            resp = client.post(f'/api/notify/robots/{self.robot.pk}/test/')
+        self.assertEqual(resp.status_code, 403)
+        post.assert_not_called()
+
+    def test_write_level_without_system(self):
+        """配告警规则不需要系统配置档（那里含 LDAP / SMTP 口令）。"""
+        client = self._client_with('nt_writer', permissions={'notify': 'write'})
+        resp = client.post('/api/notify/robots/', {'name': '值班', 'hook_token': TOKEN},
+                           format='json')
+        self.assertEqual(resp.status_code, 201, resp.content)
+        resp = client.post('/api/notify/rules/', {
+            'name': 'r', 'events': ALL_EVENTS,
+            'target_type': 'feishu_chat', 'feishu_chat': self.chat.pk}, format='json')
+        self.assertEqual(resp.status_code, 201, resp.content)
+        # 会话下拉走 notify 自己的接口；会话白名单管理仍是 system 档
+        chats = client.get('/api/notify/chats/').json()['data']
+        self.assertEqual(chats[0]['name'], '运维群')
+        self.assertNotIn('chat_id', chats[0])
+        self.assertEqual(client.get('/api/feishu/channels/').status_code, 403)
+
+    def test_system_level_alone_no_longer_enough(self):
+        client = self._client_with('nt_sys', permissions={'system': 'write', 'notify': 'none'})
+        self.assertEqual(client.get('/api/notify/rules/').status_code, 403)
+
+    def test_write_requires_sudo(self):
+        client = self._client_with('nt_nosudo', permissions={'notify': 'write'}, sudo=False)
+        resp = client.post('/api/notify/robots/', {'name': 'x', 'hook_token': TOKEN},
+                           format='json')
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json().get('error_code'), 'sudo_required')
+
+    def test_builtin_roles(self):
+        from apps.auth_mgr.models import Role
+
+        self.assertEqual(Role.objects.get(code='super').level_for('notify'), 'write')
+        self.assertEqual(Role.objects.get(code='ops_admin').level_for('notify'), 'write')
+        self.assertEqual(Role.objects.get(code='ops_member').level_for('notify'), 'none')
+        client = self._client_with('nt_ops', role=Role.objects.get(code='ops_admin'))
+        self.assertEqual(client.get('/api/notify/rules/').status_code, 200)
+
+    def test_role_meta_lists_module(self):
+        client = self._client()
+        meta = client.get('/api/auth/roles/meta/').json()['data']
+        module = next(m for m in meta['modules'] if m['value'] == 'notify')
+        self.assertEqual([lv['value'] for lv in module['levels']], ['none', 'read', 'write'])
+        group = next(g for g in meta['groups'] if g['label'] == '系统管理')
+        self.assertIn('notify', group['modules'])
+
+    def _client(self):
+        return NotifyApiTests._client(self)
+
+
+class GrantNotifyMigrationTests(TestCase):
+    """auth_mgr 0011：存量角色补 notify 档，只补缺失键，自定义角色跟随 system。"""
+
+    def _run(self):
+        import importlib
+
+        from django.apps import apps as django_apps
+
+        mig = importlib.import_module('apps.auth_mgr.migrations.0011_grant_notify_module')
+        mig.forwards(django_apps, None)
+
+    def test_custom_roles_follow_system(self):
+        from apps.auth_mgr.models import Role
+
+        sys_admin = Role.objects.create(name='配置管理员', code='cfg',
+                                        permissions={'system': 'write'})
+        viewer = Role.objects.create(name='只读', code='viewer', permissions={'cmdb': 'read'})
+        configured = Role.objects.create(name='已配置', code='done',
+                                         permissions={'system': 'write', 'notify': 'read'})
+        self._run()
+        for role in (sys_admin, viewer, configured):
+            role.refresh_from_db()
+        self.assertEqual(sys_admin.permissions['notify'], 'write')
+        self.assertEqual(viewer.permissions['notify'], 'none')
+        self.assertEqual(configured.permissions['notify'], 'read')   # 不覆盖已配过的

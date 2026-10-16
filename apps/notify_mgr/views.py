@@ -1,8 +1,15 @@
 """消息通知配置面接口。
 
-权限与飞书接入同一档：`module_perm('system', min_level='write')` + 写操作 sudo。
-群机器人 token 等于往群里发消息的凭据，订阅规则决定生产失败会不会被看见，
-都按系统配置对待；发送记录里有任务名与失败原因，读也只给同一档。
+权限走独立模块 `module_perm('notify')`（可选档 none / read / write，见 roles.py）：
+
+- read：看规则、打码后的机器人、发送记录——排查「为什么没收到」用；
+- write：新增 / 修改 / 删除规则与机器人、发测试消息。模块没有 read_create 档，
+  POST 按可选档向上取整到 write——新增一条规则就是把执行结果发到一个新的群，
+  与改规则同等敏感；
+- 写操作叠 sudo：群机器人 token 等于往群里发消息的凭据。
+
+不再挂在 `system` 上：系统配置含 LDAP / SMTP 口令，为了配一条告警规则把这些
+一起给出去，授权只能按最危险的那一项来给。
 """
 from django.db.models import Q
 from drf_spectacular.types import OpenApiTypes
@@ -20,7 +27,7 @@ from . import dispatch, events
 from .models import NotifyDelivery, NotifyRule, WebhookRobot
 from .serializers import NotifyDeliverySerializer, NotifyRuleSerializer, WebhookRobotSerializer
 
-CONFIG_PERMISSIONS = [module_perm('system', min_level='write'), SudoRequired]
+PERMISSIONS = [module_perm('notify'), SudoRequired]
 
 
 def _bool_param(request, name):
@@ -31,11 +38,31 @@ def _bool_param(request, name):
 class NotifyEventTypeView(APIView):
     """GET /api/notify/events/ —— 可订阅的通知事件清单（代码里注册的）。"""
 
-    permission_classes = CONFIG_PERMISSIONS
+    permission_classes = PERMISSIONS
 
     @extend_schema(responses=OpenApiTypes.OBJECT)
     def get(self, request):
         return ok(events.choices())
+
+
+class NotifyChatOptionsView(APIView):
+    """GET /api/notify/chats/ —— 规则表单的「应用机器人会话」下拉。
+
+    会话白名单的管理接口在 `/api/feishu/channels/`，要 system 档；只为了在规则里
+    选一个会话就要求 system，等于把系统配置一起给出去。这里只回下拉需要的几个字段。
+    """
+
+    permission_classes = PERMISSIONS
+
+    @extend_schema(responses=OpenApiTypes.OBJECT)
+    def get(self, request):
+        from apps.im_mgr.models import FeishuChannel
+
+        return ok([
+            {'id': c.id, 'name': c.name, 'chat_type': c.chat_type,
+             'chat_type_display': c.get_chat_type_display(), 'enabled': c.enabled}
+            for c in FeishuChannel.objects.order_by('name')
+        ])
 
 
 class WebhookRobotViewSet(viewsets.ModelViewSet):
@@ -43,7 +70,7 @@ class WebhookRobotViewSet(viewsets.ModelViewSet):
 
     queryset = WebhookRobot.objects.all()
     serializer_class = WebhookRobotSerializer
-    permission_classes = CONFIG_PERMISSIONS
+    permission_classes = PERMISSIONS
     pagination_class = StandardPagination
 
     def get_queryset(self):
@@ -72,7 +99,7 @@ class NotifyRuleViewSet(viewsets.ModelViewSet):
     queryset = (NotifyRule.objects.select_related('feishu_chat', 'webhook_robot')
                 .prefetch_related('project_groups', 'channels', 'environments'))
     serializer_class = NotifyRuleSerializer
-    permission_classes = CONFIG_PERMISSIONS
+    permission_classes = PERMISSIONS
     pagination_class = StandardPagination
 
     def get_queryset(self):
@@ -107,7 +134,7 @@ class NotifyDeliveryViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
 
     queryset = NotifyDelivery.objects.select_related('event')
     serializer_class = NotifyDeliverySerializer
-    permission_classes = CONFIG_PERMISSIONS
+    permission_classes = PERMISSIONS
     pagination_class = StandardPagination
 
     def get_queryset(self):

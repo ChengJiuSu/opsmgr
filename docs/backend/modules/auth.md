@@ -347,6 +347,7 @@ PUT/PATCH/DELETE → `write`；未知方法当 `write`（fail-closed）。推出
 | 系统管理 | `agent` | Agent 与执行通道路由 |
 | | `account` | 用户、角色与 API 凭证 |
 | | `system` | 系统配置 |
+| | `notify` | 消息通知（订阅规则、群机器人、发送记录）|
 | | `audit` | 操作审计 |
 
 **为什么从 8 个拆到 13 个**：第一版按「一个业务 app」切，结果四处「给 A 就顺带
@@ -375,6 +376,7 @@ PUT/PATCH/DELETE → `write`；未知方法当 `write`（fail-closed）。推出
 | `cloud_account` | none / read / write | read 只够在域名/证书页选账号（AccessKey 打码、Secret 不回显）|
 | `account` | none / write | 用户 / 角色 / API 凭证是身份与提权面 |
 | `system` | none / write | 系统配置含 LDAP / SMTP 等连接口令，读即泄露 |
+| `notify` | none / read / write | 新增规则 / 机器人 = 把执行结果（含失败日志尾段）发到一个新群，不比修改轻；read 只见打码 token 与发送记录 |
 
 收窄同时定义了方法档位的取整规则（`roles.required_level(method, module)`）：
 取不到更强的可选档就 fail-closed 要 `write`。配得出来但点了不生效的档比没有这个
@@ -389,6 +391,7 @@ PUT/PATCH/DELETE → `write`；未知方法当 `write`（fail-closed）。推出
 | 服务器 / 服务器分配 / 任务流 | `dict` read（项目组 / 环境 / 渠道等筛选项）|
 | 服务器编辑的「执行通道」 | `agent` read（Agent 下拉）|
 | 域名 / 证书 | `cloud_account` read（账号下拉）；证书部署还要 `cmdb` read + `credential` read |
+| 消息通知 | `dict` read（规则的项目组 / 渠道 / 环境下拉；不给则只能配「不限」）。会话下拉走 `/api/notify/chats/`，**不需要** `system` |
 
 前端对这些下拉逐个按模块判权限再取，缺哪个就少哪个下拉——不会因为一个 403 把
 整页选项都带走。

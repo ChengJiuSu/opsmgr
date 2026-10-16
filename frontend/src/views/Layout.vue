@@ -78,7 +78,7 @@
           <el-menu-item v-if="authStore.can('account', 'write')" index="/system/api-credentials">API 凭证</el-menu-item>
           <el-menu-item v-if="authStore.can('system', 'write')" index="/system/configs">系统配置</el-menu-item>
           <el-menu-item v-if="authStore.can('system', 'write')" index="/system/feishu">飞书接入</el-menu-item>
-          <el-menu-item v-if="authStore.can('system', 'write')" index="/system/notify">消息通知</el-menu-item>
+          <el-menu-item v-if="authStore.can('notify')" index="/system/notify">消息通知</el-menu-item>
           <el-menu-item v-if="authStore.can('account', 'write')" index="/system/feishu-bindings">飞书绑定</el-menu-item>
         </el-sub-menu>
         <el-menu-item v-if="authStore.can('audit')" index="/audit/logs">
@@ -194,7 +194,7 @@ const canTask = computed(() => ['exec', 'variable', 'artifact', 'credential']
   .some((module) => authStore.can(module)) || authStore.can('method', 'write'))
 const canSystem = computed(() =>
   authStore.can('account', 'write') || authStore.can('agent')
-  || authStore.can('system', 'write'))
+  || authStore.can('system', 'write') || authStore.can('notify'))
 
 // sudo 窗口剩余秒数：每 10s 刷一次，到点标签自动消失
 const sudoLeft = ref(sudoRemaining())

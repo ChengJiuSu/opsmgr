@@ -2,7 +2,7 @@
 
 **路由前缀：** `/api/notify/`
 **App Label：** `notify_mgr`
-**权限：** `module_perm('system', min_level='write')`，写操作叠 `SudoRequired`
+**权限：** 独立模块 `module_perm('notify')`（可选档 none / read / write），写操作叠 `SudoRequired`
 
 ---
 
@@ -116,6 +116,7 @@ events.emit('workflow.failed', source_type='workflow.run', source_id=run.id,
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/api/notify/events/` | 可订阅事件清单 `[{code, label, group, default}]` |
+| GET | `/api/notify/chats/` | 规则表单的应用机器人会话下拉（id / 名称 / 类型 / 启用，不含 chat_id）|
 | GET/POST | `/api/notify/robots/` | 群机器人列表 / 新增（`?keyword` `?enabled`） |
 | GET/PATCH/DELETE | `/api/notify/robots/{id}/` | 详情 / 修改 / 删除（连带删除发往它的规则） |
 | POST | `/api/notify/robots/{id}/test/` | 发测试消息；失败 400 带飞书错误信息 |
@@ -134,6 +135,21 @@ events.emit('workflow.failed', source_type='workflow.run', source_id=run.id,
 | `NotifyRule.target_type` | `feishu_chat` 必须选会话，`feishu_webhook` 必须选机器人；保存时清空另一种目标 |
 
 ---
+
+## 权限
+
+| 档 | 能做什么 |
+|----|---------|
+| `none` | 菜单不可见 |
+| `read` | 查看规则、群机器人（token 打码）、发送记录 |
+| `write` | 增删改规则与机器人、测试发送（叠 sudo）|
+
+- 没有 `read_create`：新增一条规则 / 机器人就是把执行结果发到一个新群，POST 向上取整到 write。
+- 从 `system` 拆出：配告警不该顺带拿到 LDAP / SMTP 口令。会话下拉因此有自己的
+  `/api/notify/chats/`，不走要 system 档的 `/api/feishu/channels/`。
+- 出厂矩阵：super / ops_admin = write，ops_member = none。存量角色由
+  `auth_mgr.0011_grant_notify_module` 补齐：自定义角色跟随其 `system` 档（write → write，否则 none），
+  已配过的不覆盖。
 
 ## 异步与保留
 

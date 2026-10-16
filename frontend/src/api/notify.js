@@ -3,6 +3,8 @@ import request from '../utils/request'
 // ── 消息通知（system 模块 write 档，写操作 sudo）──
 // 可订阅的事件清单由后端代码注册（events.register），页面不写死
 export const getEventTypes = () => request.get('/api/notify/events/')
+// 规则表单的会话下拉：只要 notify 档，不必为选会话去开 system（飞书会话白名单管理）
+export const getChatOptions = () => request.get('/api/notify/chats/')
 
 // 群机器人：token / 签名密钥只写不回显，留空表示不修改
 export const getRobots = (params) => request.get('/api/notify/robots/', { params })

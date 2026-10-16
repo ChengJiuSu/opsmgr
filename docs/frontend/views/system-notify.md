@@ -1,6 +1,6 @@
 # 消息通知（`views/system/Notify.vue`）
 
-**路由：** `/system/notify`　**权限：** `meta.perm = ['system', 'write']`
+**路由：** `/system/notify`　**权限：** `meta.perm = ['notify', 'read']`；`notify` write 才显示新增 / 编辑 / 删除 / 测试与启用开关
 **菜单：** 系统管理 → 消息通知（「飞书接入」之后）
 **接口：** `src/api/notify.js` → `/api/notify/`（见 [notify_mgr](../../backend/modules/notify_mgr.md)）
 
@@ -13,7 +13,8 @@
 - 表单：事件多选按后端注册的分组渲染（`/api/notify/events/`，新增规则默认全选
   `default=true` 的事件）；发送方式默认「群机器人」，切到「应用机器人」时选「飞书接入」
   登记的会话（停用的置灰）；项目组 / 渠道 / 环境多选，留空不限。
-- 打开弹窗时现拉会话与机器人下拉，刚新增的机器人不用刷新页面。
+- 打开弹窗时现拉会话（`/api/notify/chats/`）与机器人下拉，刚新增的机器人不用刷新页面。
+- 没有 `dict` 档时不取维度下拉（规则只能配「不限」），不会因 403 把整页选项带走。
 
 ## 群机器人
 

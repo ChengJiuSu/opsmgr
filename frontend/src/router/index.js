@@ -203,7 +203,7 @@ const router = createRouter({
           path: 'system/notify',
           name: 'SystemNotify',
           component: () => import('../views/system/Notify.vue'),
-          meta: { title: '消息通知', perm: ['system', 'write'] },
+          meta: { title: '消息通知', perm: ['notify', 'read'] },
         },
         {
           // 绑定关系决定「哪个飞书号能以哪个平台账号进来」，属身份面 → account

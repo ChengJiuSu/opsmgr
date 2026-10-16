@@ -94,16 +94,17 @@ MODULES = {
     'agent': 'Agent 与执行通道',
     'account': '用户、角色与 API 凭证',
     'system': '系统配置',
+    'notify': '消息通知（订阅规则、群机器人、发送记录）',
     'audit': '操作审计',
 }
 
-#: 页面分组：角色页按这个顺序分块渲染（13 个模块平铺成一行行单选框没法看）。
+#: 页面分组：角色页按这个顺序分块渲染（十几个模块平铺成一行行单选框没法看）。
 #: 与侧边栏菜单同构，配角色的人不用在脑子里做一次「模块标识 → 我点哪个菜单」的翻译。
 MODULE_GROUPS = (
     ('资产与配置', ('cmdb', 'dict', 'topo')),
     ('任务执行', ('exec', 'method', 'variable', 'artifact', 'credential')),
     ('云控管理', ('cloud', 'cloud_account')),
-    ('系统管理', ('agent', 'account', 'system', 'audit')),
+    ('系统管理', ('agent', 'account', 'system', 'notify', 'audit')),
 )
 
 #: 模块的可选档位（未列出 = 四档全可选）。收窄理由逐条写在值后面。
@@ -123,6 +124,9 @@ MODULE_LEVELS = {
     'system': ('none', 'write'),
     # 建 Agent 会下发一次性 token、重置 token 能顶掉现网连接，新增不比修改轻
     'agent': ('none', 'read', 'write'),
+    # 新增一条规则 / 一个群机器人 = 把执行结果（含失败日志尾段）发到一个新的群，
+    # 与改规则同等敏感，不给中间档。read 只看得到打码的 token 与发送记录
+    'notify': ('none', 'read', 'write'),
 }
 
 #: HTTP 方法 → 所需最低权限档（再由 required_level 向上取整到模块可选档）
@@ -156,6 +160,8 @@ BUILTIN_ROLES = (
             'cloud': 'write',
             'credential': 'read', 'agent': 'read', 'audit': 'read',
             'cloud_account': 'read', 'account': 'none', 'system': 'none',
+            # 告警发到哪个群是日常运维的事，不必为此开系统配置
+            'notify': 'write',
         },
     },
     {
@@ -168,6 +174,7 @@ BUILTIN_ROLES = (
             'cloud': 'read', 'audit': 'read',
             'credential': 'none', 'cloud_account': 'none',
             'agent': 'none', 'account': 'none', 'system': 'none',
+            'notify': 'none',
         },
     },
 )

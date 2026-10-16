@@ -18,7 +18,7 @@
               <el-option label="群机器人" value="feishu_webhook" />
             </el-select>
           </div>
-          <el-button type="primary" :icon="Plus" @click="openRule()">新增规则</el-button>
+          <el-button v-if="canWrite" type="primary" :icon="Plus" @click="openRule()">新增规则</el-button>
         </div>
 
         <el-table v-loading="ruleLoading" :data="rules" stripe>
@@ -54,10 +54,13 @@
           </el-table-column>
           <el-table-column label="状态" width="80">
             <template #default="{ row }">
-              <el-switch v-model="row.enabled" size="small" @change="toggleRule(row)" />
+              <el-switch v-if="canWrite" v-model="row.enabled" size="small" @change="toggleRule(row)" />
+              <el-tag v-else :type="row.enabled ? 'success' : 'info'" size="small">
+                {{ row.enabled ? '启用' : '停用' }}
+              </el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="220" fixed="right">
+          <el-table-column v-if="canWrite" label="操作" width="220" fixed="right">
             <template #default="{ row }">
               <el-button size="small" :icon="Promotion" @click="handleTestRule(row)">测试</el-button>
               <el-button size="small" :icon="Edit" @click="openRule(row)">编辑</el-button>
@@ -87,7 +90,7 @@
         <div class="toolbar">
           <el-input v-model="robotQuery.keyword" placeholder="搜索机器人名称 / 备注" clearable
                     :prefix-icon="Search" style="width:220px" @change="reloadRobots" />
-          <el-button type="primary" :icon="Plus" @click="openRobot()">新增机器人</el-button>
+          <el-button v-if="canWrite" type="primary" :icon="Plus" @click="openRobot()">新增机器人</el-button>
         </div>
 
         <el-table v-loading="robotLoading" :data="robots" stripe>
@@ -119,7 +122,7 @@
               <span v-else class="unset">—</span>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="220" fixed="right">
+          <el-table-column v-if="canWrite" label="操作" width="220" fixed="right">
             <template #default="{ row }">
               <el-button size="small" :icon="Promotion" @click="handleTestRobot(row)">测试</el-button>
               <el-button size="small" :icon="Edit" @click="openRobot(row)">编辑</el-button>
@@ -316,11 +319,14 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, Edit, Plus, Promotion, Refresh, Search } from '@element-plus/icons-vue'
 import {
   createRobot, createRule, deleteRobot, deleteRule, getDeliveries, getEventTypes,
-  getRobots, getRules, patchRule, testRobot, testRule, updateRobot, updateRule,
+  getChatOptions, getRobots, getRules, patchRule, testRobot, testRule, updateRobot, updateRule,
 } from '../../api/notify'
-import { getChannels } from '../../api/feishu'
 import { channelApi, environmentApi, fetchDictOptions, projectGroupApi } from '../../api/assets'
+import { useAuthStore } from '../../stores/auth'
 
+const authStore = useAuthStore()
+// 只读档（notify=read）只能看规则、机器人与发送记录，增删改与测试发送都要 write
+const canWrite = computed(() => authStore.can('notify', 'write'))
 const activeTab = ref('rules')
 const submitting = ref(false)
 
@@ -357,13 +363,16 @@ function eventTagType(label) {
 }
 
 async function loadOptions() {
-  const [types, projects, channels, envs] = await Promise.all([
-    getEventTypes(),
+  const types = await getEventTypes()
+  eventTypes.value = types.data
+  // 维度下拉要 dict 档：没给就不取，规则仍可保存（维度留空 = 不限），
+  // 不能因为一个 403 把整页选项都带走
+  if (!authStore.can('dict')) return
+  const [projects, channels, envs] = await Promise.all([
     fetchDictOptions(projectGroupApi),
     fetchDictOptions(channelApi),
     fetchDictOptions(environmentApi),
   ])
-  eventTypes.value = types.data
   dictOptions.projects = projects.data.results
   dictOptions.channels = channels.data.results
   dictOptions.envs = envs.data.results
@@ -371,10 +380,10 @@ async function loadOptions() {
 
 async function loadTargetOptions() {
   const [chats, robots] = await Promise.all([
-    getChannels({ page_size: 200 }),
+    getChatOptions(),
     getRobots({ page_size: 200 }),
   ])
-  chatOptions.value = chats.data.results
+  chatOptions.value = chats.data
   robotOptions.value = robots.data.results
 }
 
