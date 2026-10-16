@@ -32,7 +32,13 @@
     </div>
 
     <el-table v-loading="loading" :data="tableData" stripe>
-      <el-table-column prop="name" label="任务名称" min-width="130" show-overflow-tooltip />
+      <el-table-column prop="name" label="任务名称" min-width="130" show-overflow-tooltip>
+        <template #default="{ row }">
+          {{ row.name }}
+          <el-tag v-if="row.notify_enabled === false" type="info" size="small" class="notify-off"
+                  title="该任务已关闭消息通知">通知关</el-tag>
+        </template>
+      </el-table-column>
       <el-table-column label="任务流" min-width="180">
         <template #default="{ row }">
           <el-tooltip :content="flowTooltip(row)" placement="top">
@@ -298,6 +304,17 @@
           {{ form.default_select_all
             ? '开启后该任务会出现在飞书的任务下拉里；生产环境仍需卡片二次确认'
             : '需先勾选「执行时默认全选范围主机」——飞书里无法逐模块勾选主机' }}
+        </span>
+        <br />
+        <!-- 消息通知：默认开；测试任务跑得频繁，关掉免得把通知群刷屏 -->
+        <span class="notify-switch">
+          <el-switch v-model="form.notify_enabled" size="small" />
+          <span style="margin-left:8px">消息通知</span>
+        </span>
+        <span class="form-tip" style="margin:0 0 0 8px">
+          {{ form.notify_enabled
+            ? '执行成功 / 失败按「系统管理 → 消息通知」的订阅规则发送'
+            : '已关闭：该任务的执行结果不发任何群通知（测试任务建议关闭）' }}
         </span>
       </el-form-item>
 
@@ -875,6 +892,7 @@ const emptyForm = () => ({
   id: null, name: '',
   project_group: null, channel: null, environment: null,
   forks: 10, credential: null, default_select_all: true, im_enabled: false,
+  notify_enabled: true,
   steps: [emptyStep()],
 })
 const form = reactive(emptyForm())
@@ -996,6 +1014,7 @@ async function openForm(row) {
       forks: row.exec_mode === 'serial' ? 1 : (row.forks || 10), credential: row.credential || null,
       default_select_all: row.default_select_all !== false,
       im_enabled: !!row.im_enabled,
+      notify_enabled: row.notify_enabled !== false,
       steps: (row.steps || []).map((s) => ({
         name: s.name, task_type: s.task_type, command: s.command || '',
         playbook: s.playbook || '', pbMethod: null, method: s.method || null,
@@ -1076,6 +1095,7 @@ function buildPayload() {
     forks: form.forks || 10, credential: form.credential,
     default_select_all: form.default_select_all,
     im_enabled: form.default_select_all ? form.im_enabled : false,
+    notify_enabled: form.notify_enabled,
     steps: form.steps.map((s, i) => ({
       order: i + 1, name: s.name, task_type: s.task_type,
       command: s.task_type === 'command' ? s.command : '',
@@ -1718,6 +1738,14 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+.notify-off {
+  margin-left: 6px;
+}
+.notify-switch {
+  display: inline-flex;
+  align-items: center;
+  font-size: 12px;
+}
 .queue-hint {
   margin-left: 8px;
   font-size: 12px;

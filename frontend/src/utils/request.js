@@ -27,6 +27,8 @@ const SUDO_ACTIONS = [
   ['/api/feishu/app/', '修改飞书接入配置'],
   ['/api/feishu/channels/', '修改飞书会话白名单'],
   ['/api/feishu/bindings/', '修改飞书绑定关系'],
+  ['/api/notify/robots/', '修改群机器人'],
+  ['/api/notify/rules/', '修改消息通知订阅规则'],
   ['/api/auth/users/', '修改用户'],
   ['/api/auth/roles/', '修改角色权限'],
   ['/api/auth/api-credentials/', '修改 API 凭证'],

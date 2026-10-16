@@ -200,6 +200,12 @@ const router = createRouter({
           meta: { title: '飞书接入', perm: ['system', 'write'] },
         },
         {
+          path: 'system/notify',
+          name: 'SystemNotify',
+          component: () => import('../views/system/Notify.vue'),
+          meta: { title: '消息通知', perm: ['system', 'write'] },
+        },
+        {
           // 绑定关系决定「哪个飞书号能以哪个平台账号进来」，属身份面 → account
           path: 'system/feishu-bindings',
           name: 'SystemFeishuBindings',
